@@ -1,0 +1,9 @@
+dashboard/node_modules
+dashboard/dist
+dashboard/.angular
+**/__pycache__
+**/.git
+**/.venv
+**/venv
+**/*.pyc
+.env

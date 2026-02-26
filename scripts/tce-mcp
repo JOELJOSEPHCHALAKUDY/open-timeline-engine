@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHONPATH="${ROOT}/shared:${ROOT}/services/tce_mcp"
+export PYTHONPATH
+"${ROOT}/.venv_mcp/bin/python" -m tce_mcp.server "$@"

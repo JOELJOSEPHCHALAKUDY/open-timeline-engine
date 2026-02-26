@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>TCE Browser Options</title>
+    <style>
+      body { font-family: sans-serif; margin: 14px; max-width: 640px; }
+      h2 { margin-top: 0; }
+      label { display: block; margin-bottom: 10px; }
+      input, select, textarea { width: 100%; box-sizing: border-box; margin-top: 4px; }
+      textarea { min-height: 110px; }
+      .small { color: #555; font-size: 12px; margin-top: 6px; }
+      #save { margin-top: 10px; }
+      #status { margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h2>TCE Browser Settings</h2>
+    <label>API URL <input id="apiUrl" type="text" /></label>
+    <label>API Token <input id="apiToken" type="text" /></label>
+    <label>Consumer ID <input id="consumerId" type="text" /></label>
+    <label>
+      Role
+      <select id="role">
+        <option value="user">user</option>
+        <option value="executor">executor</option>
+        <option value="advisor">advisor</option>
+      </select>
+    </label>
+    <label>Workspace ID <input id="workspaceId" type="text" /></label>
+    <label>User ID <input id="userId" type="text" /></label>
+    <label>Default Sensitivity <input id="sensitivity" type="number" min="0" max="3" /></label>
+    <label>Takeover Session ID <input id="takeoverSessionId" type="text" /></label>
+    <label>
+      Takeover Persona Mode
+      <select id="takeoverPersonaMode">
+        <option value="normal">normal</option>
+        <option value="naruto">naruto</option>
+        <option value="shadow">shadow</option>
+      </select>
+    </label>
+    <label>
+      Activation Mode Default
+      <select id="takeoverActivationModeDefault">
+        <option value="takeover">takeover</option>
+        <option value="suggest">suggest</option>
+      </select>
+    </label>
+    <label>
+      Allowed Sites (hostnames, comma or newline separated)
+      <textarea id="allowedSites" placeholder="github.com&#10;stackoverflow.com"></textarea>
+    </label>
+    <div class="small">Per-site opt-in is enforced by hostname. Leave empty to block capture from all sites.</div>
+    <button id="save">Save</button>
+    <div id="status"></div>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,235 @@
+name: open-timeline-engine
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tce
+    ports:
+      - "${TCE_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-tuning.conf:/etc/postgresql/conf.d/tuning.conf:ro
+    command: >
+      postgres
+        -c config_file=/etc/postgresql/conf.d/tuning.conf
+        -c listen_addresses='*'
+    shm_size: '2g'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tce"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: '4'
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${TCE_REDIS_PORT:-6379}:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: '1'
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "${TCE_OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    ports:
+      - "${TCE_QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  tce-api:
+    build:
+      context: ..
+      dockerfile: services/tce_api/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce
+      TCE_REDIS_URL: redis://redis:6379/0
+      TCE_OLLAMA_URL: http://ollama:11434
+      TCE_QDRANT_ENABLED: "true"
+      TCE_QDRANT_URL: http://qdrant:6333
+      TCE_API_WORKERS: ${TCE_API_WORKERS:-4}
+      TCE_ENV_FILE: /workspace/.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      tce-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "${TCE_API_PORT:-8080}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ../.env:/workspace/.env
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: '4'
+
+  tce-migrate:
+    build:
+      context: ..
+      dockerfile: services/tce_api/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce
+    command: ["alembic", "-c", "infra/alembic.ini", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  tce-worker:
+    build:
+      context: ..
+      dockerfile: services/tce_worker/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce
+      TCE_REDIS_URL: redis://redis:6379/0
+      TCE_OLLAMA_URL: http://ollama:11434
+      TCE_QDRANT_ENABLED: "true"
+      TCE_QDRANT_URL: http://qdrant:6333
+      TCE_WORKER_LISTEN_QUEUES: ${TCE_WORKER_LISTEN_QUEUES:-tce-default,tce-embeddings}
+      TCE_WORKER_ENABLE_SCHEDULER: ${TCE_WORKER_ENABLE_SCHEDULER:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      tce-migrate:
+        condition: service_completed_successfully
+
+  tce-worker-patterns:
+    build:
+      context: ..
+      dockerfile: services/tce_worker/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce
+      TCE_REDIS_URL: redis://redis:6379/0
+      TCE_OLLAMA_URL: http://ollama:11434
+      TCE_QDRANT_ENABLED: "true"
+      TCE_QDRANT_URL: http://qdrant:6333
+      TCE_WORKER_LISTEN_QUEUES: ${TCE_WORKER_PATTERNS_QUEUES:-tce-patterns}
+      TCE_WORKER_ENABLE_SCHEDULER: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      tce-migrate:
+        condition: service_completed_successfully
+
+  tce-worker-lifecycle:
+    build:
+      context: ..
+      dockerfile: services/tce_worker/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce
+      TCE_REDIS_URL: redis://redis:6379/0
+      TCE_OLLAMA_URL: http://ollama:11434
+      TCE_QDRANT_ENABLED: "true"
+      TCE_QDRANT_URL: http://qdrant:6333
+      TCE_WORKER_LISTEN_QUEUES: ${TCE_WORKER_LIFECYCLE_QUEUES:-tce-lifecycle}
+      TCE_WORKER_ENABLE_SCHEDULER: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      tce-migrate:
+        condition: service_completed_successfully
+
+  tce-mcp:
+    build:
+      context: ..
+      dockerfile: services/tce_mcp/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_API_BASE_URL: http://tce-api:8080
+      TCE_API_TOKEN: ${TCE_API_TOKEN:-local-dev-token}
+      TCE_MCP_TRANSPORT: streamable-http
+      TCE_MCP_MOUNT_PATH: /mcp
+      TCE_MCP_CONSUMER_ID: ${TCE_MCP_EXECUTOR_CONSUMER_ID:-codex-executor}
+      TCE_MCP_ROLE: executor
+      TCE_MCP_WORKSPACE_ID: ${TCE_MCP_WORKSPACE_ID:-personal}
+      TCE_MCP_USER_ID: ${TCE_MCP_EXECUTOR_USER_ID:-codex-executor}
+      TCE_MCP_SESSION_ID: ${TCE_MCP_EXECUTOR_SESSION_ID:-codex}
+    restart: unless-stopped
+    depends_on:
+      - tce-api
+
+  tce-mcp-secondary:
+    build:
+      context: ..
+      dockerfile: services/tce_mcp/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_API_BASE_URL: http://tce-api:8080
+      TCE_API_TOKEN: ${TCE_API_TOKEN:-local-dev-token}
+      TCE_MCP_TRANSPORT: streamable-http
+      TCE_MCP_MOUNT_PATH: /mcp
+      TCE_MCP_CONSUMER_ID: ${TCE_MCP_SECONDARY_CONSUMER_ID:-claude-executor}
+      TCE_MCP_ROLE: executor
+      TCE_MCP_WORKSPACE_ID: ${TCE_MCP_WORKSPACE_ID:-personal}
+      TCE_MCP_USER_ID: ${TCE_MCP_SECONDARY_USER_ID:-claude-executor}
+      TCE_MCP_SESSION_ID: ${TCE_MCP_SECONDARY_SESSION_ID:-claude}
+    restart: unless-stopped
+    depends_on:
+      - tce-api
+
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    ports:
+      - "${TCE_PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - tce-api
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    ports:
+      - "${TCE_GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  ollama_data:
+  qdrant_data:
+  grafana_data:

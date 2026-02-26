@@ -1,0 +1,8 @@
+services:
+  postgres:
+    ports: []
+  redis:
+    ports: []
+  tce-api:
+    ports:
+      - "18080:8080"

@@ -1,0 +1,13 @@
+[Unit]
+Description=Open Timeline Engine API
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/open-timeline-engine
+EnvironmentFile=/opt/open-timeline-engine/.env
+ExecStart=/usr/bin/env PYTHONPATH=shared:services/tce_api uvicorn tce_api.main:app --host 0.0.0.0 --port 8080 --workers 4
+Restart=always
+User=tce
+
+[Install]
+WantedBy=multi-user.target

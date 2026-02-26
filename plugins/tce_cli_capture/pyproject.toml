@@ -1,0 +1,17 @@
+[project]
+name = "tce-cli-capture"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12,<1",
+  "requests>=2.32,<3",
+  "pydantic>=2.8,<3",
+  "platformdirs>=4.2,<5"
+]
+
+[project.scripts]
+tce-capture = "tce_cli_capture.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

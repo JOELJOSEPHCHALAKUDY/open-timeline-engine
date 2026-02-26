@@ -1,0 +1,130 @@
+name: ci
+
+on:
+  # pull_request:
+  # push:
+  #   branches: [master]
+  workflow_dispatch:
+
+jobs:
+  python-quality:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
+          pip install pytest ruff mypy httpx
+      - name: Lint (changed core paths)
+        run: python .github/ci/ruff_changed.py
+      - name: Type check
+        run: mypy services shared
+      - name: Unit tests
+        run: pytest tests/unit -q
+      - name: Security tests
+        run: pytest tests/security -q
+
+  integration-migration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    env:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/tce
+      TCE_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
+          pip install alembic pytest
+      - name: Migration smoke
+        run: alembic -c infra/alembic.ini upgrade head
+      - name: Export OpenAPI contracts
+        run: |
+          PYTHONPATH=shared:services/tce_api:services/tce_lite_api python scripts/export_openapi.py
+          test -s docs/openapi/tce_api.v1.json
+          test -s docs/openapi/tce_lite_api.v1.json
+      - name: Integration tests
+        run: pytest tests/integration -q
+
+  load-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install load test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e shared -e services/tce_lite_api
+          pip install locust uvicorn
+      - name: Start lite API for load test
+        run: |
+          TCE_API_TOKENS=local-dev-token TCE_LITE_DB_PATH=/tmp/tce-lite.db PYTHONPATH=shared:services/tce_lite_api \
+            nohup uvicorn tce_lite_api.main:app --host 127.0.0.1 --port 8080 >/tmp/tce-lite-api.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/v1/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/v1/health >/dev/null
+      - name: Takeover latency regression
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: local-dev-token
+          TCE_LATENCY_SESSION: ci-latency
+          TCE_LATENCY_USER: ci-latency
+          TCE_LATENCY_WORKSPACE: personal
+          TCE_LATENCY_TURNS: '40'
+          TCE_LATENCY_WARMUP: '5'
+          TCE_LATENCY_P95_BUDGET_MS: '300'
+        run: python tests/load/takeover_latency_check.py
+      - name: Load test smoke
+        run: locust -f tests/load/locustfile.py --headless -u 5 -r 1 -t 30s --host http://127.0.0.1:8080
+
+  node-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        run: npm install
+      - name: Build
+        run: npm run build
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test

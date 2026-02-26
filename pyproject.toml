@@ -1,0 +1,36 @@
+[project]
+name = "open-timeline-engine"
+version = "0.3.0"
+description = "Local-first timeline context engine"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Open Timeline Engine Contributors" }]
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[tool.ruff]
+line-length = 200
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["services/tce_api", "services/tce_worker", "services/tce_mcp", "services/tce_lite_api", "shared"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["requests", "requests.*", "pgvector", "pgvector.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pgvector.sqlalchemy"]
+ignore_missing_imports = true

@@ -1,0 +1,6 @@
+Write-Host "Install prerequisites:"
+Write-Host "- Python 3.12"
+Write-Host "- Node.js 20+"
+Write-Host "- Docker Desktop"
+Write-Host "- Git"
+Write-Host "Then run: docker compose -f infra/docker-compose.yml up --build"

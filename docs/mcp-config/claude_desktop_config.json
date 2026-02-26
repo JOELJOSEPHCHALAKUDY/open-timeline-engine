@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "tce-executor": {
+      "command": "/bin/bash",
+      "args": [
+        "-lc",
+        "cd /ABSOLUTE/PATH/TO/open-timeline-engine && PYTHONPATH=shared:services/tce_mcp python -m tce_mcp.server"
+      ],
+      "env": {
+        "TCE_API_BASE_URL": "http://localhost:8080",
+        "TCE_API_TOKEN": "local-dev-token",
+        "TCE_MCP_CONSUMER_ID": "claude-executor",
+        "TCE_MCP_ROLE": "executor",
+        "TCE_MCP_WORKSPACE_ID": "personal",
+        "TCE_MCP_USER_ID": "joel"
+      }
+    }
+  }
+}

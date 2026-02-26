@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>TCE Browser</title>
+    <style>
+      body { font-family: sans-serif; margin: 12px; width: 280px; }
+      button { width: 100%; margin-top: 8px; }
+      .small { color: #555; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h3>TCE Capture</h3>
+    <div id="queueSize" class="small">Queued events: 0</div>
+    <label>
+      <input id="captureEnabled" type="checkbox" /> Enable capture on this site
+    </label>
+    <button id="captureNow">Capture Current Tab</button>
+    <button id="replayQueue">Replay Queue</button>
+    <hr />
+    <h4>Takeover</h4>
+    <input id="takeoverMessage" type="text" placeholder="Type takeover message" style="width:100%" />
+    <button id="takeoverActivate">Activate Takeover</button>
+    <button id="takeoverStep">Send Takeover Step</button>
+    <button id="takeoverStop">Stop Takeover</button>
+    <button id="takeoverState">Check Takeover State</button>
+    <button id="openOptions">Open Settings</button>
+    <div id="status" class="small"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

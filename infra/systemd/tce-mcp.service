@@ -1,0 +1,13 @@
+[Unit]
+Description=Open Timeline Engine MCP Server
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/open-timeline-engine
+EnvironmentFile=/opt/open-timeline-engine/.env
+ExecStart=/usr/bin/env PYTHONPATH=shared:services/tce_mcp python -m tce_mcp.server
+Restart=always
+User=tce
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,241 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#06060C"/>
+      <stop offset="100%" style="stop-color:#0C0C1A"/>
+    </linearGradient>
+    <radialGradient id="iris" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#1E1B4B"/>
+      <stop offset="40%" style="stop-color:#2E1065"/>
+      <stop offset="75%" style="stop-color:#4C1D95"/>
+      <stop offset="100%" style="stop-color:#6D28D9"/>
+    </radialGradient>
+    <radialGradient id="pupil" cx="50%" cy="45%" r="50%">
+      <stop offset="0%" style="stop-color:#EDE9FE;stop-opacity:0.9"/>
+      <stop offset="30%" style="stop-color:#C4B5FD;stop-opacity:0.6"/>
+      <stop offset="60%" style="stop-color:#8B5CF6;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#4C1D95;stop-opacity:0"/>
+    </radialGradient>
+    <radialGradient id="sclera" cx="50%" cy="48%" r="55%">
+      <stop offset="0%" style="stop-color:#F5F3FF"/>
+      <stop offset="70%" style="stop-color:#EDE9FE"/>
+      <stop offset="100%" style="stop-color:#DDD6FE"/>
+    </radialGradient>
+    <radialGradient id="amb" cx="50%" cy="42%" r="50%">
+      <stop offset="0%" style="stop-color:#7C3AED;stop-opacity:0.18"/>
+      <stop offset="60%" style="stop-color:#4C1D95;stop-opacity:0.06"/>
+      <stop offset="100%" style="stop-color:#4C1D95;stop-opacity:0"/>
+    </radialGradient>
+    <linearGradient id="rA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#A78BFA;stop-opacity:0.6"/>
+      <stop offset="100%" style="stop-color:#7C3AED;stop-opacity:0.25"/>
+    </linearGradient>
+    <linearGradient id="rB" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#C4B5FD;stop-opacity:0.5"/>
+      <stop offset="100%" style="stop-color:#6366F1;stop-opacity:0.2"/>
+    </linearGradient>
+    <linearGradient id="br" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" style="stop-color:#7C3AED;stop-opacity:0.4"/>
+      <stop offset="50%" style="stop-color:#A78BFA;stop-opacity:0.6"/>
+      <stop offset="100%" style="stop-color:#7C3AED;stop-opacity:0.4"/>
+    </linearGradient>
+    <filter id="au"><feGaussianBlur stdDeviation="8"/></filter>
+    <filter id="gs">
+      <feGaussianBlur stdDeviation="1.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="gx">
+      <feGaussianBlur stdDeviation="0.8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="sh">
+      <feDropShadow dx="0" dy="0.5" stdDeviation="1.5" flood-color="#4C1D95" flood-opacity="0.4"/>
+    </filter>
+    <filter id="bg2">
+      <feGaussianBlur stdDeviation="1.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="cL">
+      <circle cx="40" cy="52" r="15"/>
+    </clipPath>
+    <clipPath id="cR">
+      <circle cx="88" cy="52" r="15"/>
+    </clipPath>
+    <symbol id="tp" viewBox="-5 -5 10 10">
+      <path d="M 0,-4.5 C 0.6,-1.5 1.5,-0.6 4.5,0 C 1.5,0.6 0.6,1.5 0,4.5 C -0.6,1.5 -1.5,0.6 -4.5,0 C -1.5,-0.6 -0.6,-1.5 0,-4.5 Z"
+          fill="#DDD6FE" stroke="#A78BFA" stroke-width="0.2"/>
+      <circle cx="0" cy="0" r="0.8" fill="#EDE9FE"/>
+    </symbol>
+  </defs>
+
+  <!-- Background -->
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+
+  <!-- Ambient glow -->
+  <ellipse cx="64" cy="52" rx="58" ry="40" fill="url(#amb)" filter="url(#au)"/>
+
+  <!-- Outer particles -->
+  <g filter="url(#gx)">
+    <circle cx="14" cy="20" r="0.7" fill="#C4B5FD" opacity="0.35">
+      <animate attributeName="opacity" values="0.35;0.08;0.35" dur="3.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="114" cy="18" r="0.6" fill="#A78BFA" opacity="0.3">
+      <animate attributeName="opacity" values="0.3;0.06;0.3" dur="3s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="10" cy="92" r="0.6" fill="#8B5CF6" opacity="0.28">
+      <animate attributeName="opacity" values="0.28;0.05;0.28" dur="4s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="118" cy="94" r="0.8" fill="#DDD6FE" opacity="0.3">
+      <animate attributeName="opacity" values="0.3;0.06;0.3" dur="2.8s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- ===== LEFT EYE ===== -->
+  <g filter="url(#sh)">
+    <!-- Sclera -->
+    <path d="M 16 52 Q 27 37 40 35 Q 53 37 64 52 Q 53 67 40 69 Q 27 67 16 52 Z"
+          fill="url(#sclera)" stroke="#C4B5FD" stroke-width="0.4" opacity="0.95"/>
+
+    <!-- Iris -->
+    <circle cx="40" cy="52" r="15" fill="url(#iris)"/>
+    <circle cx="40" cy="52" r="15" fill="none" stroke="#7C3AED" stroke-width="0.4" opacity="0.4"/>
+    <circle cx="40" cy="52" r="14.6" fill="none" stroke="#8B5CF6" stroke-width="0.15" opacity="0.2"/>
+
+    <!-- Timeline rings + stars -->
+    <g clip-path="url(#cL)">
+      <!-- Ring 3 (outer) -->
+      <circle cx="40" cy="52" r="13" fill="none" stroke="url(#rA)" stroke-width="0.3" opacity="0.5">
+        <animateTransform attributeName="transform" type="rotate" from="0 40 52" to="360 40 52" dur="32s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Ring 2 (mid) -->
+      <circle cx="40" cy="52" r="10" fill="none" stroke="url(#rB)" stroke-width="0.25" opacity="0.45">
+        <animateTransform attributeName="transform" type="rotate" from="360 40 52" to="0 40 52" dur="25s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Ring 1 (inner) -->
+      <circle cx="40" cy="52" r="7" fill="none" stroke="url(#rA)" stroke-width="0.2" opacity="0.4">
+        <animateTransform attributeName="transform" type="rotate" from="0 40 52" to="360 40 52" dur="18s" repeatCount="indefinite"/>
+      </circle>
+
+      <!-- Ring 3 stars (3 stars) -->
+      <g opacity="0.6">
+        <animateTransform attributeName="transform" type="rotate" from="0 40 52" to="360 40 52" dur="32s" repeatCount="indefinite"/>
+        <use href="#tp" x="50.5" y="50.5" width="3" height="3"/>
+        <use href="#tp" x="38.5" y="37.5" width="3" height="3"/>
+        <use href="#tp" x="27.5" y="54.5" width="3" height="3"/>
+      </g>
+
+      <!-- Ring 2 stars (2 stars) -->
+      <g opacity="0.7">
+        <animateTransform attributeName="transform" type="rotate" from="360 40 52" to="0 40 52" dur="25s" repeatCount="indefinite"/>
+        <use href="#tp" x="47.5" y="50.5" width="3" height="3"/>
+        <use href="#tp" x="33.5" y="42.5" width="3" height="3"/>
+      </g>
+
+      <!-- Ring 1 stars (2 stars) -->
+      <g opacity="0.85">
+        <animateTransform attributeName="transform" type="rotate" from="0 40 52" to="360 40 52" dur="18s" repeatCount="indefinite"/>
+        <use href="#tp" x="44.5" y="50.5" width="3" height="3">
+          <animate attributeName="opacity" values="1;0.5;1" dur="1.8s" repeatCount="indefinite"/>
+        </use>
+        <use href="#tp" x="36.5" y="45.5" width="3" height="3"/>
+      </g>
+    </g>
+
+    <!-- Pupil -->
+    <circle cx="40" cy="52" r="3" fill="#0F0722"/>
+    <circle cx="40" cy="52" r="2.5" fill="url(#pupil)" filter="url(#gx)">
+      <animate attributeName="r" values="2.5;3;2.5" dur="4s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Highlight -->
+    <circle cx="38.5" cy="50.5" r="0.8" fill="white" opacity="0.35"/>
+  </g>
+
+  <!-- ===== RIGHT EYE ===== -->
+  <g filter="url(#sh)">
+    <!-- Sclera -->
+    <path d="M 64 52 Q 75 37 88 35 Q 101 37 112 52 Q 101 67 88 69 Q 75 67 64 52 Z"
+          fill="url(#sclera)" stroke="#C4B5FD" stroke-width="0.4" opacity="0.95"/>
+
+    <!-- Iris (cooler stroke) -->
+    <circle cx="88" cy="52" r="15" fill="url(#iris)"/>
+    <circle cx="88" cy="52" r="15" fill="none" stroke="#6366F1" stroke-width="0.4" opacity="0.45"/>
+    <circle cx="88" cy="52" r="14.6" fill="none" stroke="#818CF8" stroke-width="0.15" opacity="0.2"/>
+
+    <!-- Timeline rings + stars (counter-direction from left) -->
+    <g clip-path="url(#cR)">
+      <!-- Ring 3 (outer) -->
+      <circle cx="88" cy="52" r="13" fill="none" stroke="url(#rB)" stroke-width="0.3" opacity="0.5">
+        <animateTransform attributeName="transform" type="rotate" from="360 88 52" to="0 88 52" dur="32s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Ring 2 (mid) -->
+      <circle cx="88" cy="52" r="10" fill="none" stroke="url(#rA)" stroke-width="0.25" opacity="0.45">
+        <animateTransform attributeName="transform" type="rotate" from="0 88 52" to="360 88 52" dur="25s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Ring 1 (inner) -->
+      <circle cx="88" cy="52" r="7" fill="none" stroke="url(#rB)" stroke-width="0.2" opacity="0.4">
+        <animateTransform attributeName="transform" type="rotate" from="360 88 52" to="0 88 52" dur="18s" repeatCount="indefinite"/>
+      </circle>
+
+      <!-- Ring 3 stars (3 stars, opposite rotation) -->
+      <g opacity="0.6">
+        <animateTransform attributeName="transform" type="rotate" from="360 88 52" to="0 88 52" dur="32s" repeatCount="indefinite"/>
+        <use href="#tp" x="98.5" y="50.5" width="3" height="3"/>
+        <use href="#tp" x="86.5" y="37.5" width="3" height="3"/>
+        <use href="#tp" x="75.5" y="54.5" width="3" height="3"/>
+      </g>
+
+      <!-- Ring 2 stars (2 stars) -->
+      <g opacity="0.7">
+        <animateTransform attributeName="transform" type="rotate" from="0 88 52" to="360 88 52" dur="25s" repeatCount="indefinite"/>
+        <use href="#tp" x="95.5" y="50.5" width="3" height="3"/>
+        <use href="#tp" x="81.5" y="42.5" width="3" height="3"/>
+      </g>
+
+      <!-- Ring 1 stars (2 stars) -->
+      <g opacity="0.85">
+        <animateTransform attributeName="transform" type="rotate" from="360 88 52" to="0 88 52" dur="18s" repeatCount="indefinite"/>
+        <use href="#tp" x="92.5" y="50.5" width="3" height="3">
+          <animate attributeName="opacity" values="1;0.5;1" dur="1.8s" repeatCount="indefinite"/>
+        </use>
+        <use href="#tp" x="84.5" y="45.5" width="3" height="3"/>
+      </g>
+    </g>
+
+    <!-- Pupil -->
+    <circle cx="88" cy="52" r="3" fill="#0F0722"/>
+    <circle cx="88" cy="52" r="2.5" fill="url(#pupil)" filter="url(#gx)">
+      <animate attributeName="r" values="2.5;3;2.5" dur="4s" begin="0.5s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- Highlight -->
+    <circle cx="86.5" cy="50.5" r="0.8" fill="white" opacity="0.35"/>
+  </g>
+
+  <!-- ===== NEURAL BRIDGE ===== -->
+  <g filter="url(#bg2)">
+    <!-- Upper arc -->
+    <path d="M 55 52 C 60 44 68 44 73 52" fill="none" stroke="url(#br)" stroke-width="0.5" stroke-linecap="round" opacity="0.35">
+      <animate attributeName="opacity" values="0.35;0.15;0.35" dur="3s" repeatCount="indefinite"/>
+    </path>
+    <!-- Lower arc -->
+    <path d="M 55 52 C 60 60 68 60 73 52" fill="none" stroke="url(#br)" stroke-width="0.4" stroke-linecap="round" opacity="0.25">
+      <animate attributeName="opacity" values="0.25;0.1;0.25" dur="3.5s" repeatCount="indefinite"/>
+    </path>
+    <!-- Center pulsing dot -->
+    <circle cx="64" cy="49" r="1" fill="#A78BFA" opacity="0.3">
+      <animate attributeName="r" values="1;1.5;1" dur="2.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.3;0.15;0.3" dur="2.5s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+
+  <!-- Iris glow rings -->
+  <circle cx="40" cy="52" r="16" fill="none" stroke="#7C3AED" stroke-width="0.3" opacity="0.1" filter="url(#gx)">
+    <animate attributeName="r" values="16;17;16" dur="5s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.1;0.03;0.1" dur="5s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="88" cy="52" r="16" fill="none" stroke="#6366F1" stroke-width="0.3" opacity="0.1" filter="url(#gx)">
+    <animate attributeName="r" values="16;17;16" dur="5s" begin="0.5s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0.1;0.03;0.1" dur="5s" begin="0.5s" repeatCount="indefinite"/>
+  </circle>
+</svg>

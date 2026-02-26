@@ -1,0 +1,44 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.db
+*.sqlite3
+node_modules/
+dist/
+out/
+coverage/
+.vscode-test/
+.DS_Store
+.idea/
+*.log
+*.pid
+*.seed
+infra/data/
+plugins/tce_browser/.web-ext-artifacts/
+
+# Backups (may contain .env snapshots and DB dumps)
+backups/
+
+# Virtual environments (non-standard names)
+.venv_cli_capture/
+.venv_mcp/
+
+# Local data
+.local/
+
+# Generated configs (contain local paths)
+docs/mcp-config/generated/
+
+# Build artifacts
+build/
+*.egg-info/

@@ -1,0 +1,13 @@
+[
+  "Review architecture options for scaling a monolithic API to multi-service.",
+  "Plan a safe rollout for a feature flag with canary and rollback checkpoints.",
+  "Debug a latency regression in search while preserving safety gates.",
+  "Design a migration plan for additive schema changes with zero downtime.",
+  "Refine prompt policy rules to reduce ambiguous tool-calling behavior.",
+  "Audit endpoint parity between full stack and lite stack.",
+  "Create an execution permit matrix for mutating operations by risk tier.",
+  "Investigate why dashboard metrics can be zero despite active usage.",
+  "Propose a deterministic scoring model for human-like autonomy.",
+  "Draft a production runbook for lifecycle archive and retention jobs."
+]
+

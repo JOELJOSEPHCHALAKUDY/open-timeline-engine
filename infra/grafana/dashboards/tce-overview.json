@@ -1,0 +1,36 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "title": "API Request Rate",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "sum(rate(tce_api_requests_total[1m]))", "refId": "A"}
+      ],
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "title": "API p95 Latency",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum(rate(tce_api_request_latency_seconds_bucket[5m])) by (le))", "refId": "A"}
+      ],
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0}
+    }
+  ],
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["tce"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "",
+  "title": "TCE Overview",
+  "version": 1
+}

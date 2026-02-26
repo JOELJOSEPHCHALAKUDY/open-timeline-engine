@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ROOT/.env"
+  set +a
+fi
+: "${TCE_USER_CONSUMER_ID:=${TCE_MCP_EXECUTOR_CONSUMER_ID:-codex-executor}}"
+: "${TCE_USER_ID:=${TCE_MCP_EXECUTOR_USER_ID:-${TCE_USER_CONSUMER_ID}}}"
+: "${TCE_USER_WORKSPACE_ID:=${TCE_MCP_WORKSPACE_ID:-personal}}"
+: "${TCE_USER_ROLE:=executor}"
+export TCE_USER_CONSUMER_ID TCE_USER_ID TCE_USER_WORKSPACE_ID TCE_USER_ROLE
+"${ROOT}/.venv_cli_capture/bin/tce-capture" "$@"

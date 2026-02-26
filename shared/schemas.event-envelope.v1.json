@@ -1,0 +1,4 @@
+{
+  "deprecated": true,
+  "message": "Use shared/schemas/event-envelope.v1.json"
+}

@@ -1,0 +1,15 @@
+{
+  "name": "open-timeline-engine",
+  "private": true,
+  "version": "0.3.0",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "plugins/tce_vscode",
+    "plugins/tce_browser"
+  ],
+  "scripts": {
+    "build": "npm run -w plugins/tce_vscode build && npm run -w plugins/tce_browser build",
+    "test": "npm run -w plugins/tce_vscode test && npm run -w plugins/tce_browser test",
+    "lint": "npm run -w plugins/tce_vscode lint && npm run -w plugins/tce_browser lint"
+  }
+}

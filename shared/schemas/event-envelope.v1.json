@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://open-timeline-engine.dev/schemas/event-envelope.v1.json",
+  "title": "EventEnvelope",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ts",
+    "actor",
+    "source",
+    "domain",
+    "task_type",
+    "event_type",
+    "title",
+    "sensitivity"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "ts": { "type": "string", "format": "date-time" },
+    "actor": { "type": "string" },
+    "source": { "type": "string" },
+    "domain": { "type": "string" },
+    "task_type": { "type": "string" },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "TASK_START",
+        "TASK_STEP",
+        "TASK_DECISION",
+        "TASK_DONE",
+        "CODE_CHANGE",
+        "COMMAND_RUN",
+        "DOC_EDIT",
+        "ERROR",
+        "FIX",
+        "REVIEW",
+        "REFLECTION"
+      ]
+    },
+    "title": { "type": "string" },
+    "payload": { "type": "object" },
+    "context": { "type": "object" },
+    "inputs": { "type": "object" },
+    "steps": { "type": "array" },
+    "decision": { "type": ["object", "null"] },
+    "outcome": { "type": ["object", "null"] },
+    "style": { "type": ["object", "null"] },
+    "links": { "type": ["object", "null"] },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "sensitivity": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "redaction_hints": { "type": "array", "items": { "type": "string" } }
+  }
+}

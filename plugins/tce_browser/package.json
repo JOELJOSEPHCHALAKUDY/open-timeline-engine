@@ -1,0 +1,21 @@
+{
+  "name": "tce-browser",
+  "version": "0.3.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "npm run clean && npm run build:ts && npm run copy:static",
+    "clean": "rm -rf dist",
+    "build:ts": "esbuild src/background.ts src/popup.ts src/options.ts --bundle --outdir=dist --format=iife --platform=browser --target=es2022",
+    "copy:static": "cp public/manifest.json dist/manifest.json && cp public/popup.html dist/popup.html && cp public/options.html dist/options.html",
+    "lint": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.29",
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.23.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.2"
+  }
+}

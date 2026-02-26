@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"systemMessage\": \"[TCE-HOOK] Conditional takeover policy: scan chat history for activation and stand-down state. Call mcp__tce-executor__tce_takeover_step only on activation turns and while takeover is active (use executor session_id, for example codex/claude, with activation_mode_default=takeover). On stand-down turns, call mcp__tce-executor__tce_reset_takeover_state. While inactive, respond naturally and do not call takeover_step or check_context in normal flow. If has_directive=true, execute the objective immediately. If safety_decision=confirm_required, ask for confirmation.\"}'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT\" | grep -q \"open-timeline-engine\"; then echo '{{\"systemMessage\": \"[TCE-SELF-HEAL] You modified a TCE file. Run: bash /Users/joeljoseph/Desktop/Personal Work/ai-experiments-apps/open-timeline-engine/scripts/self-heal.sh then continue the current workflow. Call mcp__tce-executor__tce_takeover_step only if takeover is active in this chat; otherwise continue naturally.\"}}'; else echo '{{\"continue\": true}}'; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,198 @@
+{
+  "name": "tce-vscode",
+  "displayName": "TCE Capture",
+  "description": "Timeline Context Engine capture extension",
+  "version": "0.3.0",
+  "publisher": "open-timeline-engine",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:tce.startTask",
+    "onCommand:tce.logStep",
+    "onCommand:tce.logDecision",
+    "onCommand:tce.completeTask",
+    "onCommand:tce.replayQueue",
+    "onCommand:tce.noteReflection",
+    "onCommand:tce.takeoverActivate",
+    "onCommand:tce.takeoverStep",
+    "onCommand:tce.takeoverStop",
+    "onCommand:tce.takeoverState"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tce.startTask",
+        "title": "TCE: Start Task"
+      },
+      {
+        "command": "tce.logStep",
+        "title": "TCE: Log Step"
+      },
+      {
+        "command": "tce.logDecision",
+        "title": "TCE: Log Decision"
+      },
+      {
+        "command": "tce.completeTask",
+        "title": "TCE: Complete Task"
+      },
+      {
+        "command": "tce.replayQueue",
+        "title": "TCE: Replay Queue"
+      },
+      {
+        "command": "tce.noteReflection",
+        "title": "TCE: Reflection Note"
+      },
+      {
+        "command": "tce.takeoverActivate",
+        "title": "TCE: Takeover Activate"
+      },
+      {
+        "command": "tce.takeoverStep",
+        "title": "TCE: Takeover Step"
+      },
+      {
+        "command": "tce.takeoverStop",
+        "title": "TCE: Takeover Stop"
+      },
+      {
+        "command": "tce.takeoverState",
+        "title": "TCE: Takeover State"
+      }
+    ],
+    "configuration": {
+      "title": "TCE",
+      "properties": {
+        "tce.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "TCE API URL"
+        },
+        "tce.apiToken": {
+          "type": "string",
+          "default": "local-dev-token",
+          "description": "Bearer token for TCE API"
+        },
+        "tce.defaultSensitivity": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 3,
+          "description": "Default event sensitivity"
+        },
+        "tce.captureScopes": {
+          "type": "array",
+          "default": [
+            "commands",
+            "editor"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Capture scopes"
+        },
+        "tce.consumerId": {
+          "type": "string",
+          "default": "vscode-user",
+          "description": "Consumer id sent to TCE"
+        },
+        "tce.role": {
+          "type": "string",
+          "default": "user",
+          "enum": [
+            "user",
+            "executor",
+            "advisor"
+          ],
+          "description": "Role header for TCE"
+        },
+        "tce.workspaceId": {
+          "type": "string",
+          "default": "personal",
+          "description": "Workspace scope header"
+        },
+        "tce.userId": {
+          "type": "string",
+          "default": "vscode-user",
+          "description": "User scope header"
+        },
+        "tce.defaultDomain": {
+          "type": "string",
+          "default": "coding",
+          "description": "Default event domain"
+        },
+        "tce.defaultTaskType": {
+          "type": "string",
+          "default": "editor_task",
+          "description": "Default task_type for events"
+        },
+        "tce.autoReplayOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically replay offline queue on activation"
+        },
+        "tce.autoCaptureCommands": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture VSCode command execution events"
+        },
+        "tce.autoCaptureSaves": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture document save events"
+        },
+        "tce.ignoredCommands": {
+          "type": "array",
+          "default": [
+            "tce.",
+            "workbench.action.files.save"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Command prefixes to ignore from auto capture"
+        },
+        "tce.takeoverSessionId": {
+          "type": "string",
+          "default": "vscode-default",
+          "description": "Session id used for takeover API calls"
+        },
+        "tce.takeoverPersonaMode": {
+          "type": "string",
+          "default": "normal",
+          "enum": [
+            "normal",
+            "naruto",
+            "shadow"
+          ],
+          "description": "Persona mode used for takeover activation/stop phrases"
+        },
+        "tce.takeoverActivationModeDefault": {
+          "type": "string",
+          "default": "takeover",
+          "enum": [
+            "suggest",
+            "takeover"
+          ],
+          "description": "Default takeover mode on activation when no explicit override is present"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "lint": "tsc -p . --noEmit",
+    "test": "tsx --test src/*.test.ts src/test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.15",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.32.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.2"
+  }
+}

@@ -1,0 +1,63 @@
+name: open-timeline-engine-lite
+
+services:
+  tce-lite-api:
+    build:
+      context: ..
+      dockerfile: services/tce_lite_api/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_LITE_DB_PATH: /data/tce-lite.db
+    ports:
+      - "${TCE_API_PORT:-8080}:8080"
+    volumes:
+      - tce_lite_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/health', timeout=2)\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  tce-mcp:
+    build:
+      context: ..
+      dockerfile: services/tce_mcp/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_API_BASE_URL: http://tce-lite-api:8080
+      TCE_API_TOKEN: ${TCE_API_TOKEN:-local-dev-token}
+      TCE_MCP_CONSUMER_ID: ${TCE_MCP_EXECUTOR_CONSUMER_ID:-codex-executor}
+      TCE_MCP_ROLE: executor
+      TCE_MCP_WORKSPACE_ID: ${TCE_MCP_WORKSPACE_ID:-personal}
+      TCE_MCP_USER_ID: ${TCE_MCP_EXECUTOR_USER_ID:-codex-executor}
+    depends_on:
+      tce-lite-api:
+        condition: service_healthy
+
+  tce-mcp-secondary:
+    build:
+      context: ..
+      dockerfile: services/tce_mcp/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      TCE_API_BASE_URL: http://tce-lite-api:8080
+      TCE_API_TOKEN: ${TCE_API_TOKEN:-local-dev-token}
+      TCE_MCP_CONSUMER_ID: ${TCE_MCP_SECONDARY_CONSUMER_ID:-claude-executor}
+      TCE_MCP_ROLE: executor
+      TCE_MCP_WORKSPACE_ID: ${TCE_MCP_WORKSPACE_ID:-personal}
+      TCE_MCP_USER_ID: ${TCE_MCP_SECONDARY_USER_ID:-claude-executor}
+      TCE_MCP_SESSION_ID: ${TCE_MCP_SECONDARY_SESSION_ID:-claude}
+    depends_on:
+      tce-lite-api:
+        condition: service_healthy
+
+volumes:
+  tce_lite_data:
