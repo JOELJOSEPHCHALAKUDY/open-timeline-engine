@@ -249,8 +249,10 @@ Small example: in this repo, takeover can return `has_directive=true` but block 
 
 | Runtime | Default | Includes |
 | --- | --- | --- |
-| `full` | Yes | FastAPI + Postgres/pgvector + Redis/RQ + MCP + worker pipelines |
-| `lite` | Optional | SQLite local mode with parity-focused core features |
+| `full` | Yes (recommended) | FastAPI + Postgres/pgvector + Redis/RQ + MCP + worker pipelines |
+| `lite` | Optional (experimental) | SQLite local mode with parity-focused core features |
+
+> ⚠️ **Lite runtime is experimental and not yet stable.** Use the full stack for reliable behavior. Lite is available for quick local testing but may have missing features or inconsistencies.
 
 ### Production-grade defaults
 

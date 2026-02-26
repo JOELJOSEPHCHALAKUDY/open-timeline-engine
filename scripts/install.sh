@@ -1409,7 +1409,7 @@ fi
 if [ "$ACTION" != "install" ] && [ "$ACTION" != "backup" ] && [ "$ACTION" != "restore" ] && [ "$STACK_SET_BY_ARG" != "true" ]; then
   if [ -t 0 ]; then
     echo "Choose stack target"
-    echo "1) Full stack"
+    echo "1) Full stack (recommended)"
     echo "2) Lightweight stack"
     echo "3) Both stacks (default)"
     read -r -p "Select target [1/2/3]: " stop_choice
@@ -1683,7 +1683,7 @@ normalize_executor_clients "$EXECUTOR_CLIENTS"
 
 if [ "$STACK_SET_BY_ARG" != "true" ] && [ -t 0 ]; then
   echo "Step 1 - Choose stack"
-  echo "1) Full production stack (default)"
+  echo "1) Full production stack (recommended, default)"
   echo "2) Lightweight stack"
   read -r -p "Select stack [1/2]: " stack_choice
   case "$stack_choice" in
