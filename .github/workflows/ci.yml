@@ -99,7 +99,7 @@ jobs:
           TCE_API_WORKERS=1
           EOF
       - name: Start real Full stack
-        run: docker compose -f infra/docker-compose.yml up -d --build postgres redis tce-migrate tce-api tce-worker
+        run: docker compose --env-file .env -f infra/docker-compose.yml up -d --build postgres redis tce-migrate tce-api tce-worker
       - name: Wait for Full API
         shell: bash
         run: |
@@ -107,7 +107,7 @@ jobs:
             if curl -fsS http://127.0.0.1:8080/v1/health >/dev/null 2>&1; then exit 0; fi
             sleep 2
           done
-          docker compose -f infra/docker-compose.yml logs tce-migrate tce-api
+          docker compose --env-file .env -f infra/docker-compose.yml logs tce-migrate tce-api
           exit 1
       - name: Install E2E clients
         run: |
@@ -155,10 +155,10 @@ jobs:
         run: python tests/load/behavior_projection_latency_check.py
       - name: Stack logs
         if: always()
-        run: docker compose -f infra/docker-compose.yml logs --no-color tce-migrate tce-api tce-worker
+        run: docker compose --env-file .env -f infra/docker-compose.yml logs --no-color tce-migrate tce-api tce-worker
       - name: Stop Full stack
         if: always()
-        run: docker compose -f infra/docker-compose.yml down -v
+        run: docker compose --env-file .env -f infra/docker-compose.yml down -v
 
   load-tests:
     runs-on: ubuntu-latest
