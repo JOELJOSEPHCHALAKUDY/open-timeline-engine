@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .version import SCHEMA_VERSION
 
@@ -128,6 +128,8 @@ class EventSearchHit(BaseModel):
     task_type: str
     score: float
     sensitivity: int
+    summary_l0: str = ""
+    summary_l1: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventSearchResponse(BaseModel):
@@ -332,6 +334,58 @@ class CloneFeedbackType(StrEnum):
     HELPFUL = "helpful"
     UNHELPFUL = "unhelpful"
     NEUTRAL = "neutral"
+
+
+class BehaviorMemoryClass(StrEnum):
+    DECISION = "decision"
+    FACT = "fact"
+    PREFERENCE = "preference"
+    SAFETY_CONSTRAINT = "safety_constraint"
+    PROCEDURAL_RUNBOOK = "procedural_runbook"
+    EPISODE = "episode"
+    HYPOTHESIS = "hypothesis"
+    REJECTED_HYPOTHESIS = "rejected_hypothesis"
+
+
+class BehaviorEvidenceSource(StrEnum):
+    EXPLICIT = "explicit"
+    INFERRED = "inferred"
+    CORRECTION = "correction"
+    CALIBRATION = "calibration"
+    BACKFILL = "backfill"
+
+
+class BehaviorLifecycleStatus(StrEnum):
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    REJECTED = "rejected"
+
+
+class BehaviorProjectionFormat(StrEnum):
+    MARKDOWN = "markdown"
+    JSON = "json"
+    HTML = "html"
+
+
+class BehaviorProjectionView(StrEnum):
+    CURRENT = "current"
+    DECISIONS = "decisions"
+    EVIDENCE = "evidence"
+    REVIEW = "review"
+
+
+class BehaviorPilotVariant(StrEnum):
+    NO_MEMORY = "no_memory"
+    CANONICAL_STRUCTURED = "canonical_structured"
+    MARKDOWN_PROJECTION = "markdown_projection"
+    PROJECTION_INDEX = "projection_index"
+
+
+class BehaviorPilotStatus(StrEnum):
+    COLLECTING = "collecting"
+    READY_FOR_REVIEW = "ready_for_review"
+    FAILED_QUALITY = "failed_quality"
+    FAILED_SAFETY = "failed_safety"
 
 
 class AutonomyPolicyProfile(StrEnum):
@@ -590,6 +644,14 @@ class TakeoverStepResponse(BaseModel):
     query_expansion_used: bool = False
     query_expansion_terms: list[str] = Field(default_factory=list)
     rerank_strategy: str = "none"
+    context_tier_used: str = "l2"
+    summary_coverage: float = 0.0
+    planner_used: bool = False
+    subquery_count: int = 0
+    subquery_labels: list[str] = Field(default_factory=list)
+    episode_boost_applied: bool = False
+    activation_boost_applied: bool = False
+    behavior_fidelity_gate: dict[str, Any] = Field(default_factory=dict)
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -756,6 +818,62 @@ class ResumePacketResponse(BaseModel):
     retrieval_meta: ResumePacketRetrievalMeta = Field(default_factory=ResumePacketRetrievalMeta)
 
 
+class CompletionCaptureRequest(BaseModel):
+    session_id: str = Field(default="default", min_length=1, max_length=160)
+    completion_key: str = Field(min_length=1, max_length=240)
+    source: str = Field(default="executor", min_length=1, max_length=64)
+    state: str = Field(default="succeeded", pattern="^(succeeded|failed|blocked)$")
+    title: str = Field(min_length=1, max_length=160)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    decision: str = Field(min_length=1, max_length=500)
+    outcome: dict[str, Any] = Field(default_factory=dict)
+    git: dict[str, Any] = Field(default_factory=dict)
+    anchors: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
+    change_summary: dict[str, Any] = Field(default_factory=dict)
+    milestone_schema: str = Field(default="v1", pattern="^v1$")
+
+
+class CompletionCaptureResponse(BaseModel):
+    outbox_id: UUID
+    delivery_status: str
+    event_id: UUID
+    handoff_record_id: UUID
+    contract_valid: bool = True
+    validation_errors: list[str] = Field(default_factory=list)
+    captured_at: datetime
+
+
+class ResumeFeedbackRequest(BaseModel):
+    packet_id: UUID
+    opened_file: str | None = Field(default=None, max_length=240)
+    correct_file: bool
+    correction_required: bool = False
+    correction_reason: str = Field(default="", max_length=500)
+
+
+class ResumeFeedbackResponse(BaseModel):
+    packet_id: UUID
+    recorded: bool
+    feedback_at: datetime
+
+
+class ContinuityPilotStatusResponse(BaseModel):
+    window_days: int
+    eligible_completion_count: int
+    captured_completion_count: int
+    handoff_capture_coverage: float
+    resume_attempt_count: int
+    feedback_count: int
+    correct_file_rate: float | None = None
+    correction_rate: float | None = None
+    median_time_to_resume_ms: float | None = None
+    p95_time_to_resume_ms: float | None = None
+    median_retrieval_latency_ms: float | None = None
+    outbox_pending_count: int = 0
+    outbox_dead_count: int = 0
+    generated_at: datetime
+
+
 class ExecutionStatusResponse(BaseModel):
     session_id: str
     pending: list[DirectiveExecution] = Field(default_factory=list)
@@ -800,6 +918,434 @@ class TakeoverFeedbackResponse(BaseModel):
     autonomy_score: float
     recent_outcomes_json: list[dict[str, Any]] = Field(default_factory=list)
     updated_at: datetime
+
+
+class BehaviorEvidenceRequest(BaseModel):
+    situation_type: str = Field(default="routine_task", min_length=1, max_length=80)
+    situation_summary: str = Field(min_length=1, max_length=500)
+    objective: str = Field(min_length=1, max_length=500)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    available_choices: list[str] = Field(default_factory=list, max_length=20)
+    selected_choice: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(default="", max_length=1000)
+    action_taken: str = Field(default="", max_length=1000)
+    outcome: str = Field(default="", max_length=1000)
+    outcome_sentiment: str | None = Field(default=None, max_length=40)
+    correction_text: str = Field(default="", max_length=1000)
+    memory_class: BehaviorMemoryClass = BehaviorMemoryClass.DECISION
+    evidence_source: BehaviorEvidenceSource = BehaviorEvidenceSource.EXPLICIT
+    lifecycle_status: BehaviorLifecycleStatus = BehaviorLifecycleStatus.ACTIVE
+    source_event_ids: list[UUID] = Field(default_factory=list, max_length=40)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    confirmed_at: datetime | None = None
+    supersedes_observation_id: UUID | None = None
+    contradicts_observation_ids: list[UUID] = Field(default_factory=list, max_length=40)
+    schema_version: str = "v1"
+
+    @model_validator(mode="after")
+    def validate_evidence_contract(self) -> BehaviorEvidenceRequest:
+        if self.schema_version != "v1":
+            raise ValueError("schema_version must be v1")
+        if self.evidence_source in {
+            BehaviorEvidenceSource.EXPLICIT,
+            BehaviorEvidenceSource.CORRECTION,
+            BehaviorEvidenceSource.CALIBRATION,
+        } and not self.rationale.strip():
+            raise ValueError(f"rationale is required for {self.evidence_source.value} evidence")
+        if self.evidence_source == BehaviorEvidenceSource.CORRECTION:
+            if not self.correction_text.strip():
+                raise ValueError("correction_text is required for correction evidence")
+            if self.supersedes_observation_id is None:
+                raise ValueError("supersedes_observation_id is required for correction evidence")
+        if self.valid_from and self.valid_until and self.valid_until <= self.valid_from:
+            raise ValueError("valid_until must be later than valid_from")
+        return self
+
+
+class BehaviorEvidenceResponse(BaseModel):
+    observation_id: UUID | None = None
+    stored: bool
+    learning_eligible: bool
+    storage_score: float
+    storage_decision: str
+    storage_reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    redaction_applied: bool = False
+    superseded_observation_id: UUID | None = None
+    review_id: UUID | None = None
+    shadow_prediction_id: UUID | None = None
+    schema_version: str = "v1"
+
+
+class BehaviorProjectionResponse(BaseModel):
+    projection_id: UUID
+    uri: str
+    view: BehaviorProjectionView
+    format: BehaviorProjectionFormat
+    topic: str | None = None
+    observation_id: str | None = None
+    mime_type: str
+    schema_version: str = "v1"
+    source_revision: str
+    content_sha256: str
+    generated_at: datetime
+    source_evidence_ids: list[UUID] = Field(default_factory=list)
+    trust_level: str
+    sensitivity: int = Field(default=1, ge=0, le=3)
+    read_only: bool = True
+    projection_learning_eligible: bool = False
+    expires_at: datetime | None = None
+    evidence_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    redaction_applied: bool = False
+    content: str
+
+
+class BehaviorPilotAssignmentRequest(BaseModel):
+    trial_key: str = Field(min_length=1, max_length=160)
+    situation_type: str = Field(default="routine_task", min_length=1, max_length=80)
+    situation_summary: str = Field(min_length=1, max_length=500)
+    objective: str = Field(min_length=1, max_length=500)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    candidate_choices: list[str] = Field(default_factory=list, max_length=20)
+
+
+class BehaviorPilotAssignmentResponse(BaseModel):
+    assignment_id: UUID
+    variant: BehaviorPilotVariant
+    assigned_at: datetime
+    expires_at: datetime
+    context_payload: dict[str, Any] = Field(default_factory=dict)
+    citations: list[UUID] = Field(default_factory=list)
+    source_revision: str
+    context_sha256: str
+    injected_tokens: int = Field(default=0, ge=0)
+    retrieval_latency_ms: int = Field(default=0, ge=0)
+    projection_learning_eligible: bool = False
+    schema_version: str = "v1"
+
+
+class BehaviorPilotOutcomeRequest(BaseModel):
+    assignment_id: UUID
+    agent_choice: str | None = Field(default=None, max_length=500)
+    top3_choices: list[str] = Field(default_factory=list, max_length=3)
+    actual_choice: str = Field(min_length=1, max_length=500)
+    agent_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    abstained: bool = False
+    action_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    workflow_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    correction_required: bool = False
+    outcome_regret: bool = False
+    irrelevant_personalization: bool = False
+    malicious_memory_activated: bool = False
+    used_evidence_ids: list[UUID] = Field(default_factory=list, max_length=40)
+    notes: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_pilot_outcome(self) -> BehaviorPilotOutcomeRequest:
+        if not self.abstained and not str(self.agent_choice or "").strip():
+            raise ValueError("agent_choice is required unless abstained=true")
+        return self
+
+
+class BehaviorPilotOutcomeResponse(BaseModel):
+    assignment_id: UUID
+    outcome_id: UUID
+    recorded: bool
+    stale_evidence_used: bool = False
+    reported_at: datetime
+    schema_version: str = "v1"
+
+
+class BehaviorPilotArmMetrics(BaseModel):
+    variant: BehaviorPilotVariant
+    assignment_count: int = 0
+    completed_count: int = 0
+    completion_rate: float = 0.0
+    top1_agreement: float | None = None
+    top3_agreement: float | None = None
+    non_abstained_precision: float | None = None
+    calibration_brier: float | None = None
+    mean_action_similarity: float | None = None
+    mean_workflow_similarity: float | None = None
+    stale_memory_use_rate: float | None = None
+    irrelevant_personalization_rate: float | None = None
+    correction_rate: float | None = None
+    outcome_regret_rate: float | None = None
+    malicious_activation_rate: float | None = None
+    median_injected_tokens: float | None = None
+    p95_injected_tokens: float | None = None
+    median_retrieval_latency_ms: float | None = None
+    p95_retrieval_latency_ms: float | None = None
+
+
+class BehaviorPilotGate(BaseModel):
+    min_window_days: int = 28
+    min_completed_per_arm: int = 30
+    min_completion_coverage: float = 0.80
+    max_p95_retrieval_latency_ms: float = 120.0
+    max_top1_degradation: float = 0.05
+    elapsed_days: float = 0.0
+    window_complete: bool = False
+    sample_complete: bool = False
+    coverage_complete: bool = False
+    latency_passed: bool = False
+    quality_passed: bool = False
+    safety_passed: bool = True
+    evaluation_ready: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class BehaviorPilotStatusResponse(BaseModel):
+    status: BehaviorPilotStatus
+    started_at: datetime | None = None
+    latest_outcome_at: datetime | None = None
+    assignment_count: int = 0
+    completed_count: int = 0
+    completion_rate: float = 0.0
+    arms: list[BehaviorPilotArmMetrics] = Field(default_factory=list)
+    gate: BehaviorPilotGate = Field(default_factory=BehaviorPilotGate)
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class BehaviorPredictionRequest(BaseModel):
+    situation_type: str = Field(default="routine_task", min_length=1, max_length=80)
+    situation_summary: str = Field(min_length=1, max_length=500)
+    objective: str = Field(min_length=1, max_length=500)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    candidate_choices: list[str] = Field(default_factory=list, max_length=20)
+    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+
+
+class BehaviorPredictionResponse(BaseModel):
+    predicted_choice: str | None = None
+    ranked_choices: list[dict[str, Any]] = Field(default_factory=list)
+    confidence: float = 0.0
+    abstained: bool = True
+    needs_clarification: bool = True
+    clarification_question: str | None = None
+    citations: list[UUID] = Field(default_factory=list)
+    neighbor_count: int = 0
+    effective_neighbor_count: float = 0.0
+    out_of_distribution: bool = False
+    ood_score: float = 1.0
+    predicted_action: str | None = None
+    fidelity_gate: dict[str, Any] = Field(default_factory=dict)
+    schema_version: str = "v1"
+
+
+class BehaviorEvaluationRequest(BaseModel):
+    holdout_ratio: float = Field(default=0.20, ge=0.05, le=0.50)
+    min_train: int = Field(default=5, ge=3, le=1000)
+    min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    max_cases: int = Field(default=500, ge=20, le=5000)
+
+
+class BehaviorEvaluationResponse(BaseModel):
+    run_id: UUID
+    status: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    gate: dict[str, Any] = Field(default_factory=dict)
+    case_results: list[dict[str, Any]] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    duration_ms: int = 0
+    schema_version: str = "v1"
+
+
+class BehaviorEvaluationListResponse(BaseModel):
+    runs: list[BehaviorEvaluationResponse] = Field(default_factory=list)
+
+
+class BehaviorCalibrationAnswerRequest(BaseModel):
+    scenario_id: str = Field(min_length=1, max_length=80)
+    selected_choice: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(min_length=1, max_length=1000)
+    action_taken: str = Field(default="", max_length=1000)
+
+
+class BehaviorCalibrationScenariosResponse(BaseModel):
+    scenarios: list[dict[str, Any]] = Field(default_factory=list)
+    schema_version: str = "v1"
+
+
+class CapabilityGrantRequest(BaseModel):
+    session_id: str = Field(default="default", min_length=1, max_length=160)
+    directive_id: UUID | None = None
+    permit_id: UUID | None = None
+    capability: str = Field(min_length=1, max_length=80)
+    action: str = Field(min_length=1, max_length=80)
+    resource: str = Field(min_length=1, max_length=500)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=120, ge=30, le=900)
+
+
+class CapabilityGrantResponse(BaseModel):
+    grant_id: UUID
+    token: str | None = None
+    status: str
+    decision: str
+    reason: str
+    capability: str
+    action: str
+    resource: str
+    action_digest: str
+    risk_tier: str
+    mutating: bool
+    one_time: bool = True
+    expires_at: datetime
+    schema_version: str = "v1"
+
+
+class CapabilityConsumeRequest(BaseModel):
+    grant_id: UUID
+    token: str = Field(min_length=32, max_length=256)
+    capability: str = Field(min_length=1, max_length=80)
+    action: str = Field(min_length=1, max_length=80)
+    resource: str = Field(min_length=1, max_length=500)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class CapabilityConsumeResponse(BaseModel):
+    grant_id: UUID
+    authorized: bool
+    status: str
+    reason: str
+    action_digest: str
+    consumed_at: datetime | None = None
+    schema_version: str = "v1"
+
+
+class ProcessMiningRequest(BaseModel):
+    lookback_days: int = Field(default=30, ge=1, le=365)
+    min_support: int = Field(default=2, ge=2, le=100)
+    max_sequences: int = Field(default=500, ge=10, le=5000)
+    max_steps: int = Field(default=12, ge=2, le=30)
+
+
+class ProcessModelItem(BaseModel):
+    process_id: UUID
+    process_signature: str
+    name: str
+    steps: list[str] = Field(default_factory=list)
+    transitions: list[dict[str, Any]] = Field(default_factory=list)
+    support: int
+    success_rate: float
+    reliability: float
+    source_sessions: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    status: str = "candidate"
+    review_id: UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "v1"
+
+
+class ProcessMiningResponse(BaseModel):
+    models: list[ProcessModelItem] = Field(default_factory=list)
+    source_event_count: int = 0
+    source_session_count: int = 0
+    duration_ms: int = 0
+    schema_version: str = "v1"
+
+
+class BehaviorShadowPredictionItem(BaseModel):
+    prediction_id: UUID
+    observation_id: UUID | None = None
+    predicted_choice: str | None = None
+    actual_choice: str
+    confidence: float
+    abstained: bool
+    correct: bool | None = None
+    evidence_count: int
+    latency_ms: int
+    created_at: datetime
+    schema_version: str = "v1"
+
+
+class BehaviorShadowStatusResponse(BaseModel):
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    recent: list[BehaviorShadowPredictionItem] = Field(default_factory=list)
+    schema_version: str = "v1"
+
+
+class MemoryReviewItem(BaseModel):
+    review_id: UUID
+    target_type: str
+    target_id: UUID
+    title: str
+    rationale: str = ""
+    status: str
+    proposed_action: str
+    source: str
+    score: float = 0.0
+    reviewer_id: str | None = None
+    review_note: str = ""
+    created_at: datetime
+    resolved_at: datetime | None = None
+    schema_version: str = "v1"
+
+
+class MemoryReviewListResponse(BaseModel):
+    reviews: list[MemoryReviewItem] = Field(default_factory=list)
+    schema_version: str = "v1"
+
+
+class MemoryReviewResolveRequest(BaseModel):
+    decision: str = Field(pattern="^(promote|reject)$")
+    note: str = Field(default="", max_length=1000)
+
+
+class CounterfactualCreateRequest(BaseModel):
+    observation_id: UUID | None = None
+    session_id: str = Field(default="default", min_length=1, max_length=160)
+    directive_id: UUID | None = None
+    decision: str = Field(min_length=1, max_length=500)
+    alternative: str = Field(min_length=1, max_length=500)
+    expected_outcome: str = Field(min_length=1, max_length=1000)
+    assumptions: list[str] = Field(default_factory=list, max_length=20)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    review_at: datetime | None = None
+
+
+class CounterfactualResolveRequest(BaseModel):
+    assessment: str = Field(pattern="^(supported|refuted|inconclusive)$")
+    observed_outcome: str = Field(min_length=1, max_length=1000)
+    lesson: str = Field(default="", max_length=1000)
+    regret_score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class CounterfactualItem(BaseModel):
+    counterfactual_id: UUID
+    observation_id: UUID | None = None
+    session_id: str
+    directive_id: UUID | None = None
+    decision: str
+    alternative: str
+    expected_outcome: str
+    assumptions: list[str] = Field(default_factory=list)
+    confidence: float
+    status: str
+    assessment: str | None = None
+    observed_outcome: str = ""
+    lesson: str = ""
+    regret_score: float | None = None
+    redaction_applied: bool = False
+    review_at: datetime | None = None
+    created_at: datetime
+    resolved_at: datetime | None = None
+    schema_version: str = "v1"
+
+
+class CounterfactualListResponse(BaseModel):
+    records: list[CounterfactualItem] = Field(default_factory=list)
+    schema_version: str = "v1"
 
 
 class CloneAdviceRequest(BaseModel):

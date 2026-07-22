@@ -27,6 +27,290 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(str(row[1]) == column for row in rows)
 
 
+def _ensure_behavior_fidelity_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        "subject_user_id": "TEXT NOT NULL DEFAULT ''",
+        "objective_text": "TEXT NOT NULL DEFAULT ''",
+        "constraints_json": "TEXT NOT NULL DEFAULT '{}'",
+        "available_choices_json": "TEXT NOT NULL DEFAULT '[]'",
+        "selected_choice": "TEXT NOT NULL DEFAULT ''",
+        "action_taken": "TEXT NOT NULL DEFAULT ''",
+        "correction_text": "TEXT NOT NULL DEFAULT ''",
+        "memory_class": "TEXT NOT NULL DEFAULT 'decision'",
+        "evidence_source": "TEXT NOT NULL DEFAULT 'inferred'",
+        "lifecycle_status": "TEXT NOT NULL DEFAULT 'active'",
+        "valid_from": "TEXT NOT NULL DEFAULT ''",
+        "valid_until": "TEXT",
+        "contradicts_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+        "confirmed_at": "TEXT",
+        "behavior_schema_version": "TEXT NOT NULL DEFAULT 'v1'",
+        "redaction_applied": "INTEGER NOT NULL DEFAULT 0",
+        "learning_eligible": "INTEGER NOT NULL DEFAULT 0",
+        "storage_score": "REAL NOT NULL DEFAULT 0.0",
+        "storage_decision": "TEXT NOT NULL DEFAULT 'audit_only'",
+    }
+    for name, ddl in columns.items():
+        if not _column_exists(conn, "decision_observations", name):
+            conn.execute(f"ALTER TABLE decision_observations ADD COLUMN {name} {ddl}")
+    conn.execute(
+        """
+        UPDATE decision_observations
+        SET subject_user_id = CASE WHEN subject_user_id = '' THEN consumer_id ELSE subject_user_id END,
+            objective_text = CASE WHEN objective_text = '' THEN situation_summary ELSE objective_text END,
+            selected_choice = CASE WHEN selected_choice = '' THEN user_response ELSE selected_choice END,
+            valid_from = CASE WHEN valid_from = '' THEN ts ELSE valid_from END,
+            lifecycle_status = CASE WHEN superseded_by IS NULL THEN 'active' ELSE 'superseded' END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS behavior_fidelity_runs (
+            id TEXT PRIMARY KEY,
+            consumer_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            gate_json TEXT NOT NULL DEFAULT '{}',
+            case_results_json TEXT NOT NULL DEFAULT '[]',
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    if not _column_exists(conn, "behavior_fidelity_runs", "subject_user_id"):
+        conn.execute("ALTER TABLE behavior_fidelity_runs ADD COLUMN subject_user_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        """
+        UPDATE behavior_fidelity_runs
+        SET subject_user_id = CASE WHEN subject_user_id = '' THEN consumer_id ELSE subject_user_id END
+        """
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_decision_observations_behavior_active")
+    conn.execute("DROP INDEX IF EXISTS idx_behavior_fidelity_runs_scope_created")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_decision_observations_behavior_active
+            ON decision_observations (
+                workspace_id, subject_user_id, lifecycle_status, learning_eligible, ts DESC
+            )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_decision_observations_validity
+            ON decision_observations (workspace_id, valid_from, valid_until, ts DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_behavior_fidelity_runs_scope_created
+            ON behavior_fidelity_runs (workspace_id, subject_user_id, created_at DESC)
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS capability_grants (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            directive_id TEXT,
+            permit_id TEXT,
+            capability TEXT NOT NULL,
+            action TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            action_digest TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            risk_tier TEXT NOT NULL,
+            mutating INTEGER NOT NULL DEFAULT 0,
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            consumed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_capability_grants_scope_status
+            ON capability_grants (workspace_id, owner_id, status, expires_at DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_process_models (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            process_signature TEXT NOT NULL,
+            name TEXT NOT NULL,
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            transitions_json TEXT NOT NULL DEFAULT '[]',
+            support INTEGER NOT NULL DEFAULT 0,
+            success_rate REAL NOT NULL DEFAULT 0.0,
+            reliability REAL NOT NULL DEFAULT 0.0,
+            source_sessions_json TEXT NOT NULL DEFAULT '[]',
+            evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'candidate',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            UNIQUE(workspace_id, subject_user_id, process_signature)
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_process_models_scope_status
+            ON behavior_process_models (workspace_id, subject_user_id, status, reliability DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_shadow_predictions (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            observation_id TEXT,
+            predicted_choice TEXT,
+            actual_choice TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.0,
+            abstained INTEGER NOT NULL DEFAULT 1,
+            correct INTEGER,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            query_json TEXT NOT NULL DEFAULT '{}',
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_shadow_scope_created
+            ON behavior_shadow_predictions (workspace_id, subject_user_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_memory_reviews (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            proposed_action TEXT NOT NULL DEFAULT 'promote',
+            source TEXT NOT NULL,
+            score REAL NOT NULL DEFAULT 0.0,
+            reviewer_id TEXT,
+            review_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            UNIQUE(workspace_id, subject_user_id, target_type, target_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_memory_reviews_scope_status
+            ON behavior_memory_reviews (workspace_id, subject_user_id, status, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_counterfactuals (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            observation_id TEXT,
+            session_id TEXT NOT NULL,
+            directive_id TEXT,
+            decision TEXT NOT NULL,
+            alternative TEXT NOT NULL,
+            expected_outcome TEXT NOT NULL,
+            assumptions_json TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.5,
+            status TEXT NOT NULL DEFAULT 'open',
+            assessment TEXT,
+            observed_outcome TEXT NOT NULL DEFAULT '',
+            lesson TEXT NOT NULL DEFAULT '',
+            regret_score REAL,
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            review_at TEXT,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_counterfactuals_scope_status
+            ON behavior_counterfactuals (workspace_id, subject_user_id, status, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_projection_pilot_assignments (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            trial_key TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            situation_type TEXT NOT NULL,
+            situation_summary TEXT NOT NULL,
+            objective_text TEXT NOT NULL,
+            request_json TEXT NOT NULL DEFAULT '{}',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            context_sha256 TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            injected_tokens INTEGER NOT NULL DEFAULT 0,
+            retrieval_latency_ms INTEGER NOT NULL DEFAULT 0,
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            assigned_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            UNIQUE(workspace_id, subject_user_id, trial_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_scope_assigned
+            ON behavior_projection_pilot_assignments (
+                workspace_id, subject_user_id, assigned_at DESC
+            );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_variant_assigned
+            ON behavior_projection_pilot_assignments (
+                workspace_id, subject_user_id, variant, assigned_at DESC
+            );
+
+        CREATE TABLE IF NOT EXISTS behavior_projection_pilot_outcomes (
+            id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL UNIQUE,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            reporter_id TEXT NOT NULL,
+            outcome_digest TEXT NOT NULL,
+            agent_choice TEXT,
+            top3_choices_json TEXT NOT NULL DEFAULT '[]',
+            actual_choice TEXT NOT NULL,
+            agent_confidence REAL NOT NULL DEFAULT 0.0,
+            abstained INTEGER NOT NULL DEFAULT 0,
+            action_similarity REAL NOT NULL DEFAULT 0.0,
+            workflow_similarity REAL NOT NULL DEFAULT 0.0,
+            correction_required INTEGER NOT NULL DEFAULT 0,
+            outcome_regret INTEGER NOT NULL DEFAULT 0,
+            irrelevant_personalization INTEGER NOT NULL DEFAULT 0,
+            malicious_memory_activated INTEGER NOT NULL DEFAULT 0,
+            stale_evidence_used INTEGER NOT NULL DEFAULT 0,
+            used_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            notes TEXT NOT NULL DEFAULT '',
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            reported_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            FOREIGN KEY(assignment_id) REFERENCES behavior_projection_pilot_assignments(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_outcome_scope_reported
+            ON behavior_projection_pilot_outcomes (
+                workspace_id, subject_user_id, reported_at DESC
+            );
+        """
+    )
+    if not _column_exists(conn, "capability_grants", "completion_required"):
+        conn.execute("ALTER TABLE capability_grants ADD COLUMN completion_required INTEGER NOT NULL DEFAULT 0")
+    if not _column_exists(conn, "capability_grants", "completion_outbox_id"):
+        conn.execute("ALTER TABLE capability_grants ADD COLUMN completion_outbox_id TEXT")
+    if not _column_exists(conn, "capability_grants", "completion_recorded_at"):
+        conn.execute("ALTER TABLE capability_grants ADD COLUMN completion_recorded_at TEXT")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_capability_grants_completion_obligation
+        ON capability_grants (
+            workspace_id, owner_id, session_id, completion_required, completion_recorded_at
+        )
+        """
+    )
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -638,6 +922,59 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
             ON handoff_records (workspace_id, owner_id, objective_text);
         """
     )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS handoff_outbox (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            behavior_subject_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            directive_id TEXT,
+            completion_key TEXT NOT NULL,
+            terminal_state TEXT NOT NULL,
+            milestone_json TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL DEFAULT 'native',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            last_error TEXT,
+            event_id TEXT NOT NULL,
+            handoff_record_id TEXT NOT NULL,
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            delivered_at TEXT,
+            UNIQUE(workspace_id, owner_id, completion_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_handoff_outbox_delivery
+            ON handoff_outbox (status, next_attempt_at, created_at);
+        CREATE INDEX IF NOT EXISTS idx_handoff_outbox_scope
+            ON handoff_outbox (workspace_id, owner_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS continuity_resume_attempts (
+            id TEXT PRIMARY KEY,
+            packet_id TEXT NOT NULL UNIQUE,
+            workspace_id TEXT NOT NULL,
+            requesting_owner_id TEXT NOT NULL,
+            target_owner_id TEXT NOT NULL,
+            selected_record_id TEXT NOT NULL,
+            query_text TEXT NOT NULL,
+            top_file TEXT,
+            requested_at TEXT NOT NULL,
+            returned_at TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            time_since_handoff_ms INTEGER NOT NULL DEFAULT 0,
+            opened_file TEXT,
+            correct_file INTEGER,
+            correction_required INTEGER,
+            correction_reason TEXT NOT NULL DEFAULT '',
+            feedback_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_continuity_resume_scope
+            ON continuity_resume_attempts (workspace_id, requesting_owner_id, requested_at DESC);
+        """
+    )
 
 
 def _seed_lifecycle_defaults(conn: sqlite3.Connection) -> None:
@@ -647,6 +984,9 @@ def _seed_lifecycle_defaults(conn: sqlite3.Connection) -> None:
         {
             "retention_days": int(settings.event_retention_days),
             "handoff_retention_days": int(getattr(settings, "handoff_retention_days", 90)),
+            "behavior_control_retention_days": int(
+                getattr(settings, "behavior_control_retention_days", 365)
+            ),
             "archive_enabled": bool(settings.archive_enabled),
             "archive_path": settings.archive_path,
         }
@@ -674,6 +1014,10 @@ def init_db() -> None:
             task_type TEXT NOT NULL,
             event_type TEXT NOT NULL,
             title TEXT NOT NULL,
+            summary_l0 TEXT NOT NULL DEFAULT '',
+            summary_l1_json TEXT NOT NULL DEFAULT '{}',
+            summary_version TEXT NOT NULL DEFAULT 'v1',
+            summary_updated_at TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL,
             context TEXT NOT NULL,
             inputs TEXT NOT NULL,
@@ -933,6 +1277,7 @@ def init_db() -> None:
             ts TEXT NOT NULL,
             consumer_id TEXT NOT NULL,
             workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
             situation_type TEXT NOT NULL,
             situation_summary TEXT NOT NULL,
             user_response TEXT NOT NULL,
@@ -943,7 +1288,41 @@ def init_db() -> None:
             source_event_ids TEXT NOT NULL DEFAULT '[]',
             context_snapshot TEXT NOT NULL DEFAULT '{}',
             embedding TEXT,
-            superseded_by TEXT
+            superseded_by TEXT,
+            objective_text TEXT NOT NULL DEFAULT '',
+            constraints_json TEXT NOT NULL DEFAULT '{}',
+            available_choices_json TEXT NOT NULL DEFAULT '[]',
+            selected_choice TEXT NOT NULL DEFAULT '',
+            action_taken TEXT NOT NULL DEFAULT '',
+            correction_text TEXT NOT NULL DEFAULT '',
+            memory_class TEXT NOT NULL DEFAULT 'decision',
+            evidence_source TEXT NOT NULL DEFAULT 'inferred',
+            lifecycle_status TEXT NOT NULL DEFAULT 'active',
+            valid_from TEXT NOT NULL DEFAULT '',
+            valid_until TEXT,
+            contradicts_ids_json TEXT NOT NULL DEFAULT '[]',
+            confirmed_at TEXT,
+            behavior_schema_version TEXT NOT NULL DEFAULT 'v1',
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            learning_eligible INTEGER NOT NULL DEFAULT 0,
+            storage_score REAL NOT NULL DEFAULT 0.0,
+            storage_decision TEXT NOT NULL DEFAULT 'audit_only'
+        );
+
+        CREATE TABLE IF NOT EXISTS behavior_fidelity_runs (
+            id TEXT PRIMARY KEY,
+            consumer_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            gate_json TEXT NOT NULL DEFAULT '{}',
+            case_results_json TEXT NOT NULL DEFAULT '[]',
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
         );
 
         CREATE TABLE IF NOT EXISTS clone_feedback (
@@ -1023,7 +1402,16 @@ def init_db() -> None:
             ON behavioral_fingerprints (consumer_id, workspace_id);
         """
         )
+        if not _column_exists(conn, "events", "summary_l0"):
+            conn.execute("ALTER TABLE events ADD COLUMN summary_l0 TEXT NOT NULL DEFAULT ''")
+        if not _column_exists(conn, "events", "summary_l1_json"):
+            conn.execute("ALTER TABLE events ADD COLUMN summary_l1_json TEXT NOT NULL DEFAULT '{}'")
+        if not _column_exists(conn, "events", "summary_version"):
+            conn.execute("ALTER TABLE events ADD COLUMN summary_version TEXT NOT NULL DEFAULT 'v1'")
+        if not _column_exists(conn, "events", "summary_updated_at"):
+            conn.execute("ALTER TABLE events ADD COLUMN summary_updated_at TEXT NOT NULL DEFAULT ''")
         _ensure_takeover_v3_schema(conn)
+        _ensure_behavior_fidelity_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

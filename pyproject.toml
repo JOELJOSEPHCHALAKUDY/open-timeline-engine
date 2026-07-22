@@ -19,6 +19,10 @@ ignore = ["B008"]
 [tool.pytest.ini_options]
 pythonpath = ["services/tce_api", "services/tce_worker", "services/tce_mcp", "services/tce_lite_api", "shared"]
 testpaths = ["tests"]
+markers = [
+  "e2e: requires a live Full PostgreSQL stack and MCP transport",
+  "integration: requires an API integration environment",
+]
 
 [tool.mypy]
 python_version = "3.12"
@@ -26,6 +30,7 @@ strict = false
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_return_any = true
+exclude = "(^|/)(build|dist|node_modules|\\.venv)/"
 
 [[tool.mypy.overrides]]
 module = ["requests", "requests.*", "pgvector", "pgvector.*"]

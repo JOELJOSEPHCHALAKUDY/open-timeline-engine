@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     event_lifecycle_enabled: bool = True
     event_retention_days: int = 180
     handoff_retention_days: int = 90
+    handoff_outbox_batch_size: int = 100
+    behavior_control_retention_days: int = 365
     archive_enabled: bool = True
     archive_path: str = "/data/archives"
     audit_retention_days: int = 180

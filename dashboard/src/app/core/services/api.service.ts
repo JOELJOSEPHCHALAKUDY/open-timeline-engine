@@ -62,6 +62,10 @@ import {
   DashboardStackRestartRequest,
   DashboardStackRestartResponse,
   DashboardStackRestartStatusResponse,
+  BehaviorShadowStatus,
+  BehaviorMemoryReview,
+  BehaviorMemoryReviewList,
+  ContinuityPilotStatus,
 } from '../models';
 
 @Injectable({ providedIn: 'root' })
@@ -1024,5 +1028,28 @@ export class ApiService {
   // Health
   getHealth(): Observable<{ status: string }> {
     return this.http.get<{ status: string }>(`${this.base}/health`);
+  }
+
+  getBehaviorShadowStatus(): Observable<BehaviorShadowStatus> {
+    return this.http.get<BehaviorShadowStatus>(`${this.base}/behavior/shadow/status`);
+  }
+
+  getBehaviorReviews(): Observable<BehaviorMemoryReviewList> {
+    return this.http.get<BehaviorMemoryReviewList>(`${this.base}/behavior/reviews`, {
+      params: { status: 'pending', limit: '100' },
+    });
+  }
+
+  resolveBehaviorReview(reviewId: string, decision: 'promote' | 'reject', note: string): Observable<BehaviorMemoryReview> {
+    return this.http.post<BehaviorMemoryReview>(`${this.base}/behavior/reviews/${reviewId}/resolve`, {
+      decision,
+      note,
+    });
+  }
+
+  getContinuityPilotStatus(days: number = 30): Observable<ContinuityPilotStatus> {
+    return this.http.get<ContinuityPilotStatus>(`${this.base}/continuity/pilot/status`, {
+      params: { days: String(days) },
+    });
   }
 }

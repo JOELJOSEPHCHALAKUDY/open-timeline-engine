@@ -43,6 +43,12 @@ def enqueue_maintenance_jobs() -> None:
         "tce_worker.jobs.graph_health.run",
         retry=retry,
     )
+    lifecycle_queue.enqueue(
+        "tce_worker.jobs.handoff_outbox.run",
+        None,
+        int(settings.handoff_outbox_batch_size),
+        retry=retry,
+    )
     if bool(getattr(settings, "qdrant_enabled", False)) and bool(getattr(settings, "qdrant_sync_enabled", True)):
         lifecycle_queue.enqueue(
             "tce_worker.jobs.qdrant_sync.run",

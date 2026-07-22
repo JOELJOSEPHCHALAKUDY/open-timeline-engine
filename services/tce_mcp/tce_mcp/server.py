@@ -5,9 +5,76 @@ import os
 from mcp.server.fastmcp import FastMCP
 
 from . import tools
+from .config import get_settings
 from .otel import setup_otel
 
 mcp = FastMCP("tce")
+
+
+def _require_behavior_resource_scope(workspace_id: str, subject_id: str) -> None:
+    settings = get_settings()
+    if workspace_id != settings.mcp_workspace_id or subject_id != settings.mcp_effective_behavior_subject_id:
+        raise ValueError("behavior resource scope does not match the authenticated MCP identity")
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/current.md",
+    name="Current behavioral evidence",
+    description="Deterministic read-only Markdown projection over active canonical behavior evidence",
+    mime_type="text/markdown",
+)
+def current_behavior_markdown(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_current_behavior_projection(format_name="markdown")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/current.json",
+    name="Current behavioral evidence (JSON)",
+    description="Deterministic read-only JSON projection over active canonical behavior evidence",
+    mime_type="application/json",
+)
+def current_behavior_json(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_current_behavior_projection(format_name="json")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/review.html",
+    name="Behavioral evidence review",
+    description="Sanitized read-only HTML review of active and historical canonical behavior evidence",
+    mime_type="text/html",
+)
+def behavior_review_html(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_behavior_review_projection()["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/decisions/{topic}.md",
+    name="Behavioral decisions by topic",
+    description="Read-only Markdown projection of active canonical behavior evidence matching a topic",
+    mime_type="text/markdown",
+)
+def behavior_decisions_markdown(workspace_id: str, subject_id: str, topic: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_behavior_decisions_projection(topic=topic, format_name="markdown")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/evidence/{observation_id}.json",
+    name="Behavioral evidence citation",
+    description="Read-only JSON projection of one canonical behavior evidence record",
+    mime_type="application/json",
+)
+def behavior_evidence_json(workspace_id: str, subject_id: str, observation_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(
+        tools.get_behavior_evidence_projection(
+            observation_id=observation_id,
+            format_name="json",
+        )["content"]
+    )
 
 
 @mcp.tool(name="tce.search_events", description="Search timeline events with filters and citations")
@@ -35,6 +102,57 @@ def get_resume_packet(
         k=k,
         include_cross_user=include_cross_user,
     )
+
+
+@mcp.tool(name="tce.complete_task", description="Mandatory completion hook that durably captures a milestone and handoff record")
+def complete_task(
+    completion_key: str,
+    title: str,
+    files: list[str],
+    decision: str,
+    next_step: str,
+    status: str = "succeeded",
+    session_id: str = "default",
+    source: str = "mcp-executor",
+    git: dict | None = None,
+    anchors: list[dict] | None = None,
+    change_summary: dict | None = None,
+) -> dict:
+    return tools.complete_task(
+        completion_key=completion_key,
+        title=title,
+        files=files,
+        decision=decision,
+        next_step=next_step,
+        status=status,
+        session_id=session_id,
+        source=source,
+        git=git,
+        anchors=anchors,
+        change_summary=change_summary,
+    )
+
+
+@mcp.tool(name="tce.report_resume_feedback", description="Record correct-file and correction feedback for a resume packet")
+def report_resume_feedback(
+    packet_id: str,
+    correct_file: bool,
+    correction_required: bool = False,
+    opened_file: str | None = None,
+    correction_reason: str = "",
+) -> dict:
+    return tools.report_resume_feedback(
+        packet_id=packet_id,
+        correct_file=correct_file,
+        correction_required=correction_required,
+        opened_file=opened_file,
+        correction_reason=correction_reason,
+    )
+
+
+@mcp.tool(name="tce.get_continuity_pilot", description="Get longitudinal continuity pilot metrics for the active workspace")
+def get_continuity_pilot(days: int = 30) -> dict:
+    return tools.get_continuity_pilot(days=days)
 
 
 @mcp.tool(name="tce.get_context_brief", description="Get deterministic context brief with citations")
@@ -205,6 +323,314 @@ def ingest_observations(
     return tools.ingest_observations(
         observations=observations,
         update_fingerprint=update_fingerprint,
+    )
+
+
+@mcp.tool(
+    name="tce.record_behavior_evidence",
+    description="Record an explicit human decision, rationale, outcome, or correction as Behavior Evidence v1",
+)
+def record_behavior_evidence(
+    situation_summary: str,
+    objective: str,
+    selected_choice: str,
+    rationale: str,
+    situation_type: str = "routine_task",
+    available_choices: list[str] | None = None,
+    constraints: dict | None = None,
+    context_snapshot: dict | None = None,
+    action_taken: str = "",
+    outcome: str = "",
+    outcome_sentiment: str | None = None,
+    memory_class: str = "decision",
+    evidence_source: str = "explicit",
+    correction_text: str = "",
+    supersedes_observation_id: str | None = None,
+    contradicts_observation_ids: list[str] | None = None,
+    source_event_ids: list[str] | None = None,
+    confidence: float = 1.0,
+) -> dict:
+    return tools.record_behavior_evidence(
+        situation_summary=situation_summary,
+        objective=objective,
+        selected_choice=selected_choice,
+        rationale=rationale,
+        situation_type=situation_type,
+        available_choices=available_choices,
+        constraints=constraints,
+        context_snapshot=context_snapshot,
+        action_taken=action_taken,
+        outcome=outcome,
+        outcome_sentiment=outcome_sentiment,
+        memory_class=memory_class,
+        evidence_source=evidence_source,
+        correction_text=correction_text,
+        supersedes_observation_id=supersedes_observation_id,
+        contradicts_observation_ids=contradicts_observation_ids,
+        source_event_ids=source_event_ids,
+        confidence=confidence,
+    )
+
+
+@mcp.tool(
+    name="tce.predict_behavior",
+    description="Predict a user choice from validated evidence, or abstain and request clarification",
+)
+def predict_behavior(
+    situation_summary: str,
+    objective: str,
+    situation_type: str = "routine_task",
+    candidate_choices: list[str] | None = None,
+    constraints: dict | None = None,
+    context_snapshot: dict | None = None,
+    min_confidence: float = 0.55,
+) -> dict:
+    return tools.predict_behavior(
+        situation_summary=situation_summary,
+        objective=objective,
+        situation_type=situation_type,
+        candidate_choices=candidate_choices,
+        constraints=constraints,
+        context_snapshot=context_snapshot,
+        min_confidence=min_confidence,
+    )
+
+
+@mcp.tool(
+    name="tce.run_behavior_fidelity_eval",
+    description="Run chronological holdout evaluation of behavioral prediction fidelity",
+)
+def run_behavior_fidelity_eval(
+    holdout_ratio: float = 0.20,
+    min_train: int = 5,
+    min_confidence: float = 0.55,
+    max_cases: int = 500,
+) -> dict:
+    return tools.run_behavior_fidelity_eval(
+        holdout_ratio=holdout_ratio,
+        min_train=min_train,
+        min_confidence=min_confidence,
+        max_cases=max_cases,
+    )
+
+
+@mcp.tool(name="tce.get_behavior_fidelity", description="List behavior fidelity evaluation history and gates")
+def get_behavior_fidelity(limit: int = 20) -> dict:
+    return tools.get_behavior_fidelity(limit=limit)
+
+
+@mcp.tool(
+    name="tce.assign_behavior_projection_pilot",
+    description="Assign one idempotent prospective behavior-memory comparison arm",
+)
+def assign_behavior_projection_pilot(
+    trial_key: str,
+    situation_summary: str,
+    objective: str,
+    situation_type: str = "routine_task",
+    constraints: dict | None = None,
+    context_snapshot: dict | None = None,
+    candidate_choices: list[str] | None = None,
+) -> dict:
+    return tools.assign_behavior_projection_pilot(
+        trial_key=trial_key,
+        situation_summary=situation_summary,
+        objective=objective,
+        situation_type=situation_type,
+        constraints=constraints,
+        context_snapshot=context_snapshot,
+        candidate_choices=candidate_choices,
+    )
+
+
+@mcp.tool(
+    name="tce.report_behavior_projection_pilot_outcome",
+    description="Report held-out choice, quality, correction, safety, and evidence-use outcomes for a pilot assignment",
+)
+def report_behavior_projection_pilot_outcome(
+    assignment_id: str,
+    actual_choice: str,
+    agent_choice: str | None = None,
+    top3_choices: list[str] | None = None,
+    agent_confidence: float = 0.0,
+    abstained: bool = False,
+    action_similarity: float = 0.0,
+    workflow_similarity: float = 0.0,
+    correction_required: bool = False,
+    outcome_regret: bool = False,
+    irrelevant_personalization: bool = False,
+    malicious_memory_activated: bool = False,
+    used_evidence_ids: list[str] | None = None,
+    notes: str = "",
+) -> dict:
+    return tools.report_behavior_projection_pilot_outcome(
+        assignment_id=assignment_id,
+        actual_choice=actual_choice,
+        agent_choice=agent_choice,
+        top3_choices=top3_choices,
+        agent_confidence=agent_confidence,
+        abstained=abstained,
+        action_similarity=action_similarity,
+        workflow_similarity=workflow_similarity,
+        correction_required=correction_required,
+        outcome_regret=outcome_regret,
+        irrelevant_personalization=irrelevant_personalization,
+        malicious_memory_activated=malicious_memory_activated,
+        used_evidence_ids=used_evidence_ids,
+        notes=notes,
+    )
+
+
+@mcp.tool(
+    name="tce.get_behavior_projection_pilot_status",
+    description="Get four-arm prospective projection metrics and pre-registered rollout gates",
+)
+def get_behavior_projection_pilot_status() -> dict:
+    return tools.get_behavior_projection_pilot_status()
+
+
+@mcp.tool(name="tce.get_behavior_calibration", description="List optional cold-start behavior calibration scenarios")
+def get_behavior_calibration() -> dict:
+    return tools.get_behavior_calibration()
+
+
+@mcp.tool(name="tce.answer_behavior_calibration", description="Record an answer to a behavior calibration scenario")
+def answer_behavior_calibration(
+    scenario_id: str,
+    selected_choice: str,
+    rationale: str,
+    action_taken: str = "",
+) -> dict:
+    return tools.answer_behavior_calibration(
+        scenario_id=scenario_id,
+        selected_choice=selected_choice,
+        rationale=rationale,
+        action_taken=action_taken,
+    )
+
+
+@mcp.tool(
+    name="tce.request_capability_grant",
+    description="Request a short-lived, one-use grant bound to an exact action; mutations require a claimed directive and allowed permit",
+)
+def request_capability_grant(
+    capability: str,
+    action: str,
+    resource: str,
+    session_id: str = "default",
+    directive_id: str | None = None,
+    permit_id: str | None = None,
+    arguments: dict | None = None,
+    ttl_seconds: int = 120,
+) -> dict:
+    return tools.request_capability_grant(
+        capability=capability,
+        action=action,
+        resource=resource,
+        session_id=session_id,
+        directive_id=directive_id,
+        permit_id=permit_id,
+        arguments=arguments,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+@mcp.tool(name="tce.consume_capability_grant", description="Atomically consume an exact one-use capability grant before execution")
+def consume_capability_grant(
+    grant_id: str,
+    token: str,
+    capability: str,
+    action: str,
+    resource: str,
+    arguments: dict | None = None,
+) -> dict:
+    return tools.consume_capability_grant(
+        grant_id=grant_id,
+        token=token,
+        capability=capability,
+        action=action,
+        resource=resource,
+        arguments=arguments,
+    )
+
+
+@mcp.tool(name="tce.mine_behavior_processes", description="Mine repeatable multi-step workflows as review-only process candidates")
+def mine_behavior_processes(
+    lookback_days: int = 30,
+    min_support: int = 2,
+    max_sequences: int = 500,
+    max_steps: int = 12,
+) -> dict:
+    return tools.mine_behavior_processes(
+        lookback_days=lookback_days,
+        min_support=min_support,
+        max_sequences=max_sequences,
+        max_steps=max_steps,
+    )
+
+
+@mcp.tool(name="tce.get_behavior_processes", description="List mined behavioral process models and promotion status")
+def get_behavior_processes(status: str | None = None, limit: int = 100) -> dict:
+    return tools.get_behavior_processes(status=status, limit=limit)
+
+
+@mcp.tool(name="tce.get_behavior_shadow_status", description="Get prospective shadow-clone precision, coverage, and drift metrics")
+def get_behavior_shadow_status(limit: int = 200) -> dict:
+    return tools.get_behavior_shadow_status(limit=limit)
+
+
+@mcp.tool(name="tce.get_behavior_memory_reviews", description="List pending or resolved behavioral memory promotion reviews")
+def get_behavior_memory_reviews(status: str | None = "pending", limit: int = 100) -> dict:
+    return tools.get_behavior_memory_reviews(status=status, limit=limit)
+
+
+@mcp.tool(name="tce.resolve_behavior_memory_review", description="Promote or reject a pending behavioral memory candidate")
+def resolve_behavior_memory_review(review_id: str, decision: str, note: str = "") -> dict:
+    return tools.resolve_behavior_memory_review(review_id=review_id, decision=decision, note=note)
+
+
+@mcp.tool(name="tce.record_behavior_counterfactual", description="Record a decision alternative and expected outcome for later validation")
+def record_behavior_counterfactual(
+    decision: str,
+    alternative: str,
+    expected_outcome: str,
+    session_id: str = "default",
+    observation_id: str | None = None,
+    directive_id: str | None = None,
+    assumptions: list[str] | None = None,
+    confidence: float = 0.5,
+) -> dict:
+    return tools.record_behavior_counterfactual(
+        decision=decision,
+        alternative=alternative,
+        expected_outcome=expected_outcome,
+        session_id=session_id,
+        observation_id=observation_id,
+        directive_id=directive_id,
+        assumptions=assumptions,
+        confidence=confidence,
+    )
+
+
+@mcp.tool(name="tce.get_behavior_counterfactuals", description="List open or resolved behavioral counterfactuals")
+def get_behavior_counterfactuals(status: str | None = None, limit: int = 100) -> dict:
+    return tools.get_behavior_counterfactuals(status=status, limit=limit)
+
+
+@mcp.tool(name="tce.resolve_behavior_counterfactual", description="Resolve a counterfactual against an observed outcome")
+def resolve_behavior_counterfactual(
+    counterfactual_id: str,
+    assessment: str,
+    observed_outcome: str,
+    lesson: str = "",
+    regret_score: float | None = None,
+) -> dict:
+    return tools.resolve_behavior_counterfactual(
+        counterfactual_id=counterfactual_id,
+        assessment=assessment,
+        observed_outcome=observed_outcome,
+        lesson=lesson,
+        regret_score=regret_score,
     )
 
 

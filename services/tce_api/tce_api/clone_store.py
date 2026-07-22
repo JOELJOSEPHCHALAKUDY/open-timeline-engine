@@ -85,15 +85,15 @@ def query_similar_observations(
     db: Session,
     consumer_id: str,
     workspace_id: str,
+    subject_user_id: str,
     situation_type: str,
     situation_text: str | None = None,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    """Query observations by workspace and situation type.
+    """Query promoted observations for one behavior subject.
 
-    Observations are shared across all consumers (executor, advisor) within the
-    same workspace so that cross-agent learning works.  We don't filter by
-    consumer_id — any agent's observations in the workspace are relevant.
+    Executor identity is intentionally not part of this filter: multiple
+    executors may contribute evidence for the same authorized human subject.
     """
     settings = get_settings()
     _ensure_decision_observation_schema(db)
@@ -106,14 +106,20 @@ def query_similar_observations(
                    source_event_ids, confidence, ts
             FROM decision_observations
             WHERE workspace_id = :workspace_id
+              AND subject_user_id = :subject_user_id
               AND situation_type = ANY(:situation_types)
+              AND learning_eligible = true
               AND superseded_by IS NULL
+              AND lifecycle_status = 'active'
+              AND valid_from <= NOW()
+              AND (valid_until IS NULL OR valid_until > NOW())
             ORDER BY ts DESC
             LIMIT :limit
             """
         ),
         {
             "workspace_id": workspace_id,
+            "subject_user_id": subject_user_id,
             "situation_types": candidates,
             "limit": limit,
         },
@@ -165,14 +171,20 @@ def query_similar_observations(
                            1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
                     FROM decision_observations
                     WHERE workspace_id = :workspace_id
+                      AND subject_user_id = :subject_user_id
+                      AND learning_eligible = true
                       AND embedding IS NOT NULL
                       AND superseded_by IS NULL
+                      AND lifecycle_status = 'active'
+                      AND valid_from <= NOW()
+                      AND (valid_until IS NULL OR valid_until > NOW())
                     ORDER BY embedding <=> CAST(:query_embedding AS vector)
                     LIMIT :limit
                     """
                 ),
                 {
                     "workspace_id": workspace_id,
+                    "subject_user_id": subject_user_id,
                     "query_embedding": _embedding_as_vector_literal(query_embedding),
                     "limit": max(limit, settings.obs_semantic_top_k),
                 },
@@ -357,7 +369,7 @@ def _mark_superseded_observations(
               AND situation_type = :situation_type
               AND superseded_by IS NULL
               AND id <> :observation_id
-              AND lower(regexp_replace(situation_summary, '\s+', ' ', 'g')) = :normalized_summary
+              AND lower(regexp_replace(situation_summary, '\\s+', ' ', 'g')) = :normalized_summary
             ORDER BY ts DESC
             LIMIT 50
             """
@@ -419,17 +431,14 @@ def save_clone_feedback(
 
 
 def load_fingerprint(db: Session, consumer_id: str, workspace_id: str) -> dict[str, Any] | None:
-    """Load behavioral fingerprint, preferring exact consumer match, falling back to workspace.
-
-    Single query with ORDER BY that prioritizes the exact consumer_id match.
-    """
+    """Load one exact behavioral profile key without workspace-wide fallback."""
     row = db.execute(
         text(
             """
             SELECT fingerprint
             FROM behavioral_fingerprints
-            WHERE workspace_id = :workspace_id
-            ORDER BY (consumer_id = :consumer_id) DESC, last_updated_at DESC
+            WHERE workspace_id = :workspace_id AND consumer_id = :consumer_id
+            ORDER BY last_updated_at DESC
             LIMIT 1
             """
         ),

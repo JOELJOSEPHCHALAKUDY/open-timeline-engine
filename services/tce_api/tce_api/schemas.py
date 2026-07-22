@@ -51,6 +51,8 @@ class EvidenceEvent(BaseModel):
     title: str
     ts: datetime
     key_payload_fields: dict[str, Any]
+    summary_l0: str = ""
+    summary_l1: dict[str, Any] = Field(default_factory=dict)
 
 
 class ContextBundleResponse(BaseModel):
@@ -62,6 +64,13 @@ class ContextBundleResponse(BaseModel):
     citations: list[UUID]
     policy: dict[str, Any]
     structured_context: dict[str, Any] = Field(default_factory=dict)
+    context_tier_used: str = "l2"
+    summary_coverage: float = 0.0
+    planner_used: bool = False
+    subquery_count: int = 0
+    subquery_labels: list[str] = Field(default_factory=list)
+    episode_boost_applied: bool = False
+    activation_boost_applied: bool = False
     schema_version: int = 1
 
 
@@ -415,6 +424,13 @@ class ContextBriefResponse(BaseModel):
     open_loops: list[ContextBriefSectionItem] = Field(default_factory=list)
     artifacts: list[ContextBriefSectionItem] = Field(default_factory=list)
     citations: list[UUID] = Field(default_factory=list)
+    context_tier_used: str = "l2"
+    summary_coverage: float = 0.0
+    planner_used: bool = False
+    subquery_count: int = 0
+    subquery_labels: list[str] = Field(default_factory=list)
+    episode_boost_applied: bool = False
+    activation_boost_applied: bool = False
     generated_at: datetime
 
 

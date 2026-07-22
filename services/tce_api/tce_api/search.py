@@ -17,8 +17,14 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from tce_model_gateway import get_gateway
+from tce_shared.autonomy_context import (
+    coerce_summary_l1,
+    plan_retrieval_subqueries,
+    propagate_episode_score,
+    summary_coverage_ratio,
+)
 from tce_shared.events import EventSearchHit, EventSearchRequest
-from tce_shared.handoff import handoff_intent
+from tce_shared.handoff import handoff_intent, task_overlap_score
 from tce_shared.policy import ConsumerContext
 
 from .cache_clients import get_redis_client
@@ -617,6 +623,59 @@ def _read_feedback_signals(
     return out
 
 
+def _load_episode_score_lookup(
+    db: Session,
+    *,
+    workspace_id: str,
+    owner_ids: list[str],
+    query_text: str,
+    max_rows: int = 180,
+) -> dict[Any, float]:
+    if not owner_ids or not str(query_text or "").strip():
+        return {}
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT eel.event_id,
+                       ep.goal,
+                       ep.context,
+                       ep.outcome
+                FROM episodes ep
+                JOIN episode_event_links eel ON eel.episode_id = ep.id
+                WHERE ep.workspace_id = :workspace_id
+                  AND ep.user_id = ANY(CAST(:owner_ids AS TEXT[]))
+                ORDER BY ep.updated_at DESC
+                LIMIT :row_limit
+                """
+            ),
+            {
+                "workspace_id": workspace_id,
+                "owner_ids": owner_ids,
+                "row_limit": max(20, int(max_rows)),
+            },
+        ).mappings().all()
+    except Exception:
+        return {}
+    scores: dict[Any, float] = {}
+    for row in rows:
+        episode_text = " ".join(
+            [
+                str(row.get("goal") or ""),
+                str(row.get("context") or ""),
+                str(row.get("outcome") or ""),
+            ]
+        ).strip()
+        overlap = task_overlap_score(query_text, episode_text)
+        if overlap <= 0:
+            continue
+        event_id = row.get("event_id")
+        if event_id is None:
+            continue
+        scores[event_id] = max(float(scores.get(event_id, 0.0)), float(overlap))
+    return scores
+
+
 def _token_set_for_row(row: dict[str, Any]) -> set[str]:
     blob = " ".join(
         [
@@ -859,6 +918,14 @@ def run_search(
     retrieval_started = monotonic()
     query_text = search_request.query.strip()
     match_all = bool(search_request.match_all) or query_text in {"", "*"}
+    intent_retrieval_enabled = bool(getattr(settings, "intent_retrieval_enabled", False))
+    planned_queries = plan_retrieval_subqueries(
+        query_text,
+        enabled=intent_retrieval_enabled,
+        match_all=match_all,
+    )
+    planner_used = bool(len(planned_queries) > 1)
+    subquery_labels = [str(item.get("label") or "") for item in planned_queries if str(item.get("label") or "").strip()]
     owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope(
         db,
         workspace_id=consumer_ctx.workspace_id,
@@ -919,11 +986,14 @@ def run_search(
     expansion_ms = 0
     mmr_ms = 0
     mmr_candidates = 0
+    activation_boost_applied = False
+    episode_boost_applied = False
+    subquery_labels_by_event: dict[Any, set[str]] = {}
 
     if match_all:
         sql = f"""
             SELECT id, ts, actor, source, domain, task_type, event_type,
-                   title, sensitivity, context, authority_level
+                   title, summary_l0, summary_l1_json, sensitivity, context, authority_level
             FROM events
             WHERE {base_where_sql}
             ORDER BY ts DESC
@@ -972,7 +1042,7 @@ def run_search(
             lexical_predicate = lexical_predicate_expansion if expansion_mode else lexical_predicate_default
             lexical_sql = f"""
                 SELECT id, ts, actor, source, domain, task_type, event_type,
-                       title, sensitivity, context, authority_level
+                       title, summary_l0, summary_l1_json, sensitivity, context, authority_level
                 FROM events
                 WHERE {base_where_sql}
                   AND ({lexical_predicate})
@@ -1196,7 +1266,29 @@ def run_search(
                 expansion_ms += int((monotonic() - rerun_started) * 1000)
                 query_expansion_terms = expanded_terms
                 query_expansion_used = True
-        merged_rows: dict[Any, dict[str, Any]] = {row["id"]: dict(row) for row in rows}
+        merged_rows: dict[Any, dict[str, Any]] = {}
+
+        def _merge_rows(batch: list[dict[str, Any]], label: str) -> None:
+            for row in batch:
+                merged_rows.setdefault(row["id"], dict(row))
+                subquery_labels_by_event.setdefault(row["id"], set()).add(label)
+
+        _merge_rows(rows, planned_queries[0]["label"] if planned_queries else "objective")
+        if planner_used and not _enhancement_budget_exhausted():
+            for index, planned in enumerate(planned_queries):
+                remaining_budget_ms = enhancement_budget_ms - int((monotonic() - retrieval_started) * 1000)
+                if remaining_budget_ms < 40:
+                    break
+                planned_query = str(planned.get("query") or "").strip().lower()
+                if not planned_query:
+                    continue
+                if index == 0 and planned_query == query_text.lower():
+                    continue
+                secondary_terms = [f"%{planned_query}%"]
+                if not secondary_terms[0].strip("%"):
+                    continue
+                extra_rows = _run_lexical_query(secondary_terms, expansion_mode=False)
+                _merge_rows(extra_rows, str(planned.get("label") or "objective"))
 
         configured_embed_timeout = max(
             0.05,
@@ -1244,7 +1336,7 @@ def run_search(
             ann_limit = max(search_request.k * 4, limit)
             ann_sql = f"""
                 SELECT e.id, e.ts, e.actor, e.source, e.domain, e.task_type, e.event_type,
-                       e.title, e.sensitivity, e.context, e.authority_level,
+                       e.title, e.summary_l0, e.summary_l1_json, e.sensitivity, e.context, e.authority_level,
                        1 - (ee.embedding <=> CAST(:query_embedding AS vector)) AS ann_similarity
                 FROM event_embeddings ee
                 JOIN events e ON e.id = ee.event_id
@@ -1298,7 +1390,7 @@ def run_search(
                     elif qdrant_ids:
                         qdrant_rows_sql = f"""
                             SELECT id, ts, actor, source, domain, task_type, event_type,
-                                   title, sensitivity, context, authority_level
+                                   title, summary_l0, summary_l1_json, sensitivity, context, authority_level
                             FROM events
                             WHERE {base_where_sql}
                               AND CAST(id AS TEXT) = ANY(:event_ids)
@@ -1350,6 +1442,11 @@ def run_search(
     weight_recency /= weight_sum
     graph_bonus = max(0.0, float(settings.search_graph_bonus))
     activation_weight = max(0.0, float(getattr(settings, "memory_activation_weight", 0.0)))
+    if planner_used and intent_retrieval_enabled:
+        multiplier = max(1.0, float(getattr(settings, "memory_activation_autonomy_weight_multiplier", 1.0)))
+        boosted_weight = activation_weight * multiplier
+        activation_boost_applied = boosted_weight > activation_weight
+        activation_weight = boosted_weight
     stability_counts = Counter((str(row["domain"]), str(row["task_type"])) for row in rows)
     activation_lookup = _read_activation_scores(
         workspace_id=consumer_ctx.workspace_id,
@@ -1371,6 +1468,13 @@ def run_search(
         max_records=max(search_request.k * 6, 30),
     )
     handoff_query_intent = handoff_intent(query_text)
+    episode_score_lookup = _load_episode_score_lookup(
+        db,
+        workspace_id=consumer_ctx.workspace_id,
+        owner_ids=owner_scope_ids,
+        query_text=query_text,
+        max_rows=max(search_request.k * 12, 120),
+    ) if (planner_used and intent_retrieval_enabled) else {}
 
     def _score_rows(active_owner_scope: set[str]) -> tuple[list[tuple[float, dict[str, Any]]], int, int, bool]:
         local_scored: list[tuple[float, dict[str, Any]]] = []
@@ -1416,8 +1520,13 @@ def run_search(
             activation_score = max(0.0, min(1.0, float(activation_lookup.get(row["id"], 0.0))))
             feedback_signal = max(-1.0, min(1.0, float(feedback_lookup.get(row["id"], 0.0))))
             feedback_delta = feedback_weight * feedback_signal
+            query_labels = subquery_labels_by_event.get(row["id"], set())
+            query_label_boost = 0.04 if "decision_history" in query_labels else 0.0
+            if "constraints_workflow" in query_labels:
+                query_label_boost += 0.03
             score = (
-                (weight_relevance * relevance_score)
+                query_label_boost
+                + (weight_relevance * relevance_score)
                 + (weight_stability * stability_score)
                 + (weight_authority * authority_score)
                 + (weight_recency * recency_score)
@@ -1433,6 +1542,9 @@ def run_search(
                     score += 0.06
                 if handoff_query_intent and bool(handoff_meta.get("has_anchors")):
                     score += 0.08
+            episode_score = max(0.0, min(1.0, float(episode_score_lookup.get(row["id"], 0.0))))
+            if episode_score > 0.0:
+                score = propagate_episode_score(score, episode_score)
             if abs(feedback_delta) > 1e-9:
                 local_feedback_applied = True
             local_scored.append((score, dict(row)))
@@ -1504,6 +1616,8 @@ def run_search(
 
     hits: list[EventSearchHit] = []
     for score, event in selected_events:
+        summary_l0 = str(event.get("summary_l0") or "").strip()
+        summary_l1 = coerce_summary_l1(event.get("summary_l1_json"))
         hits.append(
             EventSearchHit(
                 id=event["id"],
@@ -1513,6 +1627,8 @@ def run_search(
                 task_type=event["task_type"],
                 score=score,
                 sensitivity=event["sensitivity"],
+                summary_l0=summary_l0,
+                summary_l1=summary_l1,
             )
         )
 
@@ -1536,6 +1652,11 @@ def run_search(
     if match_all:
         retrieval_source = "none"
     _bump_retrieval_counter(retrieval_source)
+    episode_event_id_keys = {
+        str(key) for key, value in episode_score_lookup.items() if float(value or 0.0) > 0.0
+    }
+    if episode_score_lookup:
+        episode_boost_applied = any(str(hit.id) in episode_event_id_keys for hit in hits)
     retrieval_meta = {
         "source": retrieval_source,
         "reason": retrieval_reason,
@@ -1555,6 +1676,13 @@ def run_search(
         "handoff_hits_count": len(top_handoff_record_ids),
         "top_handoff_record_ids": top_handoff_record_ids,
         "resume_packet_available": bool(top_handoff_record_ids),
+        "context_tier_used": "l1" if bool(getattr(settings, "context_tiers_enabled", False)) else "l2",
+        "summary_coverage": summary_coverage_ratio(hits),
+        "planner_used": bool(planner_used),
+        "subquery_count": len(subquery_labels),
+        "subquery_labels": subquery_labels,
+        "episode_boost_applied": bool(episode_boost_applied),
+        "activation_boost_applied": bool(activation_boost_applied),
         "query_expansion_used": bool(query_expansion_used),
         "query_expansion_terms": query_expansion_terms[: max(0, int(getattr(settings, "search_query_expansion_max_terms", 4)))],
         "expansion_ms": int(expansion_ms),

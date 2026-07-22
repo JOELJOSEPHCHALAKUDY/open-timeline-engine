@@ -474,7 +474,13 @@ def list_team_memberships(conn: sqlite3.Connection, workspace_id: str) -> list[d
     ]
 
 
-def workspace_access_allowed(conn: sqlite3.Connection, workspace_id: str, user_id: str) -> bool:
+def workspace_access_allowed(
+    conn: sqlite3.Connection,
+    workspace_id: str,
+    user_id: str,
+    *,
+    require_membership: bool = False,
+) -> bool:
     count_row = conn.execute(
         """
         SELECT COUNT(1) AS c
@@ -486,7 +492,7 @@ def workspace_access_allowed(conn: sqlite3.Connection, workspace_id: str, user_i
     ).fetchone()
     count = int(count_row["c"]) if count_row else 0
     if count == 0:
-        return True
+        return not require_membership
     member = conn.execute(
         """
         SELECT 1

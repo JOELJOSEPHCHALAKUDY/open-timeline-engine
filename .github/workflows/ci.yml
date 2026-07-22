@@ -1,9 +1,9 @@
 name: ci
 
 on:
-  # pull_request:
-  # push:
-  #   branches: [master]
+  pull_request:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 jobs:
@@ -27,7 +27,7 @@ jobs:
       - name: Lint (changed core paths)
         run: python .github/ci/ruff_changed.py
       - name: Type check
-        run: mypy services shared
+        run: python .github/ci/mypy_changed.py
       - name: Unit tests
         run: pytest tests/unit -q
       - name: Security tests
@@ -76,6 +76,90 @@ jobs:
       - name: Integration tests
         run: pytest tests/integration -q
 
+  full-mcp-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure bound test identities
+        shell: bash
+        run: |
+          cat > .env <<'EOF'
+          TCE_API_TOKENS=e2e-codex-token,e2e-claude-token
+          TCE_API_TOKEN=e2e-codex-token
+          TCE_AUTH_MODE=bearer
+          TCE_IDENTITY_CLAIMS_MODE=enforce
+          TCE_IDENTITY_CLAIMS_JSON={"bearer:aaca686ae7a5100c8dedfa71d1c38a2eea51cd1980c80c1367c8a30b348ab3af":{"consumer":"codex-executor","role":"executor","workspace_id":"e2e-workspace","user_id":"codex-executor","behavior_subject_id":"e2e-human"},"bearer:a3d07c69c6535b4dfc8ba93e5cbdbf9fa86574acf010ba355e833980ad170a6c":{"consumer":"claude-executor","role":"executor","workspace_id":"e2e-workspace","user_id":"claude-executor","behavior_subject_id":"e2e-human"}}
+          TCE_BEHAVIOR_PROJECTIONS_ENABLED=true
+          TCE_BEHAVIOR_PROJECTION_PILOT_ENABLED=true
+          TCE_QDRANT_ENABLED=false
+          TCE_LLM_EXTRACTION=false
+          TCE_API_WORKERS=1
+          EOF
+      - name: Start real Full stack
+        run: docker compose --env-file .env -f infra/docker-compose.yml up -d --build postgres redis tce-migrate tce-api tce-worker
+      - name: Wait for Full API
+        shell: bash
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/v1/health >/dev/null 2>&1; then exit 0; fi
+            sleep 2
+          done
+          docker compose --env-file .env -f infra/docker-compose.yml logs tce-migrate tce-api
+          exit 1
+      - name: Install E2E clients
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e shared -e services/tce_api -e services/tce_worker -e services/tce_mcp pytest requests
+      - name: Full and MCP E2E
+        env:
+          TCE_E2E_BASE_URL: http://127.0.0.1:8080
+          TCE_E2E_CODEX_TOKEN: e2e-codex-token
+          TCE_E2E_CLAUDE_TOKEN: e2e-claude-token
+          TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/tce
+          TCE_REDIS_URL: redis://127.0.0.1:6379/0
+        run: pytest tests/e2e/test_full_continuity_live.py tests/e2e/test_full_outbox_worker_live.py tests/e2e/test_mcp_continuity_live.py -q
+      - name: Full continuity latency gate
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: e2e-codex-token
+          TCE_LATENCY_USER: codex-executor
+          TCE_LATENCY_WORKSPACE: e2e-workspace
+          TCE_LATENCY_BOUND_IDENTITY: 'true'
+          TCE_CONTINUITY_P95_BUDGET_MS: '120'
+        run: python tests/load/continuity_latency_check.py
+      - name: Full behavior projection pilot latency gate
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: e2e-codex-token
+          TCE_LATENCY_USER: codex-executor
+          TCE_LATENCY_WORKSPACE: e2e-workspace
+          TCE_LATENCY_BEHAVIOR_SUBJECT: e2e-human
+          TCE_PROJECTION_PILOT_LATENCY_SAMPLES: '20'
+          TCE_PROJECTION_PILOT_LATENCY_WARMUP: '3'
+          TCE_PROJECTION_PILOT_P95_BUDGET_MS: '120'
+        run: python tests/load/behavior_projection_pilot_latency_check.py
+      - name: Full behavior projection latency gate
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: e2e-codex-token
+          TCE_LATENCY_USER: codex-executor
+          TCE_LATENCY_WORKSPACE: e2e-workspace
+          TCE_LATENCY_BEHAVIOR_SUBJECT: e2e-human
+          TCE_PROJECTION_LATENCY_SEED_COUNT: '100'
+          TCE_PROJECTION_LATENCY_SAMPLES: '40'
+          TCE_PROJECTION_LATENCY_WARMUP: '5'
+          TCE_PROJECTION_P95_BUDGET_MS: '120'
+        run: python tests/load/behavior_projection_latency_check.py
+      - name: Stack logs
+        if: always()
+        run: docker compose --env-file .env -f infra/docker-compose.yml logs --no-color tce-migrate tce-api tce-worker
+      - name: Stop Full stack
+        if: always()
+        run: docker compose --env-file .env -f infra/docker-compose.yml down -v
+
   load-tests:
     runs-on: ubuntu-latest
     steps:
@@ -90,7 +174,7 @@ jobs:
           pip install locust uvicorn
       - name: Start lite API for load test
         run: |
-          TCE_API_TOKENS=local-dev-token TCE_LITE_DB_PATH=/tmp/tce-lite.db PYTHONPATH=shared:services/tce_lite_api \
+          TCE_API_TOKENS=local-dev-token TCE_LITE_DB_PATH=/tmp/tce-lite.db TCE_BEHAVIOR_PROJECTIONS_ENABLED=true TCE_BEHAVIOR_PROJECTION_PILOT_ENABLED=true PYTHONPATH=shared:services/tce_lite_api \
             nohup uvicorn tce_lite_api.main:app --host 127.0.0.1 --port 8080 >/tmp/tce-lite-api.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8080/v1/health >/dev/null 2>&1; then
@@ -110,8 +194,40 @@ jobs:
           TCE_LATENCY_WARMUP: '5'
           TCE_LATENCY_P95_BUDGET_MS: '300'
         run: python tests/load/takeover_latency_check.py
+      - name: Continuity latency regression
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: local-dev-token
+          TCE_LATENCY_SESSION: ci-continuity-latency
+          TCE_LATENCY_USER: ci-latency
+          TCE_LATENCY_WORKSPACE: personal
+          TCE_CONTINUITY_LATENCY_SAMPLES: '40'
+          TCE_CONTINUITY_LATENCY_WARMUP: '5'
+          TCE_CONTINUITY_P95_BUDGET_MS: '120'
+        run: python tests/load/continuity_latency_check.py
+      - name: Behavior projection latency regression
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: local-dev-token
+          TCE_LATENCY_USER: projection-latency
+          TCE_LATENCY_WORKSPACE: personal
+          TCE_PROJECTION_LATENCY_SEED_COUNT: '100'
+          TCE_PROJECTION_LATENCY_SAMPLES: '40'
+          TCE_PROJECTION_LATENCY_WARMUP: '5'
+          TCE_PROJECTION_P95_BUDGET_MS: '120'
+        run: python tests/load/behavior_projection_latency_check.py
+      - name: Behavior projection pilot latency regression
+        env:
+          TCE_LATENCY_BASE_URL: http://127.0.0.1:8080
+          TCE_LATENCY_TOKEN: local-dev-token
+          TCE_LATENCY_USER: projection-latency
+          TCE_LATENCY_WORKSPACE: personal
+          TCE_PROJECTION_PILOT_LATENCY_SAMPLES: '40'
+          TCE_PROJECTION_PILOT_LATENCY_WARMUP: '5'
+          TCE_PROJECTION_PILOT_P95_BUDGET_MS: '120'
+        run: python tests/load/behavior_projection_pilot_latency_check.py
       - name: Load test smoke
-        run: locust -f tests/load/locustfile.py --headless -u 5 -r 1 -t 30s --host http://127.0.0.1:8080
+        run: TCE_LOAD_BEHAVIOR_PILOT=true locust -f tests/load/locustfile.py --headless -u 5 -r 1 -t 30s --host http://127.0.0.1:8080
 
   node-quality:
     runs-on: ubuntu-latest

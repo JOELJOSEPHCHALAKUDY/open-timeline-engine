@@ -75,9 +75,11 @@ def _send_event(event: dict) -> bool:
 
 def _post_event_once(api: str, headers: dict[str, str], event: dict) -> bool:
     try:
+        endpoint = str(event.get("_tce_endpoint") or "/v1/events")
+        body = event.get("body") if endpoint != "/v1/events" else event
         response = requests.post(
-            f"{api}/v1/events",
-            json=event,
+            f"{api}{endpoint}",
+            json=body,
             headers=headers,
             timeout=10,
         )
@@ -85,6 +87,18 @@ def _post_event_once(api: str, headers: dict[str, str], event: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+def _send_completion(completion: dict) -> bool:
+    api, _ = _api_config()
+    headers = _user_headers()
+    wrapped = {"_tce_endpoint": "/v1/completions", "body": completion}
+    if _post_event_once(api, headers, wrapped):
+        return True
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with QUEUE_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(wrapped) + "\n")
+    return False
 
 
 def _git(repo: str, *args: str) -> str:
@@ -158,8 +172,37 @@ def capture_commit(
         "redaction_hints": [],
     }
 
-    sent = _send_event(event)
-    typer.echo("commit captured" if sent else "commit queued")
+    event_sent = _send_event(event)
+    files = [str(item["path"]) for item in stats]
+    change_summary = {
+        str(item["path"]): {
+            "added": 0 if item["added"] == "-" else int(item["added"]),
+            "removed": 0 if item["deleted"] == "-" else int(item["deleted"]),
+            "intent": title[:160],
+        }
+        for item in stats
+    }
+    completion_sent = _send_completion(
+        {
+            "session_id": os.getenv("TCE_MCP_SESSION_ID", "git"),
+            "completion_key": f"git:{commit}",
+            "source": "git-post-commit",
+            "state": "succeeded",
+            "title": title[:160],
+            "payload": {"files": files},
+            "decision": (body.strip() or f"Committed {title}")[:500],
+            "outcome": {"status": "succeeded", "next_step": "Continue from the committed file anchors."},
+            "git": {"repo": str(Path(repo).resolve()), "branch": branch, "commit": commit},
+            "anchors": [{"file": path} for path in files[:40]],
+            "change_summary": change_summary,
+            "milestone_schema": "v1",
+        }
+    )
+    typer.echo(
+        "commit and completion captured"
+        if event_sent and completion_sent
+        else "capture queued; run tce-git-capture replay"
+    )
 
 
 @app.command("capture-prepush")

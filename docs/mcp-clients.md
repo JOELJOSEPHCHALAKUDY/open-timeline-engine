@@ -47,6 +47,7 @@ For generic MCP clients that do not have an installer path, generate config only
 - `TCE_API_TOKEN=local-dev-token`
 - `TCE_MCP_WORKSPACE_ID=personal`
 - `TCE_MCP_USER_ID=<your-user-id>`
+- `TCE_MCP_BEHAVIOR_SUBJECT_ID=<human-profile-id>`
 
 Dual-AI mode:
 
@@ -71,6 +72,24 @@ Supported tools:
 - `tce.get_event_graph`
 - `tce.get_team_memberships`
 - `tce.get_activity_summary`
+- `tce.complete_task`
+- `tce.get_resume_packet`
+- `tce.report_resume_feedback`
+- `tce.get_continuity_pilot`
+- `tce.record_behavior_evidence`
+- `tce.predict_behavior`
+- `tce.run_behavior_fidelity_eval`
+- `tce.get_behavior_fidelity`
+- `tce.request_capability_grant`
+- `tce.consume_capability_grant`
+- `tce.mine_behavior_processes`
+- `tce.get_behavior_processes`
+- `tce.get_behavior_shadow_status`
+- `tce.get_behavior_memory_reviews`
+- `tce.resolve_behavior_memory_review`
+- `tce.record_behavior_counterfactual`
+- `tce.get_behavior_counterfactuals`
+- `tce.resolve_behavior_counterfactual`
 
 Validation coverage:
 
@@ -78,6 +97,7 @@ Validation coverage:
 - Claude contract: `tests/mcp/test_claude_contract.py`
 - Cursor contract: `tests/mcp/test_cursor_contract.py`
 - Generic compatibility baseline: `tests/integration/test_mcp_compat_contract.py`
+- Real Full/MCP transport continuity: `tests/e2e/test_mcp_continuity_live.py`
 > Docs index: [Open Timeline Engine Docs](README.md)
 >
 > Use this page for client-specific MCP details after the docs index overview.

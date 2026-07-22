@@ -169,6 +169,35 @@ async function sendEvent(
   }
 }
 
+async function sendCompletion(activeTask: ActiveTask, outcome: string): Promise<boolean> {
+  const c = cfg();
+  const editor = vscode.window.activeTextEditor;
+  const file = editor?.document.uri.fsPath ?? "workspace";
+  const line = editor ? editor.selection.active.line + 1 : undefined;
+  try {
+    const response = await fetch(`${c.apiUrl}/v1/completions`, {
+      method: "POST",
+      headers: buildEventHeaders(c),
+      body: JSON.stringify({
+        session_id: c.takeoverSessionId,
+        completion_key: `vscode:${activeTask.id}`,
+        source: "vscode-completion",
+        state: "succeeded",
+        title: activeTask.title.slice(0, 160),
+        payload: { files: [file] },
+        decision: outcome.slice(0, 500),
+        outcome: { status: "succeeded", next_step: "Continue from the active editor anchor." },
+        git: {},
+        anchors: [{ file, ...(line ? { line } : {}) }],
+        milestone_schema: "v1"
+      })
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function getActiveTask(context: vscode.ExtensionContext): Promise<ActiveTask | null> {
   return context.globalState.get<ActiveTask | null>(ACTIVE_TASK_KEY, null);
 }
@@ -343,6 +372,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const completeTask = vscode.commands.registerCommand("tce.completeTask", async () => {
     const activeTask = await getActiveTask(context);
+    if (!activeTask) {
+      vscode.window.showWarningMessage("Start a TCE task before completing it.");
+      return;
+    }
     const outcome = await vscode.window.showInputBox({ prompt: "Outcome summary" });
     if (!outcome) {
       return;
@@ -354,10 +387,15 @@ export function activate(context: vscode.ExtensionContext): void {
       activeTask
     );
     event.outcome = { success: true, metrics: {}, followups: [] };
-    const sent = await sendEvent(context, event, true);
-    await setActiveTask(context, null);
+    const eventSent = await sendEvent(context, event, true);
+    const completionSent = await sendCompletion(activeTask, outcome);
+    if (completionSent) {
+      await setActiveTask(context, null);
+    }
     await updateStatus(status, context);
-    vscode.window.showInformationMessage(sent ? "TCE task completed" : "TCE completion queued");
+    vscode.window.showInformationMessage(
+      eventSent && completionSent ? "TCE task completed" : "TCE completion not delivered; retry Complete Task"
+    );
   });
 
   const noteReflection = vscode.commands.registerCommand("tce.noteReflection", async () => {

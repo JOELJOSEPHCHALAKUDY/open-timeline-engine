@@ -825,10 +825,16 @@ _workspace_access_cache: dict[str, tuple[bool, float]] = {}
 _WORKSPACE_ACCESS_TTL = 300.0  # 5 minutes
 
 
-def workspace_access_allowed(db: Session, workspace_id: str, user_id: str) -> bool:
+def workspace_access_allowed(
+    db: Session,
+    workspace_id: str,
+    user_id: str,
+    *,
+    require_membership: bool = False,
+) -> bool:
     import time
 
-    cache_key = f"{workspace_id}:{user_id}"
+    cache_key = f"{workspace_id}:{user_id}:{int(require_membership)}"
     cached = _workspace_access_cache.get(cache_key)
     if cached is not None:
         allowed, ts = cached
@@ -848,8 +854,10 @@ def workspace_access_allowed(db: Session, workspace_id: str, user_id: str) -> bo
     ).mappings().first()
     count = int(workspace_rows["c"]) if workspace_rows else 0
     if count == 0:
-        _workspace_access_cache[cache_key] = (True, time.monotonic())
-        return True
+        allowed = not require_membership
+        if not require_membership:
+            _workspace_access_cache[cache_key] = (allowed, time.monotonic())
+        return allowed
     member = db.execute(
         text(
             """

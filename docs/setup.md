@@ -173,6 +173,7 @@ After stack startup, confirm memory loops are healthy:
 2. Identity:
    - keep one shared `X-TCE-Workspace` when you want shared memory across executors.
    - use distinct `X-TCE-User` values per executor (`codex-executor`, `claude-executor`, etc.) so ownership/audit stay correct.
+   - use the same `X-TCE-Behavior-Subject` only when those executors assist the same human.
    - use explicit cross-user phrasing when querying another executor's memory.
 3. Situation taxonomy:
    - feedback/observation situation types are canonicalized (`routine_task`, `choice_required`, `error_occurred`, etc.).
@@ -238,3 +239,8 @@ If capture commands queue instead of sending, check identity headers first.
 - Setup does not require extra flags for workflow hints.
 - Once workflow templates exist, takeover responses can include `workflow_hints` automatically.
 - Current dashboard exposure is in takeover view; dedicated workflow management page is still pending.
+## Server-Bound Identities
+
+For production, use distinct executor tokens and bind them to server-owned identity and workspace claims. Set `TCE_IDENTITY_CLAIMS_MODE=enforce` and map `bearer:<sha256-token>` or `mtls:<sha256-subject>` keys in `TCE_IDENTITY_CLAIMS_JSON`. `compat` preserves legacy header assertions during migration.
+
+Verify each credential with `GET /v1/auth/whoami`. In enforce mode, callers cannot override a bound workspace, user, role, or behavior subject using `X-TCE-*` headers.
