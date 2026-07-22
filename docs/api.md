@@ -4,7 +4,7 @@
 
 - `POST /v1/events`
 - `POST /v1/events/batch`
-- `GET /v1/events/{id}`
+- `GET /v1/events/{event_id}`
 - `POST /v1/search`
 - `POST /v1/context_bundle`
 - `GET /v1/patterns`
@@ -26,6 +26,16 @@
 - `POST /v1/behavior/predict`
 - `POST /v1/behavior/evaluate`
 - `GET /v1/behavior/evaluations`
+- `GET /v1/behavior/projections/current`
+- `GET /v1/behavior/projections/decisions/{topic}`
+- `GET /v1/behavior/projections/evidence/{observation_id}`
+- `GET /v1/behavior/projections/review`
+- `GET /v1/behavior/projections/review.html`
+- `POST /v1/behavior/projections/pilot/assign`
+- `POST /v1/behavior/projections/pilot/outcome`
+- `GET /v1/behavior/projections/pilot/status`
+- `GET /v1/behavior/calibration/scenarios`
+- `POST /v1/behavior/calibration/answer`
 - `POST /v1/behavior/processes/mine`
 - `GET /v1/behavior/processes`
 - `GET /v1/behavior/shadow/status`

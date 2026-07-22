@@ -70,7 +70,7 @@ Use it in two ways:
 ## Quickstart (~10 minutes)
 
 ```bash
-git clone https://github.com/<your-org>/open-timeline-engine.git
+git clone https://github.com/JOELJOSEPHCHALAKUDY/open-timeline-engine.git
 cd open-timeline-engine
 ./scripts/install.sh
 ./scripts/start.sh full --detach
@@ -111,7 +111,7 @@ MCP config generation respects this choice (Codex/Claude/Cursor/Generic configs 
 ### Cross-user memory retrieval (same workspace)
 
 - Default retrieval scope is `user-only`.
-- Cross-user scope is activated when a query explicitly asks for another executor's memory/history (for example: `read codex memory from claude`).
+- Cross-user scope is activated when a query explicitly asks for another executor's memory/history (for example: `read codex timeline`).
 - For executor consumers, owner scope can also auto-expand when almost all candidates are owner-blocked, to avoid empty-result false negatives.
 - When cross-user scope is applied, response policy metadata shows `policy_profile=workspace-shared` and `cross_user_scope_applied=true`.
 
@@ -123,7 +123,7 @@ MCP config generation respects this choice (Codex/Claude/Cursor/Generic configs 
 - In Docker full runtime, after editing `.env`, recreate API container to load env changes:
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d --force-recreate tce-api
+docker compose --env-file .env -f infra/docker-compose.yml up -d --force-recreate tce-api
 ```
 
 Expected health endpoint:
@@ -545,6 +545,8 @@ MCP tool calls are made by executor clients. The advisor lane runs API-side and 
 | `tce.get_takeover_goals` | Executor | List current goal queue |
 | `tce.get_autonomy_status` | Executor | Snapshot autonomy state (goal, queue, continuity, permits/notices) |
 | `tce.takeover_precompute_goals` | Executor | Warm the goal cache for near-zero latency |
+| `tce.get_takeover_goal_cache_status` | Executor | Inspect goal-cache freshness and hit state |
+| `tce.invalidate_takeover_goal_cache` | Executor | Invalidate stale goal-cache entries |
 | `tce.takeover_autonomy_tick` | Executor | Proactive goal surfacing and cache warm |
 | `tce.get_takeover_notices` | Executor | List proactive autonomy notices |
 | `tce.ack_takeover_notice` | Executor | Acknowledge a notice |
@@ -583,6 +585,24 @@ Completion writes are staged in `handoff_outbox`. The lifecycle event and canoni
 | `tce.get_behavior_fidelity` | Executor | Inspect evaluation history and autonomy gates |
 | `tce.get_behavior_calibration` | Executor | List optional cold-start decision scenarios |
 | `tce.answer_behavior_calibration` | Executor | Record a confirmed calibration answer |
+| `tce.assign_behavior_projection_pilot` | Executor | Assign a deterministic behavior-projection comparison arm |
+| `tce.report_behavior_projection_pilot_outcome` | Executor | Report the held-out outcome for a pilot assignment |
+| `tce.get_behavior_projection_pilot_status` | Executor | Read pilot metrics and rollout gates |
+
+**Behavior control plane**
+
+| MCP tool | Called by | Purpose |
+| --- | --- | --- |
+| `tce.request_capability_grant` | Executor | Request a short-lived grant for an exact operation |
+| `tce.consume_capability_grant` | Executor | Consume a one-use capability grant before execution |
+| `tce.mine_behavior_processes` | Executor | Mine review-gated workflow process candidates |
+| `tce.get_behavior_processes` | Executor | Inspect learned behavior process models |
+| `tce.get_behavior_shadow_status` | Executor | Inspect prospective shadow predictions and drift |
+| `tce.get_behavior_memory_reviews` | Executor | List behavior-memory items awaiting review |
+| `tce.resolve_behavior_memory_review` | Executor | Approve, reject, or supersede a review item |
+| `tce.record_behavior_counterfactual` | Executor | Record a counterfactual separately from learning evidence |
+| `tce.get_behavior_counterfactuals` | Executor | List behavior counterfactuals |
+| `tce.resolve_behavior_counterfactual` | Executor | Resolve a behavior counterfactual |
 
 **Graph and activity context**
 
@@ -601,7 +621,7 @@ Completion writes are staged in `handoff_outbox`. The lifecycle event and canoni
 | `tce.annotate_event` | Executor | Tag events with goals, decisions, avoid rules |
 | `tce.get_memory_rules` / `tce.upsert_memory_rule` / `tce.deprecate_memory_rule` | Executor | Boundary and preference rules |
 | `tce.forget_memory` | Executor | GDPR-safe deletion with tombstone |
-| `tce.retrieval_eval_status` / `tce.retrieval_eval_run` | Executor | Retrieval quality eval status and on-demand runs |
+| `tce.get_retrieval_eval_status` / `tce.run_retrieval_eval` | Executor | Retrieval quality eval status and on-demand runs |
 | `tce.get_patterns` | Executor | Extracted behavioral patterns by domain |
 | `tce.run_lifecycle` / `tce.get_lifecycle_status` | Executor | Event retention and cleanup |
 

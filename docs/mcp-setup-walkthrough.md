@@ -70,7 +70,7 @@ Then import `<repo-root>/docs/mcp-config/generated/generic_mcp.json` into your c
 If you change `.env` values that affect API runtime behavior (timeouts, retrieval flags, etc.), recreate API container so new env is loaded:
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d --force-recreate tce-api
+docker compose --env-file .env -f infra/docker-compose.yml up -d --force-recreate tce-api
 ```
 
 ## 3. Configure identities

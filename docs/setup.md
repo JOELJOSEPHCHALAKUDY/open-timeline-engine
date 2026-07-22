@@ -68,13 +68,13 @@ Lite runtime:
 If you changed runtime env values in `.env` (for example embedding timeout knobs), recreate API instead of plain restart so containers load new env:
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d --force-recreate tce-api
+docker compose --env-file .env -f infra/docker-compose.yml up -d --force-recreate tce-api
 ```
 
 ## Docker compose path
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build
+docker compose --env-file .env -f infra/docker-compose.yml up --build
 ```
 
 The compose stack includes two MCP services by default:

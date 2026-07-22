@@ -4,7 +4,7 @@ Behavior Fidelity v1 measures whether Open Timeline Engine can reproduce future 
 
 - Maintainer: `JOELJOSEPHCHALAKUDY`
 - Research revision: `2026-07-22`
-- Implementation baseline: `codex/behavioral-fidelity-v1` at `98dcd69ad3db`
+- Implementation baseline: `master` merge commit `0b4ed15bda96`
 - Validation status: mechanisms implemented; behavioral and continuity benefit not yet established by the required longitudinal pilot
 
 ## Research Method and Status
@@ -20,7 +20,7 @@ Implementation and efficacy are separate. The handoff outbox, resume packet, evi
 Specific audit clarifications:
 
 - DeepSeek V4 section 5.2.5, "Trajectory Logging and Preemption-Safe Resumption," explicitly describes DSec's globally ordered command/result log, cached-result fast-forwarding, protection against re-running non-idempotent operations, fine-grained provenance, and deterministic replay. The attribution is supported by the paper, but applying that design to TCE is **proposed**; TCE does not currently implement a complete action-level replay journal. Source: [DeepSeek V4](https://arxiv.org/html/2606.19348).
-- `CAPABILITY_REGISTRY` contains nine internal authorization categories. These classify operations for the capability broker; they do not filter or reduce MCP tool discovery. At this baseline the MCP server separately registers 66 tools, and lazy capability-based tool grouping is **not implemented**.
+- `CAPABILITY_REGISTRY` contains nine internal authorization categories. These classify operations for the capability broker; they do not filter or reduce MCP tool discovery. At this baseline the MCP server separately registers 69 tools, and lazy capability-based tool grouping is **not implemented**.
 - A versioned current-state ledger and a complete execution journal are **proposed** layers. Existing event hashes, idempotency keys, completion outbox, and handoff records are foundations, not equivalent implementations.
 - Numeric readiness scores are not evidence. Cross-executor continuity must remain "implemented, longitudinal validation pending" until the pilot meets capture, correct-file, correction, latency, and outbox-health gates.
 
