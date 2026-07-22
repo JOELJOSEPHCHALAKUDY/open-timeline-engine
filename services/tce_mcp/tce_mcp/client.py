@@ -23,6 +23,7 @@ class TCEApiClient:
             "X-TCE-Role": settings.mcp_role,
             "X-TCE-Workspace": settings.mcp_workspace_id,
             "X-TCE-User": settings.mcp_user_id,
+            "X-TCE-Behavior-Subject": settings.mcp_effective_behavior_subject_id,
         }
         retries = Retry(
             total=max(0, settings.mcp_http_retry_total),
@@ -129,6 +130,21 @@ class TCEApiClient:
         response.raise_for_status()
         return self._json_dict(response)
 
+    def capture_completion(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/completions", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def report_resume_feedback(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/continuity/pilot/feedback", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def continuity_pilot_status(self, days: int = 30) -> dict[str, Any]:
+        response = self._get("/v1/continuity/pilot/status", params={"days": days})
+        response.raise_for_status()
+        return self._json_dict(response)
+
     def context_brief(self, body: dict[str, Any]) -> dict[str, Any]:
         response = self._post("/v1/context/brief", body)
         response.raise_for_status()
@@ -217,6 +233,95 @@ class TCEApiClient:
 
     def ingest_observations(self, body: dict[str, Any]) -> dict[str, Any]:
         response = self._post("/v1/clone/ingest-observations", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def record_behavior_evidence(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/evidence", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def predict_behavior(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/predict", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def run_behavior_evaluation(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/evaluate", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_evaluations(self, limit: int = 20) -> dict[str, Any]:
+        response = self._get("/v1/behavior/evaluations", params={"limit": limit})
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_calibration_scenarios(self) -> dict[str, Any]:
+        response = self._get("/v1/behavior/calibration/scenarios")
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def answer_behavior_calibration(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/calibration/answer", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def create_capability_grant(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/capabilities/grants", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def consume_capability_grant(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/capabilities/consume", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def mine_behavior_processes(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/processes/mine", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_processes(self, status: str | None = None, limit: int = 100) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        response = self._get("/v1/behavior/processes", params=params)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_shadow_status(self, limit: int = 200) -> dict[str, Any]:
+        response = self._get("/v1/behavior/shadow/status", params={"limit": limit})
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_memory_reviews(self, status: str | None = "pending", limit: int = 100) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        response = self._get("/v1/behavior/reviews", params=params)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def resolve_behavior_memory_review(self, review_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post(f"/v1/behavior/reviews/{review_id}/resolve", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def create_behavior_counterfactual(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/counterfactuals", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_counterfactuals(self, status: str | None = None, limit: int = 100) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        response = self._get("/v1/behavior/counterfactuals", params=params)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def resolve_behavior_counterfactual(self, counterfactual_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post(f"/v1/behavior/counterfactuals/{counterfactual_id}/resolve", body)
         response.raise_for_status()
         return self._json_dict(response)
 

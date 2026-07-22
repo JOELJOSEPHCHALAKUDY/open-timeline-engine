@@ -417,6 +417,7 @@ Use this policy in clients that support project or custom instructions.
 4. If `safety_decision` is `confirm_required`, ask for confirmation and wait.
 5. Continue auto-calling `tce.takeover_step` for each later message while takeover is active.
 6. Stop only when stop keyword is detected or `tce.reset_takeover_state` is called.
+7. After every completed mutating change, call `tce.complete_task` unless `tce.report_execution` already captured the directive completion.
 
 ## Notes
 - Activation phrases can include persona defaults (for example: "hey beru take over", "hey igris take over", "hey kurama take over").

@@ -34,10 +34,46 @@ from ote_advisor_providers.router import (
     update_health_state as advisor_update_health_state,
 )
 from tce_shared.dashboard import timeline_dashboard_html
+from tce_shared.behavior_fidelity import (
+    CALIBRATION_SCENARIOS,
+    behavior_storage_gate,
+    evaluate_behavior_fidelity,
+    normalize_behavior_evidence,
+    predict_behavior,
+)
+from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.events import (
     AgentRole,
     AutonomyNotice,
     AutonomyGoalStatus,
+    BehaviorCalibrationAnswerRequest,
+    BehaviorCalibrationScenariosResponse,
+    BehaviorEvaluationListResponse,
+    BehaviorEvaluationRequest,
+    BehaviorEvaluationResponse,
+    BehaviorEvidenceSource,
+    BehaviorEvidenceRequest,
+    BehaviorEvidenceResponse,
+    BehaviorPredictionRequest,
+    BehaviorPredictionResponse,
+    BehaviorShadowStatusResponse,
+    CapabilityConsumeRequest,
+    CapabilityConsumeResponse,
+    CapabilityGrantRequest,
+    CapabilityGrantResponse,
+    CounterfactualCreateRequest,
+    CounterfactualItem,
+    CounterfactualListResponse,
+    CounterfactualResolveRequest,
+    CompletionCaptureRequest,
+    CompletionCaptureResponse,
+    ContinuityPilotStatusResponse,
+    MemoryReviewItem,
+    MemoryReviewListResponse,
+    MemoryReviewResolveRequest,
+    ProcessMiningRequest,
+    ProcessMiningResponse,
+    ProcessModelItem,
     CloneAdviceRequest,
     CloneAdviceResponse,
     DirectiveExecution,
@@ -57,6 +93,8 @@ from tce_shared.events import (
     PatternFeedbackRequest,
     ResumePacketRequest,
     ResumePacketResponse,
+    ResumeFeedbackRequest,
+    ResumeFeedbackResponse,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
     TakeoverAutonomyTickResponse,
@@ -74,11 +112,29 @@ from tce_shared.events import (
     TakeoverStepResponse,
 )
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
+from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_text
 
 from .auth import AuthContext, get_auth_context
+from .behavior_control_store import (
+    consume_capability_grant,
+    create_counterfactual,
+    create_memory_review,
+    issue_capability_grant,
+    list_counterfactuals,
+    list_memory_reviews as list_behavior_memory_reviews,
+    list_process_models,
+    load_process_source_rows,
+    mine_and_time,
+    resolve_counterfactual,
+    resolve_memory_review,
+    save_process_models,
+    save_shadow_prediction,
+    shadow_status,
+)
 from .config import get_settings
+from .continuity_store import deliver_handoff_safely, drain_pending_handoffs, enqueue_handoff, pilot_metrics
 from .db import get_db, init_db
 from .store import (
     activity_summary,
@@ -96,6 +152,11 @@ from .store import (
     runtime_mode,
     run_lifecycle_maintenance,
     save_fingerprint_lite,
+    save_behavior_evidence_lite,
+    save_fidelity_run_lite,
+    load_behavior_evidence_lite,
+    list_fidelity_runs_lite,
+    latest_fidelity_gate_lite,
     save_observation_lite,
     search_events,
     set_runtime_mode,
@@ -2198,11 +2259,43 @@ def _docker_service_stats() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return result
 
 
+def _behavior_subject_access_allowed(auth: AuthContext) -> bool:
+    if auth.behavior_subject_id == auth.user_id:
+        return True
+    raw = str(getattr(settings, "behavior_subject_bindings", "") or "")
+    for entry in raw.split(","):
+        owner, separator, subjects = entry.partition("=")
+        if not separator or owner.strip() != auth.user_id:
+            continue
+        allowed = {item.strip() for item in subjects.split("|") if item.strip()}
+        return auth.behavior_subject_id in allowed
+    return False
+
+
 def _enforce_workspace_access(auth: AuthContext, conn: sqlite3.Connection) -> None:
-    if auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR}:
+    access_mode = str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower()
+    if access_mode != "strict" and auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR}:
         return
-    if not workspace_access_allowed(conn, workspace_id=auth.workspace_id, user_id=auth.user_id):
+    try:
+        allowed = workspace_access_allowed(
+            conn,
+            workspace_id=auth.workspace_id,
+            user_id=auth.user_id,
+            require_membership=access_mode == "strict",
+        )
+    except Exception as exc:
+        if access_mode == "strict":
+            raise HTTPException(status_code=503, detail="workspace access could not be verified") from exc
+        allowed = True
+    if not allowed:
         raise HTTPException(status_code=403, detail="workspace access denied")
+    if access_mode == "strict" and not _behavior_subject_access_allowed(auth):
+        raise HTTPException(status_code=403, detail="behavior subject access denied")
+
+
+def _reject_advisor_writes(auth: AuthContext) -> None:
+    if auth.role == AgentRole.ADVISOR:
+        raise HTTPException(status_code=403, detail="advisor role is read-only")
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -2368,6 +2461,12 @@ def _auto_capture_interaction(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    connection_scope = get_db()
+    conn = next(connection_scope)
+    try:
+        drain_pending_handoffs(conn, retention_days=int(settings.handoff_retention_days))
+    finally:
+        connection_scope.close()
 
 
 @app.middleware("http")
@@ -2573,6 +2672,13 @@ def search(
             "cross_user_scope_applied": bool(retrieval_meta.get("cross_user_scope_applied", False)),
             "cross_user_scope_owners": list(retrieval_meta.get("cross_user_scope_owners") or []),
             "resume_packet_available": bool(retrieval_meta.get("resume_packet_available", False)),
+            "context_tier_used": str(retrieval_meta.get("context_tier_used") or "l2"),
+            "summary_coverage": float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
+            "planner_used": bool(retrieval_meta.get("planner_used", False)),
+            "subquery_count": int(retrieval_meta.get("subquery_count", 0) or 0),
+            "subquery_labels": list(retrieval_meta.get("subquery_labels") or []),
+            "episode_boost_applied": bool(retrieval_meta.get("episode_boost_applied", False)),
+            "activation_boost_applied": bool(retrieval_meta.get("activation_boost_applied", False)),
         },
         "policy": {
             "blocked_sensitivity": settings.block_sensitivity,
@@ -2593,6 +2699,124 @@ def handoff_resume(
     if not bool(getattr(settings, "resume_packet_enabled", True)):
         raise HTTPException(status_code=404, detail="resume packet endpoint disabled")
     return get_resume_packet(conn, auth=auth, body=body, settings=settings)
+
+
+@app.post("/v1/completions", response_model=CompletionCaptureResponse)
+def capture_completion(
+    body: CompletionCaptureRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CompletionCaptureResponse:
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, conn)
+    normalized = normalize_milestone_v1(
+        details=body.model_dump(),
+        state=body.state,
+        fallback_title=body.title,
+    )
+    if not normalized["valid"]:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "invalid completion milestone", "errors": normalized["errors"]},
+        )
+    milestone = dict(normalized["normalized"])
+    milestone["change_summary_json"] = dict(body.change_summary or {})
+    milestone["source"] = body.source
+    now = datetime.now(tz=UTC)
+    outbox = enqueue_handoff(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        behavior_subject_id=auth.behavior_subject_id,
+        session_id=body.session_id,
+        directive_id=None,
+        completion_key=body.completion_key,
+        terminal_state=body.state,
+        milestone=milestone,
+        source=body.source,
+        redaction_applied=bool(normalized["redaction_applied"]),
+        now=now,
+    )
+    conn.commit()
+    delivered = deliver_handoff_safely(
+        conn,
+        outbox_id=str(outbox["id"]),
+        retention_days=int(settings.handoff_retention_days),
+    )
+    return CompletionCaptureResponse(
+        outbox_id=UUID(str(delivered["id"])),
+        delivery_status=str(delivered["status"]),
+        event_id=UUID(str(delivered["event_id"])),
+        handoff_record_id=UUID(str(delivered["handoff_record_id"])),
+        contract_valid=True,
+        captured_at=datetime.fromisoformat(str(delivered["created_at"])),
+    )
+
+
+@app.post("/v1/continuity/pilot/feedback", response_model=ResumeFeedbackResponse)
+def capture_resume_feedback(
+    body: ResumeFeedbackRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ResumeFeedbackResponse:
+    _enforce_workspace_access(auth, conn)
+    row = conn.execute(
+        """
+        SELECT packet_id FROM continuity_resume_attempts
+        WHERE packet_id = ? AND workspace_id = ? AND requesting_owner_id = ?
+        """,
+        (str(body.packet_id), auth.workspace_id, auth.user_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="resume packet not found")
+    opened_file, _ = redact_text(str(body.opened_file or "")[:240])
+    correction_reason, _ = redact_text(body.correction_reason[:500])
+    now = datetime.now(tz=UTC)
+    conn.execute(
+        """
+        UPDATE continuity_resume_attempts
+        SET opened_file = ?, correct_file = ?, correction_required = ?,
+            correction_reason = ?, feedback_at = ?
+        WHERE packet_id = ?
+        """,
+        (
+            opened_file or None,
+            1 if body.correct_file else 0,
+            1 if body.correction_required else 0,
+            correction_reason,
+            now.isoformat(),
+            str(body.packet_id),
+        ),
+    )
+    conn.commit()
+    return ResumeFeedbackResponse(packet_id=body.packet_id, recorded=True, feedback_at=now)
+
+
+@app.get("/v1/continuity/pilot/status", response_model=ContinuityPilotStatusResponse)
+def continuity_pilot_status(
+    days: int = 30,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ContinuityPilotStatusResponse:
+    _enforce_workspace_access(auth, conn)
+    window_days = max(1, min(365, int(days)))
+    return ContinuityPilotStatusResponse(
+        window_days=window_days,
+        generated_at=datetime.now(tz=UTC),
+        **pilot_metrics(conn, workspace_id=auth.workspace_id, days=window_days),
+    )
+
+
+@app.get("/v1/auth/whoami", response_model=dict)
+def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]:
+    return {
+        "consumer": auth.consumer,
+        "role": auth.role.value,
+        "workspace_id": auth.workspace_id,
+        "user_id": auth.user_id,
+        "behavior_subject_id": auth.behavior_subject_id,
+        "identity_claims_mode": settings.identity_claims_mode,
+    }
 
 
 @app.get("/v1/context/retrieval/status", response_model=dict)
@@ -4451,6 +4675,756 @@ class IngestObservationsResponse(_PydanticBaseModel):
     fingerprint_updated: bool
 
 
+def _rebuild_behavior_fingerprint_lite(
+    conn: sqlite3.Connection, *, workspace_id: str, subject_user_id: str
+) -> None:
+    evidence = load_behavior_evidence_lite(
+        conn,
+        workspace_id=workspace_id,
+        subject_user_id=subject_user_id,
+        limit=5000,
+        eligible_only=True,
+    )
+    fingerprint = DEFAULT_FINGERPRINT.copy()
+    for item in evidence:
+        fingerprint = merge_observation_into_fingerprint(
+            fingerprint,
+            {
+                "situation_type": item.get("situation_type"),
+                "user_response": item.get("selected_choice") or item.get("user_response"),
+                "response_reasoning": item.get("response_reasoning"),
+                "outcome": item.get("outcome"),
+                "outcome_sentiment": item.get("outcome_sentiment"),
+            },
+        )
+    save_fingerprint_lite(
+        conn,
+        consumer_id=subject_user_id,
+        workspace_id=workspace_id,
+        fingerprint=fingerprint,
+        observation_count=len(evidence),
+    )
+
+
+def _store_behavior_evidence_lite_api(
+    *,
+    body: BehaviorEvidenceRequest,
+    auth: AuthContext,
+    conn: sqlite3.Connection,
+) -> BehaviorEvidenceResponse:
+    if not bool(getattr(settings, "behavior_evidence_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior evidence capture is disabled")
+    raw = body.model_dump(mode="python")
+    if body.evidence_source.value in {"explicit", "correction", "calibration"} and not raw.get("confirmed_at"):
+        raw["confirmed_at"] = datetime.now(tz=UTC)
+    normalized = normalize_behavior_evidence(raw)
+    storage_gate = behavior_storage_gate(
+        normalized,
+        threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
+    )
+    prior_evidence: list[dict[str, Any]] = []
+    shadow_prediction: dict[str, Any] | None = None
+    shadow_latency_ms = 0
+    if bool(getattr(settings, "behavior_shadow_evaluation_enabled", True)):
+        prior_evidence = load_behavior_evidence_lite(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            limit=500,
+            eligible_only=True,
+        )
+        shadow_started = time.perf_counter()
+        shadow_prediction = predict_behavior(
+            prior_evidence,
+            {
+                "situation_type": normalized["situation_type"],
+                "situation_summary": normalized["situation_summary"],
+                "objective_text": normalized["objective_text"],
+                "constraints": normalized["constraints"],
+                "context_snapshot": normalized["context_snapshot"],
+            },
+            candidate_choices=list(normalized.get("available_choices") or []),
+            min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
+        )
+        shadow_latency_ms = max(0, int((time.perf_counter() - shadow_started) * 1000))
+    mode = str(getattr(settings, "behavior_storage_gate_mode", "shadow") or "shadow").strip().lower()
+    if mode not in {"shadow", "warn", "enforce"}:
+        mode = "shadow"
+    warnings: list[str] = []
+    if not storage_gate["learning_eligible"]:
+        message = "evidence stored for audit but excluded from behavioral learning"
+        if mode == "enforce":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "behavior_storage_gate_rejected",
+                    "message": message,
+                    "storage_gate": storage_gate,
+                },
+            )
+        if mode == "warn":
+            warnings.append(message)
+    review_pending = bool(
+        getattr(settings, "behavior_memory_review_enabled", True)
+        and storage_gate["learning_eligible"]
+        and normalized.get("evidence_source") in {"inferred", "backfill"}
+    )
+    if review_pending:
+        storage_gate = {
+            **storage_gate,
+            "learning_eligible": False,
+            "decision": "pending_review",
+            "reasons": [*list(storage_gate.get("reasons") or []), "human_review_required"],
+        }
+        warnings.append("evidence is pending memory review and cannot influence behavior yet")
+    supersedes = normalized.get("supersedes_observation_id")
+    if supersedes:
+        target_exists = conn.execute(
+            """
+            SELECT 1 FROM decision_observations
+            WHERE id = ? AND workspace_id = ? AND subject_user_id = ?
+            """,
+            (str(supersedes), auth.workspace_id, auth.behavior_subject_id),
+        ).fetchone()
+        if target_exists is None:
+            raise HTTPException(status_code=404, detail="superseded observation not found in workspace")
+    observation_id = save_behavior_evidence_lite(
+        conn,
+        consumer_id=auth.consumer,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        evidence=normalized,
+        storage_gate=storage_gate,
+    )
+    review_id: str | None = None
+    if bool(getattr(settings, "behavior_memory_review_enabled", True)):
+        review_status = "pending" if review_pending else ("promoted" if storage_gate["learning_eligible"] else "rejected")
+        review_id = create_memory_review(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            target_type="evidence",
+            target_id=observation_id,
+            title=str(normalized.get("situation_summary") or normalized.get("objective_text") or "Behavior evidence"),
+            rationale=str(normalized.get("rationale") or ""),
+            source=str(normalized.get("evidence_source") or "unknown"),
+            score=float(storage_gate.get("score", 0.0) or 0.0),
+            status=review_status,
+        )
+    shadow_prediction_id: str | None = None
+    if shadow_prediction is not None:
+        shadow_prediction_id = save_shadow_prediction(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            observation_id=observation_id,
+            actual_choice=str(normalized["selected_choice"]),
+            query={
+                "situation_type": normalized["situation_type"],
+                "situation_summary": normalized["situation_summary"],
+                "objective_text": normalized["objective_text"],
+            },
+            prediction=shadow_prediction,
+            evidence_count=len(prior_evidence),
+            latency_ms=shadow_latency_ms,
+        )
+    if storage_gate["learning_eligible"]:
+        fingerprint_data = load_fingerprint_lite(
+            conn,
+            consumer_id=auth.behavior_subject_id,
+            workspace_id=auth.workspace_id,
+        )
+        fingerprint = fingerprint_data["fingerprint"] if fingerprint_data else DEFAULT_FINGERPRINT.copy()
+        fingerprint = merge_observation_into_fingerprint(
+            fingerprint,
+            {
+                "situation_type": normalized["situation_type"],
+                "user_response": normalized["selected_choice"],
+                "response_reasoning": normalized["rationale"],
+                "outcome": normalized["outcome"],
+                "outcome_sentiment": normalized["outcome_sentiment"],
+            },
+        )
+        observation_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(1) AS c FROM decision_observations
+                WHERE workspace_id = ? AND subject_user_id = ? AND learning_eligible = 1
+                """,
+                (auth.workspace_id, auth.behavior_subject_id),
+            ).fetchone()["c"]
+        )
+        save_fingerprint_lite(
+            conn,
+            consumer_id=auth.behavior_subject_id,
+            workspace_id=auth.workspace_id,
+            fingerprint=fingerprint,
+            observation_count=observation_count,
+        )
+    return BehaviorEvidenceResponse(
+        observation_id=UUID(observation_id),
+        stored=True,
+        learning_eligible=bool(storage_gate["learning_eligible"]),
+        storage_score=float(storage_gate["score"]),
+        storage_decision=str(storage_gate["decision"]),
+        storage_reasons=list(storage_gate.get("reasons") or []),
+        warnings=warnings,
+        redaction_applied=bool(normalized.get("redaction_applied", False)),
+        superseded_observation_id=body.supersedes_observation_id,
+        review_id=UUID(review_id) if review_id else None,
+        shadow_prediction_id=UUID(shadow_prediction_id) if shadow_prediction_id else None,
+    )
+
+
+@app.post("/v1/behavior/evidence", response_model=BehaviorEvidenceResponse)
+def record_behavior_evidence(
+    body: BehaviorEvidenceRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorEvidenceResponse:
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_evidence", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    return _store_behavior_evidence_lite_api(body=body, auth=auth, conn=conn)
+
+
+@app.post("/v1/behavior/predict", response_model=BehaviorPredictionResponse)
+def predict_behavior_choice(
+    body: BehaviorPredictionRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorPredictionResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_predict", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_prediction_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior prediction is disabled")
+    evidence = load_behavior_evidence_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        limit=2000,
+        eligible_only=True,
+    )
+    prediction = predict_behavior(
+        evidence,
+        {
+            "situation_type": body.situation_type,
+            "situation_summary": body.situation_summary,
+            "objective_text": body.objective,
+            "constraints": body.constraints,
+            "context_snapshot": body.context_snapshot,
+        },
+        candidate_choices=body.candidate_choices,
+        min_confidence=max(
+            body.min_confidence,
+            float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
+        ),
+    )
+    gate = latest_fidelity_gate_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+    )
+    if bool(getattr(settings, "behavior_autonomy_gate_enabled", False)) and not bool(gate.get("passed", False)):
+        prediction.update(
+            {
+                "predicted_choice": None,
+                "abstained": True,
+                "needs_clarification": True,
+                "clarification_question": "Behavior fidelity is not validated yet. What choice should be made?",
+            }
+        )
+    return BehaviorPredictionResponse(**prediction, fidelity_gate=gate)
+
+
+@app.post("/v1/behavior/evaluate", response_model=BehaviorEvaluationResponse)
+def run_behavior_evaluation(
+    body: BehaviorEvaluationRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorEvaluationResponse:
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_evaluate", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_fidelity_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior fidelity evaluation is disabled")
+    config = body.model_dump(mode="json")
+    evidence = load_behavior_evidence_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        limit=body.max_cases,
+        eligible_only=True,
+    )
+    result = evaluate_behavior_fidelity(evidence, **body.model_dump(mode="python"))
+    run_id, created_at = save_fidelity_run_lite(
+        conn,
+        consumer_id=auth.consumer,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        config=config,
+        result=result,
+    )
+    return BehaviorEvaluationResponse(
+        run_id=UUID(run_id),
+        status=str(result["status"]),
+        metrics=dict(result["metrics"]),
+        gate=dict(result["gate"]),
+        case_results=list(result["case_results"]),
+        config=config,
+        created_at=created_at,
+        duration_ms=int(result["duration_ms"]),
+    )
+
+
+@app.get("/v1/behavior/evaluations", response_model=BehaviorEvaluationListResponse)
+def behavior_evaluations(
+    limit: int = 20,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorEvaluationListResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_evaluations", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    rows = list_fidelity_runs_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        limit=limit,
+    )
+    return BehaviorEvaluationListResponse(
+        runs=[
+            BehaviorEvaluationResponse(
+                run_id=UUID(str(row["id"])),
+                status=str(row["status"]),
+                metrics=dict(row.get("metrics") or {}),
+                gate=dict(row.get("gate") or {}),
+                case_results=list(row.get("case_results") or []),
+                config=dict(row.get("config") or {}),
+                created_at=datetime.fromisoformat(str(row["created_at"])),
+                duration_ms=int(row.get("duration_ms", 0) or 0),
+                schema_version=str(row.get("schema_version") or "v1"),
+            )
+            for row in rows
+        ]
+    )
+
+
+@app.get("/v1/behavior/calibration/scenarios", response_model=BehaviorCalibrationScenariosResponse)
+def behavior_calibration_scenarios(
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorCalibrationScenariosResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_calibration_scenarios", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_calibration_enabled", False)):
+        raise HTTPException(status_code=404, detail="behavior calibration is disabled")
+    return BehaviorCalibrationScenariosResponse(scenarios=[dict(item) for item in CALIBRATION_SCENARIOS])
+
+
+@app.post("/v1/behavior/calibration/answer", response_model=BehaviorEvidenceResponse)
+def answer_behavior_calibration(
+    body: BehaviorCalibrationAnswerRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorEvidenceResponse:
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_calibration_answer", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_calibration_enabled", False)):
+        raise HTTPException(status_code=404, detail="behavior calibration is disabled")
+    scenario = next((dict(item) for item in CALIBRATION_SCENARIOS if item["id"] == body.scenario_id), None)
+    if scenario is None:
+        raise HTTPException(status_code=404, detail="calibration scenario not found")
+    if body.selected_choice not in scenario["choices"]:
+        raise HTTPException(status_code=422, detail="selected_choice must be one of the scenario choices")
+    evidence_body = BehaviorEvidenceRequest(
+        situation_type=scenario["situation_type"],
+        situation_summary=scenario["objective"],
+        objective=scenario["objective"],
+        available_choices=list(scenario["choices"]),
+        selected_choice=body.selected_choice,
+        rationale=body.rationale,
+        action_taken=body.action_taken,
+        memory_class=scenario["memory_class"],
+        evidence_source=BehaviorEvidenceSource.CALIBRATION,
+        confirmed_at=datetime.now(tz=UTC),
+    )
+    return _store_behavior_evidence_lite_api(body=evidence_body, auth=auth, conn=conn)
+
+
+@app.post("/v1/capabilities/grants", response_model=CapabilityGrantResponse)
+def capability_grant_create(
+    body: CapabilityGrantRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CapabilityGrantResponse:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="capability_grant_create", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_capability_broker_enabled", True)):
+        raise HTTPException(status_code=404, detail="capability broker is disabled")
+    payload = body.model_dump(mode="python")
+    if body.ttl_seconds == 120:
+        payload["ttl_seconds"] = int(getattr(settings, "capability_grant_ttl_seconds", 120))
+    response = CapabilityGrantResponse(
+        **issue_capability_grant(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            body=payload,
+        )
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="capability_grant_create",
+        query={
+            "grant_id": str(response.grant_id),
+            "capability": response.capability,
+            "action": response.action,
+            "resource": response.resource,
+            "action_digest": response.action_digest,
+            "mutating": response.mutating,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "decision": response.decision,
+            "status": response.status,
+            "risk_tier": response.risk_tier,
+            "role": auth.role.value,
+        },
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
+@app.post("/v1/capabilities/consume", response_model=CapabilityConsumeResponse)
+def capability_grant_consume(
+    body: CapabilityConsumeRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CapabilityConsumeResponse:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="capability_grant_consume", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_capability_broker_enabled", True)):
+        raise HTTPException(status_code=404, detail="capability broker is disabled")
+    response = CapabilityConsumeResponse(
+        **consume_capability_grant(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            body=body.model_dump(mode="python"),
+        )
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="capability_grant_consume",
+        query={
+            "grant_id": str(response.grant_id),
+            "action_digest": response.action_digest,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "authorized": response.authorized,
+            "status": response.status,
+            "reason": response.reason,
+            "role": auth.role.value,
+        },
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
+@app.post("/v1/behavior/processes/mine", response_model=ProcessMiningResponse)
+def mine_behavior_processes(
+    body: ProcessMiningRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ProcessMiningResponse:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_processes_mine", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_process_mining_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior process mining is disabled")
+    rows = load_process_source_rows(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        lookback_days=body.lookback_days,
+        limit=body.max_sequences,
+    )
+    min_support = max(body.min_support, int(getattr(settings, "behavior_process_min_support", 2)))
+    models, duration_ms = mine_and_time(rows, min_support=min_support, max_steps=body.max_steps)
+    stored = save_process_models(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        models=models,
+    )
+    if bool(getattr(settings, "behavior_memory_review_enabled", True)):
+        for model in stored:
+            create_memory_review(
+                conn,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                target_type="process_model",
+                target_id=str(model["process_id"]),
+                title=str(model["name"]),
+                rationale=f"Observed in {model['support']} sessions with reliability {model['reliability']:.2f}",
+                source="process_mining",
+                score=float(model["reliability"]),
+            )
+        stored = list_process_models(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            status=None,
+            limit=100,
+        )
+    response = ProcessMiningResponse(
+        models=[ProcessModelItem(**item) for item in stored],
+        source_event_count=len(rows),
+        source_session_count=len({str(row.get("session_id")) for row in rows}),
+        duration_ms=duration_ms,
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_processes_mine",
+        query={
+            "lookback_days": body.lookback_days,
+            "min_support": min_support,
+            "max_sequences": body.max_sequences,
+            "max_steps": body.max_steps,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "model_count": len(response.models),
+            "source_event_count": response.source_event_count,
+            "source_session_count": response.source_session_count,
+            "role": auth.role.value,
+        },
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
+@app.get("/v1/behavior/processes", response_model=ProcessMiningResponse)
+def behavior_processes(
+    status: str | None = None,
+    limit: int = 100,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ProcessMiningResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_processes", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    models = list_process_models(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        status=status,
+        limit=limit,
+    )
+    return ProcessMiningResponse(models=[ProcessModelItem(**item) for item in models])
+
+
+@app.get("/v1/behavior/shadow/status", response_model=BehaviorShadowStatusResponse)
+def behavior_shadow_evaluation_status(
+    limit: int = 200,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorShadowStatusResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_shadow_status", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_shadow_evaluation_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior shadow evaluation is disabled")
+    return BehaviorShadowStatusResponse(
+        **shadow_status(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            limit=limit,
+        )
+    )
+
+
+@app.get("/v1/behavior/reviews", response_model=MemoryReviewListResponse)
+def behavior_memory_reviews(
+    status: str | None = "pending",
+    limit: int = 100,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> MemoryReviewListResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_memory_reviews", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    rows = list_behavior_memory_reviews(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        status=status,
+        limit=limit,
+    )
+    return MemoryReviewListResponse(reviews=[MemoryReviewItem(**row) for row in rows])
+
+
+@app.post("/v1/behavior/reviews/{review_id}/resolve", response_model=MemoryReviewItem)
+def behavior_memory_review_resolve(
+    review_id: UUID,
+    body: MemoryReviewResolveRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> MemoryReviewItem:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_memory_review_resolve", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    note, _ = redact_control_text(body.note, limit=1000)
+    row = resolve_memory_review(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        review_id=str(review_id),
+        reviewer_id=auth.user_id,
+        decision=body.decision,
+        note=note,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="pending memory review not found")
+    if body.decision == "promote" and row.get("target_type") == "evidence":
+        _rebuild_behavior_fingerprint_lite(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+        )
+    response = MemoryReviewItem(**row)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_memory_review_resolve",
+        query={
+            "review_id": str(review_id),
+            "target_type": response.target_type,
+            "target_id": str(response.target_id),
+        },
+        result_event_ids=[],
+        policy_decisions={"decision": body.decision, "status": response.status, "role": auth.role.value},
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
+@app.post("/v1/behavior/counterfactuals", response_model=CounterfactualItem)
+def behavior_counterfactual_create(
+    body: CounterfactualCreateRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CounterfactualItem:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_counterfactual_create", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    if not bool(getattr(settings, "behavior_counterfactual_enabled", True)):
+        raise HTTPException(status_code=404, detail="behavior counterfactual logging is disabled")
+    normalized = normalize_counterfactual(body.model_dump(mode="python"))
+    payload = {**body.model_dump(mode="python"), **normalized}
+    response = CounterfactualItem(
+        **create_counterfactual(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            owner_id=auth.user_id,
+            body=payload,
+        )
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_counterfactual_create",
+        query={
+            "counterfactual_id": str(response.counterfactual_id),
+            "observation_id": str(response.observation_id) if response.observation_id else None,
+            "directive_id": str(response.directive_id) if response.directive_id else None,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "status": response.status,
+            "redaction_applied": response.redaction_applied,
+            "role": auth.role.value,
+        },
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
+@app.get("/v1/behavior/counterfactuals", response_model=CounterfactualListResponse)
+def behavior_counterfactuals(
+    status: str | None = None,
+    limit: int = 100,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CounterfactualListResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_counterfactuals", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    rows = list_counterfactuals(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        status=status,
+        limit=limit,
+    )
+    return CounterfactualListResponse(records=[CounterfactualItem(**row) for row in rows])
+
+
+@app.post("/v1/behavior/counterfactuals/{counterfactual_id}/resolve", response_model=CounterfactualItem)
+def behavior_counterfactual_resolve(
+    counterfactual_id: UUID,
+    body: CounterfactualResolveRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CounterfactualItem:
+    start = time.perf_counter()
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="behavior_counterfactual_resolve", method="POST").inc()
+    _enforce_workspace_access(auth, conn)
+    observed, observed_redacted = redact_control_text(body.observed_outcome, limit=1000)
+    lesson, lesson_redacted = redact_control_text(body.lesson, limit=1000)
+    row = resolve_counterfactual(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        counterfactual_id=str(counterfactual_id),
+        body={
+            **body.model_dump(mode="python"),
+            "observed_outcome": observed,
+            "lesson": lesson,
+            "redaction_applied": observed_redacted or lesson_redacted,
+        },
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="open counterfactual not found")
+    response = CounterfactualItem(**row)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_counterfactual_resolve",
+        query={"counterfactual_id": str(counterfactual_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "assessment": response.assessment,
+            "status": response.status,
+            "redaction_applied": response.redaction_applied,
+            "role": auth.role.value,
+        },
+        latency_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return response
+
+
 @app.post("/v1/clone/ingest-observations", response_model=IngestObservationsResponse)
 def ingest_observations(
     body: IngestObservationsRequest,
@@ -4469,14 +5443,14 @@ def ingest_observations(
 
     fingerprint_updated = False
     if body.update_fingerprint and ingested > 0:
-        fp_data = load_fingerprint_lite(conn, consumer_id=auth.consumer, workspace_id=auth.workspace_id)
+        fp_data = load_fingerprint_lite(conn, consumer_id=auth.behavior_subject_id, workspace_id=auth.workspace_id)
         fp = fp_data["fingerprint"] if fp_data else DEFAULT_FINGERPRINT.copy()
         obs_count = (fp_data["observation_count"] if fp_data else 0) + ingested
         for obs in body.observations:
             fp = merge_observation_into_fingerprint(fp, obs)
         save_fingerprint_lite(
             conn,
-            consumer_id=auth.consumer,
+            consumer_id=auth.behavior_subject_id,
             workspace_id=auth.workspace_id,
             fingerprint=fp,
             observation_count=obs_count,
@@ -4580,7 +5554,7 @@ def get_fingerprint(
     REQUEST_COUNT.labels(endpoint="fingerprint", method="GET").inc()
     _enforce_workspace_access(auth, conn)
 
-    fp_data = load_fingerprint_lite(conn, consumer_id=auth.consumer, workspace_id=auth.workspace_id)
+    fp_data = load_fingerprint_lite(conn, consumer_id=auth.behavior_subject_id, workspace_id=auth.workspace_id)
     if fp_data is None:
         # Fall back to any fingerprint in the workspace
         row = conn.execute(
@@ -4701,7 +5675,7 @@ def get_clone_score(
     observation_count_score = min(25, int(obs_count * 25 / 100))
 
     # 2. Fingerprint confidence — count non-default dimensions
-    fp_data = load_fingerprint_lite(conn, consumer_id=auth.consumer, workspace_id=auth.workspace_id)
+    fp_data = load_fingerprint_lite(conn, consumer_id=auth.behavior_subject_id, workspace_id=auth.workspace_id)
     if fp_data and fp_data["fingerprint"]:
         non_default = 0
         total_dims = 0

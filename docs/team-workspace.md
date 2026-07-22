@@ -7,7 +7,8 @@ Open Timeline Engine (TCE) supports per-workspace timeline isolation with member
 Each request can include:
 
 - `X-TCE-Workspace`: workspace scope id
-- `X-TCE-User`: user id in that workspace
+- `X-TCE-User`: event owner/executor id in that workspace
+- `X-TCE-Behavior-Subject`: human behavior profile id; defaults to `X-TCE-User`
 
 Each event is stamped with internal scope markers:
 
@@ -29,9 +30,9 @@ On first event write in a workspace, owner membership is auto-created.
 
 ## Access behavior
 
-- if workspace has no memberships yet, access defaults open (bootstrap)
+- in `compat` mode, a workspace with no memberships defaults open for bootstrap
 - once members exist, access requires active membership
-- advisor/executor flows still respect workspace/user scoping in retrieval paths
+- in `strict` mode, every role requires an active membership and membership lookup failures deny access
 - default retrieval profile is `user-only`
 - explicit/eligible cross-user memory queries can return `workspace-shared` policy metadata for that request
 
@@ -72,6 +73,13 @@ If your history is mostly older auto-capture logs, run one focused handoff sessi
 - workspace scoping is in addition to sensitivity/policy checks
 - sensitivity `3` remains blocked by default from output paths
 - audit log captures consumer, action, returned citations, and policy outcomes
+- set `TCE_WORKSPACE_ACCESS_MODE=strict` after provisioning memberships
+- bind executor owners to shared human profiles with `TCE_BEHAVIOR_SUBJECT_BINDINGS=codex-executor=local-user,claude-executor=local-user`
+- set `TCE_AUDIT_WRITE_MODE=durable` when a failed audit write must fail the request
+- TCE includes one-use capability grants bound to exact action digests and existing execution permits
+- non-bypassable host enforcement still requires executors or a sandbox to route every mutation through the broker; direct host access is not intercepted
+
+For production, use `TCE_IDENTITY_CLAIMS_MODE=enforce` and map each bearer token or mTLS subject fingerprint in `TCE_IDENTITY_CLAIMS_JSON`. The server then owns the workspace, executor, role, and behavior-subject claims; `X-TCE-*` headers become consistency checks rather than caller-controlled identity. Verify provisioning through `GET /v1/auth/whoami`.
 
 ## Continuity metadata
 

@@ -39,6 +39,13 @@ export const routes: Routes = [
       import('./features/human-clone/human-clone.component').then(m => m.HumanCloneComponent),
   },
   {
+    path: 'behavior-review',
+    loadComponent: () =>
+      import('./features/behavior-review/behavior-review.component').then(
+        m => m.BehaviorReviewComponent
+      ),
+  },
+  {
     path: 'episodes',
     loadComponent: () =>
       import('./features/episodes/episodes.component').then(m => m.EpisodesComponent),

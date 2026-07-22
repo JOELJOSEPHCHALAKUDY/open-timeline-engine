@@ -16,6 +16,18 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
+from tce_shared.autonomy_context import (
+    SUMMARY_VERSION,
+    autonomy_profile_tuning,
+    build_retry_feedback,
+    coerce_summary_l1,
+    plan_retrieval_subqueries,
+    propagate_episode_score,
+    summarize_event_record,
+    summarize_hit_text,
+    summary_coverage_ratio,
+)
+from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence
 from tce_shared.fingerprint import (
     DEFAULT_FINGERPRINT,
     apply_feedback_to_fingerprint,
@@ -127,10 +139,12 @@ from tce_shared.handoff import (
     normalize_milestone_v1,
     normalize_objective_text,
     rank_resume_candidates,
+    task_overlap_score,
 )
 
 from .auth import AuthContext
 from .config import Settings, get_settings
+from .continuity_store import deliver_handoff_safely, enqueue_handoff, record_resume_attempt
 from .store_graph import (
     _ensure_owner_membership,
     _index_graph,
@@ -995,6 +1009,47 @@ def _read_feedback_signals_lite(
     return out
 
 
+def _load_episode_score_lookup_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    owner_ids: list[str],
+    query_text: str,
+    max_rows: int = 180,
+) -> dict[str, float]:
+    if not owner_ids or not str(query_text or "").strip():
+        return {}
+    placeholders = ",".join("?" for _ in owner_ids)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT eel.event_id, ep.goal, ep.context, ep.outcome
+            FROM episodes ep
+            JOIN episode_event_links eel ON eel.episode_id = ep.id
+            WHERE ep.workspace_id = ?
+              AND ep.user_id IN ({placeholders})
+            ORDER BY ep.updated_at DESC
+            LIMIT ?
+            """,
+            (workspace_id, *owner_ids, max(20, int(max_rows))),
+        ).fetchall()
+    except Exception:
+        return {}
+    scores: dict[str, float] = {}
+    for row in rows:
+        episode_text = " ".join(
+            [str(row["goal"] or ""), str(row["context"] or ""), str(row["outcome"] or "")]
+        ).strip()
+        overlap = task_overlap_score(query_text, episode_text)
+        if overlap <= 0:
+            continue
+        event_id = str(row["event_id"] or "").strip()
+        if not event_id:
+            continue
+        scores[event_id] = max(float(scores.get(event_id, 0.0)), float(overlap))
+    return scores
+
+
 def _token_set_for_hit_lite(row: sqlite3.Row) -> set[str]:
     blob = " ".join(
         [
@@ -1795,17 +1850,26 @@ def store_event(
     outcome = redact_payload(event.outcome.model_dump(), hints=event.redaction_hints)[0] if event.outcome else None
     style = redact_payload(event.style.model_dump(), hints=event.redaction_hints)[0] if event.style else None
     links = redact_payload(event.links.model_dump(), hints=event.redaction_hints)[0] if event.links else None
+    summary_l0, summary_l1 = summarize_event_record(
+        title=event.title,
+        task_type=event.task_type,
+        domain=event.domain,
+        payload=payload,
+        decision=decision,
+        outcome=outcome,
+    )
 
     event_id = uuid.uuid4()
     conn.execute(
         """
         INSERT INTO events(
             id, ts, actor, source, domain, task_type, event_type, title,
+            summary_l0, summary_l1_json, summary_version, summary_updated_at,
             payload, context, inputs, steps, decision, outcome, style, links,
             tags, sensitivity, redaction_hints, hash, schema_version,
             source_id, source_seq, vector_clock, idempotency_key, authority_level
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(event_id),
@@ -1816,6 +1880,10 @@ def store_event(
             event.task_type,
             event.event_type.value,
             event.title,
+            summary_l0,
+            json_dumps(summary_l1),
+            SUMMARY_VERSION,
+            event.ts.astimezone(UTC).isoformat(),
             json_dumps(payload),
             json_dumps(context),
             json_dumps(inputs),
@@ -1928,6 +1996,14 @@ def search_events(
     retrieval_started = time.perf_counter()
     query_text = body.query.strip().lower()
     match_all = bool(body.match_all) or query_text in {"", "*"}
+    intent_retrieval_enabled = bool(getattr(settings, "intent_retrieval_enabled", False))
+    planned_queries = plan_retrieval_subqueries(
+        query_text,
+        enabled=intent_retrieval_enabled,
+        match_all=match_all,
+    )
+    planner_used = bool(len(planned_queries) > 1)
+    subquery_labels = [str(item.get("label") or "") for item in planned_queries if str(item.get("label") or "").strip()]
     owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope_lite(
         conn,
         workspace_id=workspace_id,
@@ -1941,6 +2017,9 @@ def search_events(
     expansion_ms = 0
     mmr_ms = 0
     mmr_candidates = 0
+    activation_boost_applied = False
+    episode_boost_applied = False
+    subquery_labels_by_event: dict[str, set[str]] = {}
 
     max_allowed = max_read_sensitivity(settings)
     filters = body.filters
@@ -1998,7 +2077,7 @@ def search_events(
         def _query() -> list[sqlite3.Row]:
             return conn.execute(
                 f"""
-                SELECT id, ts, title, domain, task_type, sensitivity, payload, tags, context, authority_level
+                SELECT id, ts, title, summary_l0, summary_l1_json, domain, task_type, sensitivity, payload, tags, context, authority_level
                 FROM events
                 WHERE {' AND '.join(local_clauses)}
                 ORDER BY ts DESC
@@ -2069,6 +2148,31 @@ def search_events(
             expansion_ms += int((time.perf_counter() - rerun_started) * 1000)
             query_expansion_used = True
             query_expansion_terms = expanded_terms
+
+    if not match_all:
+        merged_rows: dict[str, sqlite3.Row] = {}
+
+        def _merge_rows(batch: list[sqlite3.Row], label: str) -> None:
+            for row in batch:
+                key = str(row["id"])
+                if key not in merged_rows:
+                    merged_rows[key] = row
+                subquery_labels_by_event.setdefault(key, set()).add(label)
+
+        _merge_rows(rows, planned_queries[0]["label"] if planned_queries else "objective")
+        if planner_used and not _enhancement_budget_exhausted():
+            for index, planned in enumerate(planned_queries):
+                remaining_budget_ms = enhancement_budget_ms - int((time.perf_counter() - retrieval_started) * 1000)
+                if remaining_budget_ms < 40:
+                    break
+                planned_query = str(planned.get("query") or "").strip().lower()
+                if not planned_query:
+                    continue
+                if index == 0 and planned_query == query_text:
+                    continue
+                extra_rows = _query_rows([f"%{planned_query}%"], expansion_mode=False)
+                _merge_rows(extra_rows, str(planned.get("label") or "objective"))
+        rows = list(merged_rows.values())
 
     citation_dup_ratio = _citation_dup_ratio_lite(rows)
 
@@ -2156,6 +2260,11 @@ def search_events(
     weight_recency /= weight_total
     graph_bonus = max(0.0, float(settings.search_graph_bonus))
     activation_weight = max(0.0, float(getattr(settings, "memory_activation_weight", 0.0)))
+    if planner_used and intent_retrieval_enabled:
+        multiplier = max(1.0, float(getattr(settings, "memory_activation_autonomy_weight_multiplier", 1.0)))
+        boosted_weight = activation_weight * multiplier
+        activation_boost_applied = boosted_weight > activation_weight
+        activation_weight = boosted_weight
     recurrence = Counter((str(row["domain"]), str(row["task_type"])) for row in rows)
     activation_lookup = _read_activation_scores_lite(
         workspace_id=workspace_id,
@@ -2177,6 +2286,13 @@ def search_events(
         max_records=max(body.k * 6, 30),
     )
     handoff_query_intent = handoff_intent(query_text)
+    episode_score_lookup = _load_episode_score_lookup_lite(
+        conn,
+        workspace_id=workspace_id,
+        owner_ids=sorted(owner_scope),
+        query_text=query_text,
+        max_rows=max(body.k * 12, 120),
+    ) if (planner_used and intent_retrieval_enabled) else {}
     normalized_workspace_id = _normalize_owner_token_lite(workspace_id)
 
     def _score_rows_for_scope(
@@ -2222,8 +2338,13 @@ def search_events(
             activation_score = max(0.0, min(1.0, float(activation_lookup.get(str(row["id"]), 0.0))))
             feedback_signal = max(-1.0, min(1.0, float(feedback_lookup.get(str(row["id"]), 0.0))))
             feedback_delta = feedback_weight * feedback_signal
+            query_labels = subquery_labels_by_event.get(str(row["id"]), set())
+            query_label_boost = 0.04 if "decision_history" in query_labels else 0.0
+            if "constraints_workflow" in query_labels:
+                query_label_boost += 0.03
             score = (
-                (weight_relevance * relevance)
+                query_label_boost
+                + (weight_relevance * relevance)
                 + (weight_stability * stability)
                 + (weight_authority * authority)
                 + (weight_recency * recency)
@@ -2239,6 +2360,9 @@ def search_events(
                     score += 0.06
                 if handoff_query_intent and bool(handoff_meta.get("has_anchors")):
                     score += 0.08
+            episode_score = max(0.0, min(1.0, float(episode_score_lookup.get(str(row["id"]), 0.0))))
+            if episode_score > 0.0:
+                score = propagate_episode_score(score, episode_score)
             if abs(feedback_delta) > 1e-9:
                 local_feedback_applied = True
             local_scored.append(
@@ -2252,6 +2376,10 @@ def search_events(
                         task_type=row["task_type"],
                         score=score,
                         sensitivity=row["sensitivity"],
+                        summary_l0=str(row["summary_l0"] or "").strip() if "summary_l0" in row.keys() else "",
+                        summary_l1=coerce_summary_l1(
+                            json_loads(row["summary_l1_json"], {}) if "summary_l1_json" in row.keys() else {}
+                        ),
                     ),
                     row,
                 )
@@ -2339,6 +2467,11 @@ def search_events(
     response = EventSearchResponse(hits=hits, citations=[hit.id for hit in hits])
     retrieval_source = "none" if match_all else "lexical_only"
     _bump_retrieval_counter(retrieval_source)
+    episode_event_id_keys = {
+        str(key) for key, value in episode_score_lookup.items() if float(value or 0.0) > 0.0
+    }
+    if episode_score_lookup:
+        episode_boost_applied = any(str(hit.id) in episode_event_id_keys for hit in hits)
     retrieval_meta = {
         "source": retrieval_source,
         "reason": None,
@@ -2354,6 +2487,13 @@ def search_events(
         "handoff_hits_count": len(top_handoff_record_ids),
         "top_handoff_record_ids": top_handoff_record_ids,
         "resume_packet_available": bool(top_handoff_record_ids),
+        "context_tier_used": "l1" if bool(getattr(settings, "context_tiers_enabled", False)) else "l2",
+        "summary_coverage": summary_coverage_ratio(hits),
+        "planner_used": bool(planner_used),
+        "subquery_count": len(subquery_labels),
+        "subquery_labels": subquery_labels,
+        "episode_boost_applied": bool(episode_boost_applied),
+        "activation_boost_applied": bool(activation_boost_applied),
         "query_expansion_used": bool(query_expansion_used),
         "query_expansion_terms": query_expansion_terms[: max(0, int(getattr(settings, "search_query_expansion_max_terms", 4)))],
         "expansion_ms": int(expansion_ms),
@@ -2487,8 +2627,9 @@ def get_resume_packet(
     selected_id = str(selected.get("id") or "").strip()
     selected_uuid = UUID(selected_id)
     files = _resume_file_items_from_record_lite(selected, query_text=body.query)
-    return ResumePacketResponse(
-        packet_id=uuid.uuid4(),
+    packet_id = uuid.uuid4()
+    response = ResumePacketResponse(
+        packet_id=packet_id,
         selected_record_id=selected_uuid,
         selection_reason="task_overlap_then_recency",
         cross_user_scope_applied=bool(cross_user_scope_applied),
@@ -2511,6 +2652,23 @@ def get_resume_packet(
             alternates=alternates,
         ),
     )
+    selected_ts = selected.get("ts")
+    if isinstance(selected_ts, datetime):
+        returned_at = datetime.now(tz=UTC)
+        record_resume_attempt(
+            conn,
+            packet_id=packet_id,
+            workspace_id=auth.workspace_id,
+            requesting_owner_id=auth.user_id,
+            target_owner_id=str(selected.get("owner_id") or body.target_owner or auth.user_id),
+            selected_record_id=selected_id,
+            query_text=body.query,
+            top_file=files[0].path if files else None,
+            requested_at=returned_at - timedelta(milliseconds=response.retrieval_meta.latency_ms),
+            returned_at=returned_at,
+            handoff_ts=selected_ts,
+        )
+    return response
 
 
 def list_patterns(
@@ -2637,6 +2795,8 @@ def context_bundle(
             title=hit.title,
             ts=hit.ts,
             key_payload_fields={"domain": hit.domain, "task_type": hit.task_type},
+            summary_l0=hit.summary_l0,
+            summary_l1=hit.summary_l1,
         )
         for hit in search_response.hits
     ]
@@ -2683,10 +2843,21 @@ def context_bundle(
         len(evidence_events) < settings.cold_start_min_events
         or len(top_patterns) < settings.cold_start_min_patterns
     )
+    context_tiers_enabled = bool(getattr(settings, "context_tiers_enabled", False))
     summary = (
         f"Bundle generated at {now_utc().isoformat()} with "
         f"{len(evidence_events)} evidence events and {len(top_patterns)} patterns."
     )
+    if context_tiers_enabled and evidence_events:
+        summary = " | ".join(
+            [
+                f"{len(evidence_events)} evidence events",
+                *[
+                    summarize_hit_text(event.title, event.summary_l0, event.ts)
+                    for event in evidence_events[:3]
+                ],
+            ]
+        )[:500]
     if cold_start:
         summary = (
             "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance."
@@ -2712,6 +2883,13 @@ def context_bundle(
             "resume_packet_available": bool(retrieval_meta.get("resume_packet_available", False)),
             "cross_user_scope_applied": bool(retrieval_meta.get("cross_user_scope_applied", False)),
             "cross_user_scope_owners": list(retrieval_meta.get("cross_user_scope_owners") or []),
+            "context_tier_used": str(retrieval_meta.get("context_tier_used") or "l2"),
+            "summary_coverage": float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
+            "planner_used": bool(retrieval_meta.get("planner_used", False)),
+            "subquery_count": int(retrieval_meta.get("subquery_count", 0) or 0),
+            "subquery_labels": list(retrieval_meta.get("subquery_labels") or []),
+            "episode_boost_applied": bool(retrieval_meta.get("episode_boost_applied", False)),
+            "activation_boost_applied": bool(retrieval_meta.get("activation_boost_applied", False)),
             "retrieval": retrieval_meta,
         },
         structured_context={
@@ -2728,6 +2906,13 @@ def context_bundle(
             "typed_memory": typed_memory,
             "retrieval": retrieval_meta,
         },
+        context_tier_used=str(retrieval_meta.get("context_tier_used") or "l2"),
+        summary_coverage=float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
+        planner_used=bool(retrieval_meta.get("planner_used", False)),
+        subquery_count=int(retrieval_meta.get("subquery_count", 0) or 0),
+        subquery_labels=list(retrieval_meta.get("subquery_labels") or []),
+        episode_boost_applied=bool(retrieval_meta.get("episode_boost_applied", False)),
+        activation_boost_applied=bool(retrieval_meta.get("activation_boost_applied", False)),
     )
     conn.execute(
         """
@@ -3067,8 +3252,16 @@ def context_brief(
     standard_approach = [{"text": text, "citations": []} for text in bundle.do_dont.get("do", [])[:limit]]
     for item in typed_skills[: max(0, limit - len(standard_approach))]:
         standard_approach.append({"text": item, "citations": []})
+    context_tiers_enabled = bool(getattr(settings, "context_tiers_enabled", False))
     current_state = [
-        {"text": f"{event.title} ({event.ts.isoformat()})", "citations": [event.id]}
+        {
+            "text": (
+                summarize_hit_text(event.title, event.summary_l0, event.ts)
+                if context_tiers_enabled
+                else f"{event.title} ({event.ts.isoformat()})"
+            ),
+            "citations": [event.id],
+        }
         for event in bundle.evidence_events[:limit]
     ]
     for item in typed_facts[: max(0, limit - len(current_state))]:
@@ -3118,13 +3311,20 @@ def context_brief(
                 seen.add(key)
                 merged_citations.append(citation)
     return {
-        "summary": f"Context brief for '{task[:80]}' with {len(merged_citations)} citations.",
+        "summary": bundle.summary,
         "standard_approach": standard_approach[:limit],
         "current_state": current_state[:limit],
         "constraints_preferences": constraints_preferences[:limit],
         "open_loops": open_loops[:limit],
         "artifacts": artifacts[:limit],
         "citations": merged_citations,
+        "context_tier_used": bundle.context_tier_used,
+        "summary_coverage": bundle.summary_coverage,
+        "planner_used": bundle.planner_used,
+        "subquery_count": bundle.subquery_count,
+        "subquery_labels": bundle.subquery_labels,
+        "episode_boost_applied": bundle.episode_boost_applied,
+        "activation_boost_applied": bundle.activation_boost_applied,
         "generated_at": now_utc(),
     }
 
@@ -4345,6 +4545,7 @@ def _query_similar_observations_lite(
     conn: sqlite3.Connection,
     *,
     workspace_id: str,
+    subject_user_id: str,
     situation_type: str,
     situation_text: str,
     settings: Settings,
@@ -4354,16 +4555,22 @@ def _query_similar_observations_lite(
     aliases = [key for key, value in _SITUATION_ALIAS_MAP.items() if value == canonical]
     candidates = [canonical, *aliases]
     placeholders = ",".join("?" for _ in candidates)
+    current_ts = now_utc().isoformat()
     exact_rows = conn.execute(
         f"""
         SELECT id, ts, situation_type, situation_summary, user_response, response_reasoning,
                outcome, outcome_sentiment, confidence, source_event_ids, context_snapshot
         FROM decision_observations
-        WHERE workspace_id = ? AND situation_type IN ({placeholders}) AND superseded_by IS NULL
+        WHERE workspace_id = ? AND subject_user_id = ?
+          AND situation_type IN ({placeholders}) AND superseded_by IS NULL
+          AND learning_eligible = 1
+          AND lifecycle_status = 'active'
+          AND (valid_from = '' OR valid_from <= ?)
+          AND (valid_until IS NULL OR valid_until > ?)
         ORDER BY ts DESC
         LIMIT ?
         """,
-        (workspace_id, *candidates, limit),
+        (workspace_id, subject_user_id, *candidates, current_ts, current_ts, limit),
     ).fetchall()
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4402,11 +4609,15 @@ def _query_similar_observations_lite(
         SELECT id, ts, situation_type, situation_summary, user_response, response_reasoning,
                outcome, outcome_sentiment, confidence, source_event_ids, context_snapshot
         FROM decision_observations
-        WHERE workspace_id = ? AND superseded_by IS NULL
+        WHERE workspace_id = ? AND subject_user_id = ? AND superseded_by IS NULL
+          AND learning_eligible = 1
+          AND lifecycle_status = 'active'
+          AND (valid_from = '' OR valid_from <= ?)
+          AND (valid_until IS NULL OR valid_until > ?)
         ORDER BY ts DESC
         LIMIT 200
         """,
-        (workspace_id,),
+        (workspace_id, subject_user_id, current_ts, current_ts),
     ).fetchall()
     scored: list[tuple[float, sqlite3.Row]] = []
     for row in candidate_rows:
@@ -4532,6 +4743,7 @@ def build_clone_advice(
     similar_observations = _query_similar_observations_lite(
         conn,
         workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
         situation_type=situation_type,
         situation_text=body.task,
         settings=settings,
@@ -5013,6 +5225,13 @@ def _build_takeover_working_set(
         "graph_entities": len((bundle.structured_context.get("graph", {}) or {}).get("entities", []))
         if isinstance(bundle.structured_context, dict)
         else 0,
+        "context_tier_used": bundle.context_tier_used,
+        "summary_coverage": bundle.summary_coverage,
+        "planner_used": bundle.planner_used,
+        "subquery_count": bundle.subquery_count,
+        "subquery_labels": bundle.subquery_labels,
+        "episode_boost_applied": bundle.episode_boost_applied,
+        "activation_boost_applied": bundle.activation_boost_applied,
         "refreshed_at": now_utc().isoformat(),
     }
 
@@ -7093,6 +7312,7 @@ def report_execution(
     rollback_available = bool(body.rollback_performed or bool((body.details or {}).get("rollback_available")))
     failure_class = None
     retry_strategy = None
+    retry_feedback: dict[str, Any] | None = None
     retry_scheduled = False
     retry_directive_id = None
     execution_observation_id: str | None = None
@@ -7112,6 +7332,8 @@ def report_execution(
         checkpoint_anchor=checkpoint_anchor,
     )
     milestone = dict(milestone_result["milestone"])
+    milestone["change_summary_json"] = details_map.get("change_summary_json") or details_map.get("change_summary") or {}
+    milestone["source"] = "native"
     details_map.update(milestone)
     milestone_mode = normalize_handoff_mode(getattr(settings, "handoff_milestone_validation_mode", "shadow"))
     merged_meta["milestone_validation"] = {
@@ -7177,6 +7399,14 @@ def report_execution(
             failure_class=failure_class,
             rollback_available=rollback_available,
         )
+        if bool(getattr(settings, "retry_feedback_enabled", False)):
+            retry_feedback = build_retry_feedback(
+                action_kind=current.action_kind,
+                failure_class=failure_class,
+                failure_reason=effective_failure_reason,
+                retry_strategy=retry_strategy,
+            )
+            merged_meta["retry_feedback"] = retry_feedback
     conn.execute(
         """
         UPDATE directive_executions
@@ -7191,9 +7421,23 @@ def report_execution(
                 retry_strategy.value if retry_strategy else None,
                 json_dumps(merged_meta),
                 now.isoformat(),
-                str(body.directive_id),
-            ),
-        )
+            str(body.directive_id),
+        ),
+    )
+    completion_outbox = enqueue_handoff(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        behavior_subject_id=auth.behavior_subject_id,
+        session_id=body.session_id,
+        directive_id=body.directive_id,
+        completion_key=f"directive:{body.directive_id}:{effective_state.value}",
+        terminal_state=effective_state.value,
+        milestone=milestone,
+        source="native",
+        redaction_applied=bool(milestone_result.get("redaction_applied", False)),
+        now=now,
+    )
 
     if (
         settings.takeover_retry_enabled
@@ -7250,7 +7494,13 @@ def report_execution(
                     None,
                     None,
                     retry_strategy.value if retry_strategy else RetryStrategy.NARROW_SCOPE.value,
-                    json_dumps({"retry_of": str(body.directive_id), "previous_failure": effective_failure_reason}),
+                    json_dumps(
+                        {
+                            "retry_of": str(body.directive_id),
+                            "previous_failure": effective_failure_reason,
+                            "retry_feedback": retry_feedback or {},
+                        }
+                    ),
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -7442,79 +7692,11 @@ def report_execution(
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
     conn.commit()
-    handoff_record_id: str | None = None
-    lifecycle_event_id: UUID | None = None
-    try:
-        lifecycle_event = EventEnvelope(
-            ts=now,
-            actor=str(auth.user_id or auth.consumer or "executor"),
-            source="tce-execution-report",
-            domain="takeover",
-            task_type="execution_lifecycle",
-            event_type=(
-                EventType.TASK_DONE
-                if effective_state == DirectiveExecutionState.SUCCEEDED
-                else EventType.TASK_DECISION
-            ),
-            title=str(milestone.get("title") or f"Directive {effective_state.value}: {current.action_kind}")[:160],
-            payload={
-                "directive_id": str(body.directive_id),
-                "action_kind": str(current.action_kind or "execute"),
-                "attempt": int(current.attempt),
-                "retry_scheduled": bool(retry_scheduled),
-                "failure_reason": effective_failure_reason,
-                "failure_class": failure_class.value if failure_class else None,
-                "observation_id": execution_observation_id,
-                "files": list((milestone.get("payload") or {}).get("files") or [])[:40],
-                "decision": str(milestone.get("decision") or "")[:500],
-                "outcome": milestone.get("outcome") if isinstance(milestone.get("outcome"), dict) else {
-                    "status": effective_state.value,
-                    "next_step": "Continue with the next objective."
-                    if effective_state == DirectiveExecutionState.SUCCEEDED
-                    else "Retry or request clarification before continuing.",
-                },
-                "git": dict(milestone.get("git") or {}),
-                "anchors": list(milestone.get("anchors") or [])[:40],
-                "milestone_schema": str(milestone.get("milestone_schema") or "v1"),
-            },
-            context={
-                "session_id": body.session_id,
-                "objective_hash": str(current.objective_hash or ""),
-                "workspace_id": auth.workspace_id,
-                "user_id": auth.user_id,
-            },
-            outcome=EventOutcome(
-                success=effective_state == DirectiveExecutionState.SUCCEEDED,
-                metrics={
-                    "state": effective_state.value,
-                    "retry_strategy": retry_strategy.value if retry_strategy else None,
-                },
-                followups=(
-                    [f"retry:{str(retry_directive_id)}"]
-                    if retry_scheduled and retry_directive_id is not None
-                    else []
-                ),
-                ),
-            idempotency_key=f"directive-report:{body.directive_id}:{effective_state.value}",
-            authority_level="high",
-        )
-        lifecycle_event_id = store_event(conn, lifecycle_event, settings, auth)
-    except Exception:
-        pass
-    try:
-        handoff_record_id = _persist_handoff_record_lite(
-            conn,
-            auth=auth,
-            session_id=body.session_id,
-            directive_id=body.directive_id,
-            event_id=lifecycle_event_id,
-            milestone=milestone,
-            redaction_applied=bool(milestone_result.get("redaction_applied", False)),
-            recorded_at=now,
-            settings=settings,
-        )
-    except Exception:
-        pass
+    delivered_outbox = deliver_handoff_safely(
+        conn,
+        outbox_id=str(completion_outbox["id"]),
+        retention_days=int(settings.handoff_retention_days),
+    )
     return {
         "directive_id": str(body.directive_id),
         "state": effective_state.value,
@@ -7522,10 +7704,13 @@ def report_execution(
         "retry_directive_id": str(retry_directive_id) if retry_directive_id else None,
         "failure_class": failure_class.value if failure_class else None,
         "retry_strategy": retry_strategy.value if retry_strategy else None,
+        "retry_feedback": retry_feedback or {},
         "contract_validation": merged_meta.get("contract_validation"),
         "dependency_preflight": merged_meta.get("dependency_preflight"),
         "milestone_validation": merged_meta.get("milestone_validation"),
-        "handoff_record_id": handoff_record_id,
+        "handoff_record_id": str(delivered_outbox["handoff_record_id"]),
+        "completion_outbox_id": str(delivered_outbox["id"]),
+        "completion_delivery_status": str(delivered_outbox["status"]),
         "objective_quality": context.get("objective_quality", {}),
         "objective_contract": context.get("objective_contract", {}),
         "updated_at": now.isoformat(),
@@ -7646,7 +7831,44 @@ def takeover_feedback(
     if body.observation_ids:
         feedback_details.setdefault("observation_ids", [str(value) for value in body.observation_ids])
 
+    behavior_evidence_id: str | None = None
+    if normalized_situation_type and body.correction_text:
+        supersedes_id = str(body.observation_ids[0]) if body.observation_ids else None
+        correction_evidence = normalize_behavior_evidence(
+            {
+                "situation_type": normalized_situation_type,
+                "situation_summary": f"Human correction during {body.action_kind}",
+                "objective": str(state.takeover_context.get("objective") or f"feedback:{normalized_situation_type}"),
+                "selected_choice": body.correction_text,
+                "rationale": str(feedback_details.get("reasoning_summary") or "Human correction after takeover feedback"),
+                "action_taken": body.correction_text,
+                "outcome": body.result,
+                "outcome_sentiment": "negative" if feedback_type == "unhelpful" else "neutral",
+                "correction_text": body.correction_text if supersedes_id else "",
+                "evidence_source": "correction" if supersedes_id else "explicit",
+                "memory_class": "preference",
+                "supersedes_observation_id": supersedes_id,
+                "confidence": 1.0,
+                "confirmed_at": now_utc(),
+            }
+        )
+        correction_gate = behavior_storage_gate(
+            correction_evidence,
+            threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
+        )
+        behavior_evidence_id = save_behavior_evidence_lite(
+            conn,
+            consumer_id=auth.consumer,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            evidence=correction_evidence,
+            storage_gate=correction_gate,
+        )
+        feedback_details["behavior_evidence_id"] = behavior_evidence_id
+
     feedback_observation_ids: list[str] = [str(value) for value in (body.observation_ids or [])]
+    if behavior_evidence_id is not None and not feedback_observation_ids:
+        feedback_observation_ids.append(behavior_evidence_id)
     if normalized_situation_type and body.correction_text and not feedback_observation_ids:
         feedback_obs_id = save_observation_lite(
             conn,
@@ -7665,7 +7887,7 @@ def takeover_feedback(
         feedback_observation_ids.append(feedback_obs_id)
 
     if feedback_type in {"helpful", "unhelpful", "neutral"} or body.correction_text:
-        fp_data = load_fingerprint_lite(conn, consumer_id=auth.consumer, workspace_id=auth.workspace_id)
+        fp_data = load_fingerprint_lite(conn, consumer_id=auth.behavior_subject_id, workspace_id=auth.workspace_id)
         fingerprint = (fp_data or {}).get("fingerprint", DEFAULT_FINGERPRINT.copy())
         observation_count = int((fp_data or {}).get("observation_count", 0))
         adjusted_alpha = feedback_adjusted_alpha(
@@ -7686,7 +7908,7 @@ def takeover_feedback(
             )
             save_fingerprint_lite(
                 conn,
-                consumer_id=auth.consumer,
+                consumer_id=auth.behavior_subject_id,
                 workspace_id=auth.workspace_id,
                 fingerprint=fingerprint,
                 observation_count=max(observation_count, 1),
@@ -7927,6 +8149,11 @@ def takeover_step(
             state.takeover_context["objective"] = pending_objective
             state.objective_hash = pending_execution.objective_hash or objective_hash(pending_objective)
             state.takeover_context["_pending_directive_locked"] = True
+        retry_feedback_payload = (pending_execution.meta or {}).get("retry_feedback") if isinstance(pending_execution.meta, dict) else None
+        if bool(getattr(settings, "retry_feedback_enabled", False)) and isinstance(retry_feedback_payload, dict):
+            state.takeover_context["retry_feedback"] = retry_feedback_payload
+        else:
+            state.takeover_context.pop("retry_feedback", None)
     if pending_execution is not None and awaiting_next_objective:
         state.takeover_context.pop("awaiting_next_objective", None)
         state.takeover_context.pop("awaiting_next_objective_turns", None)
@@ -8105,9 +8332,20 @@ def takeover_step(
         + (0.15 * outcome_stability_score),
         4,
     )
-    trigger_threshold = float(settings.context_retrieval_trigger_score)
+    profile_tuning = (
+        autonomy_profile_tuning(state.autonomy_policy_profile)
+        if bool(getattr(settings, "profile_tuning_enabled", False))
+        else autonomy_profile_tuning("human_consultative")
+    )
+    trigger_threshold = float(settings.context_retrieval_trigger_score) + float(
+        profile_tuning.get("retrieval_trigger_delta", 0.0)
+    )
+    trigger_threshold = max(0.35, min(0.92, trigger_threshold))
     confidence_trigger = float(getattr(settings, "takeover_retrieval_confidence_trigger", 0.70))
-    evidence_threshold = int(getattr(settings, "takeover_retrieval_low_evidence_threshold", 2))
+    evidence_threshold = int(getattr(settings, "takeover_retrieval_low_evidence_threshold", 2)) + int(
+        profile_tuning.get("evidence_floor_delta", 0)
+    )
+    evidence_threshold = max(1, evidence_threshold)
     min_turn_for_evidence = int(getattr(settings, "takeover_retrieval_min_turn_for_evidence_gate", 4))
     cooldown_turns = max(0, int(getattr(settings, "takeover_retrieval_cooldown_turns", 2)))
     deep_intent = any(token in normalized_message for token in ("research", "deep", "explore", "investigate"))
@@ -8184,7 +8422,10 @@ def takeover_step(
     advisor_failure_reason: str | None = None
     fast_path_reason = "fast_path_default"
     advisor_required_in_takeover = bool(state.mode == TakeoverMode.TAKEOVER)
-    advisor_cadence_turns = max(1, int(getattr(settings, "takeover_advisor_every_n_turns", 2)))
+    advisor_cadence_turns = max(
+        1,
+        int(profile_tuning.get("advisor_cadence_turns", getattr(settings, "takeover_advisor_every_n_turns", 2))),
+    )
     advisor_cadence_due = turn_count <= 2 or (turn_count % advisor_cadence_turns == 0)
     stable_context_threshold = max(trigger_threshold + 0.08, 0.82)
     stable_evidence_floor = max(2, evidence_threshold)
@@ -8464,6 +8705,13 @@ def takeover_step(
             recent_outcomes=state.recent_outcomes_json,
             semantic_ratio=semantic_ratio,
         )
+    needs_human_threshold = round(
+        max(
+            0.0,
+            min(1.0, needs_human_threshold + float(profile_tuning.get("needs_human_delta", 0.0))),
+        ),
+        4,
+    )
     suppress_auto_directive = bool(
         (
             awaiting_next_objective
@@ -8650,10 +8898,23 @@ def takeover_step(
         and should_call_clone_advice
         and advisor_fail_streak >= advisor_fail_streak_limit
     )
+    behavior_fidelity_gate = {"enabled": False, "passed": True, "reason": "gate_disabled"}
+    behavior_gate_blocked = False
+    if bool(getattr(settings, "behavior_autonomy_gate_enabled", False)):
+        behavior_fidelity_gate = {
+            "enabled": True,
+            **latest_fidelity_gate_lite(
+                conn,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+            ),
+        }
+        behavior_gate_blocked = not bool(behavior_fidelity_gate.get("passed", False))
     needs_human = (
         (decision_confidence < needs_human_threshold)
         or (retrieval_triggered and context_quality_score < float(settings.context_retrieval_escalate_score))
         or advisor_unhealthy
+        or behavior_gate_blocked
         or (safety_decision != SafetyDecision.ALLOW)
     ) and not actionable_lifecycle_pause
     if advisor_unhealthy and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
@@ -8663,6 +8924,12 @@ def takeover_step(
                 "Advisor runtime is unavailable in takeover mode. "
                 "Fix advisor route/model connectivity, then continue execution."
             )
+    if behavior_gate_blocked and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        final_response = (
+            "Behavior fidelity is not validated for autonomous continuation. "
+            "Confirm the preferred choice or run a behavior fidelity evaluation."
+        )
     quality_history = state.takeover_context.get("quality_history")
     if not isinstance(quality_history, list):
         quality_history = []
@@ -8819,6 +9086,14 @@ def takeover_step(
         query_expansion_used=query_expansion_used_meta,
         query_expansion_terms=query_expansion_terms_meta,
         rerank_strategy=rerank_strategy_meta,
+        context_tier_used=str(working_set.get("context_tier_used") or "l2"),
+        summary_coverage=float(working_set.get("summary_coverage", 0.0) or 0.0),
+        planner_used=bool(working_set.get("planner_used", False)),
+        subquery_count=int(working_set.get("subquery_count", 0) or 0),
+        subquery_labels=list(working_set.get("subquery_labels") or []),
+        episode_boost_applied=bool(working_set.get("episode_boost_applied", False)),
+        activation_boost_applied=bool(working_set.get("activation_boost_applied", False)),
+        behavior_fidelity_gate=behavior_fidelity_gate,
     )
 
 
@@ -8994,6 +9269,9 @@ def lifecycle_status(conn: sqlite3.Connection, settings: Settings) -> dict[str, 
             {
                 "retention_days": int(settings.event_retention_days),
                 "handoff_retention_days": int(getattr(settings, "handoff_retention_days", 90)),
+                "behavior_control_retention_days": int(
+                    getattr(settings, "behavior_control_retention_days", 365)
+                ),
                 "archive_enabled": bool(settings.archive_enabled),
                 "archive_path": settings.archive_path,
             },
@@ -9060,12 +9338,14 @@ def run_lifecycle_maintenance(
         "ran_at": now.isoformat(),
         "retention_days": retention,
         "handoff_retention_days": int(getattr(settings, "handoff_retention_days", 90)),
+        "behavior_control_retention_days": int(getattr(settings, "behavior_control_retention_days", 365)),
         "dry_run": effective_dry_run,
         "archive_enabled": archive_enabled,
         "archive_path": str(archive_path),
         "cutoff": cutoff.isoformat(),
         "events_deleted": 0,
         "handoff_rows_deleted": 0,
+        "behavior_control_rows_deleted": 0,
         "audit_rows_deleted": 0,
         "interaction_rows_deleted": 0,
         "patterns_pruned": 0,
@@ -9084,7 +9364,7 @@ def run_lifecycle_maintenance(
         SELECT id, ts, actor, source, domain, task_type, event_type, title, payload, context
         FROM events
         WHERE ts < ?
-        ORDER BY ts ASC
+        ORDER BY ts DESC
         LIMIT ?
         """,
         (cutoff.isoformat(), max_rows),
@@ -9123,6 +9403,20 @@ def run_lifecycle_maintenance(
             (now.isoformat(), handoff_cutoff),
         )
         summary["handoff_rows_deleted"] = int(deleted_handoff.rowcount or 0)
+        behavior_cutoff = (
+            now - timedelta(days=max(1, int(getattr(settings, "behavior_control_retention_days", 365))))
+        ).isoformat()
+        behavior_deleted = 0
+        for statement in (
+            "DELETE FROM capability_grants WHERE created_at < ?",
+            "DELETE FROM behavior_shadow_predictions WHERE created_at < ?",
+            "DELETE FROM behavior_memory_reviews WHERE resolved_at IS NOT NULL AND resolved_at < ?",
+            "DELETE FROM behavior_counterfactuals WHERE resolved_at IS NOT NULL AND resolved_at < ?",
+            "DELETE FROM behavior_process_models WHERE status = 'rejected' AND updated_at < ?",
+        ):
+            deleted = conn.execute(statement, (behavior_cutoff,))
+            behavior_deleted += int(deleted.rowcount or 0)
+        summary["behavior_control_rows_deleted"] = behavior_deleted
 
         patterns = conn.execute("SELECT id, evidence_event_ids FROM patterns").fetchall()
         pruned = 0
@@ -9148,6 +9442,7 @@ def run_lifecycle_maintenance(
     retention_payload = {
         "retention_days": retention,
         "handoff_retention_days": int(getattr(settings, "handoff_retention_days", 90)),
+        "behavior_control_retention_days": int(getattr(settings, "behavior_control_retention_days", 365)),
         "archive_enabled": archive_enabled,
         "archive_path": str(archive_path),
     }
@@ -9369,3 +9664,220 @@ def save_observation_lite(conn: sqlite3.Connection, obs: dict[str, Any]) -> str:
     )
     conn.commit()
     return observation_id
+
+
+def save_behavior_evidence_lite(
+    conn: sqlite3.Connection,
+    *,
+    consumer_id: str,
+    workspace_id: str,
+    subject_user_id: str,
+    evidence: dict[str, Any],
+    storage_gate: dict[str, Any],
+) -> str:
+    observation_id = str(uuid.uuid4())
+    now = now_utc()
+    valid_from = evidence.get("valid_from") or now
+    if isinstance(valid_from, datetime):
+        valid_from = valid_from.isoformat()
+    valid_until = evidence.get("valid_until")
+    if isinstance(valid_until, datetime):
+        valid_until = valid_until.isoformat()
+    confirmed_at = evidence.get("confirmed_at")
+    if isinstance(confirmed_at, datetime):
+        confirmed_at = confirmed_at.isoformat()
+    conn.execute(
+        """
+        INSERT INTO decision_observations(
+            id, ts, consumer_id, workspace_id, subject_user_id, situation_type, situation_summary,
+            user_response, response_reasoning, outcome, outcome_sentiment,
+            confidence, source_event_ids, context_snapshot, embedding, superseded_by,
+            objective_text, constraints_json, available_choices_json, selected_choice,
+            action_taken, correction_text, memory_class, evidence_source,
+            lifecycle_status, valid_from, valid_until, contradicts_ids_json,
+            confirmed_at, behavior_schema_version, redaction_applied,
+            learning_eligible, storage_score, storage_decision
+        ) VALUES(
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        """,
+        (
+            observation_id,
+            now.isoformat(),
+            consumer_id,
+            workspace_id,
+            subject_user_id,
+            str(evidence.get("situation_type") or "routine_task"),
+            str(evidence.get("situation_summary") or ""),
+            str(evidence.get("selected_choice") or ""),
+            str(evidence.get("rationale") or "") or None,
+            str(evidence.get("outcome") or "") or None,
+            evidence.get("outcome_sentiment"),
+            float(evidence.get("confidence", 1.0) or 0.0),
+            json_dumps(evidence.get("source_event_ids") or []),
+            json_dumps(evidence.get("context_snapshot") or {}),
+            str(evidence.get("objective_text") or ""),
+            json_dumps(evidence.get("constraints") or {}),
+            json_dumps(evidence.get("available_choices") or []),
+            str(evidence.get("selected_choice") or ""),
+            str(evidence.get("action_taken") or ""),
+            str(evidence.get("correction_text") or ""),
+            str(evidence.get("memory_class") or "decision"),
+            str(evidence.get("evidence_source") or "explicit"),
+            str(evidence.get("lifecycle_status") or "active"),
+            valid_from,
+            valid_until,
+            json_dumps(evidence.get("contradicts_observation_ids") or []),
+            confirmed_at,
+            str(evidence.get("schema_version") or "v1"),
+            1 if evidence.get("redaction_applied") else 0,
+            1 if storage_gate.get("learning_eligible") else 0,
+            float(storage_gate.get("score", 0.0) or 0.0),
+            str(storage_gate.get("decision") or "audit_only"),
+        ),
+    )
+    supersedes = evidence.get("supersedes_observation_id")
+    if supersedes:
+        conn.execute(
+            """
+            UPDATE decision_observations
+            SET superseded_by = ?, lifecycle_status = 'superseded'
+            WHERE id = ? AND workspace_id = ? AND subject_user_id = ? AND superseded_by IS NULL
+            """,
+            (observation_id, str(supersedes), workspace_id, subject_user_id),
+        )
+    conn.commit()
+    return observation_id
+
+
+def load_behavior_evidence_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    limit: int = 5000,
+    eligible_only: bool = True,
+) -> list[dict[str, Any]]:
+    eligibility = "AND learning_eligible = 1" if eligible_only else ""
+    rows = conn.execute(
+        f"""
+        SELECT id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
+               context_snapshot, user_response, response_reasoning, outcome,
+               outcome_sentiment, source_event_ids, confidence, superseded_by,
+               objective_text, constraints_json, available_choices_json, selected_choice,
+               action_taken, correction_text, memory_class, evidence_source,
+               lifecycle_status, valid_from, valid_until, contradicts_ids_json,
+               confirmed_at, behavior_schema_version, redaction_applied,
+               learning_eligible, storage_score, storage_decision
+        FROM decision_observations
+        WHERE workspace_id = ? AND subject_user_id = ? {eligibility}
+        ORDER BY ts DESC
+        LIMIT ?
+        """,
+        (workspace_id, subject_user_id, max(1, min(limit, 5000))),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        item = dict(row)
+        item["context_snapshot"] = json_loads(item.get("context_snapshot"), {})
+        item["constraints"] = json_loads(item.pop("constraints_json", "{}"), {})
+        item["available_choices"] = json_loads(item.pop("available_choices_json", "[]"), [])
+        item["source_event_ids"] = json_loads(item.get("source_event_ids"), [])
+        item["contradicts_observation_ids"] = json_loads(item.pop("contradicts_ids_json", "[]"), [])
+        item["learning_eligible"] = bool(item.get("learning_eligible"))
+        output.append(item)
+    return output
+
+
+def save_fidelity_run_lite(
+    conn: sqlite3.Connection,
+    *,
+    consumer_id: str,
+    workspace_id: str,
+    subject_user_id: str,
+    config: dict[str, Any],
+    result: dict[str, Any],
+) -> tuple[str, datetime]:
+    run_id = str(uuid.uuid4())
+    created_at = now_utc()
+    metrics = dict(result.get("metrics") or {})
+    conn.execute(
+        """
+        INSERT INTO behavior_fidelity_runs(
+            id, consumer_id, workspace_id, subject_user_id, created_at, status, config_json,
+            metrics_json, gate_json, case_results_json, evidence_count,
+            duration_ms, schema_version
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1')
+        """,
+        (
+            run_id,
+            consumer_id,
+            workspace_id,
+            subject_user_id,
+            created_at.isoformat(),
+            str(result.get("status") or "completed"),
+            json_dumps(config),
+            json_dumps(metrics),
+            json_dumps(result.get("gate") or {}),
+            json_dumps(result.get("case_results") or []),
+            int(metrics.get("eligible_evidence_count", 0) or 0),
+            int(result.get("duration_ms", 0) or 0),
+        ),
+    )
+    conn.commit()
+    return run_id, created_at
+
+
+def list_fidelity_runs_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, status, config_json, metrics_json, gate_json, case_results_json,
+               created_at, duration_ms, schema_version
+        FROM behavior_fidelity_runs
+        WHERE workspace_id = ? AND subject_user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (workspace_id, subject_user_id, max(1, min(limit, 100))),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["config"] = json_loads(item.pop("config_json", "{}"), {})
+        item["metrics"] = json_loads(item.pop("metrics_json", "{}"), {})
+        item["gate"] = json_loads(item.pop("gate_json", "{}"), {})
+        item["case_results"] = json_loads(item.pop("case_results_json", "[]"), [])
+        output.append(item)
+    return output
+
+
+def latest_fidelity_gate_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT gate_json, metrics_json, created_at
+        FROM behavior_fidelity_runs
+        WHERE workspace_id = ? AND subject_user_id = ? AND status = 'completed'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (workspace_id, subject_user_id),
+    ).fetchone()
+    if row is None:
+        return {"passed": False, "reason": "no_completed_fidelity_run"}
+    return {
+        **json_loads(row["gate_json"], {}),
+        "metrics": json_loads(row["metrics_json"], {}),
+        "evaluated_at": row["created_at"],
+    }

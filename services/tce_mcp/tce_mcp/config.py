@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from functools import lru_cache
 import re
+from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     mcp_role: str = "executor"
     mcp_workspace_id: str = "personal"
     mcp_user_id: str = "local-user"
+    mcp_behavior_subject_id: str = ""
     mcp_session_id: str = ""
     mcp_http_retry_total: int = 3
     mcp_http_retry_backoff_seconds: float = 0.4
@@ -39,6 +40,10 @@ class Settings(BaseSettings):
 
         source = re.sub(r"[^a-z0-9_-]+", "-", source).strip("-_")
         return source or "default"
+
+    @property
+    def mcp_effective_behavior_subject_id(self) -> str:
+        return str(self.mcp_behavior_subject_id or self.mcp_user_id).strip() or "local-user"
 
     @property
     def mcp_retry_status_codes(self) -> tuple[int, ...]:

@@ -881,3 +881,44 @@ export interface ResourceUsageSnapshot {
   docker: ResourceDockerUsage;
   services: ResourceServiceUsage[];
 }
+
+export interface BehaviorShadowStatus {
+  metrics: Record<string, number | boolean | string | null>;
+  recent: Array<Record<string, unknown>>;
+  schema_version: string;
+}
+
+export interface BehaviorMemoryReview {
+  review_id: string;
+  target_type: string;
+  target_id: string;
+  title: string;
+  rationale: string;
+  status: string;
+  proposed_action: string;
+  source: string;
+  score: number;
+  created_at: string;
+}
+
+export interface BehaviorMemoryReviewList {
+  reviews: BehaviorMemoryReview[];
+  schema_version: string;
+}
+
+export interface ContinuityPilotStatus {
+  window_days: number;
+  eligible_completion_count: number;
+  captured_completion_count: number;
+  handoff_capture_coverage: number;
+  resume_attempt_count: number;
+  feedback_count: number;
+  correct_file_rate: number | null;
+  correction_rate: number | null;
+  median_time_to_resume_ms: number | null;
+  p95_time_to_resume_ms: number | null;
+  median_retrieval_latency_ms: number | null;
+  outbox_pending_count: number;
+  outbox_dead_count: number;
+  generated_at: string;
+}

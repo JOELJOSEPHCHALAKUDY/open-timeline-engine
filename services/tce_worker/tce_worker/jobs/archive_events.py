@@ -61,9 +61,10 @@ def _ensure_retention_runtime_setting(db, retention_days: int, archive_enabled: 
         {
             "value": json.dumps(
                 {
-                    "retention_days": retention_days,
-                    "handoff_retention_days": int(get_settings().handoff_retention_days),
-                    "archive_enabled": archive_enabled,
+                "retention_days": retention_days,
+                "handoff_retention_days": int(get_settings().handoff_retention_days),
+                "behavior_control_retention_days": int(get_settings().behavior_control_retention_days),
+                "archive_enabled": archive_enabled,
                     "archive_path": archive_path,
                 }
             ),
@@ -189,6 +190,7 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
         "ran_at": now.isoformat(),
         "retention_days": retention,
         "handoff_retention_days": int(settings.handoff_retention_days),
+        "behavior_control_retention_days": int(settings.behavior_control_retention_days),
         "dry_run": effective_dry_run,
         "archive_enabled": archive_enabled,
         "archive_path": str(archive_path),
@@ -197,6 +199,7 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
         "dropped_partitions": [],
         "default_rows_deleted": 0,
         "handoff_rows_deleted": 0,
+        "behavior_control_rows_deleted": 0,
         "audit_rows_deleted": 0,
         "interaction_rows_deleted": 0,
         "patterns_pruned": 0,
@@ -311,6 +314,20 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
                 {"now": now, "handoff_cutoff": handoff_cutoff},
             )
             summary["handoff_rows_deleted"] = int(deleted_handoff.rowcount or 0)
+            behavior_cutoff = now - timedelta(
+                days=max(1, int(getattr(settings, "behavior_control_retention_days", 365)))
+            )
+            behavior_deleted = 0
+            for statement in (
+                "DELETE FROM capability_grants WHERE created_at < :cutoff",
+                "DELETE FROM behavior_shadow_predictions WHERE created_at < :cutoff",
+                "DELETE FROM behavior_memory_reviews WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff",
+                "DELETE FROM behavior_counterfactuals WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff",
+                "DELETE FROM behavior_process_models WHERE status = 'rejected' AND updated_at < :cutoff",
+            ):
+                deleted = db.execute(text(statement), {"cutoff": behavior_cutoff})
+                behavior_deleted += int(getattr(deleted, "rowcount", 0) or 0)
+            summary["behavior_control_rows_deleted"] = behavior_deleted
 
             pattern_rows = db.execute(text("SELECT id, evidence_event_ids FROM patterns")).fetchall()
             pruned = 0

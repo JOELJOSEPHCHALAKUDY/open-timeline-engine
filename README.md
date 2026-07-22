@@ -299,12 +299,12 @@ For full setup and customization (persona phrases, stop keywords, external advis
 | **Dual-AI** | Single-agent memory augmentation | Executor + advisor architecture with arbitration and loop guards |
 | **Safety** | Trust boundary is the application layer | Built-in sensitivity levels, ABAC policy, redaction zones, audit trail |
 | **Pattern mining** | No pattern extraction | Automatic workflow and behavioral pattern mining from timeline data |
-| **Personality clone** | Not a goal | Fingerprint model across 25 dimensions (6 categories) with confidence scoring |
+| **Behavioral continuity** | Not a goal | Evidence-backed fingerprint plus chronological fidelity evaluation |
 | **Latency model** | Optimized for low-overhead retrieval | Bounded retrieval + policy-gated deliberation with provider/budget limits |
 
 **Where Mem0 wins**: simpler integration, broader ecosystem support, managed cloud option, lower barrier to entry for basic memory needs.
 
-**Where Open Timeline Engine wins**: decision autonomy, behavioral cloning, multi-source capture, dual-AI orchestration, policy enforcement, and auditability.
+**Where Open Timeline Engine wins**: decision continuity, multi-source capture, dual-AI orchestration, policy enforcement, and auditability.
 
 **Using both together**: Mem0 can serve as a fast preference layer ("user likes dark mode, prefers TypeScript") while Open Timeline Engine handles execution-level decisions ("when the user encounters a failing test, they run the debugger before reading logs, then fix the root cause before addressing symptoms"). They are complementary — Mem0 for *what you like*, Open Timeline Engine for *how you work*.
 
@@ -316,29 +316,29 @@ The AI memory space has strong products — [Zep](https://www.getzep.com/) for t
 
 Zep tracks *what happened* with temporal graphs. Open Timeline Engine tracks *what the user decided, why, and what the outcome was* — with situation-type classification across 12 behavioral categories and outcome tracking that feeds back into future decisions.
 
-**2. Passive behavioral fingerprinting**
+**2. Behavioral evidence and measurable fidelity**
 
-Stanford's research showed [85% accuracy cloning personality from 2-hour interviews](https://hai.stanford.edu/news/ai-agents-simulate-1052-individuals-personalities-with-impressive-accuracy). Open Timeline Engine does this passively — no interviews needed. It builds a 25-dimension fingerprint across 6 categories (decision making, communication, priorities, context switching, learning style, emotional patterns) from real work behavior captured over time, updated incrementally with every decision observation.
+Research on generative agents has shown that detailed interviews can support simulations that reproduce parts of a person's survey and decision behavior. Open Timeline Engine uses a different input source: structured decisions and outcomes from real work. It builds a 25-dimension heuristic fingerprint, but does **not** claim that the fingerprint is a literal human clone or that interview-study accuracy transfers to TCE. Behavior Evidence v1 adds explicit choices, alternatives, rationale, outcomes, corrections, validity, and provenance. A chronological holdout evaluator measures future-choice agreement, calibration, abstention, workflow similarity, and drift before behavioral predictions may gate autonomy.
 
 **3. Dual-AI executor + advisor architecture**
 
-No product in the market ships this. The executor AI does the work. The advisor AI (powered by the timeline) can rewrite the executor's responses, gate unsafe actions, and enforce learned working style. They share memory but have separated concerns with arbitration when they disagree. This is not the "manager/worker" pattern in agent frameworks — the advisor has its own memory-powered enforcement loop.
+The executor AI does the work. The advisor AI (powered by the timeline) can review the executor's responses, recommend safer actions, and apply learned working-style guidance. They share memory but have separated concerns with arbitration when they disagree. TCE includes short-lived, one-use capability grants bound to exact operation digests and takeover permits. Non-bypassable host enforcement still requires executors or a sandbox to route every mutation through that broker protocol.
 
 **4. Graduated autonomous execution**
 
 The takeover engine runs a two-lane architecture with configurable thresholds and budgets: a fast path for high-confidence continuation and a deliberation lane for ambiguous situations. Confidence scoring across four dimensions (objective clarity, evidence strength, outcome stability, classifier certainty) determines whether to continue, deliberate, or ask the human. This is policy-driven (not hardcoded to fixed numeric bands) and remains bounded by retrieval and advisor runtime budgets.
 
-**5. Safety enforcement as architecture, not prompts**
+**5. Policy and safety gates beyond prompts**
 
-Most agent frameworks (including OpenClaw) rely on prompt-level safety instructions — trivially bypassed by injection. Open Timeline Engine enforces safety through architecture: ABAC policy engine, sensitivity levels with default blocking, redaction zones that strip data before embeddings, `check_context` gates before file edits, `_reject_advisor_writes()` that blocks the advisor from writing events, and immutable audit trails. The MCP firewall layer strips directive text so executors cannot echo raw instructions.
+Open Timeline Engine adds application-layer controls beyond prompt instructions: ABAC policy, sensitivity levels, redaction before embeddings, `check_context` checks, advisor write restrictions, execution permits, and audit records. Strict workspace membership and durable audit writes are opt-in production modes. These controls govern clients that use the TCE protocol; TCE does not claim to intercept direct shell or filesystem access outside that protocol.
 
 **6. Behavioral pattern mining**
 
-Zep tracks temporal facts. Open Timeline Engine *mines behavioral patterns* from them — automatic workflow detection using frequency/recency/consistency scoring, LLM-refined pattern statements, confidence thresholds, and a feedback loop where users can approve or reject discovered patterns. Patterns graduate from `needs_review` to `active` based on evidence.
+Zep tracks temporal facts. Open Timeline Engine identifies recurring activity clusters and deterministic cross-session action sequences. Mined process models include support, transitions, success rate, and evidence IDs, remain candidates until human promotion, and only then become workflow templates. This is evidence-backed workflow discovery, not proof that a complete human workflow has been cloned.
 
 **7. Multi-source passive capture**
 
-Letta and Mem0 learn from conversations. Open Timeline Engine captures from CLI commands, Git commits, VSCode activity, and browser interactions — building a timeline from *actual work*, not just what the user tells the agent. This is what enables behavioral cloning at a level that conversation-only memory cannot reach.
+Letta and Mem0 learn from conversations. Open Timeline Engine captures from CLI commands, Git commits, VSCode activity, and browser interactions, then separates raw audit events from evidence eligible to influence learned behavior. Passive activity alone is not treated as proof of a user's preference.
 
 ### Landscape at a glance
 
@@ -351,13 +351,13 @@ Letta and Mem0 learn from conversations. Open Timeline Engine captures from CLI 
 | Dual-AI (executor + advisor) | No | No | No | No | No | **Yes** |
 | Autonomous execution with confidence gating | No | No | No | No | No | **Yes** |
 | Pattern mining from behavior | No | No | No | No | No | **Yes** |
-| Safety enforcement (architectural) | No | No | No | No | No | **Yes** |
+| Application policy and safety gates | No | No | No | No | No | **Yes** |
 | Multi-source capture (CLI/Git/VSCode/browser) | No | No | No | No | No | **Yes** |
 | Managed cloud option | Yes | Yes | Yes | Yes | No | No |
 | Broad ecosystem integrations | Partial | Yes | Yes | Yes | Partial | MCP-native |
 | Developer onboarding simplicity | Moderate | Easy | Easy | Easy | Moderate | Docker stack |
 
-**The market is saturated with memory recall. Nobody is answering: "How do I make an agent that acts like a specific human?" That is what Open Timeline Engine does.**
+**The market has many memory-recall systems. Open Timeline Engine focuses on evidence-backed continuity and context-specific behavioral alignment across executors.**
 
 ## Architecture at a glance
 
@@ -558,6 +558,12 @@ MCP tool calls are made by executor clients. The advisor lane runs API-side and 
 | `tce.claim_execution` | Executor | Lock a directive before mutating work |
 | `tce.report_execution` | Executor | Report success or failure (closes the loop) |
 | `tce.get_execution_status` | Executor | Check directive queue and execution state |
+| `tce.complete_task` | Executor | Mandatory durable completion/handoff capture outside a directive |
+| `tce.get_resume_packet` | Executor | Retrieve the exact file, anchor, git refs, and next step from another executor |
+| `tce.report_resume_feedback` | Executor | Record correct-file and correction feedback for the longitudinal pilot |
+| `tce.get_continuity_pilot` | Executor | Read capture coverage, time-to-resume, correct-file, and correction metrics |
+
+Completion writes are staged in `handoff_outbox`. The lifecycle event and canonical `handoff_records` row are delivered atomically and retried by the Full worker or Lite startup drain. The Review & Drift dashboard combines these continuity metrics with memory review and shadow-clone drift.
 
 **Clone advisor**
 
@@ -566,6 +572,17 @@ MCP tool calls are made by executor clients. The advisor lane runs API-side and 
 | `tce.get_clone_advice` | Executor (any lane) | Behavioral guidance from fingerprint + past decisions |
 | `tce.arbitrate_with_clone` | Executor | Resolve conflict between executor and advisor |
 | `tce.ingest_observations` | Executor | Feed decision observations into clone fingerprint |
+
+**Behavior fidelity (v1)**
+
+| MCP tool | Called by | Purpose |
+| --- | --- | --- |
+| `tce.record_behavior_evidence` | Executor | Record an explicit decision, alternatives, rationale, outcome, or correction |
+| `tce.predict_behavior` | Executor | Predict a choice from eligible evidence or abstain and request clarification |
+| `tce.run_behavior_fidelity_eval` | Executor | Run chronological holdout fidelity and calibration evaluation |
+| `tce.get_behavior_fidelity` | Executor | Inspect evaluation history and autonomy gates |
+| `tce.get_behavior_calibration` | Executor | List optional cold-start decision scenarios |
+| `tce.answer_behavior_calibration` | Executor | Record a confirmed calibration answer |
 
 **Graph and activity context**
 
@@ -791,8 +808,9 @@ tce.report_execution(state="succeeded")
 | **High-risk detection** | Directive generation | `rm`, `delete`, `drop table` → pauses for confirmation |
 | **Continuity health** | Every turn | Stale sessions auto-degrade, directives expire |
 | **Quality gates** | Confidence scoring | Below 0.55 → pauses and asks user instead of guessing |
+| **Behavior fidelity** | Optional takeover gate | Pauses when future-choice fidelity has not passed chronological evaluation |
 
-### Clone learning (how the system gets smarter)
+### Behavior learning (how the system gets safer and more accurate)
 
 Every successful execution feeds back as a decision observation:
 
@@ -809,6 +827,10 @@ Execute "build auth flow" → success
         ├── learning_style (exploration_vs_exploitation, feedback_response, ...)
         └── emotional_patterns (frustration_triggers, satisfaction_signals, ...)
 ```
+
+Automatically captured observations still support continuity and the existing heuristic fingerprint. Behavior-fidelity evaluation uses only evidence that passes the learning-eligibility gate. Explicit corrections supersede stale evidence instead of reinforcing it.
+
+See [Behavior Fidelity v1](docs/behavior-fidelity.md) for the evidence contract, metrics, feature flags, and rollout requirements.
 
 Next time a similar task appears, the clone advice system surfaces these past decisions as hints:
 
@@ -827,7 +849,7 @@ Next time a similar task appears, the clone advice system surfaces these past de
 }
 ```
 
-The system becomes more autonomous over time — not because thresholds are lowered, but because evidence accumulates. More past decisions mean higher evidence strength, which means higher confidence scores, which means more turns on the fast path.
+More evidence does not automatically grant more autonomy. Autonomous continuation can be gated on chronological holdout accuracy, calibration, non-abstained precision, and minimum sample count. If fidelity is weak or unknown, TCE abstains and asks for clarification.
 
 ## Docs map
 

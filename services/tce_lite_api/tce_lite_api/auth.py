@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from fastapi import Header, HTTPException
 from tce_shared.events import AgentRole
+from tce_shared.identity import claim_conflicts, parse_identity_claims, resolve_bound_identity
 
 from .config import get_settings
 
@@ -14,6 +15,7 @@ class AuthContext:
     role: AgentRole
     workspace_id: str
     user_id: str
+    behavior_subject_id: str
 
 
 def _parse_bearer_token(authorization: str | None) -> str | None:
@@ -27,10 +29,11 @@ def _parse_bearer_token(authorization: str | None) -> str | None:
 
 def get_auth_context(
     authorization: str | None = Header(default=None),
-    consumer: str = Header(default="local-user", alias="X-TCE-Consumer"),
-    role: str = Header(default="user", alias="X-TCE-Role"),
-    workspace: str = Header(default="personal", alias="X-TCE-Workspace"),
-    user: str = Header(default="", alias="X-TCE-User"),
+    consumer: str | None = Header(default=None, alias="X-TCE-Consumer"),
+    role: str | None = Header(default=None, alias="X-TCE-Role"),
+    workspace: str | None = Header(default=None, alias="X-TCE-Workspace"),
+    user: str | None = Header(default=None, alias="X-TCE-User"),
+    behavior_subject: str | None = Header(default=None, alias="X-TCE-Behavior-Subject"),
 ) -> AuthContext:
     settings = get_settings()
     token = _parse_bearer_token(authorization)
@@ -39,15 +42,50 @@ def get_auth_context(
             status_code=401,
             detail="Invalid credentials. Provide Authorization: Bearer <token> and X-TCE-Workspace/X-TCE-User headers.",
         )
+    normalized_consumer = str(consumer or "local-user").strip() or "local-user"
+    normalized_workspace = str(workspace or "personal").strip() or "personal"
+    normalized_user = str(user or "").strip() or normalized_consumer
+    normalized_behavior_subject = str(behavior_subject or "").strip() or normalized_user
+    if len(normalized_behavior_subject) > 160 or any(ord(char) < 32 for char in normalized_behavior_subject):
+        raise HTTPException(status_code=400, detail="invalid X-TCE-Behavior-Subject")
+    bound = resolve_bound_identity(
+        claims=parse_identity_claims(settings.identity_claims_json),
+        kind="bearer",
+        credential=token,
+    )
+    if bound is not None:
+        if settings.identity_claims_mode.lower() == "enforce" and claim_conflicts(
+            bound,
+            {
+                "consumer": consumer,
+                "role": role,
+                "workspace_id": workspace,
+                "user_id": user,
+                "behavior_subject_id": behavior_subject,
+            },
+        ):
+            raise HTTPException(status_code=403, detail="asserted identity conflicts with server-bound bearer claim")
+        try:
+            bound_role = AgentRole(bound.role)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="server identity claim has invalid role") from exc
+        return AuthContext(
+            consumer=bound.consumer,
+            role=bound_role,
+            workspace_id=bound.workspace_id,
+            user_id=bound.user_id,
+            behavior_subject_id=bound.behavior_subject_id,
+        )
+    if settings.identity_claims_mode.lower() == "enforce":
+        raise HTTPException(status_code=403, detail="bearer token is not bound to a server claim")
     try:
-        parsed_role = AgentRole(role)
+        parsed_role = AgentRole(role or "user")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid X-TCE-Role") from exc
-    normalized_workspace = workspace.strip() or "personal"
-    normalized_user = user.strip() or consumer.strip() or "local-user"
     return AuthContext(
-        consumer=consumer,
+        consumer=normalized_consumer,
         role=parsed_role,
         workspace_id=normalized_workspace,
         user_id=normalized_user,
+        behavior_subject_id=normalized_behavior_subject,
     )

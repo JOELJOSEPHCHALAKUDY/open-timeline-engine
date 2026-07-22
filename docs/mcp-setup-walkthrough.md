@@ -80,6 +80,7 @@ MCP executor identity:
 - `TCE_MCP_ROLE=executor`
 - consumer id like `codex-executor` or `claude-executor`
 - set distinct `TCE_MCP_USER_ID` per executor (usually same value as consumer id)
+- set the same `TCE_MCP_BEHAVIOR_SUBJECT_ID` for executors assisting the same human
 
 Shared values:
 

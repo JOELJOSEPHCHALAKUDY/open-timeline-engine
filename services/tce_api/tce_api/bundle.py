@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from tce_shared.autonomy_context import summarize_hit_text
 from tce_shared.events import EventFilter, EventSearchRequest, EventSearchResponse
 from tce_shared.policy import ConsumerContext
 
@@ -200,6 +201,8 @@ def build_context_bundle(
             title=hit.title,
             ts=hit.ts,
             key_payload_fields={"domain": hit.domain, "task_type": hit.task_type},
+            summary_l0=hit.summary_l0,
+            summary_l1=hit.summary_l1,
         )
         for hit in hits
     ]
@@ -247,11 +250,22 @@ def build_context_bundle(
         len(evidence_events) < settings.cold_start_min_events
         or len(top_patterns) < settings.cold_start_min_patterns
     )
+    context_tiers_enabled = bool(getattr(settings, "context_tiers_enabled", False))
 
     summary = (
         f"Bundle generated at {datetime.now(tz=UTC).isoformat()} with "
         f"{len(evidence_events)} evidence events and {len(top_patterns)} patterns"
     )
+    if context_tiers_enabled and evidence_events:
+        summary = " | ".join(
+            [
+                f"{len(evidence_events)} evidence events",
+                *[
+                    summarize_hit_text(event.title, event.summary_l0, event.ts)
+                    for event in evidence_events[:3]
+                ],
+            ]
+        )[:500]
     if cold_start:
         summary = (
             "Cold start mode: limited historical signal. Acting as high-quality timeline log/search with cautious suggestions."
@@ -280,6 +294,13 @@ def build_context_bundle(
             "resume_packet_available": bool(retrieval_meta.get("resume_packet_available", False)),
             "cross_user_scope_applied": bool(retrieval_meta.get("cross_user_scope_applied", False)),
             "cross_user_scope_owners": list(retrieval_meta.get("cross_user_scope_owners") or []),
+            "context_tier_used": str(retrieval_meta.get("context_tier_used") or "l2"),
+            "summary_coverage": float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
+            "planner_used": bool(retrieval_meta.get("planner_used", False)),
+            "subquery_count": int(retrieval_meta.get("subquery_count", 0) or 0),
+            "subquery_labels": list(retrieval_meta.get("subquery_labels") or []),
+            "episode_boost_applied": bool(retrieval_meta.get("episode_boost_applied", False)),
+            "activation_boost_applied": bool(retrieval_meta.get("activation_boost_applied", False)),
             "retrieval": retrieval_meta,
         },
         structured_context={
@@ -291,6 +312,13 @@ def build_context_bundle(
             "graph": graph_snapshot,
             "retrieval": retrieval_meta,
         },
+        context_tier_used=str(retrieval_meta.get("context_tier_used") or "l2"),
+        summary_coverage=float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
+        planner_used=bool(retrieval_meta.get("planner_used", False)),
+        subquery_count=int(retrieval_meta.get("subquery_count", 0) or 0),
+        subquery_labels=list(retrieval_meta.get("subquery_labels") or []),
+        episode_boost_applied=bool(retrieval_meta.get("episode_boost_applied", False)),
+        activation_boost_applied=bool(retrieval_meta.get("activation_boost_applied", False)),
     )
     return response, blocked, []
 

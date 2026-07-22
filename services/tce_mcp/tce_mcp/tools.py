@@ -469,6 +469,70 @@ def get_resume_packet(
     return with_schema({"kind": "resume_packet", "result": result, "citations": citations})
 
 
+def complete_task(
+    *,
+    completion_key: str,
+    title: str,
+    files: list[str],
+    decision: str,
+    next_step: str,
+    status: str = "succeeded",
+    session_id: str = "default",
+    source: str = "mcp-executor",
+    git: dict[str, Any] | None = None,
+    anchors: list[dict[str, Any]] | None = None,
+    change_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = client.capture_completion(
+        {
+            "session_id": session_id,
+            "completion_key": completion_key,
+            "source": source,
+            "state": status,
+            "title": title,
+            "payload": {"files": files},
+            "decision": decision,
+            "outcome": {"status": status, "next_step": next_step},
+            "git": git or {},
+            "anchors": anchors or [],
+            "change_summary": change_summary or {},
+            "milestone_schema": "v1",
+        }
+    )
+    return with_schema(
+        {
+            "kind": "completion_capture",
+            "result": result,
+            "citations": [str(result.get("event_id")), str(result.get("handoff_record_id"))],
+        }
+    )
+
+
+def report_resume_feedback(
+    *,
+    packet_id: str,
+    correct_file: bool,
+    correction_required: bool = False,
+    opened_file: str | None = None,
+    correction_reason: str = "",
+) -> dict[str, Any]:
+    result = client.report_resume_feedback(
+        {
+            "packet_id": packet_id,
+            "opened_file": opened_file,
+            "correct_file": correct_file,
+            "correction_required": correction_required,
+            "correction_reason": correction_reason,
+        }
+    )
+    return with_schema({"kind": "resume_feedback", "result": result, "citations": [packet_id]})
+
+
+def get_continuity_pilot(days: int = 30) -> dict[str, Any]:
+    result = client.continuity_pilot_status(days=max(1, min(365, int(days))))
+    return with_schema({"kind": "continuity_pilot", "result": result, "citations": []})
+
+
 def get_context_brief(
     task: str,
     session_id: str = "default",
@@ -676,6 +740,276 @@ def ingest_observations(
         }
     )
     return with_schema({"kind": "ingest_observations", "result": result, "citations": []})
+
+
+def record_behavior_evidence(
+    situation_summary: str,
+    objective: str,
+    selected_choice: str,
+    rationale: str,
+    situation_type: str = "routine_task",
+    available_choices: list[str] | None = None,
+    constraints: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
+    action_taken: str = "",
+    outcome: str = "",
+    outcome_sentiment: str | None = None,
+    memory_class: str = "decision",
+    evidence_source: str = "explicit",
+    correction_text: str = "",
+    supersedes_observation_id: str | None = None,
+    contradicts_observation_ids: list[str] | None = None,
+    source_event_ids: list[str] | None = None,
+    confidence: float = 1.0,
+) -> dict[str, Any]:
+    result = client.record_behavior_evidence(
+        {
+            "situation_type": situation_type,
+            "situation_summary": situation_summary,
+            "objective": objective,
+            "context_snapshot": context_snapshot or {},
+            "constraints": constraints or {},
+            "available_choices": available_choices or [],
+            "selected_choice": selected_choice,
+            "rationale": rationale,
+            "action_taken": action_taken,
+            "outcome": outcome,
+            "outcome_sentiment": outcome_sentiment,
+            "correction_text": correction_text,
+            "memory_class": memory_class,
+            "evidence_source": evidence_source,
+            "source_event_ids": source_event_ids or [],
+            "confidence": confidence,
+            "supersedes_observation_id": supersedes_observation_id,
+            "contradicts_observation_ids": contradicts_observation_ids or [],
+            "schema_version": "v1",
+        }
+    )
+    citations = [str(result["observation_id"])] if result.get("observation_id") else []
+    return with_schema({"kind": "behavior_evidence", "result": result, "citations": citations})
+
+
+def predict_behavior(
+    situation_summary: str,
+    objective: str,
+    situation_type: str = "routine_task",
+    candidate_choices: list[str] | None = None,
+    constraints: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
+    min_confidence: float = 0.55,
+) -> dict[str, Any]:
+    result = client.predict_behavior(
+        {
+            "situation_type": situation_type,
+            "situation_summary": situation_summary,
+            "objective": objective,
+            "constraints": constraints or {},
+            "context_snapshot": context_snapshot or {},
+            "candidate_choices": candidate_choices or [],
+            "min_confidence": min_confidence,
+        }
+    )
+    return with_schema(
+        {
+            "kind": "behavior_prediction",
+            "result": result,
+            "citations": list(result.get("citations") or []),
+        }
+    )
+
+
+def run_behavior_fidelity_eval(
+    holdout_ratio: float = 0.20,
+    min_train: int = 5,
+    min_confidence: float = 0.55,
+    max_cases: int = 500,
+) -> dict[str, Any]:
+    result = client.run_behavior_evaluation(
+        {
+            "holdout_ratio": holdout_ratio,
+            "min_train": min_train,
+            "min_confidence": min_confidence,
+            "max_cases": max_cases,
+        }
+    )
+    citations = [
+        str(case["observation_id"])
+        for case in (result.get("case_results") or [])
+        if isinstance(case, dict) and case.get("observation_id")
+    ]
+    return with_schema({"kind": "behavior_fidelity_evaluation", "result": result, "citations": citations})
+
+
+def get_behavior_fidelity(limit: int = 20) -> dict[str, Any]:
+    result = client.get_behavior_evaluations(limit=limit)
+    return with_schema({"kind": "behavior_fidelity_history", "result": result, "citations": []})
+
+
+def get_behavior_calibration() -> dict[str, Any]:
+    result = client.get_behavior_calibration_scenarios()
+    return with_schema({"kind": "behavior_calibration_scenarios", "result": result, "citations": []})
+
+
+def answer_behavior_calibration(
+    scenario_id: str,
+    selected_choice: str,
+    rationale: str,
+    action_taken: str = "",
+) -> dict[str, Any]:
+    result = client.answer_behavior_calibration(
+        {
+            "scenario_id": scenario_id,
+            "selected_choice": selected_choice,
+            "rationale": rationale,
+            "action_taken": action_taken,
+        }
+    )
+    citations = [str(result["observation_id"])] if result.get("observation_id") else []
+    return with_schema({"kind": "behavior_calibration_answer", "result": result, "citations": citations})
+
+
+def request_capability_grant(
+    capability: str,
+    action: str,
+    resource: str,
+    session_id: str = "default",
+    directive_id: str | None = None,
+    permit_id: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    ttl_seconds: int = 120,
+) -> dict[str, Any]:
+    result = client.create_capability_grant(
+        {
+            "session_id": session_id,
+            "directive_id": directive_id,
+            "permit_id": permit_id,
+            "capability": capability,
+            "action": action,
+            "resource": resource,
+            "arguments": arguments or {},
+            "ttl_seconds": ttl_seconds,
+        }
+    )
+    return with_schema({"kind": "capability_grant", "result": result, "citations": []})
+
+
+def consume_capability_grant(
+    grant_id: str,
+    token: str,
+    capability: str,
+    action: str,
+    resource: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = client.consume_capability_grant(
+        {
+            "grant_id": grant_id,
+            "token": token,
+            "capability": capability,
+            "action": action,
+            "resource": resource,
+            "arguments": arguments or {},
+        }
+    )
+    return with_schema({"kind": "capability_consumption", "result": result, "citations": []})
+
+
+def mine_behavior_processes(
+    lookback_days: int = 30,
+    min_support: int = 2,
+    max_sequences: int = 500,
+    max_steps: int = 12,
+) -> dict[str, Any]:
+    result = client.mine_behavior_processes(
+        {
+            "lookback_days": lookback_days,
+            "min_support": min_support,
+            "max_sequences": max_sequences,
+            "max_steps": max_steps,
+        }
+    )
+    citations = [
+        str(value)
+        for model in (result.get("models") or [])
+        if isinstance(model, dict)
+        for value in (model.get("evidence_ids") or [])
+    ]
+    return with_schema({"kind": "behavior_process_models", "result": result, "citations": citations})
+
+
+def get_behavior_processes(status: str | None = None, limit: int = 100) -> dict[str, Any]:
+    result = client.get_behavior_processes(status=status, limit=limit)
+    return with_schema({"kind": "behavior_process_models", "result": result, "citations": []})
+
+
+def get_behavior_shadow_status(limit: int = 200) -> dict[str, Any]:
+    result = client.get_behavior_shadow_status(limit=limit)
+    citations = [
+        str(item["observation_id"])
+        for item in (result.get("recent") or [])
+        if isinstance(item, dict) and item.get("observation_id")
+    ]
+    return with_schema({"kind": "behavior_shadow_status", "result": result, "citations": citations})
+
+
+def get_behavior_memory_reviews(status: str | None = "pending", limit: int = 100) -> dict[str, Any]:
+    result = client.get_behavior_memory_reviews(status=status, limit=limit)
+    return with_schema({"kind": "behavior_memory_reviews", "result": result, "citations": []})
+
+
+def resolve_behavior_memory_review(review_id: str, decision: str, note: str = "") -> dict[str, Any]:
+    result = client.resolve_behavior_memory_review(review_id, {"decision": decision, "note": note})
+    return with_schema({"kind": "behavior_memory_review", "result": result, "citations": []})
+
+
+def record_behavior_counterfactual(
+    decision: str,
+    alternative: str,
+    expected_outcome: str,
+    session_id: str = "default",
+    observation_id: str | None = None,
+    directive_id: str | None = None,
+    assumptions: list[str] | None = None,
+    confidence: float = 0.5,
+) -> dict[str, Any]:
+    result = client.create_behavior_counterfactual(
+        {
+            "observation_id": observation_id,
+            "session_id": session_id,
+            "directive_id": directive_id,
+            "decision": decision,
+            "alternative": alternative,
+            "expected_outcome": expected_outcome,
+            "assumptions": assumptions or [],
+            "confidence": confidence,
+        }
+    )
+    citations = [observation_id] if observation_id else []
+    return with_schema({"kind": "behavior_counterfactual", "result": result, "citations": citations})
+
+
+def get_behavior_counterfactuals(status: str | None = None, limit: int = 100) -> dict[str, Any]:
+    result = client.get_behavior_counterfactuals(status=status, limit=limit)
+    return with_schema({"kind": "behavior_counterfactuals", "result": result, "citations": []})
+
+
+def resolve_behavior_counterfactual(
+    counterfactual_id: str,
+    assessment: str,
+    observed_outcome: str,
+    lesson: str = "",
+    regret_score: float | None = None,
+) -> dict[str, Any]:
+    result = client.resolve_behavior_counterfactual(
+        counterfactual_id,
+        {
+            "assessment": assessment,
+            "observed_outcome": observed_outcome,
+            "lesson": lesson,
+            "regret_score": regret_score,
+        },
+    )
+    return with_schema({"kind": "behavior_counterfactual", "result": result, "citations": []})
 
 
 def search_entities(query: str, k: int = 20) -> dict[str, Any]:

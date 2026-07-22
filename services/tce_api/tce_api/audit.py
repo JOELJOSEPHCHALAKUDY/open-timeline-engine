@@ -8,6 +8,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from .config import get_settings
 from .db import get_session_factory
 from .models import AuditLog
 
@@ -21,6 +22,8 @@ def _write_audit_sync(
     result_event_ids: list[UUID],
     policy_decisions: dict[str, Any],
     latency_ms: int,
+    *,
+    raise_on_error: bool = False,
 ) -> None:
     """Write audit log in a background thread with its own DB session."""
     db: Session | None = None
@@ -44,6 +47,8 @@ def _write_audit_sync(
                 db.rollback()
             except Exception:
                 pass
+        if raise_on_error:
+            raise
     finally:
         if db is not None:
             try:
@@ -61,7 +66,19 @@ def write_audit_log(
     policy_decisions: dict[str, Any],
     latency_ms: int,
 ) -> None:
-    """Fire-and-forget audit log write in a background thread."""
+    """Write asynchronously by default, or fail closed in durable mode."""
+    mode = str(getattr(get_settings(), "audit_write_mode", "async") or "async").strip().lower()
+    if mode == "durable":
+        _write_audit_sync(
+            consumer,
+            action,
+            query,
+            result_event_ids,
+            policy_decisions,
+            latency_ms,
+            raise_on_error=True,
+        )
+        return
     t = threading.Thread(
         target=_write_audit_sync,
         args=(consumer, action, query, result_event_ids, policy_decisions, latency_ms),

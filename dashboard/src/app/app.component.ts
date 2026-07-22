@@ -40,6 +40,9 @@ import { AuthService } from './core/services/auth.service';
         <a class="sidebar-link" routerLink="/human-clone" routerLinkActive="active">
           <span class="icon">🫀</span> Human Clone
         </a>
+        <a class="sidebar-link" routerLink="/behavior-review" routerLinkActive="active">
+          <span class="icon">◇</span> Review & Drift
+        </a>
         <a class="sidebar-link" routerLink="/episodes" routerLinkActive="active">
           <span class="icon">🧾</span> Episodes
         </a>

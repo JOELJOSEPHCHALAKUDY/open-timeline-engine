@@ -23,6 +23,10 @@ class Event(Base):
     task_type: Mapped[str] = mapped_column(TEXT, nullable=False)
     event_type: Mapped[str] = mapped_column(TEXT, nullable=False)
     title: Mapped[str] = mapped_column(TEXT, nullable=False)
+    summary_l0: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    summary_l1_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    summary_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+    summary_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     context: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     inputs: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
@@ -231,6 +235,60 @@ class HandoffRecord(Base):
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
     redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class HandoffOutbox(Base):
+    __tablename__ = "handoff_outbox"
+    __table_args__ = (
+        Index("idx_handoff_outbox_delivery", "status", "next_attempt_at", "created_at"),
+        Index("idx_handoff_outbox_scope", "workspace_id", "owner_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    behavior_subject_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    completion_key: Mapped[str] = mapped_column(TEXT, nullable=False)
+    terminal_state: Mapped[str] = mapped_column(TEXT, nullable=False)
+    milestone_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    source: Mapped[str] = mapped_column(TEXT, nullable=False, default="native")
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_error: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    handoff_record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ContinuityResumeAttempt(Base):
+    __tablename__ = "continuity_resume_attempts"
+    __table_args__ = (
+        Index("idx_continuity_resume_scope", "workspace_id", "requesting_owner_id", "requested_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    packet_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    requesting_owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    target_owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    selected_record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    query_text: Mapped[str] = mapped_column(TEXT, nullable=False)
+    top_file: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    returned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    time_since_handoff_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    opened_file: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    correct_file: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    correction_required: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    correction_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TakeoverActionLog(Base):
@@ -515,6 +573,7 @@ class DecisionObservation(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     consumer_id: Mapped[str] = mapped_column(TEXT, nullable=False)
     workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="default")
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     situation_type: Mapped[str] = mapped_column(TEXT, nullable=False)
     situation_summary: Mapped[str] = mapped_column(TEXT, nullable=False)
@@ -527,6 +586,173 @@ class DecisionObservation(Base):
     confidence: Mapped[float] = mapped_column(REAL, nullable=False, default=1.0)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1024), nullable=True)
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    objective_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    constraints_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    available_choices_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    selected_choice: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    action_taken: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    correction_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    memory_class: Mapped[str] = mapped_column(TEXT, nullable=False, default="decision")
+    evidence_source: Mapped[str] = mapped_column(TEXT, nullable=False, default="inferred")
+    lifecycle_status: Mapped[str] = mapped_column(TEXT, nullable=False, default="active")
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    contradicts_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    behavior_schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    learning_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    storage_score: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    storage_decision: Mapped[str] = mapped_column(TEXT, nullable=False, default="audit_only")
+
+
+class BehaviorFidelityRun(Base):
+    __tablename__ = "behavior_fidelity_runs"
+    __table_args__ = (
+        Index("idx_behavior_fidelity_runs_scope_created", "workspace_id", "subject_user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    consumer_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False)
+    config_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    metrics_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    gate_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    case_results_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class CapabilityGrant(Base):
+    __tablename__ = "capability_grants"
+    __table_args__ = (Index("idx_capability_grants_scope_status", "workspace_id", "owner_id", "status", "expires_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    permit_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    capability: Mapped[str] = mapped_column(TEXT, nullable=False)
+    action: Mapped[str] = mapped_column(TEXT, nullable=False)
+    resource: Mapped[str] = mapped_column(TEXT, nullable=False)
+    action_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    token_hash: Mapped[str] = mapped_column(TEXT, nullable=False)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False)
+    decision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    reason: Mapped[str] = mapped_column(TEXT, nullable=False)
+    risk_tier: Mapped[str] = mapped_column(TEXT, nullable=False)
+    mutating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completion_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    completion_outbox_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    completion_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BehaviorProcessModel(Base):
+    __tablename__ = "behavior_process_models"
+    __table_args__ = (
+        Index("idx_behavior_process_models_scope_status", "workspace_id", "subject_user_id", "status", "reliability"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    process_signature: Mapped[str] = mapped_column(TEXT, nullable=False)
+    name: Mapped[str] = mapped_column(TEXT, nullable=False)
+    steps_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    transitions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    support: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_rate: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    reliability: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    source_sessions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="candidate")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class BehaviorShadowPrediction(Base):
+    __tablename__ = "behavior_shadow_predictions"
+    __table_args__ = (Index("idx_behavior_shadow_scope_created", "workspace_id", "subject_user_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    observation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    predicted_choice: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    actual_choice: Mapped[str] = mapped_column(TEXT, nullable=False)
+    confidence: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    abstained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    query_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    citations_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class BehaviorMemoryReview(Base):
+    __tablename__ = "behavior_memory_reviews"
+    __table_args__ = (
+        Index("idx_behavior_memory_reviews_scope_status", "workspace_id", "subject_user_id", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    target_type: Mapped[str] = mapped_column(TEXT, nullable=False)
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    title: Mapped[str] = mapped_column(TEXT, nullable=False)
+    rationale: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="pending")
+    proposed_action: Mapped[str] = mapped_column(TEXT, nullable=False, default="promote")
+    source: Mapped[str] = mapped_column(TEXT, nullable=False)
+    score: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    reviewer_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    review_note: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class BehaviorCounterfactual(Base):
+    __tablename__ = "behavior_counterfactuals"
+    __table_args__ = (
+        Index("idx_behavior_counterfactuals_scope_status", "workspace_id", "subject_user_id", "status", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    observation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    decision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    alternative: Mapped[str] = mapped_column(TEXT, nullable=False)
+    expected_outcome: Mapped[str] = mapped_column(TEXT, nullable=False)
+    assumptions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    confidence: Mapped[float] = mapped_column(REAL, nullable=False, default=0.5)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="open")
+    assessment: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    observed_outcome: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    lesson: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    regret_score: Mapped[float | None] = mapped_column(REAL, nullable=True)
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
 
 
 class BehavioralFingerprint(Base):

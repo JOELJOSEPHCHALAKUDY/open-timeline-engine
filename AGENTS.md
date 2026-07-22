@@ -44,6 +44,7 @@ If you find a bug in these paths, report it to the user instead of changing it, 
 14. After execution:
     - Success: call `tce.report_execution(..., state="succeeded")`
     - Failure: call `tce.report_execution(..., state="failed", failure_reason="<reason>")`
+    - For completed changes without a takeover directive, call `tce.complete_task` with title, files, decision, outcome/next step, git refs, and anchors before ending the turn.
 15. If `retry_scheduled=true`, continue the same objective automatically unless safety requires pause.
 16. If `autonomy_notice` is present, call `tce.ack_takeover_notice` unless already acknowledged.
 
@@ -88,6 +89,11 @@ If you find a bug in these paths, report it to the user instead of changing it, 
 31. Reuse hinted steps for the first execution attempt before inventing a new sequence.
 32. If workflow hints conflict with `constraints`, permit/claim requirements, or safety decisions, constraints and safety win.
 33. Workflow hints are guidance only; always finish with normal directive lifecycle reporting (`tce.report_execution`).
+
+## Mandatory completion capture
+1. Every completed mutating change must end with either `tce.report_execution` for a directive or `tce.complete_task` for ordinary work.
+2. Use a stable idempotency key such as `git:<commit>` or `<session>:<task>:<result>`.
+3. Do not claim completion when capture is queued or dead; report the delivery state and retry it.
 
 ## Conditional: check_context during active takeover only
 Call `tce.check_context(file_path="<path>")` only when takeover/suggest mode is active and you are about to edit:

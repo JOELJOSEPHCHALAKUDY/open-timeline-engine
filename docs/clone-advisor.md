@@ -60,6 +60,7 @@ Executor headers (example A):
 - `X-TCE-Role: executor`
 - `X-TCE-Workspace: personal` (or your shared workspace id)
 - `X-TCE-User: codex-executor` (or another unique executor user id)
+- `X-TCE-Behavior-Subject: local-user` (the human profile shared across executors)
 
 Executor headers (example B):
 
@@ -67,11 +68,14 @@ Executor headers (example B):
 - `X-TCE-Role: executor`
 - `X-TCE-Workspace: personal` (same workspace for shared-memory mode)
 - `X-TCE-User: claude-executor` (distinct from other executors for owner/audit separation)
+- `X-TCE-Behavior-Subject: local-user` (same human profile as executor A)
 
 Identity rules:
 
 - keep `X-TCE-Workspace` shared when you want shared memory.
 - keep `X-TCE-User` distinct per executor identity.
+- keep `X-TCE-Behavior-Subject` the same only when the executors assist the same human.
+- behavior evidence and fingerprints are isolated by workspace plus behavior subject.
 - cross-user memory lookup is explicit-query scoped and returns policy metadata when applied.
 - advisor model routing is API-side (`/v1/setup/advisor/*`), not an MCP `advisor` role.
 - keep cross-user prompts explicit (examples: `read codex timeline`, `read codex memory`, `continue codex work on README`).
@@ -184,6 +188,8 @@ Compatibility:
 
 ## Human-level score interpretation
 
+This dashboard score is an operational readiness indicator, not scientific evidence that TCE has cloned a human. Use the Behavior Fidelity v1 chronological evaluation before allowing learned behavior to influence autonomous continuation.
+
 Dashboard human-level score combines four deterministic subscores:
 
 - `clone_readiness` (existing clone score logic)
@@ -197,6 +203,32 @@ Band mapping:
 - `40..64`: `developing`
 - `65..84`: `advanced`
 - `85..100`: `human_like`
+
+The `human_like` label is retained for API/UI compatibility. It means high internal readiness on these four subscores, not human equivalence.
+
+## Behavior Fidelity v1
+
+Behavior Evidence v1 records the information required to evaluate decision continuity:
+
+- situation and objective
+- available choices and selected choice
+- constraints and context snapshot
+- rationale and action taken
+- outcome and correction
+- memory class, provenance, validity window, contradictions, and supersession
+
+Public surfaces:
+
+- `POST /v1/behavior/evidence`
+- `POST /v1/behavior/predict`
+- `POST /v1/behavior/evaluate`
+- `GET /v1/behavior/evaluations`
+- `GET /v1/behavior/calibration/scenarios`
+- `POST /v1/behavior/calibration/answer`
+
+Predictions abstain below the configured confidence floor. When `TCE_BEHAVIOR_AUTONOMY_GATE_ENABLED=true`, takeover also pauses unless the latest chronological evaluation passes its accuracy, calibration, precision, and sample-count gates. Permit/claim/report and hard safety gates remain mandatory.
+
+Detailed rollout instructions: [Behavior Fidelity v1](behavior-fidelity.md).
 
 ## Long-term goal definition
 

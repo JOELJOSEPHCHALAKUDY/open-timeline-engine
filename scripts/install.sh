@@ -1164,6 +1164,14 @@ hooks = {
                 'command': 'if echo \"\$TOOL_INPUT\" | grep -q \"open-timeline-engine\"; then echo \\'{{\"systemMessage\": \"[TCE-SELF-HEAL] You modified a TCE file. Run: bash ' + self_heal + ' then continue the current workflow. Call mcp__tce-executor__tce_takeover_step only if takeover is active in this chat; otherwise continue naturally.\"}}\\'; else echo \\'{{\"continue\": true}}\\'; fi',
                 'timeout': 10
             }]
+        }],
+        'Stop': [{
+            'matcher': '*',
+            'hooks': [{
+                'type': 'command',
+                'command': 'echo \'{"systemMessage": "[TCE-COMPLETION] Before ending after any mutating change, call mcp__tce-executor__tce_complete_task with the title, touched files, decision, outcome/next step, git refs, and anchors. Skip only when tce.report_execution already captured this completion."}\'',
+                'timeout': 10
+            }]
         }]
     }
 }
