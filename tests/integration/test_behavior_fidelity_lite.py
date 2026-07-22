@@ -917,12 +917,13 @@ def test_full_and_lite_register_same_behavior_routes() -> None:
     }
 
     def routes(api) -> set[tuple[str, str]]:
-        return {
-            (route.path, method)
-            for route in api.routes
-            for method in (route.methods or set())
-            if route.path.startswith("/v1/behavior/")
-        }
+        registered: set[tuple[str, str]] = set()
+        for route in api.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if isinstance(path, str) and path.startswith("/v1/behavior/") and methods:
+                registered.update((path, method) for method in methods)
+        return registered
 
     assert expected <= routes(app)
     assert expected <= routes(full_app)
