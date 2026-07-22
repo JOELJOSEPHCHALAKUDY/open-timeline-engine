@@ -8948,7 +8948,6 @@ def check_context(
         search_terms.append("/".join(path_parts[: i + 1]))
 
     # Query observations that mention any of the path components
-    placeholders = ", ".join(f":term_{i}" for i in range(len(search_terms)))
     params: dict[str, Any] = {"workspace_id": auth.workspace_id}
     for i, term in enumerate(search_terms):
         params[f"term_{i}"] = f"%{term}%"
