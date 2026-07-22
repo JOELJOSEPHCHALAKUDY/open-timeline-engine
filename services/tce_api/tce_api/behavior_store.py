@@ -9,6 +9,17 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+_BEHAVIOR_EVIDENCE_COLUMNS = """
+    id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
+    context_snapshot, user_response, response_reasoning, outcome,
+    outcome_sentiment, source_event_ids, confidence, superseded_by,
+    objective_text, constraints_json, available_choices_json, selected_choice,
+    action_taken, correction_text, memory_class, evidence_source,
+    lifecycle_status, valid_from, valid_until, contradicts_ids_json,
+    confirmed_at, behavior_schema_version, redaction_applied,
+    learning_eligible, storage_score, storage_decision
+"""
+
 
 def _uuid_list(values: list[Any]) -> list[UUID]:
     output: list[UUID] = []
@@ -117,6 +128,15 @@ def save_behavior_evidence(
     return observation_id
 
 
+def _behavior_evidence_from_row(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    item["constraints"] = item.pop("constraints_json", {}) or {}
+    item["available_choices"] = item.pop("available_choices_json", []) or []
+    item["contradicts_observation_ids"] = item.pop("contradicts_ids_json", []) or []
+    item["learning_eligible"] = bool(item.get("learning_eligible"))
+    return item
+
+
 def load_behavior_evidence(
     db: Session,
     *,
@@ -129,14 +149,7 @@ def load_behavior_evidence(
     rows = db.execute(
         text(
             f"""
-            SELECT id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
-                   context_snapshot, user_response, response_reasoning, outcome,
-                   outcome_sentiment, source_event_ids, confidence, superseded_by,
-                   objective_text, constraints_json, available_choices_json, selected_choice,
-                   action_taken, correction_text, memory_class, evidence_source,
-                   lifecycle_status, valid_from, valid_until, contradicts_ids_json,
-                   confirmed_at, behavior_schema_version, redaction_applied,
-                   learning_eligible, storage_score, storage_decision
+            SELECT {_BEHAVIOR_EVIDENCE_COLUMNS}
             FROM decision_observations
             WHERE workspace_id = :workspace_id
               AND subject_user_id = :subject_user_id
@@ -151,15 +164,34 @@ def load_behavior_evidence(
             "limit": max(1, min(limit, 5000)),
         },
     ).mappings().all()
-    evidence: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        item = dict(row)
-        item["constraints"] = item.pop("constraints_json", {}) or {}
-        item["available_choices"] = item.pop("available_choices_json", []) or []
-        item["contradicts_observation_ids"] = item.pop("contradicts_ids_json", []) or []
-        item["learning_eligible"] = bool(item.get("learning_eligible"))
-        evidence.append(item)
-    return evidence
+    return [_behavior_evidence_from_row(row) for row in reversed(rows)]
+
+
+def load_behavior_evidence_by_id(
+    db: Session,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    observation_id: UUID,
+) -> dict[str, Any] | None:
+    row = db.execute(
+        text(
+            f"""
+            SELECT {_BEHAVIOR_EVIDENCE_COLUMNS}
+            FROM decision_observations
+            WHERE id = :observation_id
+              AND workspace_id = :workspace_id
+              AND subject_user_id = :subject_user_id
+            LIMIT 1
+            """
+        ),
+        {
+            "observation_id": observation_id,
+            "workspace_id": workspace_id,
+            "subject_user_id": subject_user_id,
+        },
+    ).mappings().first()
+    return _behavior_evidence_from_row(row) if row is not None else None
 
 
 def save_fidelity_run(

@@ -9413,6 +9413,7 @@ def run_lifecycle_maintenance(
             "DELETE FROM behavior_memory_reviews WHERE resolved_at IS NOT NULL AND resolved_at < ?",
             "DELETE FROM behavior_counterfactuals WHERE resolved_at IS NOT NULL AND resolved_at < ?",
             "DELETE FROM behavior_process_models WHERE status = 'rejected' AND updated_at < ?",
+            "DELETE FROM behavior_projection_pilot_assignments WHERE assigned_at < ?",
         ):
             deleted = conn.execute(statement, (behavior_cutoff,))
             behavior_deleted += int(deleted.rowcount or 0)
@@ -9751,6 +9752,29 @@ def save_behavior_evidence_lite(
     return observation_id
 
 
+_BEHAVIOR_EVIDENCE_COLUMNS = """
+    id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
+    context_snapshot, user_response, response_reasoning, outcome,
+    outcome_sentiment, source_event_ids, confidence, superseded_by,
+    objective_text, constraints_json, available_choices_json, selected_choice,
+    action_taken, correction_text, memory_class, evidence_source,
+    lifecycle_status, valid_from, valid_until, contradicts_ids_json,
+    confirmed_at, behavior_schema_version, redaction_applied,
+    learning_eligible, storage_score, storage_decision
+"""
+
+
+def _behavior_evidence_from_row_lite(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["context_snapshot"] = json_loads(item.get("context_snapshot"), {})
+    item["constraints"] = json_loads(item.pop("constraints_json", "{}"), {})
+    item["available_choices"] = json_loads(item.pop("available_choices_json", "[]"), [])
+    item["source_event_ids"] = json_loads(item.get("source_event_ids"), [])
+    item["contradicts_observation_ids"] = json_loads(item.pop("contradicts_ids_json", "[]"), [])
+    item["learning_eligible"] = bool(item.get("learning_eligible"))
+    return item
+
+
 def load_behavior_evidence_lite(
     conn: sqlite3.Connection,
     *,
@@ -9762,14 +9786,7 @@ def load_behavior_evidence_lite(
     eligibility = "AND learning_eligible = 1" if eligible_only else ""
     rows = conn.execute(
         f"""
-        SELECT id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
-               context_snapshot, user_response, response_reasoning, outcome,
-               outcome_sentiment, source_event_ids, confidence, superseded_by,
-               objective_text, constraints_json, available_choices_json, selected_choice,
-               action_taken, correction_text, memory_class, evidence_source,
-               lifecycle_status, valid_from, valid_until, contradicts_ids_json,
-               confirmed_at, behavior_schema_version, redaction_applied,
-               learning_eligible, storage_score, storage_decision
+        SELECT {_BEHAVIOR_EVIDENCE_COLUMNS}
         FROM decision_observations
         WHERE workspace_id = ? AND subject_user_id = ? {eligibility}
         ORDER BY ts DESC
@@ -9777,17 +9794,26 @@ def load_behavior_evidence_lite(
         """,
         (workspace_id, subject_user_id, max(1, min(limit, 5000))),
     ).fetchall()
-    output: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        item = dict(row)
-        item["context_snapshot"] = json_loads(item.get("context_snapshot"), {})
-        item["constraints"] = json_loads(item.pop("constraints_json", "{}"), {})
-        item["available_choices"] = json_loads(item.pop("available_choices_json", "[]"), [])
-        item["source_event_ids"] = json_loads(item.get("source_event_ids"), [])
-        item["contradicts_observation_ids"] = json_loads(item.pop("contradicts_ids_json", "[]"), [])
-        item["learning_eligible"] = bool(item.get("learning_eligible"))
-        output.append(item)
-    return output
+    return [_behavior_evidence_from_row_lite(row) for row in reversed(rows)]
+
+
+def load_behavior_evidence_by_id_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    observation_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        f"""
+        SELECT {_BEHAVIOR_EVIDENCE_COLUMNS}
+        FROM decision_observations
+        WHERE id = ? AND workspace_id = ? AND subject_user_id = ?
+        LIMIT 1
+        """,
+        (observation_id, workspace_id, subject_user_id),
+    ).fetchone()
+    return _behavior_evidence_from_row_lite(row) if row is not None else None
 
 
 def save_fidelity_run_lite(

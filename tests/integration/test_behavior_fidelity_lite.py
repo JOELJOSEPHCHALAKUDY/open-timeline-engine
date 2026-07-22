@@ -60,6 +60,8 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
         "behavior_storage_gate_mode": settings.behavior_storage_gate_mode,
         "behavior_autonomy_gate_enabled": settings.behavior_autonomy_gate_enabled,
         "behavior_calibration_enabled": settings.behavior_calibration_enabled,
+        "behavior_projections_enabled": settings.behavior_projections_enabled,
+        "behavior_projection_pilot_enabled": settings.behavior_projection_pilot_enabled,
         "behavior_control_retention_days": settings.behavior_control_retention_days,
         "event_lifecycle_enabled": settings.event_lifecycle_enabled,
         "lifecycle_dry_run": settings.lifecycle_dry_run,
@@ -71,6 +73,8 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
     settings.behavior_storage_gate_mode = "shadow"
     settings.behavior_autonomy_gate_enabled = False
     settings.behavior_calibration_enabled = True
+    settings.behavior_projections_enabled = True
+    settings.behavior_projection_pilot_enabled = True
     settings.workspace_access_mode = "compat"
     with TestClient(app) as test_client:
         yield test_client
@@ -507,10 +511,13 @@ def test_behavior_control_retention_preserves_unresolved_and_active_records(clie
         "open_counterfactual",
         "rejected_process",
         "active_process",
+        "pilot_assignment",
+        "pilot_outcome",
     )}
     conn = sqlite3.connect(settings.lite_db_path)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
             """
             INSERT INTO capability_grants(
@@ -571,6 +578,31 @@ def test_behavior_control_retention_preserves_unresolved_and_active_records(clie
                 """,
                 (ids[key], key, status, old, old),
             )
+        conn.execute(
+            """
+            INSERT INTO behavior_projection_pilot_assignments(
+                id, workspace_id, subject_user_id, owner_id, trial_key, request_digest,
+                variant, situation_type, situation_summary, objective_text, request_json,
+                context_json, context_sha256, source_revision, citations_json,
+                injected_tokens, retrieval_latency_ms, redaction_applied, assigned_at,
+                expires_at
+            ) VALUES(?, 'behavior-test-workspace', 'behavior-test-user',
+                     'behavior-test-user', 'retention-pilot', 'request-digest',
+                     'no_memory', 'retention', 'old pilot assignment', 'verify cleanup',
+                     '{}', '{}', 'context-hash', 'source-revision', '[]', 0, 1, 0, ?, ?)
+            """,
+            (ids["pilot_assignment"], old, future),
+        )
+        conn.execute(
+            """
+            INSERT INTO behavior_projection_pilot_outcomes(
+                id, assignment_id, workspace_id, subject_user_id, reporter_id,
+                outcome_digest, actual_choice, reported_at
+            ) VALUES(?, ?, 'behavior-test-workspace', 'behavior-test-user',
+                     'behavior-test-user', 'outcome-digest', 'safe choice', ?)
+            """,
+            (ids["pilot_outcome"], ids["pilot_assignment"], old),
+        )
         conn.commit()
 
         result = run_lifecycle_maintenance(conn, settings, retention_days=3650, dry_run=False)
@@ -582,17 +614,21 @@ def test_behavior_control_retention_preserves_unresolved_and_active_records(clie
                 "behavior_memory_reviews",
                 "behavior_counterfactuals",
                 "behavior_process_models",
+                "behavior_projection_pilot_assignments",
+                "behavior_projection_pilot_outcomes",
             )
         }
     finally:
         conn.close()
 
-    assert result["behavior_control_rows_deleted"] == 5
+    assert result["behavior_control_rows_deleted"] == 6
     assert ids["grant"] not in remaining["capability_grants"]
     assert ids["shadow"] not in remaining["behavior_shadow_predictions"]
     assert remaining["behavior_memory_reviews"] == {ids["pending_review"]}
     assert remaining["behavior_counterfactuals"] == {ids["open_counterfactual"]}
     assert remaining["behavior_process_models"] == {ids["active_process"]}
+    assert remaining["behavior_projection_pilot_assignments"] == set()
+    assert remaining["behavior_projection_pilot_outcomes"] == set()
 
 
 def test_strict_workspace_access_requires_membership_for_executor(client: TestClient) -> None:
@@ -637,6 +673,229 @@ def test_capped_evidence_load_uses_most_recent_records(client: TestClient) -> No
     ]
 
 
+def test_behavior_projections_are_scoped_deterministic_and_citation_addressable(client: TestClient) -> None:
+    first = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    assert first.status_code == 200
+    first_id = first.json()["observation_id"]
+    correction_payload = _payload(2, choice="broad refactor")
+    correction_payload.update(
+        {
+            "evidence_source": "correction",
+            "correction_text": "The focused patch missed the shared invariant",
+            "supersedes_observation_id": first_id,
+        }
+    )
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    assert correction.status_code == 200
+    correction_id = correction.json()["observation_id"]
+
+    current = client.get("/v1/behavior/projections/current", headers=_headers())
+    repeated = client.get("/v1/behavior/projections/current", headers=_headers())
+    assert current.status_code == 200
+    assert current.json() == repeated.json()
+    assert current.json()["source_evidence_ids"] == [correction_id]
+    assert first_id not in current.json()["content"]
+    assert current.json()["mime_type"].startswith("text/markdown")
+
+    topic = client.get("/v1/behavior/projections/decisions/production?format=json", headers=_headers())
+    assert topic.status_code == 200
+    assert topic.json()["source_evidence_ids"] == [correction_id]
+    assert json.loads(topic.json()["content"])["metadata"]["view"] == "decisions"
+
+    historical = client.get(
+        f"/v1/behavior/projections/evidence/{first_id}",
+        headers=_headers(),
+    )
+    assert historical.status_code == 200
+    assert historical.json()["trust_level"] == "historical"
+    assert historical.json()["source_evidence_ids"] == [first_id]
+
+    isolated = client.get(
+        "/v1/behavior/projections/current",
+        headers=_headers(behavior_subject="different-human"),
+    )
+    assert isolated.status_code == 200
+    assert isolated.json()["evidence_count"] == 0
+
+    settings = get_settings()
+    conn = sqlite3.connect(settings.lite_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        audit = conn.execute(
+            """
+            SELECT query, policy_decisions FROM audit_log
+            WHERE action = 'behavior_projection_read'
+            ORDER BY ts DESC LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+    assert audit is not None
+    assert json.loads(audit["query"])["behavior_subject_id"] == "different-human"
+    assert json.loads(audit["policy_decisions"])["projection_learning_eligible"] is False
+
+
+def test_behavior_projection_feature_flag_is_a_safe_rollback(client: TestClient) -> None:
+    settings = get_settings()
+    settings.behavior_projections_enabled = False
+    try:
+        response = client.get("/v1/behavior/projections/current", headers=_headers())
+    finally:
+        settings.behavior_projections_enabled = True
+    assert response.status_code == 404
+    assert response.json()["detail"] == "behavior projections are disabled"
+
+
+def test_behavior_review_html_is_sanitized_and_includes_historical_records(client: TestClient) -> None:
+    first_payload = _payload(1)
+    first_payload["situation_summary"] = '<script src="https://evil.invalid/x.js">attack</script>'
+    first = client.post("/v1/behavior/evidence", json=first_payload, headers=_headers())
+    assert first.status_code == 200
+    correction_payload = _payload(2, choice="broad refactor")
+    correction_payload.update(
+        {
+            "evidence_source": "correction",
+            "correction_text": "The first choice was superseded",
+            "supersedes_observation_id": first.json()["observation_id"],
+        }
+    )
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    assert correction.status_code == 200
+
+    wrapped = client.get("/v1/behavior/projections/review", headers=_headers())
+    raw = client.get("/v1/behavior/projections/review.html", headers=_headers())
+    assert wrapped.status_code == 200
+    assert raw.status_code == 200
+    assert wrapped.json()["format"] == "html"
+    assert set(wrapped.json()["source_evidence_ids"]) == {
+        first.json()["observation_id"],
+        correction.json()["observation_id"],
+    }
+    assert "<script" not in raw.text.lower()
+    assert "&lt;script" in raw.text.lower()
+    assert "default-src 'none'" in raw.headers["content-security-policy"]
+    assert raw.headers["x-content-type-options"] == "nosniff"
+
+
+def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client: TestClient) -> None:
+    evidence = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    assert evidence.status_code == 200
+    assignment_payload = {
+        "trial_key": "pilot-trial-1",
+        "situation_type": "prioritization_needed",
+        "situation_summary": "Choose production fix scope",
+        "objective": "Fix without regression",
+        "constraints": {"api_key": "plain-pilot-secret", "risk": "production"},
+        "context_snapshot": {"component": "api"},
+        "candidate_choices": ["minimal verified fix", "broad refactor"],
+    }
+    assigned = client.post(
+        "/v1/behavior/projections/pilot/assign",
+        json=assignment_payload,
+        headers=_headers(),
+    )
+    replayed = client.post(
+        "/v1/behavior/projections/pilot/assign",
+        json=assignment_payload,
+        headers=_headers(),
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert replayed.status_code == 200
+    assert assigned.json() == replayed.json()
+    assert "plain-pilot-secret" not in json.dumps(assigned.json())
+
+    conflicting = dict(assignment_payload)
+    conflicting["objective"] = "A different objective"
+    conflict = client.post(
+        "/v1/behavior/projections/pilot/assign",
+        json=conflicting,
+        headers=_headers(),
+    )
+    assert conflict.status_code == 409
+
+    citations = assigned.json()["citations"]
+    outcome_payload = {
+        "assignment_id": assigned.json()["assignment_id"],
+        "agent_choice": "minimal verified fix",
+        "top3_choices": ["minimal verified fix", "broad refactor"],
+        "actual_choice": "minimal verified fix",
+        "agent_confidence": 0.9,
+        "action_similarity": 0.9,
+        "workflow_similarity": 0.8,
+        "used_evidence_ids": citations,
+        "notes": "token=plain-outcome-secret",
+    }
+    outcome = client.post(
+        "/v1/behavior/projections/pilot/outcome",
+        json=outcome_payload,
+        headers=_headers(),
+    )
+    outcome_replay = client.post(
+        "/v1/behavior/projections/pilot/outcome",
+        json=outcome_payload,
+        headers=_headers(),
+    )
+    assert outcome.status_code == 200, outcome.text
+    assert outcome_replay.status_code == 200
+    assert outcome.json() == outcome_replay.json()
+    assert outcome.json()["stale_evidence_used"] is False
+
+    status = client.get("/v1/behavior/projections/pilot/status", headers=_headers())
+    assert status.status_code == 200
+    assert status.json()["status"] == "collecting"
+    assert status.json()["assignment_count"] == 1
+    assert status.json()["completed_count"] == 1
+    assert status.json()["gate"]["window_complete"] is False
+
+    settings = get_settings()
+    conn = sqlite3.connect(settings.lite_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        assignment_row = conn.execute(
+            "SELECT request_json, context_json FROM behavior_projection_pilot_assignments"
+        ).fetchone()
+        outcome_row = conn.execute(
+            "SELECT notes FROM behavior_projection_pilot_outcomes"
+        ).fetchone()
+        observation_count = conn.execute("SELECT COUNT(*) FROM decision_observations").fetchone()[0]
+    finally:
+        conn.close()
+    assert "plain-pilot-secret" not in assignment_row["request_json"]
+    assert "plain-pilot-secret" not in assignment_row["context_json"]
+    assert "plain-outcome-secret" not in outcome_row["notes"]
+    assert observation_count == 1
+
+
+def test_behavior_projection_pilot_feature_flag_is_a_safe_rollback(client: TestClient) -> None:
+    settings = get_settings()
+    settings.behavior_projection_pilot_enabled = False
+    try:
+        response = client.get("/v1/behavior/projections/pilot/status", headers=_headers())
+    finally:
+        settings.behavior_projection_pilot_enabled = True
+    assert response.status_code == 404
+    assert response.json()["detail"] == "behavior projection pilot is disabled"
+
+
+def test_behavior_projection_pilot_preserves_advisor_read_only_policy(client: TestClient) -> None:
+    headers = {
+        **_headers(consumer="behavior-test-advisor"),
+        "X-TCE-Role": "advisor",
+    }
+    response = client.post(
+        "/v1/behavior/projections/pilot/assign",
+        json={
+            "trial_key": "advisor-write-attempt",
+            "situation_summary": "Attempt to create a pilot assignment",
+            "objective": "Verify the read-only policy",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "advisor role is read-only"
+
+
 def test_full_and_lite_register_same_behavior_routes() -> None:
     from tce_api.main import app as full_app
 
@@ -645,6 +904,14 @@ def test_full_and_lite_register_same_behavior_routes() -> None:
         ("/v1/behavior/predict", "POST"),
         ("/v1/behavior/evaluate", "POST"),
         ("/v1/behavior/evaluations", "GET"),
+        ("/v1/behavior/projections/current", "GET"),
+        ("/v1/behavior/projections/decisions/{topic}", "GET"),
+        ("/v1/behavior/projections/evidence/{observation_id}", "GET"),
+        ("/v1/behavior/projections/review", "GET"),
+        ("/v1/behavior/projections/review.html", "GET"),
+        ("/v1/behavior/projections/pilot/assign", "POST"),
+        ("/v1/behavior/projections/pilot/outcome", "POST"),
+        ("/v1/behavior/projections/pilot/status", "GET"),
         ("/v1/behavior/calibration/scenarios", "GET"),
         ("/v1/behavior/calibration/answer", "POST"),
     }

@@ -37,9 +37,18 @@ from tce_shared.dashboard import timeline_dashboard_html
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
     behavior_storage_gate,
+    eligible_behavior_evidence,
     evaluate_behavior_fidelity,
     normalize_behavior_evidence,
     predict_behavior,
+)
+from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.behavior_pilot import (
+    assign_behavior_pilot_variant,
+    behavior_pilot_outcome_digest,
+    behavior_pilot_status,
+    prepare_behavior_pilot_context,
+    sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.events import (
@@ -54,8 +63,15 @@ from tce_shared.events import (
     BehaviorEvidenceSource,
     BehaviorEvidenceRequest,
     BehaviorEvidenceResponse,
+    BehaviorPilotAssignmentRequest,
+    BehaviorPilotAssignmentResponse,
+    BehaviorPilotOutcomeRequest,
+    BehaviorPilotOutcomeResponse,
+    BehaviorPilotStatusResponse,
     BehaviorPredictionRequest,
     BehaviorPredictionResponse,
+    BehaviorProjectionFormat,
+    BehaviorProjectionResponse,
     BehaviorShadowStatusResponse,
     CapabilityConsumeRequest,
     CapabilityConsumeResponse,
@@ -133,6 +149,14 @@ from .behavior_control_store import (
     save_shadow_prediction,
     shadow_status,
 )
+from .behavior_pilot_store import (
+    BehaviorPilotConflict,
+    BehaviorPilotExpired,
+    BehaviorPilotNotFound,
+    create_or_get_assignment_lite as create_or_get_behavior_pilot_assignment,
+    list_pilot_rows_lite as list_behavior_pilot_rows,
+    record_outcome_lite as record_behavior_pilot_outcome,
+)
 from .config import get_settings
 from .continuity_store import deliver_handoff_safely, drain_pending_handoffs, enqueue_handoff, pilot_metrics
 from .db import get_db, init_db
@@ -155,6 +179,7 @@ from .store import (
     save_behavior_evidence_lite,
     save_fidelity_run_lite,
     load_behavior_evidence_lite,
+    load_behavior_evidence_by_id_lite,
     list_fidelity_runs_lite,
     latest_fidelity_gate_lite,
     save_observation_lite,
@@ -4886,6 +4911,385 @@ def record_behavior_evidence(
     REQUEST_COUNT.labels(endpoint="behavior_evidence", method="POST").inc()
     _enforce_workspace_access(auth, conn)
     return _store_behavior_evidence_lite_api(body=body, auth=auth, conn=conn)
+
+
+def _behavior_projection_lite(
+    *,
+    auth: AuthContext,
+    conn: sqlite3.Connection,
+    view: str,
+    format_name: BehaviorProjectionFormat,
+    topic: str | None = None,
+    observation_id: UUID | None = None,
+) -> BehaviorProjectionResponse:
+    if not bool(getattr(settings, "behavior_projections_enabled", False)):
+        raise HTTPException(status_code=404, detail="behavior projections are disabled")
+    started = time.perf_counter()
+    if observation_id is not None:
+        evidence_item = load_behavior_evidence_by_id_lite(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            observation_id=str(observation_id),
+        )
+        if evidence_item is None:
+            raise HTTPException(status_code=404, detail="behavior evidence was not found")
+        evidence = [evidence_item]
+    else:
+        evidence = load_behavior_evidence_lite(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            limit=5000,
+            eligible_only=view != "review",
+        )
+    try:
+        projection = build_behavior_projection(
+            evidence,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            view=view,
+            format_name=format_name.value,
+            topic=topic,
+            observation_id=str(observation_id) if observation_id else None,
+        )
+    except BehaviorProjectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response = BehaviorProjectionResponse.model_validate(projection)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    REQUEST_LATENCY.labels(endpoint=f"behavior_projection_{view}", method="GET").observe(latency_ms / 1000)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_projection_read",
+        query={
+            "workspace_id": auth.workspace_id,
+            "behavior_subject_id": auth.behavior_subject_id,
+            "projection_id": str(response.projection_id),
+            "uri": response.uri,
+            "view": response.view.value,
+            "topic": response.topic,
+            "observation_id": response.observation_id,
+            "source_revision": response.source_revision,
+            "source_evidence_ids": [str(item) for item in response.source_evidence_ids],
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "role": auth.role.value,
+            "trust_level": response.trust_level,
+            "read_only": response.read_only,
+            "projection_learning_eligible": response.projection_learning_eligible,
+        },
+        latency_ms=latency_ms,
+    )
+    return response
+
+
+@app.get("/v1/behavior/projections/current", response_model=BehaviorProjectionResponse)
+def current_behavior_projection(
+    format: BehaviorProjectionFormat = BehaviorProjectionFormat.MARKDOWN,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorProjectionResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_projection_current", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    return _behavior_projection_lite(auth=auth, conn=conn, view="current", format_name=format)
+
+
+@app.get("/v1/behavior/projections/decisions/{topic}", response_model=BehaviorProjectionResponse)
+def behavior_decisions_projection(
+    topic: str,
+    format: BehaviorProjectionFormat = BehaviorProjectionFormat.MARKDOWN,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorProjectionResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_projection_decisions", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    if len(topic) > 120 or any(ord(char) < 32 for char in topic):
+        raise HTTPException(status_code=422, detail="topic must be 1 to 120 printable characters")
+    return _behavior_projection_lite(
+        auth=auth,
+        conn=conn,
+        view="decisions",
+        format_name=format,
+        topic=topic,
+    )
+
+
+@app.get("/v1/behavior/projections/evidence/{observation_id}", response_model=BehaviorProjectionResponse)
+def behavior_evidence_projection(
+    observation_id: UUID,
+    format: BehaviorProjectionFormat = BehaviorProjectionFormat.JSON,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorProjectionResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_projection_evidence", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    return _behavior_projection_lite(
+        auth=auth,
+        conn=conn,
+        view="evidence",
+        format_name=format,
+        observation_id=observation_id,
+    )
+
+
+@app.get("/v1/behavior/projections/review", response_model=BehaviorProjectionResponse)
+def behavior_review_projection(
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorProjectionResponse:
+    REQUEST_COUNT.labels(endpoint="behavior_projection_review", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    return _behavior_projection_lite(
+        auth=auth,
+        conn=conn,
+        view="review",
+        format_name=BehaviorProjectionFormat.HTML,
+    )
+
+
+@app.get("/v1/behavior/projections/review.html", response_class=HTMLResponse)
+def behavior_review_projection_html(
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> HTMLResponse:
+    response = behavior_review_projection(auth=auth, conn=conn)
+    return HTMLResponse(
+        content=response.content,
+        headers={
+            "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+                "form-action 'none'; frame-ancestors 'none'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+def _require_behavior_projection_pilot() -> None:
+    if not bool(getattr(settings, "behavior_projection_pilot_enabled", False)):
+        raise HTTPException(status_code=404, detail="behavior projection pilot is disabled")
+
+
+@app.post(
+    "/v1/behavior/projections/pilot/assign",
+    response_model=BehaviorPilotAssignmentResponse,
+)
+def assign_behavior_projection_pilot(
+    body: BehaviorPilotAssignmentRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorPilotAssignmentResponse:
+    _require_behavior_projection_pilot()
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="behavior_projection_pilot_assign", method="POST").inc()
+    raw_request = body.model_dump(mode="json")
+    sanitized, redaction_applied = sanitize_behavior_pilot_payload(raw_request)
+    if not isinstance(sanitized, dict):
+        raise HTTPException(status_code=422, detail="invalid behavior pilot request")
+    request_digest = behavior_pilot_outcome_digest(sanitized)
+    variant = assign_behavior_pilot_variant(
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        trial_key=str(sanitized["trial_key"]),
+        assignment_salt=str(getattr(settings, "behavior_pilot_assignment_salt", "tce-behavior-pilot-v1")),
+    )
+    started = time.perf_counter()
+    evidence = load_behavior_evidence_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        limit=5000,
+        eligible_only=True,
+    )
+    context = prepare_behavior_pilot_context(
+        evidence,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        request=sanitized,
+        variant=variant,
+    )
+    retrieval_latency_ms = int((time.perf_counter() - started) * 1000)
+    assigned_at = datetime.now(tz=UTC)
+    expires_at = assigned_at + timedelta(
+        days=max(1, int(getattr(settings, "behavior_pilot_assignment_ttl_days", 30)))
+    )
+    try:
+        assignment, inserted = create_or_get_behavior_pilot_assignment(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            owner_id=auth.user_id,
+            request=sanitized,
+            request_digest=request_digest,
+            variant=variant.value,
+            context_payload=dict(context["context_payload"]),
+            context_sha256=str(context["context_sha256"]),
+            source_revision=str(context["source_revision"]),
+            citations=[str(item) for item in context["citations"]],
+            injected_tokens=int(context["injected_tokens"]),
+            retrieval_latency_ms=retrieval_latency_ms,
+            redaction_applied=bool(redaction_applied),
+            assigned_at=assigned_at,
+            expires_at=expires_at,
+        )
+    except BehaviorPilotConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response = BehaviorPilotAssignmentResponse(
+        assignment_id=assignment["id"],
+        variant=assignment["variant"],
+        assigned_at=assignment["assigned_at"],
+        expires_at=assignment["expires_at"],
+        context_payload=assignment["context_payload"],
+        citations=assignment["citations"],
+        source_revision=assignment["source_revision"],
+        context_sha256=assignment["context_sha256"],
+        injected_tokens=assignment["injected_tokens"],
+        retrieval_latency_ms=assignment["retrieval_latency_ms"],
+    )
+    REQUEST_LATENCY.labels(endpoint="behavior_projection_pilot_assign", method="POST").observe(
+        retrieval_latency_ms / 1000
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_projection_pilot_assignment",
+        query={
+            "workspace_id": auth.workspace_id,
+            "behavior_subject_id": auth.behavior_subject_id,
+            "assignment_id": str(response.assignment_id),
+            "trial_key": sanitized["trial_key"],
+            "variant": response.variant.value,
+            "source_revision": response.source_revision,
+            "source_evidence_ids": [str(item) for item in response.citations],
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "role": auth.role.value,
+            "idempotent_replay": not inserted,
+            "projection_learning_eligible": False,
+            "redaction_applied": bool(redaction_applied),
+        },
+        latency_ms=retrieval_latency_ms,
+    )
+    return response
+
+
+@app.post(
+    "/v1/behavior/projections/pilot/outcome",
+    response_model=BehaviorPilotOutcomeResponse,
+)
+def report_behavior_projection_pilot_outcome(
+    body: BehaviorPilotOutcomeRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorPilotOutcomeResponse:
+    _require_behavior_projection_pilot()
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="behavior_projection_pilot_outcome", method="POST").inc()
+    sanitized, redaction_applied = sanitize_behavior_pilot_payload(body.model_dump(mode="json"))
+    if not isinstance(sanitized, dict):
+        raise HTTPException(status_code=422, detail="invalid behavior pilot outcome")
+    digest = behavior_pilot_outcome_digest(sanitized)
+    now = datetime.now(tz=UTC)
+    evidence = load_behavior_evidence_lite(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        limit=5000,
+        eligible_only=True,
+    )
+    active_ids = {
+        str(item.get("id"))
+        for item in eligible_behavior_evidence(evidence, at=now)
+        if item.get("id")
+    }
+    try:
+        outcome, inserted = record_behavior_pilot_outcome(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            reporter_id=auth.user_id,
+            assignment_id=str(body.assignment_id),
+            outcome=sanitized,
+            outcome_digest=digest,
+            active_evidence_ids=active_ids,
+            redaction_applied=bool(redaction_applied),
+            reported_at=now,
+        )
+    except BehaviorPilotNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (BehaviorPilotConflict, BehaviorPilotExpired) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    response = BehaviorPilotOutcomeResponse(
+        assignment_id=outcome["assignment_id"],
+        outcome_id=outcome["id"],
+        recorded=True,
+        stale_evidence_used=bool(outcome["stale_evidence_used"]),
+        reported_at=outcome["reported_at"],
+    )
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="behavior_projection_pilot_outcome",
+        query={
+            "workspace_id": auth.workspace_id,
+            "behavior_subject_id": auth.behavior_subject_id,
+            "assignment_id": str(response.assignment_id),
+            "outcome_id": str(response.outcome_id),
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "role": auth.role.value,
+            "idempotent_replay": not inserted,
+            "stale_evidence_used": response.stale_evidence_used,
+            "redaction_applied": bool(redaction_applied),
+            "promoted_to_behavior_evidence": False,
+        },
+        latency_ms=0,
+    )
+    return response
+
+
+@app.get(
+    "/v1/behavior/projections/pilot/status",
+    response_model=BehaviorPilotStatusResponse,
+)
+def behavior_projection_pilot_status(
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> BehaviorPilotStatusResponse:
+    _require_behavior_projection_pilot()
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="behavior_projection_pilot_status", method="GET").inc()
+    rows = list_behavior_pilot_rows(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+    )
+    status_payload = behavior_pilot_status(
+        rows,
+        min_window_days=max(1, int(getattr(settings, "behavior_pilot_min_window_days", 28))),
+        min_completed_per_arm=max(
+            1, int(getattr(settings, "behavior_pilot_min_completed_per_arm", 30))
+        ),
+        min_completion_coverage=float(
+            getattr(settings, "behavior_pilot_min_completion_coverage", 0.80)
+        ),
+        max_p95_retrieval_latency_ms=float(
+            getattr(settings, "behavior_pilot_max_p95_retrieval_latency_ms", 120.0)
+        ),
+        max_top1_degradation=float(
+            getattr(settings, "behavior_pilot_max_top1_degradation", 0.05)
+        ),
+    )
+    return BehaviorPilotStatusResponse.model_validate(status_payload)
 
 
 @app.post("/v1/behavior/predict", response_model=BehaviorPredictionResponse)

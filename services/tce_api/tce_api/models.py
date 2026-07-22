@@ -755,6 +755,95 @@ class BehaviorCounterfactual(Base):
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
 
 
+class BehaviorProjectionPilotAssignment(Base):
+    __tablename__ = "behavior_projection_pilot_assignments"
+    __table_args__ = (
+        Index(
+            "uq_behavior_projection_pilot_trial",
+            "workspace_id",
+            "subject_user_id",
+            "trial_key",
+            unique=True,
+        ),
+        Index(
+            "idx_behavior_projection_pilot_scope_assigned",
+            "workspace_id",
+            "subject_user_id",
+            "assigned_at",
+        ),
+        Index(
+            "idx_behavior_projection_pilot_variant_assigned",
+            "workspace_id",
+            "subject_user_id",
+            "variant",
+            "assigned_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    trial_key: Mapped[str] = mapped_column(TEXT, nullable=False)
+    request_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    variant: Mapped[str] = mapped_column(TEXT, nullable=False)
+    situation_type: Mapped[str] = mapped_column(TEXT, nullable=False)
+    situation_summary: Mapped[str] = mapped_column(TEXT, nullable=False)
+    objective_text: Mapped[str] = mapped_column(TEXT, nullable=False)
+    request_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    context_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    context_sha256: Mapped[str] = mapped_column(TEXT, nullable=False)
+    source_revision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    citations_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    injected_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retrieval_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class BehaviorProjectionPilotOutcome(Base):
+    __tablename__ = "behavior_projection_pilot_outcomes"
+    __table_args__ = (
+        Index("uq_behavior_projection_pilot_outcome", "assignment_id", unique=True),
+        Index(
+            "idx_behavior_projection_pilot_outcome_scope_reported",
+            "workspace_id",
+            "subject_user_id",
+            "reported_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    assignment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("behavior_projection_pilot_assignments.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    reporter_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    outcome_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    agent_choice: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    top3_choices_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    actual_choice: Mapped[str] = mapped_column(TEXT, nullable=False)
+    agent_confidence: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    abstained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    action_similarity: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    workflow_similarity: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    correction_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    outcome_regret: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    irrelevant_personalization: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    malicious_memory_activated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    stale_evidence_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    used_evidence_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    notes: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
 class BehavioralFingerprint(Base):
     __tablename__ = "behavioral_fingerprints"
 

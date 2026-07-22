@@ -228,6 +228,71 @@ def _ensure_behavior_fidelity_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_behavior_counterfactuals_scope_status
             ON behavior_counterfactuals (workspace_id, subject_user_id, status, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS behavior_projection_pilot_assignments (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            trial_key TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            variant TEXT NOT NULL,
+            situation_type TEXT NOT NULL,
+            situation_summary TEXT NOT NULL,
+            objective_text TEXT NOT NULL,
+            request_json TEXT NOT NULL DEFAULT '{}',
+            context_json TEXT NOT NULL DEFAULT '{}',
+            context_sha256 TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            injected_tokens INTEGER NOT NULL DEFAULT 0,
+            retrieval_latency_ms INTEGER NOT NULL DEFAULT 0,
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            assigned_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            UNIQUE(workspace_id, subject_user_id, trial_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_scope_assigned
+            ON behavior_projection_pilot_assignments (
+                workspace_id, subject_user_id, assigned_at DESC
+            );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_variant_assigned
+            ON behavior_projection_pilot_assignments (
+                workspace_id, subject_user_id, variant, assigned_at DESC
+            );
+
+        CREATE TABLE IF NOT EXISTS behavior_projection_pilot_outcomes (
+            id TEXT PRIMARY KEY,
+            assignment_id TEXT NOT NULL UNIQUE,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            reporter_id TEXT NOT NULL,
+            outcome_digest TEXT NOT NULL,
+            agent_choice TEXT,
+            top3_choices_json TEXT NOT NULL DEFAULT '[]',
+            actual_choice TEXT NOT NULL,
+            agent_confidence REAL NOT NULL DEFAULT 0.0,
+            abstained INTEGER NOT NULL DEFAULT 0,
+            action_similarity REAL NOT NULL DEFAULT 0.0,
+            workflow_similarity REAL NOT NULL DEFAULT 0.0,
+            correction_required INTEGER NOT NULL DEFAULT 0,
+            outcome_regret INTEGER NOT NULL DEFAULT 0,
+            irrelevant_personalization INTEGER NOT NULL DEFAULT 0,
+            malicious_memory_activated INTEGER NOT NULL DEFAULT 0,
+            stale_evidence_used INTEGER NOT NULL DEFAULT 0,
+            used_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            notes TEXT NOT NULL DEFAULT '',
+            redaction_applied INTEGER NOT NULL DEFAULT 0,
+            reported_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            FOREIGN KEY(assignment_id) REFERENCES behavior_projection_pilot_assignments(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_behavior_projection_pilot_outcome_scope_reported
+            ON behavior_projection_pilot_outcomes (
+                workspace_id, subject_user_id, reported_at DESC
+            );
         """
     )
     if not _column_exists(conn, "capability_grants", "completion_required"):

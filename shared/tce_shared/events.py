@@ -361,6 +361,33 @@ class BehaviorLifecycleStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class BehaviorProjectionFormat(StrEnum):
+    MARKDOWN = "markdown"
+    JSON = "json"
+    HTML = "html"
+
+
+class BehaviorProjectionView(StrEnum):
+    CURRENT = "current"
+    DECISIONS = "decisions"
+    EVIDENCE = "evidence"
+    REVIEW = "review"
+
+
+class BehaviorPilotVariant(StrEnum):
+    NO_MEMORY = "no_memory"
+    CANONICAL_STRUCTURED = "canonical_structured"
+    MARKDOWN_PROJECTION = "markdown_projection"
+    PROJECTION_INDEX = "projection_index"
+
+
+class BehaviorPilotStatus(StrEnum):
+    COLLECTING = "collecting"
+    READY_FOR_REVIEW = "ready_for_review"
+    FAILED_QUALITY = "failed_quality"
+    FAILED_SAFETY = "failed_safety"
+
+
 class AutonomyPolicyProfile(StrEnum):
     HUMAN_CONSULTATIVE = "human_consultative"
     HUMAN_SAFE = "human_safe"
@@ -950,6 +977,139 @@ class BehaviorEvidenceResponse(BaseModel):
     superseded_observation_id: UUID | None = None
     review_id: UUID | None = None
     shadow_prediction_id: UUID | None = None
+    schema_version: str = "v1"
+
+
+class BehaviorProjectionResponse(BaseModel):
+    projection_id: UUID
+    uri: str
+    view: BehaviorProjectionView
+    format: BehaviorProjectionFormat
+    topic: str | None = None
+    observation_id: str | None = None
+    mime_type: str
+    schema_version: str = "v1"
+    source_revision: str
+    content_sha256: str
+    generated_at: datetime
+    source_evidence_ids: list[UUID] = Field(default_factory=list)
+    trust_level: str
+    sensitivity: int = Field(default=1, ge=0, le=3)
+    read_only: bool = True
+    projection_learning_eligible: bool = False
+    expires_at: datetime | None = None
+    evidence_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    redaction_applied: bool = False
+    content: str
+
+
+class BehaviorPilotAssignmentRequest(BaseModel):
+    trial_key: str = Field(min_length=1, max_length=160)
+    situation_type: str = Field(default="routine_task", min_length=1, max_length=80)
+    situation_summary: str = Field(min_length=1, max_length=500)
+    objective: str = Field(min_length=1, max_length=500)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+    candidate_choices: list[str] = Field(default_factory=list, max_length=20)
+
+
+class BehaviorPilotAssignmentResponse(BaseModel):
+    assignment_id: UUID
+    variant: BehaviorPilotVariant
+    assigned_at: datetime
+    expires_at: datetime
+    context_payload: dict[str, Any] = Field(default_factory=dict)
+    citations: list[UUID] = Field(default_factory=list)
+    source_revision: str
+    context_sha256: str
+    injected_tokens: int = Field(default=0, ge=0)
+    retrieval_latency_ms: int = Field(default=0, ge=0)
+    projection_learning_eligible: bool = False
+    schema_version: str = "v1"
+
+
+class BehaviorPilotOutcomeRequest(BaseModel):
+    assignment_id: UUID
+    agent_choice: str | None = Field(default=None, max_length=500)
+    top3_choices: list[str] = Field(default_factory=list, max_length=3)
+    actual_choice: str = Field(min_length=1, max_length=500)
+    agent_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    abstained: bool = False
+    action_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    workflow_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    correction_required: bool = False
+    outcome_regret: bool = False
+    irrelevant_personalization: bool = False
+    malicious_memory_activated: bool = False
+    used_evidence_ids: list[UUID] = Field(default_factory=list, max_length=40)
+    notes: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_pilot_outcome(self) -> BehaviorPilotOutcomeRequest:
+        if not self.abstained and not str(self.agent_choice or "").strip():
+            raise ValueError("agent_choice is required unless abstained=true")
+        return self
+
+
+class BehaviorPilotOutcomeResponse(BaseModel):
+    assignment_id: UUID
+    outcome_id: UUID
+    recorded: bool
+    stale_evidence_used: bool = False
+    reported_at: datetime
+    schema_version: str = "v1"
+
+
+class BehaviorPilotArmMetrics(BaseModel):
+    variant: BehaviorPilotVariant
+    assignment_count: int = 0
+    completed_count: int = 0
+    completion_rate: float = 0.0
+    top1_agreement: float | None = None
+    top3_agreement: float | None = None
+    non_abstained_precision: float | None = None
+    calibration_brier: float | None = None
+    mean_action_similarity: float | None = None
+    mean_workflow_similarity: float | None = None
+    stale_memory_use_rate: float | None = None
+    irrelevant_personalization_rate: float | None = None
+    correction_rate: float | None = None
+    outcome_regret_rate: float | None = None
+    malicious_activation_rate: float | None = None
+    median_injected_tokens: float | None = None
+    p95_injected_tokens: float | None = None
+    median_retrieval_latency_ms: float | None = None
+    p95_retrieval_latency_ms: float | None = None
+
+
+class BehaviorPilotGate(BaseModel):
+    min_window_days: int = 28
+    min_completed_per_arm: int = 30
+    min_completion_coverage: float = 0.80
+    max_p95_retrieval_latency_ms: float = 120.0
+    max_top1_degradation: float = 0.05
+    elapsed_days: float = 0.0
+    window_complete: bool = False
+    sample_complete: bool = False
+    coverage_complete: bool = False
+    latency_passed: bool = False
+    quality_passed: bool = False
+    safety_passed: bool = True
+    evaluation_ready: bool = False
+    reasons: list[str] = Field(default_factory=list)
+
+
+class BehaviorPilotStatusResponse(BaseModel):
+    status: BehaviorPilotStatus
+    started_at: datetime | None = None
+    latest_outcome_at: datetime | None = None
+    assignment_count: int = 0
+    completed_count: int = 0
+    completion_rate: float = 0.0
+    arms: list[BehaviorPilotArmMetrics] = Field(default_factory=list)
+    gate: BehaviorPilotGate = Field(default_factory=BehaviorPilotGate)
+    generated_at: datetime
     schema_version: str = "v1"
 
 

@@ -324,6 +324,7 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
                 "DELETE FROM behavior_memory_reviews WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff",
                 "DELETE FROM behavior_counterfactuals WHERE resolved_at IS NOT NULL AND resolved_at < :cutoff",
                 "DELETE FROM behavior_process_models WHERE status = 'rejected' AND updated_at < :cutoff",
+                "DELETE FROM behavior_projection_pilot_assignments WHERE assigned_at < :cutoff",
             ):
                 deleted = db.execute(text(statement), {"cutoff": behavior_cutoff})
                 behavior_deleted += int(getattr(deleted, "rowcount", 0) or 0)

@@ -2037,6 +2037,640 @@
         "title": "BehaviorMemoryClass",
         "type": "string"
       },
+      "BehaviorPilotArmMetrics": {
+        "properties": {
+          "assignment_count": {
+            "default": 0,
+            "title": "Assignment Count",
+            "type": "integer"
+          },
+          "calibration_brier": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calibration Brier"
+          },
+          "completed_count": {
+            "default": 0,
+            "title": "Completed Count",
+            "type": "integer"
+          },
+          "completion_rate": {
+            "default": 0.0,
+            "title": "Completion Rate",
+            "type": "number"
+          },
+          "correction_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correction Rate"
+          },
+          "irrelevant_personalization_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Irrelevant Personalization Rate"
+          },
+          "malicious_activation_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Malicious Activation Rate"
+          },
+          "mean_action_similarity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Action Similarity"
+          },
+          "mean_workflow_similarity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Workflow Similarity"
+          },
+          "median_injected_tokens": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Injected Tokens"
+          },
+          "median_retrieval_latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Retrieval Latency Ms"
+          },
+          "non_abstained_precision": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Non Abstained Precision"
+          },
+          "outcome_regret_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome Regret Rate"
+          },
+          "p95_injected_tokens": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Injected Tokens"
+          },
+          "p95_retrieval_latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Retrieval Latency Ms"
+          },
+          "stale_memory_use_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stale Memory Use Rate"
+          },
+          "top1_agreement": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top1 Agreement"
+          },
+          "top3_agreement": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top3 Agreement"
+          },
+          "variant": {
+            "$ref": "#/components/schemas/BehaviorPilotVariant"
+          }
+        },
+        "required": [
+          "variant"
+        ],
+        "title": "BehaviorPilotArmMetrics",
+        "type": "object"
+      },
+      "BehaviorPilotAssignmentRequest": {
+        "properties": {
+          "candidate_choices": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 20,
+            "title": "Candidate Choices",
+            "type": "array"
+          },
+          "constraints": {
+            "additionalProperties": true,
+            "title": "Constraints",
+            "type": "object"
+          },
+          "context_snapshot": {
+            "additionalProperties": true,
+            "title": "Context Snapshot",
+            "type": "object"
+          },
+          "objective": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "situation_summary": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Situation Summary",
+            "type": "string"
+          },
+          "situation_type": {
+            "default": "routine_task",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Situation Type",
+            "type": "string"
+          },
+          "trial_key": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Trial Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trial_key",
+          "situation_summary",
+          "objective"
+        ],
+        "title": "BehaviorPilotAssignmentRequest",
+        "type": "object"
+      },
+      "BehaviorPilotAssignmentResponse": {
+        "properties": {
+          "assigned_at": {
+            "format": "date-time",
+            "title": "Assigned At",
+            "type": "string"
+          },
+          "assignment_id": {
+            "format": "uuid",
+            "title": "Assignment Id",
+            "type": "string"
+          },
+          "citations": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Citations",
+            "type": "array"
+          },
+          "context_payload": {
+            "additionalProperties": true,
+            "title": "Context Payload",
+            "type": "object"
+          },
+          "context_sha256": {
+            "title": "Context Sha256",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "injected_tokens": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Injected Tokens",
+            "type": "integer"
+          },
+          "projection_learning_eligible": {
+            "default": false,
+            "title": "Projection Learning Eligible",
+            "type": "boolean"
+          },
+          "retrieval_latency_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Retrieval Latency Ms",
+            "type": "integer"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "source_revision": {
+            "title": "Source Revision",
+            "type": "string"
+          },
+          "variant": {
+            "$ref": "#/components/schemas/BehaviorPilotVariant"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "variant",
+          "assigned_at",
+          "expires_at",
+          "source_revision",
+          "context_sha256"
+        ],
+        "title": "BehaviorPilotAssignmentResponse",
+        "type": "object"
+      },
+      "BehaviorPilotGate": {
+        "properties": {
+          "coverage_complete": {
+            "default": false,
+            "title": "Coverage Complete",
+            "type": "boolean"
+          },
+          "elapsed_days": {
+            "default": 0.0,
+            "title": "Elapsed Days",
+            "type": "number"
+          },
+          "evaluation_ready": {
+            "default": false,
+            "title": "Evaluation Ready",
+            "type": "boolean"
+          },
+          "latency_passed": {
+            "default": false,
+            "title": "Latency Passed",
+            "type": "boolean"
+          },
+          "max_p95_retrieval_latency_ms": {
+            "default": 120.0,
+            "title": "Max P95 Retrieval Latency Ms",
+            "type": "number"
+          },
+          "max_top1_degradation": {
+            "default": 0.05,
+            "title": "Max Top1 Degradation",
+            "type": "number"
+          },
+          "min_completed_per_arm": {
+            "default": 30,
+            "title": "Min Completed Per Arm",
+            "type": "integer"
+          },
+          "min_completion_coverage": {
+            "default": 0.8,
+            "title": "Min Completion Coverage",
+            "type": "number"
+          },
+          "min_window_days": {
+            "default": 28,
+            "title": "Min Window Days",
+            "type": "integer"
+          },
+          "quality_passed": {
+            "default": false,
+            "title": "Quality Passed",
+            "type": "boolean"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "safety_passed": {
+            "default": true,
+            "title": "Safety Passed",
+            "type": "boolean"
+          },
+          "sample_complete": {
+            "default": false,
+            "title": "Sample Complete",
+            "type": "boolean"
+          },
+          "window_complete": {
+            "default": false,
+            "title": "Window Complete",
+            "type": "boolean"
+          }
+        },
+        "title": "BehaviorPilotGate",
+        "type": "object"
+      },
+      "BehaviorPilotOutcomeRequest": {
+        "properties": {
+          "abstained": {
+            "default": false,
+            "title": "Abstained",
+            "type": "boolean"
+          },
+          "action_similarity": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Action Similarity",
+            "type": "number"
+          },
+          "actual_choice": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Actual Choice",
+            "type": "string"
+          },
+          "agent_choice": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Choice"
+          },
+          "agent_confidence": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Agent Confidence",
+            "type": "number"
+          },
+          "assignment_id": {
+            "format": "uuid",
+            "title": "Assignment Id",
+            "type": "string"
+          },
+          "correction_required": {
+            "default": false,
+            "title": "Correction Required",
+            "type": "boolean"
+          },
+          "irrelevant_personalization": {
+            "default": false,
+            "title": "Irrelevant Personalization",
+            "type": "boolean"
+          },
+          "malicious_memory_activated": {
+            "default": false,
+            "title": "Malicious Memory Activated",
+            "type": "boolean"
+          },
+          "notes": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Notes",
+            "type": "string"
+          },
+          "outcome_regret": {
+            "default": false,
+            "title": "Outcome Regret",
+            "type": "boolean"
+          },
+          "top3_choices": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 3,
+            "title": "Top3 Choices",
+            "type": "array"
+          },
+          "used_evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Used Evidence Ids",
+            "type": "array"
+          },
+          "workflow_similarity": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Workflow Similarity",
+            "type": "number"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "actual_choice"
+        ],
+        "title": "BehaviorPilotOutcomeRequest",
+        "type": "object"
+      },
+      "BehaviorPilotOutcomeResponse": {
+        "properties": {
+          "assignment_id": {
+            "format": "uuid",
+            "title": "Assignment Id",
+            "type": "string"
+          },
+          "outcome_id": {
+            "format": "uuid",
+            "title": "Outcome Id",
+            "type": "string"
+          },
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          },
+          "reported_at": {
+            "format": "date-time",
+            "title": "Reported At",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "stale_evidence_used": {
+            "default": false,
+            "title": "Stale Evidence Used",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "assignment_id",
+          "outcome_id",
+          "recorded",
+          "reported_at"
+        ],
+        "title": "BehaviorPilotOutcomeResponse",
+        "type": "object"
+      },
+      "BehaviorPilotStatus": {
+        "enum": [
+          "collecting",
+          "ready_for_review",
+          "failed_quality",
+          "failed_safety"
+        ],
+        "title": "BehaviorPilotStatus",
+        "type": "string"
+      },
+      "BehaviorPilotStatusResponse": {
+        "properties": {
+          "arms": {
+            "items": {
+              "$ref": "#/components/schemas/BehaviorPilotArmMetrics"
+            },
+            "title": "Arms",
+            "type": "array"
+          },
+          "assignment_count": {
+            "default": 0,
+            "title": "Assignment Count",
+            "type": "integer"
+          },
+          "completed_count": {
+            "default": 0,
+            "title": "Completed Count",
+            "type": "integer"
+          },
+          "completion_rate": {
+            "default": 0.0,
+            "title": "Completion Rate",
+            "type": "number"
+          },
+          "gate": {
+            "$ref": "#/components/schemas/BehaviorPilotGate"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "latest_outcome_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Outcome At"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BehaviorPilotStatus"
+          }
+        },
+        "required": [
+          "status",
+          "generated_at"
+        ],
+        "title": "BehaviorPilotStatusResponse",
+        "type": "object"
+      },
+      "BehaviorPilotVariant": {
+        "enum": [
+          "no_memory",
+          "canonical_structured",
+          "markdown_projection",
+          "projection_index"
+        ],
+        "title": "BehaviorPilotVariant",
+        "type": "string"
+      },
       "BehaviorPredictionRequest": {
         "properties": {
           "candidate_choices": {
@@ -2190,6 +2824,163 @@
         },
         "title": "BehaviorPredictionResponse",
         "type": "object"
+      },
+      "BehaviorProjectionFormat": {
+        "enum": [
+          "markdown",
+          "json",
+          "html"
+        ],
+        "title": "BehaviorProjectionFormat",
+        "type": "string"
+      },
+      "BehaviorProjectionResponse": {
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "content_sha256": {
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "evidence_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Evidence Count",
+            "type": "integer"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "format": {
+            "$ref": "#/components/schemas/BehaviorProjectionFormat"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "mime_type": {
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "observation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation Id"
+          },
+          "projection_id": {
+            "format": "uuid",
+            "title": "Projection Id",
+            "type": "string"
+          },
+          "projection_learning_eligible": {
+            "default": false,
+            "title": "Projection Learning Eligible",
+            "type": "boolean"
+          },
+          "read_only": {
+            "default": true,
+            "title": "Read Only",
+            "type": "boolean"
+          },
+          "redaction_applied": {
+            "default": false,
+            "title": "Redaction Applied",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "sensitivity": {
+            "default": 1,
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Sensitivity",
+            "type": "integer"
+          },
+          "source_evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Source Evidence Ids",
+            "type": "array"
+          },
+          "source_revision": {
+            "title": "Source Revision",
+            "type": "string"
+          },
+          "topic": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topic"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "trust_level": {
+            "title": "Trust Level",
+            "type": "string"
+          },
+          "uri": {
+            "title": "Uri",
+            "type": "string"
+          },
+          "view": {
+            "$ref": "#/components/schemas/BehaviorProjectionView"
+          }
+        },
+        "required": [
+          "projection_id",
+          "uri",
+          "view",
+          "format",
+          "mime_type",
+          "source_revision",
+          "content_sha256",
+          "generated_at",
+          "trust_level",
+          "content"
+        ],
+        "title": "BehaviorProjectionResponse",
+        "type": "object"
+      },
+      "BehaviorProjectionView": {
+        "enum": [
+          "current",
+          "decisions",
+          "evidence",
+          "review"
+        ],
+        "title": "BehaviorProjectionView",
+        "type": "string"
       },
       "BehaviorShadowPredictionItem": {
         "properties": {
@@ -10665,6 +11456,1080 @@
           }
         },
         "summary": "Mine Behavior Processes"
+      }
+    },
+    "/v1/behavior/projections/current": {
+      "get": {
+        "operationId": "current_behavior_projection_v1_behavior_projections_current_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BehaviorProjectionFormat",
+              "default": "markdown"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Current Behavior Projection"
+      }
+    },
+    "/v1/behavior/projections/decisions/{topic}": {
+      "get": {
+        "operationId": "behavior_decisions_projection_v1_behavior_projections_decisions__topic__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "topic",
+            "required": true,
+            "schema": {
+              "title": "Topic",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BehaviorProjectionFormat",
+              "default": "markdown"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Behavior Decisions Projection"
+      }
+    },
+    "/v1/behavior/projections/evidence/{observation_id}": {
+      "get": {
+        "operationId": "behavior_evidence_projection_v1_behavior_projections_evidence__observation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "observation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Observation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BehaviorProjectionFormat",
+              "default": "json"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Behavior Evidence Projection"
+      }
+    },
+    "/v1/behavior/projections/pilot/assign": {
+      "post": {
+        "operationId": "assign_behavior_projection_pilot_v1_behavior_projections_pilot_assign_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BehaviorPilotAssignmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorPilotAssignmentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Assign Behavior Projection Pilot"
+      }
+    },
+    "/v1/behavior/projections/pilot/outcome": {
+      "post": {
+        "operationId": "report_behavior_projection_pilot_outcome_v1_behavior_projections_pilot_outcome_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BehaviorPilotOutcomeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorPilotOutcomeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Behavior Projection Pilot Outcome"
+      }
+    },
+    "/v1/behavior/projections/pilot/status": {
+      "get": {
+        "operationId": "behavior_projection_pilot_status_v1_behavior_projections_pilot_status_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorPilotStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Behavior Projection Pilot Status"
+      }
+    },
+    "/v1/behavior/projections/review": {
+      "get": {
+        "operationId": "behavior_review_projection_v1_behavior_projections_review_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BehaviorProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Behavior Review Projection"
+      }
+    },
+    "/v1/behavior/projections/review.html": {
+      "get": {
+        "operationId": "behavior_review_projection_html_v1_behavior_projections_review_html_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Behavior Review Projection Html"
       }
     },
     "/v1/behavior/reviews": {

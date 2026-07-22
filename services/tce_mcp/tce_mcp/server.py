@@ -5,9 +5,76 @@ import os
 from mcp.server.fastmcp import FastMCP
 
 from . import tools
+from .config import get_settings
 from .otel import setup_otel
 
 mcp = FastMCP("tce")
+
+
+def _require_behavior_resource_scope(workspace_id: str, subject_id: str) -> None:
+    settings = get_settings()
+    if workspace_id != settings.mcp_workspace_id or subject_id != settings.mcp_effective_behavior_subject_id:
+        raise ValueError("behavior resource scope does not match the authenticated MCP identity")
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/current.md",
+    name="Current behavioral evidence",
+    description="Deterministic read-only Markdown projection over active canonical behavior evidence",
+    mime_type="text/markdown",
+)
+def current_behavior_markdown(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_current_behavior_projection(format_name="markdown")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/current.json",
+    name="Current behavioral evidence (JSON)",
+    description="Deterministic read-only JSON projection over active canonical behavior evidence",
+    mime_type="application/json",
+)
+def current_behavior_json(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_current_behavior_projection(format_name="json")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/review.html",
+    name="Behavioral evidence review",
+    description="Sanitized read-only HTML review of active and historical canonical behavior evidence",
+    mime_type="text/html",
+)
+def behavior_review_html(workspace_id: str, subject_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_behavior_review_projection()["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/decisions/{topic}.md",
+    name="Behavioral decisions by topic",
+    description="Read-only Markdown projection of active canonical behavior evidence matching a topic",
+    mime_type="text/markdown",
+)
+def behavior_decisions_markdown(workspace_id: str, subject_id: str, topic: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(tools.get_behavior_decisions_projection(topic=topic, format_name="markdown")["content"])
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/behavior/{subject_id}/evidence/{observation_id}.json",
+    name="Behavioral evidence citation",
+    description="Read-only JSON projection of one canonical behavior evidence record",
+    mime_type="application/json",
+)
+def behavior_evidence_json(workspace_id: str, subject_id: str, observation_id: str) -> str:
+    _require_behavior_resource_scope(workspace_id, subject_id)
+    return str(
+        tools.get_behavior_evidence_projection(
+            observation_id=observation_id,
+            format_name="json",
+        )["content"]
+    )
 
 
 @mcp.tool(name="tce.search_events", description="Search timeline events with filters and citations")
@@ -350,6 +417,76 @@ def run_behavior_fidelity_eval(
 @mcp.tool(name="tce.get_behavior_fidelity", description="List behavior fidelity evaluation history and gates")
 def get_behavior_fidelity(limit: int = 20) -> dict:
     return tools.get_behavior_fidelity(limit=limit)
+
+
+@mcp.tool(
+    name="tce.assign_behavior_projection_pilot",
+    description="Assign one idempotent prospective behavior-memory comparison arm",
+)
+def assign_behavior_projection_pilot(
+    trial_key: str,
+    situation_summary: str,
+    objective: str,
+    situation_type: str = "routine_task",
+    constraints: dict | None = None,
+    context_snapshot: dict | None = None,
+    candidate_choices: list[str] | None = None,
+) -> dict:
+    return tools.assign_behavior_projection_pilot(
+        trial_key=trial_key,
+        situation_summary=situation_summary,
+        objective=objective,
+        situation_type=situation_type,
+        constraints=constraints,
+        context_snapshot=context_snapshot,
+        candidate_choices=candidate_choices,
+    )
+
+
+@mcp.tool(
+    name="tce.report_behavior_projection_pilot_outcome",
+    description="Report held-out choice, quality, correction, safety, and evidence-use outcomes for a pilot assignment",
+)
+def report_behavior_projection_pilot_outcome(
+    assignment_id: str,
+    actual_choice: str,
+    agent_choice: str | None = None,
+    top3_choices: list[str] | None = None,
+    agent_confidence: float = 0.0,
+    abstained: bool = False,
+    action_similarity: float = 0.0,
+    workflow_similarity: float = 0.0,
+    correction_required: bool = False,
+    outcome_regret: bool = False,
+    irrelevant_personalization: bool = False,
+    malicious_memory_activated: bool = False,
+    used_evidence_ids: list[str] | None = None,
+    notes: str = "",
+) -> dict:
+    return tools.report_behavior_projection_pilot_outcome(
+        assignment_id=assignment_id,
+        actual_choice=actual_choice,
+        agent_choice=agent_choice,
+        top3_choices=top3_choices,
+        agent_confidence=agent_confidence,
+        abstained=abstained,
+        action_similarity=action_similarity,
+        workflow_similarity=workflow_similarity,
+        correction_required=correction_required,
+        outcome_regret=outcome_regret,
+        irrelevant_personalization=irrelevant_personalization,
+        malicious_memory_activated=malicious_memory_activated,
+        used_evidence_ids=used_evidence_ids,
+        notes=notes,
+    )
+
+
+@mcp.tool(
+    name="tce.get_behavior_projection_pilot_status",
+    description="Get four-arm prospective projection metrics and pre-registered rollout gates",
+)
+def get_behavior_projection_pilot_status() -> dict:
+    return tools.get_behavior_projection_pilot_status()
 
 
 @mcp.tool(name="tce.get_behavior_calibration", description="List optional cold-start behavior calibration scenarios")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, cast
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -253,6 +254,58 @@ class TCEApiClient:
 
     def get_behavior_evaluations(self, limit: int = 20) -> dict[str, Any]:
         response = self._get("/v1/behavior/evaluations", params={"limit": limit})
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_current_behavior_projection(self, format_name: str = "markdown") -> dict[str, Any]:
+        response = self._get(
+            "/v1/behavior/projections/current",
+            params={"format": format_name},
+        )
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_decisions_projection(
+        self,
+        topic: str,
+        format_name: str = "markdown",
+    ) -> dict[str, Any]:
+        response = self._get(
+            f"/v1/behavior/projections/decisions/{quote(topic, safe='')}",
+            params={"format": format_name},
+        )
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_evidence_projection(
+        self,
+        observation_id: str,
+        format_name: str = "json",
+    ) -> dict[str, Any]:
+        response = self._get(
+            f"/v1/behavior/projections/evidence/{quote(observation_id, safe='')}",
+            params={"format": format_name},
+        )
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_review_projection(self) -> dict[str, Any]:
+        response = self._get("/v1/behavior/projections/review")
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def assign_behavior_projection_pilot(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/projections/pilot/assign", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def report_behavior_projection_pilot_outcome(self, body: dict[str, Any]) -> dict[str, Any]:
+        response = self._post("/v1/behavior/projections/pilot/outcome", body)
+        response.raise_for_status()
+        return self._json_dict(response)
+
+    def get_behavior_projection_pilot_status(self) -> dict[str, Any]:
+        response = self._get("/v1/behavior/projections/pilot/status")
         response.raise_for_status()
         return self._json_dict(response)
 

@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     clone_user_name: str = "User"
     behavior_evidence_enabled: bool = True
     behavior_fidelity_enabled: bool = True
+    behavior_projections_enabled: bool = False
+    behavior_projection_pilot_enabled: bool = False
+    behavior_pilot_assignment_salt: str = "tce-behavior-pilot-v1"
+    behavior_pilot_assignment_ttl_days: int = 30
+    behavior_pilot_min_window_days: int = 28
+    behavior_pilot_min_completed_per_arm: int = 30
+    behavior_pilot_min_completion_coverage: float = 0.80
+    behavior_pilot_max_p95_retrieval_latency_ms: float = 120.0
+    behavior_pilot_max_top1_degradation: float = 0.05
     behavior_prediction_enabled: bool = True
     behavior_calibration_enabled: bool = False
     behavior_autonomy_gate_enabled: bool = False

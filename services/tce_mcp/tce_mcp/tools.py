@@ -845,6 +845,108 @@ def get_behavior_fidelity(limit: int = 20) -> dict[str, Any]:
     return with_schema({"kind": "behavior_fidelity_history", "result": result, "citations": []})
 
 
+def get_current_behavior_projection(format_name: str = "markdown") -> dict[str, Any]:
+    return client.get_current_behavior_projection(format_name=format_name)
+
+
+def get_behavior_decisions_projection(topic: str, format_name: str = "markdown") -> dict[str, Any]:
+    return client.get_behavior_decisions_projection(topic=topic, format_name=format_name)
+
+
+def get_behavior_evidence_projection(observation_id: str, format_name: str = "json") -> dict[str, Any]:
+    return client.get_behavior_evidence_projection(
+        observation_id=observation_id,
+        format_name=format_name,
+    )
+
+
+def get_behavior_review_projection() -> dict[str, Any]:
+    return client.get_behavior_review_projection()
+
+
+def assign_behavior_projection_pilot(
+    trial_key: str,
+    situation_summary: str,
+    objective: str,
+    situation_type: str = "routine_task",
+    constraints: dict[str, Any] | None = None,
+    context_snapshot: dict[str, Any] | None = None,
+    candidate_choices: list[str] | None = None,
+) -> dict[str, Any]:
+    result = client.assign_behavior_projection_pilot(
+        {
+            "trial_key": trial_key,
+            "situation_type": situation_type,
+            "situation_summary": situation_summary,
+            "objective": objective,
+            "constraints": constraints or {},
+            "context_snapshot": context_snapshot or {},
+            "candidate_choices": candidate_choices or [],
+        }
+    )
+    return with_schema(
+        {
+            "kind": "behavior_projection_pilot_assignment",
+            "result": result,
+            "citations": list(result.get("citations") or []),
+        }
+    )
+
+
+def report_behavior_projection_pilot_outcome(
+    assignment_id: str,
+    actual_choice: str,
+    agent_choice: str | None = None,
+    top3_choices: list[str] | None = None,
+    agent_confidence: float = 0.0,
+    abstained: bool = False,
+    action_similarity: float = 0.0,
+    workflow_similarity: float = 0.0,
+    correction_required: bool = False,
+    outcome_regret: bool = False,
+    irrelevant_personalization: bool = False,
+    malicious_memory_activated: bool = False,
+    used_evidence_ids: list[str] | None = None,
+    notes: str = "",
+) -> dict[str, Any]:
+    result = client.report_behavior_projection_pilot_outcome(
+        {
+            "assignment_id": assignment_id,
+            "agent_choice": agent_choice,
+            "top3_choices": top3_choices or [],
+            "actual_choice": actual_choice,
+            "agent_confidence": agent_confidence,
+            "abstained": abstained,
+            "action_similarity": action_similarity,
+            "workflow_similarity": workflow_similarity,
+            "correction_required": correction_required,
+            "outcome_regret": outcome_regret,
+            "irrelevant_personalization": irrelevant_personalization,
+            "malicious_memory_activated": malicious_memory_activated,
+            "used_evidence_ids": used_evidence_ids or [],
+            "notes": notes,
+        }
+    )
+    return with_schema(
+        {
+            "kind": "behavior_projection_pilot_outcome",
+            "result": result,
+            "citations": list(used_evidence_ids or []),
+        }
+    )
+
+
+def get_behavior_projection_pilot_status() -> dict[str, Any]:
+    result = client.get_behavior_projection_pilot_status()
+    return with_schema(
+        {
+            "kind": "behavior_projection_pilot_status",
+            "result": result,
+            "citations": [],
+        }
+    )
+
+
 def get_behavior_calibration() -> dict[str, Any]:
     result = client.get_behavior_calibration_scenarios()
     return with_schema({"kind": "behavior_calibration_scenarios", "result": result, "citations": []})

@@ -339,6 +339,17 @@ def _eligible_evidence_rows(
     return [row for row in active if str(row.get("id") or "") not in contradicted_ids]
 
 
+def eligible_behavior_evidence(
+    evidence_rows: Iterable[dict[str, Any]],
+    *,
+    at: datetime | None = None,
+    historical: bool = False,
+) -> list[dict[str, Any]]:
+    """Return evidence that is currently eligible to influence behavior."""
+
+    return _eligible_evidence_rows(evidence_rows, at=at, historical=historical)
+
+
 def _similarity(query: dict[str, Any], evidence: dict[str, Any], *, newest_ts: datetime) -> float:
     query_tokens = _tokens(_evidence_text(query))
     evidence_tokens = _tokens(_evidence_text(evidence))
