@@ -9,8 +9,13 @@ on:
 jobs:
   python-quality:
     strategy:
+      # Independent legs: one OS failing must not cancel the others.
+      fail-fast: false
+      # OTE is a Linux/Docker-deployed backend; it does not ship on Windows, and
+      # the unit tests assume POSIX (paths, /tmp, line endings). Test on the two
+      # Unix targets and drop the Windows leg, which only produced false failures.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
