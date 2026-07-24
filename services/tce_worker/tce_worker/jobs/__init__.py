@@ -1,15 +1,15 @@
-from .compaction import run as run_compaction
 from .archive_events import run as run_archive_events
-from .episode_extraction import run as run_episode_extraction
+from .compaction import run as run_compaction
 from .embed_observations import run as run_embed_observations
 from .embedding import run as run_embedding
+from .episode_extraction import run as run_episode_extraction
+from .graph_health import run as run_graph_health
+from .patterns import run as run_patterns
+from .qdrant_sync import run as run_qdrant_sync
 from .reflection import run as run_reflection
 from .semantic_consolidation import run as run_semantic_consolidation
-from .qdrant_sync import run as run_qdrant_sync
-from .patterns import run as run_patterns
 from .validation import run as run_validation
 from .workflow import run as run_workflow
-from .graph_health import run as run_graph_health
 
 __all__ = [
     "run_embedding",

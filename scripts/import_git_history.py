@@ -106,7 +106,10 @@ def ingest_events(
         timeout=60,
     )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("batch ingest returned a non-object response")
+    return payload
 
 
 def main() -> None:

@@ -16,6 +16,9 @@ echo
 
 STACK_MODE="full"
 STACK_SET_BY_ARG="false"
+RUNTIME_PROFILE=""
+RUNTIME_PROFILE_SET_BY_ARG="false"
+ENV_CREATED_THIS_RUN="false"
 OPERATION_MODE="timeline_only"
 OPERATION_SET_BY_ARG="false"
 SETUP_MODE="setup"
@@ -68,15 +71,20 @@ MAINTENANCE_CRON_MARKER="# open-timeline-engine-maintenance"
 MAINTENANCE_CRON_DEFAULT_EXPR="17 3 * * 0"
 AUTONOMY_TICK_CRON_MARKER="# open-timeline-engine-autonomy-tick"
 AUTONOMY_TICK_CRON_DEFAULT_EXPR="*/5 * * * *"
+BACKUP_CRON_MARKER="# open-timeline-engine-backup"
+BACKUP_CRON_DEFAULT_EXPR="30 2 * * *"
+BACKUP_RETENTION_DAYS_DEFAULT="14"
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/install.sh [install|restart|stop|remove|doctor|fix|backup|restore] [full|lite|all|auto] [--yes]
-       ./scripts/install.sh [install|restart|stop|remove|doctor|fix|backup|restore] [full|lite|all|auto] [--behavior timeline_only|clone_advisor] [--setup-mode setup|env] [--yes] [--remove-policy] [--backup-file <path>]
+       ./scripts/install.sh [install|restart|stop|remove|doctor|fix|backup|restore] [full|lite|all|auto] [--profile local-lite|local-full|team-secure|research] [--behavior timeline_only|clone_advisor] [--setup-mode setup|env] [--yes] [--remove-policy] [--backup-file <path>]
 
 Examples:
   ./scripts/install.sh
   ./scripts/install.sh install full
+  ./scripts/install.sh install full --profile local-full
+  ./scripts/install.sh install full --profile team-secure
   ./scripts/install.sh restart full
   ./scripts/install.sh install full --behavior clone_advisor --yes
   ./scripts/install.sh install full --setup-mode env --yes
@@ -122,6 +130,19 @@ while [ $# -gt 0 ]; do
       ;;
     -y|--yes)
       ASSUME_YES="true"
+      ;;
+    --profile)
+      RUNTIME_PROFILE="${2:-}"
+      case "$RUNTIME_PROFILE" in
+        local-lite|local-full|team-secure|research)
+          ;;
+        *)
+          echo "Invalid runtime profile: ${RUNTIME_PROFILE:-<empty>}" >&2
+          exit 1
+          ;;
+      esac
+      RUNTIME_PROFILE_SET_BY_ARG="true"
+      shift
       ;;
     --remove-policy)
       REMOVE_WORKSPACE_POLICY="true"
@@ -196,6 +217,9 @@ set_env_key() {
 }
 
 backup_env() {
+  if [ -n "${ENV_BACKUP:-}" ]; then
+    return
+  fi
   if [ -f "$ENV_FILE" ]; then
     local backup="${ENV_FILE}.backup.$(date +%s)"
     cp "$ENV_FILE" "$backup"
@@ -866,6 +890,51 @@ remove_maintenance_cron() {
   return 0
 }
 
+ensure_backup_cron() {
+  # Opt-in nightly backup via scripts/db_backup.sh (the path that actually
+  # works against the named-volume stack), with retention pruning.
+  if [ ! -x "${ROOT}/scripts/db_backup.sh" ]; then
+    echo "Warning: scripts/db_backup.sh missing or not executable."
+    return 1
+  fi
+  if ! command -v crontab >/dev/null 2>&1; then
+    echo "Warning: crontab not found. Schedule ${ROOT}/scripts/db_backup.sh manually."
+    return 1
+  fi
+
+  local schedule retention prune_cmd cron_line existing filtered
+  schedule="${TCE_BACKUP_CRON:-$BACKUP_CRON_DEFAULT_EXPR}"
+  retention="${TCE_BACKUP_RETENTION_DAYS:-$BACKUP_RETENTION_DAYS_DEFAULT}"
+  prune_cmd="find \"${ROOT}/backups/manual\" -type f -name 'tce_*' -mtime +${retention} -delete"
+  cron_line="${schedule} cd \"${ROOT}\" && bash \"${ROOT}/scripts/db_backup.sh\" --reason nightly && ${prune_cmd} >> \"${ROOT}/install.log\" 2>&1 ${BACKUP_CRON_MARKER}"
+
+  existing="$(crontab -l 2>/dev/null || true)"
+  filtered="$(printf '%s\n' "$existing" | grep -Fv "$BACKUP_CRON_MARKER" || true)"
+  if [ -n "$filtered" ]; then
+    printf '%s\n%s\n' "$filtered" "$cron_line" | crontab -
+  else
+    printf '%s\n' "$cron_line" | crontab -
+  fi
+  echo "Backup scheduler: nightly cron installed (${schedule}, retention ${retention}d)."
+  return 0
+}
+
+remove_backup_cron() {
+  if ! command -v crontab >/dev/null 2>&1; then
+    return 0
+  fi
+  local existing filtered
+  existing="$(crontab -l 2>/dev/null || true)"
+  filtered="$(printf '%s\n' "$existing" | grep -Fv "$BACKUP_CRON_MARKER" || true)"
+  if [ -z "$filtered" ]; then
+    crontab -r >/dev/null 2>&1 || true
+  else
+    printf '%s\n' "$filtered" | crontab -
+  fi
+  echo "Backup scheduler cron removed."
+  return 0
+}
+
 configure_maintenance_scheduler_for_stack() {
   local mode="$1"
   case "$mode" in
@@ -874,6 +943,12 @@ configure_maintenance_scheduler_for_stack() {
       ;;
     *)
       ensure_maintenance_cron || true
+      # Nightly backups are opt-in: set TCE_ENABLE_NIGHTLY_BACKUP=1 to enable.
+      if [ "${TCE_ENABLE_NIGHTLY_BACKUP:-0}" = "1" ]; then
+        ensure_backup_cron || true
+      else
+        echo "Backup scheduler: disabled (set TCE_ENABLE_NIGHTLY_BACKUP=1 to enable nightly db_backup.sh)."
+      fi
       ;;
   esac
 }
@@ -1656,6 +1731,7 @@ if [ "$ACTION" = "remove" ]; then
   uninstall_host_runtimes
   remove_maintenance_cron || true
   remove_autonomy_tick_cron || true
+  remove_backup_cron || true
   if [ "$REMOVE_WORKSPACE_POLICY" = "true" ]; then
     remove_workspace_takeover_policy "${PWD}"
   else
@@ -1671,23 +1747,8 @@ fi
 
 if [ ! -f "$ENV_FILE" ]; then
   cp "${ROOT}/.env.example" "$ENV_FILE"
+  ENV_CREATED_THIS_RUN="true"
 fi
-
-REAL_TAKEOVER="$(env_value_or_default "TCE_ADVISOR_REAL_TAKEOVER" "$REAL_TAKEOVER")"
-REAL_TAKEOVER_MODE="$(env_value_or_default "TCE_ADVISOR_REAL_TAKEOVER_MODE" "$REAL_TAKEOVER_MODE")"
-ADVISOR_COMMAND="$(env_value_or_default "TCE_ADVISOR_COMMAND" "$ADVISOR_COMMAND")"
-ADVISOR_TIMEOUT_SECONDS="$(env_value_or_default "TCE_ADVISOR_TIMEOUT_SECONDS" "$ADVISOR_TIMEOUT_SECONDS")"
-ADVISOR_TCE_ENRICH="$(env_value_or_default "TCE_ADVISOR_TCE_ENRICH" "$ADVISOR_TCE_ENRICH")"
-ADVISOR_PRIMARY_PROVIDER="$(env_value_or_default "TCE_ADVISOR_PRIMARY_PROVIDER" "$ADVISOR_PRIMARY_PROVIDER")"
-ADVISOR_PRIMARY_MODEL="$(env_value_or_default "TCE_ADVISOR_PRIMARY_MODEL" "$ADVISOR_PRIMARY_MODEL")"
-ADVISOR_FALLBACK_CHAIN="$(env_value_or_default "TCE_ADVISOR_FALLBACK_CHAIN" "$ADVISOR_FALLBACK_CHAIN")"
-ADVISOR_CUSTOM_BASE_URL="$(env_value_or_default "TCE_ADVISOR_CUSTOM_BASE_URL" "$ADVISOR_CUSTOM_BASE_URL")"
-ADVISOR_CUSTOM_MODEL="$(env_value_or_default "TCE_ADVISOR_CUSTOM_MODEL" "$ADVISOR_CUSTOM_MODEL")"
-ADVISOR_CUSTOM_API_KEY_REF="$(env_value_or_default "TCE_ADVISOR_CUSTOM_API_KEY_REF" "$ADVISOR_CUSTOM_API_KEY_REF")"
-ADVISOR_PROVIDER_TIMEOUT_MS="$(env_value_or_default "TCE_ADVISOR_PROVIDER_TIMEOUT_MS" "$ADVISOR_PROVIDER_TIMEOUT_MS")"
-ADVISOR_PROVIDER_RETRY_MAX="$(env_value_or_default "TCE_ADVISOR_PROVIDER_RETRY_MAX" "$ADVISOR_PROVIDER_RETRY_MAX")"
-EXECUTOR_CLIENTS="$(env_value_or_default "TCE_EXECUTOR_CLIENTS" "$EXECUTOR_CLIENTS")"
-normalize_executor_clients "$EXECUTOR_CLIENTS"
 
 if [ "$STACK_SET_BY_ARG" != "true" ] && [ -t 0 ]; then
   echo "Step 1 - Choose stack"
@@ -1710,6 +1771,51 @@ else
 fi
 echo "Selected stack: ${STACK_MODE}"
 echo
+
+existing_runtime_profile="$(env_value_or_default "TCE_RUNTIME_PROFILE" "")"
+if [ "$RUNTIME_PROFILE_SET_BY_ARG" != "true" ]; then
+  case "$existing_runtime_profile" in
+    local-lite|local-full|team-secure|research)
+      RUNTIME_PROFILE="$existing_runtime_profile"
+      ;;
+    *)
+      if [ "$STACK_MODE" = "lite" ]; then
+        RUNTIME_PROFILE="local-lite"
+      else
+        RUNTIME_PROFILE="local-full"
+      fi
+      ;;
+  esac
+fi
+
+if [ "$RUNTIME_PROFILE_SET_BY_ARG" = "true" ] || [ "$ENV_CREATED_THIS_RUN" = "true" ] || [ -z "$existing_runtime_profile" ]; then
+  backup_env
+  profile_args=(--profile "$RUNTIME_PROFILE" --env-file "$ENV_FILE")
+  if [ "$RUNTIME_PROFILE_SET_BY_ARG" = "true" ] || [ "$ENV_CREATED_THIS_RUN" = "true" ]; then
+    profile_args+=(--overwrite)
+  fi
+  "${ROOT}/scripts/apply_runtime_profile.sh" "${profile_args[@]}"
+else
+  echo "Using runtime profile from existing .env: ${RUNTIME_PROFILE}"
+fi
+echo "Selected runtime profile: ${RUNTIME_PROFILE}"
+echo
+
+REAL_TAKEOVER="$(env_value_or_default "TCE_ADVISOR_REAL_TAKEOVER" "$REAL_TAKEOVER")"
+REAL_TAKEOVER_MODE="$(env_value_or_default "TCE_ADVISOR_REAL_TAKEOVER_MODE" "$REAL_TAKEOVER_MODE")"
+ADVISOR_COMMAND="$(env_value_or_default "TCE_ADVISOR_COMMAND" "$ADVISOR_COMMAND")"
+ADVISOR_TIMEOUT_SECONDS="$(env_value_or_default "TCE_ADVISOR_TIMEOUT_SECONDS" "$ADVISOR_TIMEOUT_SECONDS")"
+ADVISOR_TCE_ENRICH="$(env_value_or_default "TCE_ADVISOR_TCE_ENRICH" "$ADVISOR_TCE_ENRICH")"
+ADVISOR_PRIMARY_PROVIDER="$(env_value_or_default "TCE_ADVISOR_PRIMARY_PROVIDER" "$ADVISOR_PRIMARY_PROVIDER")"
+ADVISOR_PRIMARY_MODEL="$(env_value_or_default "TCE_ADVISOR_PRIMARY_MODEL" "$ADVISOR_PRIMARY_MODEL")"
+ADVISOR_FALLBACK_CHAIN="$(env_value_or_default "TCE_ADVISOR_FALLBACK_CHAIN" "$ADVISOR_FALLBACK_CHAIN")"
+ADVISOR_CUSTOM_BASE_URL="$(env_value_or_default "TCE_ADVISOR_CUSTOM_BASE_URL" "$ADVISOR_CUSTOM_BASE_URL")"
+ADVISOR_CUSTOM_MODEL="$(env_value_or_default "TCE_ADVISOR_CUSTOM_MODEL" "$ADVISOR_CUSTOM_MODEL")"
+ADVISOR_CUSTOM_API_KEY_REF="$(env_value_or_default "TCE_ADVISOR_CUSTOM_API_KEY_REF" "$ADVISOR_CUSTOM_API_KEY_REF")"
+ADVISOR_PROVIDER_TIMEOUT_MS="$(env_value_or_default "TCE_ADVISOR_PROVIDER_TIMEOUT_MS" "$ADVISOR_PROVIDER_TIMEOUT_MS")"
+ADVISOR_PROVIDER_RETRY_MAX="$(env_value_or_default "TCE_ADVISOR_PROVIDER_RETRY_MAX" "$ADVISOR_PROVIDER_RETRY_MAX")"
+EXECUTOR_CLIENTS="$(env_value_or_default "TCE_EXECUTOR_CLIENTS" "$EXECUTOR_CLIENTS")"
+normalize_executor_clients "$EXECUTOR_CLIENTS"
 
 if [ "$ACTION" = "install" ]; then
   if [ "$SETUP_MODE_SET_BY_ARG" = "true" ]; then

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import errno
+import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -12,39 +13,51 @@ import threading
 import time
 import uuid
 from collections import Counter as CollectionCounter
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, ValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
-from prometheus_client import Counter as PromCounter
-import logging
-
 import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from ote_advisor_providers import get_provider, list_provider_metadata, resolve_fallback_chain
 from ote_advisor_providers.base import ProviderAttemptResult, ProviderRequest
 from ote_advisor_providers.router import (
     active_profile as advisor_active_profile,
+)
+from ote_advisor_providers.router import (
     enforce_required_category_coverage as advisor_enforce_required_category_coverage,
+)
+from ote_advisor_providers.router import (
     normalize_profile as advisor_normalize_profile,
+)
+from ote_advisor_providers.router import (
     normalize_profile_bundle as advisor_normalize_profile_bundle,
+)
+from ote_advisor_providers.router import (
     resolve_chain_from_profile as advisor_resolve_chain_from_profile,
-    select_route as advisor_select_route,
+)
+from ote_advisor_providers.router import (
     runtime_status as advisor_runtime_status,
+)
+from ote_advisor_providers.router import (
+    select_route as advisor_select_route,
+)
+from ote_advisor_providers.router import (
     update_health_state as advisor_update_health_state,
 )
+from prometheus_client import Counter as PromCounter
+from prometheus_client import Histogram
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse
 from tce_model_gateway.factory import get_gateway as get_model_gateway
-from tce_shared.dashboard import timeline_dashboard_html
 from tce_shared.autonomy_context import (
     SUMMARY_VERSION,
     autonomy_profile_tuning,
@@ -52,6 +65,14 @@ from tce_shared.autonomy_context import (
     summarize_event_record,
     summarize_hit_text,
 )
+from tce_shared.autonomy_goals import (
+    adjust_consultative_threshold,
+    classify_risk_tier,
+    continuity_health,
+    evaluate_execution_permit,
+    score_goal,
+)
+from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
     behavior_storage_gate,
@@ -60,7 +81,6 @@ from tce_shared.behavior_fidelity import (
     normalize_behavior_evidence,
     predict_behavior,
 )
-from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.behavior_pilot import (
     assign_behavior_pilot_variant,
     behavior_pilot_outcome_digest,
@@ -68,17 +88,22 @@ from tce_shared.behavior_pilot import (
     prepare_behavior_pilot_context,
     sanitize_behavior_pilot_payload,
 )
-from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
+from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.events import (
     AgentRole,
+    AutonomyGoalSource,
+    AutonomyGoalStatus,
+    AutonomyNotice,
+    AutonomyPolicyProfile,
+    AutonomyRiskTier,
     BehaviorCalibrationAnswerRequest,
     BehaviorCalibrationScenariosResponse,
     BehaviorEvaluationListResponse,
     BehaviorEvaluationRequest,
     BehaviorEvaluationResponse,
-    BehaviorEvidenceSource,
     BehaviorEvidenceRequest,
     BehaviorEvidenceResponse,
+    BehaviorEvidenceSource,
     BehaviorPilotAssignmentRequest,
     BehaviorPilotAssignmentResponse,
     BehaviorPilotOutcomeRequest,
@@ -93,36 +118,17 @@ from tce_shared.events import (
     CapabilityConsumeResponse,
     CapabilityGrantRequest,
     CapabilityGrantResponse,
+    CloneAdviceRequest,
+    CloneAdviceResponse,
+    CompletionCaptureRequest,
+    CompletionCaptureResponse,
+    ContinuityPilotStatusResponse,
     CounterfactualCreateRequest,
     CounterfactualItem,
     CounterfactualListResponse,
     CounterfactualResolveRequest,
-    CompletionCaptureRequest,
-    CompletionCaptureResponse,
-    ContinuityPilotStatusResponse,
-    MemoryReviewItem,
-    MemoryReviewListResponse,
-    MemoryReviewResolveRequest,
-    ProcessMiningRequest,
-    ProcessMiningResponse,
-    ProcessModelItem,
-    AutonomyNotice,
-    AutonomyGoalSource,
-    AutonomyGoalStatus,
-    AutonomyPolicyProfile,
-    AutonomyRiskTier,
-    GoalKind,
-    CloneAdviceRequest,
-    CloneAdviceResponse,
     DirectiveExecution,
     DirectiveExecutionState,
-    ExecutionPermitDecision,
-    ExecutionClaimRequest,
-    ExecutionReportRequest,
-    ExecutionStatusResponse,
-    ExecutionPermitRequest,
-    ExecutionPermitResolveRequest,
-    ExecutionPermitResponse,
     EventDecision,
     EventEnvelope,
     EventLinks,
@@ -130,18 +136,33 @@ from tce_shared.events import (
     EventSearchRequest,
     EventStyle,
     EventType,
+    ExecutionClaimRequest,
+    ExecutionPermitDecision,
+    ExecutionPermitRequest,
+    ExecutionPermitResolveRequest,
+    ExecutionPermitResponse,
+    ExecutionReportRequest,
+    ExecutionStatusResponse,
+    FailureClass,
+    GoalKind,
+    GovernanceStatusResponse,
+    MemoryReviewItem,
+    MemoryReviewListResponse,
+    MemoryReviewResolveRequest,
     OperationMode,
     PatternFeedbackRequest,
-    RuntimeModeConfig,
-    RetryStrategy,
+    ProcessMiningRequest,
+    ProcessMiningResponse,
+    ProcessModelItem,
+    ResumeFeedbackRequest,
+    ResumeFeedbackResponse,
+    ResumePacketAnchor,
+    ResumePacketChangeSummary,
+    ResumePacketFileItem,
     ResumePacketRequest,
     ResumePacketResponse,
     ResumePacketRetrievalMeta,
-    ResumePacketFileItem,
-    ResumePacketAnchor,
-    ResumePacketChangeSummary,
-    ResumeFeedbackRequest,
-    ResumeFeedbackResponse,
+    RetryStrategy,
     SafetyDecision,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
@@ -150,19 +171,19 @@ from tce_shared.events import (
     TakeoverDecisionSource,
     TakeoverFeedbackRequest,
     TakeoverFeedbackResponse,
+    TakeoverGoal,
     TakeoverGoalCacheInvalidateRequest,
     TakeoverGoalCacheStatusResponse,
-    TakeoverGoal,
-    TakeoverGoalsPrecomputeRequest,
     TakeoverGoalsDiscoverRequest,
+    TakeoverGoalSelectRequest,
+    TakeoverGoalsPrecomputeRequest,
     TakeoverGoalsResponse,
     TakeoverLatencyBreakdown,
     TakeoverMode,
     TakeoverNextAction,
-    TakeoverPolicy,
     TakeoverNoticeAckRequest,
     TakeoverNoticesResponse,
-    TakeoverGoalSelectRequest,
+    TakeoverPolicy,
     TakeoverPreloadRequest,
     TakeoverPreloadResponse,
     TakeoverState,
@@ -175,6 +196,33 @@ from tce_shared.fingerprint import (
     apply_feedback_to_fingerprint,
     feedback_adjusted_alpha,
     merge_observation_into_fingerprint,
+)
+from tce_shared.goal_affect import classify_goal_kind, compute_affective_scores, score_goal_affective
+from tce_shared.goal_cache import (
+    cache_key as goal_cache_key,
+)
+from tce_shared.goal_cache import (
+    deserialize_payload as goal_cache_deserialize,
+)
+from tce_shared.goal_cache import (
+    get_l1 as goal_cache_get_l1,
+)
+from tce_shared.goal_cache import (
+    invalidate_l1 as goal_cache_invalidate_l1,
+)
+from tce_shared.goal_cache import (
+    put_l1 as goal_cache_put_l1,
+)
+from tce_shared.goal_similarity import dedupe_candidates_by_similarity
+from tce_shared.governance import build_governance_status
+from tce_shared.handoff import (
+    latest_checkpoint_anchor,
+    merge_anchors,
+    normalize_anchor_list,
+    normalize_handoff_mode,
+    normalize_milestone_v1,
+    normalize_objective_text,
+    rank_resume_candidates,
 )
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
@@ -193,63 +241,19 @@ from tce_shared.takeover import (
     persona_defaults,
     recent_failure_count,
     resolve_objective,
+    sanitize_untrusted_objective,
     should_trigger_deliberation,
     update_recent_outcomes,
-)
-from tce_shared.autonomy_goals import (
-    adjust_consultative_threshold,
-    classify_risk_tier,
-    continuity_health,
-    evaluate_execution_permit,
-    score_goal,
-)
-from tce_shared.goal_affect import classify_goal_kind, compute_affective_scores, score_goal_affective
-from tce_shared.goal_cache import (
-    cache_key as goal_cache_key,
-    deserialize_payload as goal_cache_deserialize,
-    get_l1 as goal_cache_get_l1,
-    invalidate_l1 as goal_cache_invalidate_l1,
-    l1_status as goal_cache_l1_status,
-    put_l1 as goal_cache_put_l1,
-)
-from tce_shared.goal_similarity import dedupe_candidates_by_similarity
-from tce_shared.handoff import (
-    handoff_intent,
-    latest_checkpoint_anchor,
-    merge_anchors,
-    normalize_anchor_list,
-    normalize_handoff_mode,
-    normalize_objective_text,
-    normalize_milestone_v1,
-    rank_resume_candidates,
 )
 
 from .audit import write_audit_log
 from .auth import AuthContext, get_auth_context
-from .bundle import build_context_bundle, search_response
-from .behavior_store import (
-    latest_fidelity_gate,
-    list_fidelity_runs,
-    load_behavior_evidence,
-    load_behavior_evidence_by_id,
-    save_behavior_evidence,
-    save_fidelity_run,
-)
-from .behavior_pilot_store import (
-    BehaviorPilotConflict,
-    BehaviorPilotExpired,
-    BehaviorPilotNotFound,
-    create_or_get_assignment as create_or_get_behavior_pilot_assignment,
-    list_pilot_rows as list_behavior_pilot_rows,
-    record_outcome as record_behavior_pilot_outcome,
-)
 from .behavior_control_store import (
     consume_capability_grant,
     create_counterfactual,
     create_memory_review,
     issue_capability_grant,
     list_counterfactuals,
-    list_memory_reviews as list_behavior_memory_reviews,
     list_process_models,
     load_process_source_rows,
     mine_and_time,
@@ -259,6 +263,32 @@ from .behavior_control_store import (
     save_shadow_prediction,
     shadow_status,
 )
+from .behavior_control_store import (
+    list_memory_reviews as list_behavior_memory_reviews,
+)
+from .behavior_pilot_store import (
+    BehaviorPilotConflict,
+    BehaviorPilotExpired,
+    BehaviorPilotNotFound,
+)
+from .behavior_pilot_store import (
+    create_or_get_assignment as create_or_get_behavior_pilot_assignment,
+)
+from .behavior_pilot_store import (
+    list_pilot_rows as list_behavior_pilot_rows,
+)
+from .behavior_pilot_store import (
+    record_outcome as record_behavior_pilot_outcome,
+)
+from .behavior_store import (
+    latest_fidelity_gate,
+    list_fidelity_runs,
+    load_behavior_evidence,
+    load_behavior_evidence_by_id,
+    save_behavior_evidence,
+    save_fidelity_run,
+)
+from .bundle import build_context_bundle, search_response
 from .cache_clients import get_redis_client
 from .clone import (
     advisor_reason,
@@ -276,14 +306,15 @@ from .clone_store import (
     save_fingerprint,
     save_observation,
 )
-from .config import get_settings
-from .crypto import maybe_decrypt_payload, maybe_encrypt_payload
+from .config import Settings, get_settings
 from .continuity_store import (
     deliver_handoff_safely,
     enqueue_handoff,
     pilot_metrics,
     record_resume_attempt,
+    record_resume_progress,
 )
+from .crypto import maybe_encrypt_payload
 from .db import get_db, get_session_factory
 from .graph import (
     graph_for_event,
@@ -303,8 +334,6 @@ from .models import (
     EpisodeEventLink,
     EpisodeLesson,
     Event,
-    EventIdentity,
-    ContinuityResumeAttempt,
     HandoffRecord,
     MemoryRule,
     MemoryTombstone,
@@ -320,6 +349,27 @@ from .redaction import apply_redaction_zones, redact_payload, redact_text
 from .routes.system import build_system_router
 from .schemas import (
     ActivitySummaryResponse,
+    AdvisorConfigResponse,
+    AdvisorConfigUpdateRequest,
+    AdvisorLiveModelsRequest,
+    AdvisorLocalOllamaPullRequest,
+    AdvisorLocalOllamaPullResponse,
+    AdvisorLocalOllamaPullStatusResponse,
+    AdvisorModelsResponse,
+    AdvisorProfileItem,
+    AdvisorProviderItem,
+    AdvisorProvidersResponse,
+    AdvisorRouteItem,
+    AdvisorRouteVerifyRequest,
+    AdvisorRuntimeProbeRequest,
+    AdvisorRuntimeProbeResponse,
+    AdvisorRuntimeStatusResponse,
+    AdvisorRuntimeStatusRoute,
+    AdvisorSwitchRequest,
+    AdvisorSwitchResponse,
+    AdvisorVerifyAttempt,
+    AdvisorVerifyRequest,
+    AdvisorVerifyResponse,
     ApiStatusInfo,
     BatchIngestRequest,
     BatchIngestResponse,
@@ -327,28 +377,14 @@ from .schemas import (
     CloneArbitrationResponse,
     CloneScoreBreakdown,
     CloneScoreResponse,
+    ContextBriefRequest,
+    ContextBriefResponse,
+    ContextBriefSectionItem,
     ContextBundleRequest,
     ContextBundleResponse,
-    DatabaseStatusInfo,
-    FingerprintResponse,
-    GraphEntitySearchResponse,
-    GraphEventResponse,
-    HealthResponse,
-    IngestObservationsRequest,
-    IngestObservationsResponse,
-    IngestResponse,
-    ObservationItem,
-    ObservationListResponse,
-    PatternItem,
-    RuntimeModeInfo,
-    RuntimeModeSetRequest,
-    ServiceStatusInfo,
-    SystemStatusResponse,
-    TeamMembershipUpsertRequest,
-    DashboardClientConfigResponse,
     DashboardAgentRole,
     DashboardAgentRolesResponse,
-    DashboardIdentityInfo,
+    DashboardClientConfigResponse,
     DashboardGoalIntelligenceItem,
     DashboardGoalsIntelligenceResponse,
     DashboardGoalsIntelligenceSummary,
@@ -357,64 +393,59 @@ from .schemas import (
     DashboardHumanScoreRecomputeRequest,
     DashboardHumanScoreResponse,
     DashboardHumanScoreSubscores,
-    EpisodeItem,
-    EpisodeListResponse,
-    EventAnnotationRequest,
-    EventAnnotationResponse,
-    ContextBriefRequest,
-    ContextBriefResponse,
-    ContextBriefSectionItem,
-    MemoryRuleItem,
-    MemoryRuleUpsertRequest,
-    MemoryRuleListResponse,
-    MemoryRuleDeprecateResponse,
-    MemoryForgetRequest,
-    MemoryForgetResponse,
-    RetrievalEvalRunRequest,
-    RetrievalEvalRunResponse,
-    RetrievalEvalStatusResponse,
-    GoalEmotionValue,
-    GoalRelationEdge,
-    AdvisorProviderItem,
-    AdvisorProvidersResponse,
-    AdvisorModelsResponse,
-    AdvisorLiveModelsRequest,
-    AdvisorRouteVerifyRequest,
-    AdvisorLocalOllamaPullRequest,
-    AdvisorLocalOllamaPullResponse,
-    AdvisorLocalOllamaPullStatusResponse,
-    AdvisorVerifyRequest,
-    AdvisorVerifyAttempt,
-    AdvisorVerifyResponse,
-    AdvisorConfigUpdateRequest,
-    AdvisorConfigResponse,
-    AdvisorProfileItem,
-    AdvisorRouteItem,
-    AdvisorRuntimeProbeRequest,
-    AdvisorRuntimeProbeResponse,
-    AdvisorRuntimeStatusResponse,
-    AdvisorRuntimeStatusRoute,
-    AdvisorSwitchRequest,
-    AdvisorSwitchResponse,
+    DashboardIdentityInfo,
     DashboardStackRestartRequest,
     DashboardStackRestartResponse,
     DashboardStackRestartStatusResponse,
+    DatabaseStatusInfo,
+    EpisodeDecisionItem,
+    EpisodeItem,
+    EpisodeLessonItem,
+    EpisodeListResponse,
+    EventAnnotationRequest,
+    EventAnnotationResponse,
+    FingerprintResponse,
+    GoalEmotionValue,
+    GoalRelationEdge,
+    GraphEntitySearchResponse,
+    GraphEventResponse,
+    IngestObservationsRequest,
+    IngestObservationsResponse,
+    IngestResponse,
+    MemoryForgetRequest,
+    MemoryForgetResponse,
+    MemoryRuleDeprecateResponse,
+    MemoryRuleItem,
+    MemoryRuleListResponse,
+    MemoryRuleUpsertRequest,
+    ObservationItem,
+    ObservationListResponse,
+    PatternItem,
+    RetrievalEvalRunRequest,
+    RetrievalEvalRunResponse,
+    RetrievalEvalStatusResponse,
+    RuntimeModeInfo,
+    ServiceStatusInfo,
+    SystemStatusResponse,
+    TeamMembershipUpsertRequest,
 )
 from .search import _owner_matches_hint, _resolve_owner_scope, retrieval_status_snapshot, run_search
 from .takeover_store import (
     load_recent_session_memory_snapshot,
     load_takeover_state,
     record_takeover_action,
-    reset_takeover_state as store_reset_takeover_state,
     save_session_memory_snapshot,
     save_takeover_state,
+)
+from .takeover_store import (
+    reset_takeover_state as store_reset_takeover_state,
 )
 
 settings = get_settings()
 configure_logging(settings.log_level)
 setup_otel("tce-api")
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Open Timeline Engine API", version="0.3.0")
+app = FastAPI(title="Open Timeline Engine API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins or ["*"],
@@ -473,6 +504,20 @@ DASHBOARD_HUMAN_SCORE_RECOMPUTE_COUNT = PromCounter(
     "tce_api_dashboard_human_score_recompute_total",
     "Dashboard human score recompute invocations",
 )
+DIRECTIVE_REPORT_COUNT = PromCounter(
+    "tce_api_directive_report_total",
+    "Directive execution reports by terminal state and failure class",
+    ["state", "failure_class"],
+)
+DIRECTIVE_RETRY_SCHEDULED_COUNT = PromCounter(
+    "tce_api_directive_retry_scheduled_total",
+    "Retry directives minted after failed execution reports",
+)
+PERMIT_DECISION_COUNT = PromCounter(
+    "tce_api_permit_decision_total",
+    "Execution permit decisions by decision and risk tier",
+    ["decision", "risk_tier"],
+)
 _OLLAMA_PULL_JOBS: dict[str, dict[str, Any]] = {}
 _OLLAMA_PULL_LOCK = threading.Lock()
 _STACK_RESTART_JOBS: dict[str, dict[str, Any]] = {}
@@ -484,6 +529,10 @@ def _safe_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _result_rowcount(result: Any) -> int:
+    return max(0, _safe_int(getattr(result, "rowcount", 0)))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1004,7 +1053,7 @@ def _advisor_runtime_reason_from_routes(
         200,
         int(config.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
     )
-    custom_headers = config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
+    custom_headers = _normalized_custom_headers(config.get("custom_headers"))
     api_version = str(config.get("api_version") or "").strip() or None
 
     for idx, route in enumerate(routes):
@@ -1559,7 +1608,7 @@ def _sanitize_event_steps(raw: Any) -> list[dict[str, Any]]:
                 continue
             out.append(
                 {
-                    "order": int(item.get("order") if item.get("order") is not None else idx),
+                    "order": _safe_int(item.get("order")) if item.get("order") is not None else idx,
                     "description": description,
                     "tool": item.get("tool"),
                     "output_ref": item.get("output_ref"),
@@ -1607,7 +1656,7 @@ def _config_response_from_raw(config_raw: dict[str, Any]) -> AdvisorConfigRespon
         advisor_custom_api_key_ref=config_raw.get("advisor_custom_api_key_ref"),
         advisor_provider_timeout_ms=int(config_raw.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
         advisor_provider_retry_max=int(config_raw.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max),
-        custom_headers=config_raw.get("custom_headers") if isinstance(config_raw.get("custom_headers"), dict) else {},
+        custom_headers=_normalized_custom_headers(config_raw.get("custom_headers")),
         key_storage_backend=str(config_raw.get("key_storage_backend") or ""),
         key_present=bool(config_raw.get("key_present", False)),
         profile_id=str(config_raw.get("profile_id") or "default"),
@@ -1618,6 +1667,18 @@ def _config_response_from_raw(config_raw: dict[str, Any]) -> AdvisorConfigRespon
         profiles=profiles,
         updated_at=updated_at,
     )
+
+
+def _normalized_custom_headers(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, raw_value in value.items():
+        normalized_key = str(key).strip().lower()
+        normalized_value = str(raw_value).strip()
+        if normalized_key in settings.advisor_custom_headers_allowlist_set and normalized_value:
+            normalized[normalized_key] = normalized_value
+    return normalized
 
 
 def _start_ollama_pull_job(*, model: str, base_url: str) -> str:
@@ -2402,7 +2463,7 @@ def _compute_human_score(
         session_id=session_id,
     )
 
-    execution_stats = db.execute(
+    execution_stats_row = db.execute(
         text(
             """
             SELECT
@@ -2422,14 +2483,15 @@ def _compute_human_score(
             """
         ),
         {"ws": workspace_id, "uid": user_id, "sid": session_id},
-    ).mappings().first() or {}
+    ).mappings().first()
+    execution_stats: dict[str, Any] = dict(execution_stats_row) if execution_stats_row else {}
     total_exec = max(0, _safe_int(execution_stats.get("total")))
     succeeded_exec = max(0, _safe_int(execution_stats.get("succeeded")))
     retry_units = max(0, _safe_int(execution_stats.get("retry_units")))
     mutating_total = max(0, _safe_int(execution_stats.get("mutating_total")))
     permit_misses = max(0, _safe_int(execution_stats.get("permit_misses")))
 
-    takeover_row = db.execute(
+    takeover_result = db.execute(
         text(
             """
             SELECT continuity_violation_count, goal_queue_size, pending_directive_count, retry_backlog_count
@@ -2442,7 +2504,8 @@ def _compute_human_score(
             """
         ),
         {"ws": workspace_id, "uid": user_id, "sid": session_id},
-    ).mappings().first() or {}
+    ).mappings().first()
+    takeover_row: dict[str, Any] = dict(takeover_result) if takeover_result else {}
     continuity_violations = max(0, _safe_int(takeover_row.get("continuity_violation_count")))
     queue_size = max(0, _safe_int(takeover_row.get("goal_queue_size")))
     pending_directives = max(0, _safe_int(takeover_row.get("pending_directive_count")))
@@ -2525,7 +2588,7 @@ def _compute_human_score(
     overwhelm_control = max(0.0, min(1.0, 1.0 - avg_overwhelm))
     identity_alignment = sum(identity_values) / len(identity_values) if identity_values else 0.35
 
-    observation_sentiment = db.execute(
+    observation_sentiment_row = db.execute(
         text(
             """
             SELECT
@@ -2541,7 +2604,10 @@ def _compute_human_score(
             """
         ),
         {"ws": workspace_id},
-    ).mappings().first() or {}
+    ).mappings().first()
+    observation_sentiment: dict[str, Any] = (
+        dict(observation_sentiment_row) if observation_sentiment_row else {}
+    )
     obs_total = max(0, _safe_int(observation_sentiment.get("total")))
     obs_positive_neutral = max(0, _safe_int(observation_sentiment.get("positive_neutral")))
     positive_signal_ratio = (obs_positive_neutral / obs_total) if obs_total else 0.5
@@ -2776,8 +2842,15 @@ def _docker_service_stats() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import time
 
     now = time.monotonic()
-    if _docker_stats_cache["data"] is not None and (now - _docker_stats_cache["ts"]) < _DOCKER_CACHE_TTL:
-        return _docker_stats_cache["data"]
+    cached = _docker_stats_cache["data"]
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and isinstance(cached[0], list)
+        and isinstance(cached[1], dict)
+        and (now - float(_docker_stats_cache["ts"])) < _DOCKER_CACHE_TTL
+    ):
+        return cached[0], cached[1]
 
     socket_path = os.getenv("TCE_DOCKER_SOCKET", "/var/run/docker.sock")
     if not os.path.exists(socket_path):
@@ -2849,7 +2922,10 @@ def _docker_service_stats() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     timeout=_DOCKER_STATS_REQUEST_TIMEOUT_SECONDS,
                 )
                 resp.raise_for_status()
-                return resp.json()
+                payload = resp.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Docker stats endpoint returned a non-object payload")
+                return payload
 
             futures = {
                     _DOCKER_STATS_EXECUTOR.submit(_fetch_stats, cid): (cid, proj, svc, cname)
@@ -3155,7 +3231,7 @@ def _store_event(db: Session, event: EventEnvelope, auth: AuthContext) -> UUID:
             },
         ).scalar_one_or_none()
         if existing_id is not None:
-            return existing_id
+            return UUID(str(existing_id))
 
     if source_id and source_seq is not None:
         existing_id = db.execute(
@@ -3179,7 +3255,7 @@ def _store_event(db: Session, event: EventEnvelope, auth: AuthContext) -> UUID:
             },
         ).scalar_one_or_none()
         if existing_id is not None:
-            return existing_id
+            return UUID(str(existing_id))
 
     payload_input = event.payload if isinstance(event.payload, dict) else {}
     if event.task_type == "editor_checkpoint" and event.event_type == EventType.TASK_STEP:
@@ -3399,17 +3475,17 @@ def _build_citation_snippets(
                     if len(detail_bits) >= 2:
                         break
             source = f"{title} | {'; '.join(detail_bits)}" if detail_bits else title
-            excerpt = _redacted_excerpt(source, max_chars=snippet_chars)
-            if excerpt:
-                evidence_lookup[event_id] = excerpt
+            evidence_excerpt = _redacted_excerpt(source, max_chars=snippet_chars)
+            if evidence_excerpt:
+                evidence_lookup[event_id] = evidence_excerpt
 
     missing_ids: list[UUID] = []
     snippets: list[dict[str, str]] = []
     for citation_id in ordered_ids:
         event_id = str(citation_id)
-        excerpt = evidence_lookup.get(event_id)
-        if excerpt:
-            snippets.append({"id": event_id, "excerpt": excerpt})
+        cached_excerpt = evidence_lookup.get(event_id)
+        if cached_excerpt:
+            snippets.append({"id": event_id, "excerpt": cached_excerpt})
         else:
             missing_ids.append(citation_id)
 
@@ -3430,17 +3506,20 @@ def _build_citation_snippets(
             row = row_lookup.get(event_id)
             if row is None:
                 continue
-            excerpt = _citation_excerpt_from_event_row(row, snippet_chars=snippet_chars)
-            if excerpt:
-                snippets.append({"id": event_id, "excerpt": excerpt})
+            row_excerpt = _citation_excerpt_from_event_row(
+                dict(row),
+                snippet_chars=snippet_chars,
+            )
+            if row_excerpt:
+                snippets.append({"id": event_id, "excerpt": row_excerpt})
 
     snippet_lookup = {item["id"]: item["excerpt"] for item in snippets if item.get("id") and item.get("excerpt")}
     ordered: list[dict[str, str]] = []
     for citation_id in ordered_ids:
         event_id = str(citation_id)
-        excerpt = snippet_lookup.get(event_id)
-        if excerpt:
-            ordered.append({"id": event_id, "excerpt": excerpt})
+        ordered_excerpt = snippet_lookup.get(event_id)
+        if ordered_excerpt:
+            ordered.append({"id": event_id, "excerpt": ordered_excerpt})
     return ordered
 
 
@@ -3722,6 +3801,28 @@ def _reject_advisor_writes(auth: AuthContext) -> None:
         raise HTTPException(status_code=403, detail="advisor role is read-only")
 
 
+_INSECURE_API_TOKENS = {"", "changeme", "local-dev-token"}
+
+
+def _reject_privileged_default_token(settings_obj: Settings | None = None) -> None:
+    """Refuse privileged operations while a well-known default token is live.
+
+    Privileged means host-level effect: docker-socket stack restarts and
+    .env writers. TCE_ALLOW_DEFAULT_TOKEN=1 opts a dev-only install back in.
+    """
+    cfg = settings_obj if settings_obj is not None else get_settings()
+    if cfg.allow_default_token:
+        return
+    if cfg.token_set & _INSECURE_API_TOKENS:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "privileged operation disabled: default API token in use. "
+                "Set a real TCE_API_TOKEN, or TCE_ALLOW_DEFAULT_TOKEN=1 for a dev-only install."
+            ),
+        )
+
+
 def _behavior_subject_access_allowed(auth: AuthContext) -> bool:
     if auth.behavior_subject_id == auth.user_id:
         return True
@@ -3977,31 +4078,33 @@ def get_event(
     if not decision.allow:
         raise HTTPException(status_code=403, detail=decision.reason)
 
-    return EventEnvelope(
-        schema_version=event.schema_version,
-        ts=event.ts,
-        actor=event.actor,
-        source=event.source,
-        domain=event.domain,
-        task_type=event.task_type,
-        event_type=EventType(event.event_type),
-        title=event.title,
-        payload=event.payload,
-        context=event.context,
-        inputs=event.inputs,
-        steps=_sanitize_event_steps(event.steps),
-        decision=_safe_validate(EventDecision, event.decision),
-        outcome=_safe_validate(EventOutcome, event.outcome, outcome=True),
-        style=_safe_validate(EventStyle, event.style),
-        links=_safe_validate(EventLinks, event.links),
-        tags=event.tags,
-        sensitivity=event.sensitivity,
-        redaction_hints=event.redaction_hints,
-        source_id=event.source_id,
-        source_seq=event.source_seq,
-        vector_clock=event.vector_clock or {},
-        idempotency_key=event.idempotency_key,
-        authority_level=event.authority_level,
+    return EventEnvelope.model_validate(
+        {
+            "schema_version": event.schema_version,
+            "ts": event.ts,
+            "actor": event.actor,
+            "source": event.source,
+            "domain": event.domain,
+            "task_type": event.task_type,
+            "event_type": EventType(event.event_type),
+            "title": event.title,
+            "payload": event.payload,
+            "context": event.context,
+            "inputs": event.inputs,
+            "steps": _sanitize_event_steps(event.steps),
+            "decision": _safe_validate(EventDecision, event.decision),
+            "outcome": _safe_validate(EventOutcome, event.outcome, outcome=True),
+            "style": _safe_validate(EventStyle, event.style),
+            "links": _safe_validate(EventLinks, event.links),
+            "tags": event.tags,
+            "sensitivity": event.sensitivity,
+            "redaction_hints": event.redaction_hints,
+            "source_id": event.source_id,
+            "source_seq": event.source_seq,
+            "vector_clock": event.vector_clock or {},
+            "idempotency_key": event.idempotency_key,
+            "authority_level": event.authority_level,
+        }
     )
 
 
@@ -4069,9 +4172,12 @@ def search(
 
 
 def _resume_file_items_from_record(record: dict[str, Any], *, query_text: str) -> list[ResumePacketFileItem]:
-    files_raw = record.get("files_json") if isinstance(record.get("files_json"), list) else []
-    anchors_raw = record.get("anchors_json") if isinstance(record.get("anchors_json"), list) else []
-    change_raw = record.get("change_summary_json") if isinstance(record.get("change_summary_json"), dict) else {}
+    files_value = record.get("files_json")
+    files_raw: list[Any] = files_value if isinstance(files_value, list) else []
+    anchors_value = record.get("anchors_json")
+    anchors_raw: list[Any] = anchors_value if isinstance(anchors_value, list) else []
+    change_value = record.get("change_summary_json")
+    change_raw: dict[str, Any] = change_value if isinstance(change_value, dict) else {}
     anchors_by_file: dict[str, list[ResumePacketAnchor]] = {}
     for item in anchors_raw:
         if not isinstance(item, dict):
@@ -4218,9 +4324,11 @@ def handoff_resume_packet(
             workspace_id=auth.workspace_id,
             requesting_owner_id=auth.user_id,
             target_owner_id=str(selected.get("owner_id") or body.target_owner or auth.user_id),
+            session_id=body.session_id,
             selected_record_id=selected_uuid,
             query_text=body.query,
             top_file=files[0].path if files else None,
+            recommended_files=[item.path for item in files],
             requested_at=requested_at,
             returned_at=datetime.now(tz=UTC),
             handoff_ts=selected_ts,
@@ -4275,6 +4383,15 @@ def capture_completion(
             enqueue_job("tce_worker.jobs.handoff_outbox.run", str(delivered.id), 1)
         except Exception:
             logger.warning("failed to enqueue pending handoff outbox", exc_info=True)
+    record_resume_progress(
+        db,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="completed",
+        outcome_status=body.state,
+        progress_source="complete_task",
+    )
     return CompletionCaptureResponse(
         outbox_id=delivered.id,
         delivery_status=delivered.status,
@@ -4292,25 +4409,32 @@ def capture_resume_feedback(
     db: Session = Depends(get_db),
 ) -> ResumeFeedbackResponse:
     _enforce_workspace_access(auth, db)
-    row = db.execute(
-        select(ContinuityResumeAttempt).where(
-            ContinuityResumeAttempt.packet_id == body.packet_id,
-            ContinuityResumeAttempt.workspace_id == auth.workspace_id,
-            ContinuityResumeAttempt.requesting_owner_id == auth.user_id,
-        )
-    ).scalar_one_or_none()
-    if row is None:
+    progress = record_resume_progress(
+        db,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        packet_id=body.packet_id,
+        phase=body.phase,
+        opened_file=body.opened_file,
+        correct_file=body.correct_file,
+        correct_anchor=body.correct_anchor,
+        opened_file_rank=body.opened_file_rank,
+        correction_required=body.correction_required,
+        correction_reason=body.correction_reason,
+        archaeology_tool_calls=body.archaeology_tool_calls,
+        archaeology_tokens=body.archaeology_tokens,
+        outcome_status=body.outcome_status,
+        progress_source=body.progress_source,
+    )
+    if progress is None:
         raise HTTPException(status_code=404, detail="resume packet not found")
-    opened_file, _ = redact_text(str(body.opened_file or "")[:240])
-    correction_reason, _ = redact_text(body.correction_reason[:500])
     now = datetime.now(tz=UTC)
-    row.opened_file = opened_file or None
-    row.correct_file = body.correct_file
-    row.correction_required = body.correction_required
-    row.correction_reason = correction_reason
-    row.feedback_at = now
-    db.commit()
-    return ResumeFeedbackResponse(packet_id=body.packet_id, recorded=True, feedback_at=now)
+    return ResumeFeedbackResponse(
+        packet_id=body.packet_id,
+        recorded=True,
+        phase=progress[1],
+        feedback_at=now,
+    )
 
 
 @app.get("/v1/continuity/pilot/status", response_model=ContinuityPilotStatusResponse)
@@ -4338,6 +4462,29 @@ def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]
         "behavior_subject_id": auth.behavior_subject_id,
         "identity_claims_mode": settings.identity_claims_mode,
     }
+
+
+@app.get("/v1/governance/status", response_model=GovernanceStatusResponse)
+def governance_status(
+    _auth: AuthContext = Depends(get_auth_context),
+) -> GovernanceStatusResponse:
+    return GovernanceStatusResponse(
+        **build_governance_status(
+            runtime="full",
+            runtime_profile=settings.runtime_profile,
+            auth_mode=settings.auth_mode,
+            identity_claims_mode=settings.identity_claims_mode,
+            workspace_access_mode=settings.workspace_access_mode,
+            audit_write_mode=settings.audit_write_mode,
+            cors_origins=settings.cors_origins,
+            api_tokens=settings.token_set,
+            capability_broker_enabled=settings.behavior_capability_broker_enabled,
+            mcp_tool_profile=settings.mcp_tool_profile,
+            requested_execution_enforcement=settings.execution_enforcement_level,
+            execution_interception_attested=settings.execution_interception_attested,
+            execution_interception_provider=settings.execution_interception_provider,
+        )
+    )
 
 
 @app.get("/v1/context/retrieval/status", response_model=dict)
@@ -4407,7 +4554,6 @@ def setup_advisor_models(
         route=route,
         config=config_raw,
     )
-    custom_headers = config_raw.get("custom_headers") if isinstance(config_raw.get("custom_headers"), dict) else {}
     request = _provider_request_for(
         provider_id,
         model=str((route or {}).get("model") or config_raw.get("advisor_custom_model") or config_raw.get("advisor_primary_model") or "").strip() or None,
@@ -4415,7 +4561,7 @@ def setup_advisor_models(
         api_version=str((route or {}).get("api_version") or config_raw.get("api_version") or adapter.metadata.api_version or "").strip() or None,
         api_key=api_key,
         timeout_ms=int(config_raw.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
-        custom_headers={str(k): str(v) for k, v in custom_headers.items()},
+        custom_headers=_normalized_custom_headers(config_raw.get("custom_headers")),
     )
     try:
         models = adapter.list_models(request)
@@ -4473,15 +4619,21 @@ def setup_advisor_models_live(
             requires_api_key=True,
             connection_type=_provider_connection_type(provider_id),
         )
-    custom_headers = config_raw.get("custom_headers") if isinstance(config_raw.get("custom_headers"), dict) else {}
     request = _provider_request_for(
         provider_id,
         model=None,
-        base_url=str((body.base_url or "").strip() or (route or {}).get("base_url") or config_raw.get("advisor_custom_base_url") or _provider_default_base_url(provider_id, adapter.metadata.default_base_url) or "").strip() or None,
+        base_url=str(
+            (body.base_url or "").strip()
+            or (route or {}).get("base_url")
+            or config_raw.get("advisor_custom_base_url")
+            or _provider_default_base_url(provider_id, adapter.metadata.default_base_url)
+            or ""
+        ).strip()
+        or None,
         api_version=str((route or {}).get("api_version") or config_raw.get("api_version") or adapter.metadata.api_version or "").strip() or None,
         api_key=api_key,
         timeout_ms=int(body.timeout_ms or config_raw.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
-        custom_headers={str(k): str(v) for k, v in custom_headers.items()},
+        custom_headers=_normalized_custom_headers(config_raw.get("custom_headers")),
     )
     try:
         models = adapter.list_models(request)
@@ -4526,16 +4678,20 @@ def setup_advisor_route_verify(
         explicit_key_ref=body.api_key_ref,
         provided_key=body.api_key,
     )
-    custom_headers_raw = body.custom_headers or (config_raw.get("custom_headers") if isinstance(config_raw.get("custom_headers"), dict) else {})
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
+    custom_headers = _normalized_custom_headers(
+        body.custom_headers or config_raw.get("custom_headers")
+    )
     req = _provider_request_for(
         provider_id,
         model=(body.model or "").strip() or str((route or {}).get("model") or "").strip() or None,
-        base_url=(body.base_url or "").strip() or str((route or {}).get("base_url") or config_raw.get("advisor_custom_base_url") or _provider_default_base_url(provider_id, adapter.metadata.default_base_url) or "").strip() or None,
+        base_url=(body.base_url or "").strip()
+        or str(
+            (route or {}).get("base_url")
+            or config_raw.get("advisor_custom_base_url")
+            or _provider_default_base_url(provider_id, adapter.metadata.default_base_url)
+            or ""
+        ).strip()
+        or None,
         api_version=(body.api_version or "").strip() or str((route or {}).get("api_version") or config_raw.get("api_version") or adapter.metadata.api_version or "").strip() or None,
         api_key=api_key,
         timeout_ms=int(body.timeout_ms or config_raw.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
@@ -4621,14 +4777,9 @@ def setup_advisor_verify(
 
     timeout_ms = int(body.timeout_ms or configured.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms)
     retry_max = max(1, int(body.retry_max or configured.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max))
-    custom_headers_raw = body.custom_headers or (
-        configured.get("custom_headers") if isinstance(configured.get("custom_headers"), dict) else {}
+    custom_headers = _normalized_custom_headers(
+        body.custom_headers or configured.get("custom_headers")
     )
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
 
     health = _load_advisor_health(db, workspace_id=auth.workspace_id, user_id=auth.user_id)
     attempts: list[AdvisorVerifyAttempt] = []
@@ -4765,6 +4916,7 @@ def setup_advisor_config(
     db: Session = Depends(get_db),
 ) -> AdvisorConfigResponse:
     REQUEST_COUNT.labels(endpoint="setup_advisor_config", method="PUT").inc()
+    _reject_privileged_default_token()
     _enforce_workspace_access(auth, db)
     _reject_advisor_writes(auth)
 
@@ -4780,7 +4932,7 @@ def setup_advisor_config(
             custom_headers[k] = str(value)
     api_key_ref = (body.advisor_custom_api_key_ref or settings.advisor_custom_api_key_ref).strip()
 
-    payload = {
+    payload: dict[str, Any] = {
         "advisor_primary_provider": primary,
         "advisor_primary_model": (body.advisor_primary_model or "").strip() or None,
         "advisor_fallback_chain": fallback,
@@ -4795,7 +4947,7 @@ def setup_advisor_config(
         "key_present": False,
         "updated_at": datetime.now(tz=UTC).isoformat(),
     }
-    routes_in = [
+    routes_in: list[dict[str, Any]] = [
         item.model_dump(mode="json")
         for item in body.routes
     ] if body.routes else [
@@ -4887,7 +5039,8 @@ def setup_advisor_config(
     payload["profiles"] = list(profile_bundle.get("profiles") or [])
     env_key_present = False
     seen_key_providers: set[str] = set()
-    for route in payload["routes"]:
+    active_routes = payload.get("routes")
+    for route in active_routes if isinstance(active_routes, list) else []:
         if not isinstance(route, dict):
             continue
         provider_id = str(route.get("provider_id") or "").strip().lower()
@@ -4906,21 +5059,29 @@ def setup_advisor_config(
     try:
         _persist_advisor_config_to_env(
             primary_provider=primary,
-            primary_model=payload.get("advisor_primary_model"),
-            fallback_chain=list(payload.get("advisor_fallback_chain") or []),
-            custom_base_url=payload.get("advisor_custom_base_url"),
-            custom_model=payload.get("advisor_custom_model"),
-            custom_api_key_ref=payload.get("advisor_custom_api_key_ref"),
+            primary_model=str(payload.get("advisor_primary_model") or "") or None,
+            fallback_chain=[
+                str(item)
+                for item in payload.get("advisor_fallback_chain", [])
+                if isinstance(item, str)
+            ],
+            custom_base_url=str(payload.get("advisor_custom_base_url") or "") or None,
+            custom_model=str(payload.get("advisor_custom_model") or "") or None,
+            custom_api_key_ref=str(payload.get("advisor_custom_api_key_ref") or "") or None,
             provider_timeout_ms=int(payload.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
             provider_retry_max=int(payload.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max),
             api_key=body.api_key,
             api_key_ref=api_key_ref,
-            routes=list(payload.get("routes") or []),
-            active_profile_id=payload.get("active_profile_id"),
+            routes=[
+                dict(item)
+                for item in payload.get("routes", [])
+                if isinstance(item, dict)
+            ],
+            active_profile_id=str(payload.get("active_profile_id") or "") or None,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("failed to persist advisor config to .env")
-        raise HTTPException(status_code=500, detail="failed to persist advisor config to .env")
+        raise HTTPException(status_code=500, detail="failed to persist advisor config to .env") from exc
     _purge_advisor_secret_runtime_settings(db)
     _upsert_runtime_setting(db, _advisor_setup_setting_key(auth.workspace_id, auth.user_id), payload)
     _upsert_runtime_setting(db, _advisor_profiles_setting_key(auth.workspace_id, auth.user_id), profile_bundle)
@@ -4968,9 +5129,9 @@ def setup_advisor_switch(
                     "TCE_ADVISOR_ROUTES_JSON": json.dumps(config["routes"], separators=(",", ":")),
                 }
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("failed to persist active advisor profile to .env")
-            raise HTTPException(status_code=500, detail="failed to persist active advisor profile to .env")
+            raise HTTPException(status_code=500, detail="failed to persist active advisor profile to .env") from exc
         _upsert_runtime_setting(db, _advisor_setup_setting_key(auth.workspace_id, auth.user_id), config)
         db.commit()
     return AdvisorSwitchResponse(
@@ -5004,11 +5165,11 @@ def setup_advisor_runtime_status(
         routing_mode=str(status.get("routing_mode") or "adaptive"),
         failure_policy=str(status.get("failure_policy") or "risk_aware_fail_safe"),
         category_coverage=list(status.get("category_coverage") or []),
-        advisor_total_budget_ms=int(
+        advisor_total_budget_ms=_safe_int(
             status.get("advisor_total_budget_ms")
             or getattr(settings, "effective_advisor_total_budget_ms", settings.advisor_total_budget_ms)
         ),
-        advisor_attempt_timeout_ms=int(
+        advisor_attempt_timeout_ms=_safe_int(
             status.get("advisor_attempt_timeout_ms")
             or getattr(settings, "effective_advisor_attempt_timeout_ms", settings.advisor_attempt_timeout_ms)
         ),
@@ -5045,7 +5206,7 @@ def setup_advisor_runtime_probe(
     probe_deadline = time.monotonic() + (
         max(1.0, (max(200, timeout_ms) * max(1, len(routes)) / 1000.0) + 0.75)
     )
-    custom_headers = config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
+    custom_headers = _normalized_custom_headers(config.get("custom_headers"))
 
     attempts_by_index: dict[int, AdvisorVerifyAttempt] = {}
     prepared_routes: dict[int, dict[str, Any]] = {}
@@ -5087,11 +5248,11 @@ def setup_advisor_runtime_probe(
 
     verify_results: dict[int, ProviderAttemptResult] = {}
     future_to_index: dict[Any, int] = {}
-    for idx, prepared in prepared_routes.items():
+    for idx, prepared_route in prepared_routes.items():
         future = _ADVISOR_PROBE_EXECUTOR.submit(
             _verify_provider_with_retries,
-            adapter=prepared["adapter"],
-            request=prepared["request"],
+            adapter=prepared_route["adapter"],
+            request=prepared_route["request"],
             retry_max=1,
         )
         future_to_index[future] = idx
@@ -5140,8 +5301,8 @@ def setup_advisor_runtime_probe(
         if idx in attempts_by_index:
             attempts.append(attempts_by_index[idx])
             continue
-        prepared = prepared_routes.get(idx)
-        if not prepared:
+        selected_prepared_route = prepared_routes.get(idx)
+        if not selected_prepared_route:
             attempts.append(
                 AdvisorVerifyAttempt(
                     provider_id="unknown",
@@ -5153,10 +5314,10 @@ def setup_advisor_runtime_probe(
                 )
             )
             continue
-        route = prepared["route"]
-        provider_id = str(prepared["provider_id"])
-        adapter = prepared["adapter"]
-        req = prepared["request"]
+        route = selected_prepared_route["route"]
+        provider_id = str(selected_prepared_route["provider_id"])
+        adapter = selected_prepared_route["adapter"]
+        req = selected_prepared_route["request"]
         verify_result = verify_results.get(idx) or ProviderAttemptResult(
             provider_id=provider_id,
             ok=False,
@@ -5315,18 +5476,18 @@ def _episode_item_from_model(db: Session, episode: Episode) -> EpisodeItem:
         select(EpisodeEventLink.event_id).where(EpisodeEventLink.episode_id == episode.id).order_by(EpisodeEventLink.created_at.asc())
     ).scalars().all()
     decisions = [
-        {
-            "decision": row.decision,
-            "why": row.why,
-            "alternatives": list(row.alternatives_json or []),
-        }
+        EpisodeDecisionItem(
+            decision=row.decision,
+            why=row.why,
+            alternatives=list(row.alternatives_json or []),
+        )
         for row in decision_rows
     ]
-    lessons = {
-        "do_more": list((lesson.do_more_json if lesson else []) or []),
-        "do_less": list((lesson.do_less_json if lesson else []) or []),
-        "avoid": list((lesson.avoid_json if lesson else []) or []),
-    }
+    lessons = EpisodeLessonItem(
+        do_more=list((lesson.do_more_json if lesson else []) or []),
+        do_less=list((lesson.do_less_json if lesson else []) or []),
+        avoid=list((lesson.avoid_json if lesson else []) or []),
+    )
     return EpisodeItem(
         id=episode.id,
         workspace_id=episode.workspace_id,
@@ -5659,8 +5820,8 @@ def context_brief(
     merged_citations: list[UUID] = []
     seen: set[UUID] = set()
     for group in (standard_approach, current_state, constraints_preferences, open_loops, artifacts):
-        for item in group:
-            for citation in item.citations:
+        for section_item in group:
+            for citation in section_item.citations:
                 if citation in seen:
                     continue
                 seen.add(citation)
@@ -5812,7 +5973,7 @@ def forget_memory(
     deleted_count = 0
     if body.target_type == "event":
         if ids:
-            deleted_count = int(
+            deleted_count = _result_rowcount(
                 db.execute(
                     text(
                         """
@@ -5823,12 +5984,11 @@ def forget_memory(
                         """
                     ),
                     {"ids": ids, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
-                ).rowcount
-                or 0
+                )
             )
     elif body.target_type == "episode":
         if ids:
-            deleted_count = int(
+            deleted_count = _result_rowcount(
                 db.execute(
                     text(
                         """
@@ -5839,12 +5999,11 @@ def forget_memory(
                         """
                     ),
                     {"ids": ids, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
-                ).rowcount
-                or 0
+                )
             )
     elif body.target_type == "rule":
         if ids:
-            deleted_count = int(
+            deleted_count = _result_rowcount(
                 db.execute(
                     text(
                         """
@@ -5855,8 +6014,7 @@ def forget_memory(
                         """
                     ),
                     {"ids": ids, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
-                ).rowcount
-                or 0
+                )
             )
     else:
         raise HTTPException(status_code=400, detail="unsupported target_type")
@@ -5923,24 +6081,30 @@ def _autonomy_quality_snapshot(
     for row in action_rows:
         raw_meta = row.get("meta")
         if isinstance(raw_meta, dict):
-            meta = raw_meta
+            action_meta = raw_meta
         elif isinstance(raw_meta, str):
             try:
                 parsed = json.loads(raw_meta)
             except Exception:
                 parsed = {}
-            meta = parsed if isinstance(parsed, dict) else {}
+            action_meta = parsed if isinstance(parsed, dict) else {}
         else:
-            meta = {}
-        if str(row.get("result") or "").strip().lower() == "needs_human" or bool(meta.get("needs_human")):
+            action_meta = {}
+        if str(row.get("result") or "").strip().lower() == "needs_human" or bool(
+            action_meta.get("needs_human")
+        ):
             needs_human_count += 1
-        if bool(meta.get("retrieval_triggered")):
+        if bool(action_meta.get("retrieval_triggered")):
             retrieval_trigger_count += 1
-        directive_id = str(meta.get("directive_id") or "").strip()
+        directive_id = str(action_meta.get("directive_id") or "").strip()
         if directive_id:
             action_log_directive_ids.add(directive_id)
-        decision_confidence_values.append(_safe_float(meta.get("decision_confidence"), default=0.0))
-        context_quality_values.append(_safe_float(meta.get("context_quality_score"), default=0.0))
+        decision_confidence_values.append(
+            _safe_float(action_meta.get("decision_confidence"), default=0.0)
+        )
+        context_quality_values.append(
+            _safe_float(action_meta.get("context_quality_score"), default=0.0)
+        )
 
     directive_rows = db.execute(
         text(
@@ -5987,23 +6151,25 @@ def _autonomy_quality_snapshot(
             if state_value == DirectiveExecutionState.SUCCEEDED.value:
                 success_count += 1
         raw_meta = row.get("meta")
-        meta: dict[str, Any]
+        execution_meta: dict[str, Any]
         if isinstance(raw_meta, dict):
-            meta = raw_meta
+            execution_meta = raw_meta
         elif isinstance(raw_meta, str):
             try:
                 parsed = json.loads(raw_meta)
             except Exception:
                 parsed = {}
-            meta = parsed if isinstance(parsed, dict) else {}
+            execution_meta = parsed if isinstance(parsed, dict) else {}
         else:
-            meta = {}
-        if meta.get("retry_of"):
+            execution_meta = {}
+        if execution_meta.get("retry_of"):
             retry_count += 1
         if state_value in execution_states:
-            if bool(meta.get("outcome_recorded")) or bool(meta.get("observation_id")):
+            if bool(execution_meta.get("outcome_recorded")) or bool(
+                execution_meta.get("observation_id")
+            ):
                 outcome_feedback_count += 1
-            raw_conf = meta.get("decision_confidence")
+            raw_conf = execution_meta.get("decision_confidence")
             conf_value = _safe_float(raw_conf, default=-1.0)
             if conf_value >= 0.0:
                 conf_value = max(0.0, min(1.0, conf_value))
@@ -6208,11 +6374,9 @@ def _autonomy_readiness_payload(
             f"{float(metrics['avg_context_quality']):.2f} >= {float(thresholds['min_avg_context_quality']):.2f}"
         ),
         "eval_floor": (
-            (
-                "missing retrieval eval window, using bootstrap estimate"
-                if eval_missing
-                else f"{float(metrics['eval_floor']):.2f} >= {float(thresholds['min_eval_floor']):.2f}"
-            )
+            "missing retrieval eval window, using bootstrap estimate"
+            if eval_missing
+            else f"{float(metrics['eval_floor']):.2f} >= {float(thresholds['min_eval_floor']):.2f}"
         ),
         "confidence_alignment": (
             "insufficient calibration samples; collecting live confidence/outcome pairs"
@@ -7526,7 +7690,7 @@ def clone_advice(
     # Default path is client-side advisor reasoning via MCP.
     # Optional cloud/local advisor routing is configured through /v1/setup/advisor/*.
     # We always return prompt + context so external executors and advisors stay deterministic.
-    clone_context = None
+    clone_context: dict[str, Any] | None = None
     advisor_decision: dict[str, Any] | None = None
     if settings.clone_reasoning_enabled:
         try:
@@ -7624,18 +7788,18 @@ def clone_advice(
                         and not bool((legacy_decision or {}).get("fallback"))
                     ):
                         advisor_decision = legacy_decision
-                    runtime_meta = clone_context.get("advisor_runtime") if isinstance(clone_context.get("advisor_runtime"), dict) else {}
+                    runtime_value = clone_context.get("advisor_runtime")
+                    runtime_meta: dict[str, Any] = (
+                        runtime_value if isinstance(runtime_value, dict) else {}
+                    )
                     runtime_meta["legacy_fallback_used"] = True
                     runtime_meta["legacy_model_provider"] = str(getattr(settings, "model_provider", "ollama"))
                     clone_context["advisor_runtime"] = runtime_meta
                 except Exception:
                     logging.getLogger(__name__).warning("Legacy advisor gateway fallback failed", exc_info=True)
             elif not advisor_decision:
-                runtime_meta = (
-                    clone_context.get("advisor_runtime")
-                    if isinstance(clone_context.get("advisor_runtime"), dict)
-                    else {}
-                )
+                runtime_value = clone_context.get("advisor_runtime")
+                runtime_meta = runtime_value if isinstance(runtime_value, dict) else {}
                 runtime_meta["legacy_fallback_skipped"] = True
                 clone_context["advisor_runtime"] = runtime_meta
         except Exception:
@@ -7656,12 +7820,13 @@ def clone_advice(
             if clean_actions:
                 recommended_actions = clean_actions[:5]
         llm_conf_raw = advisor_decision.get("confidence")
-        try:
-            llm_conf = float(llm_conf_raw)
-            if math.isfinite(llm_conf):
-                confidence = _clamp_confidence(llm_conf, low=0.0, high=1.0)
-        except (TypeError, ValueError):
-            pass
+        if llm_conf_raw is not None:
+            try:
+                llm_conf = float(llm_conf_raw)
+                if math.isfinite(llm_conf):
+                    confidence = _clamp_confidence(llm_conf, low=0.0, high=1.0)
+            except (TypeError, ValueError):
+                pass
         citation_count = len(bundle.citations)
         if citation_count >= 5 and confidence >= 0.65:
             evidence_strength = "strong"
@@ -7672,6 +7837,12 @@ def clone_advice(
         if "advisor_runtime_llm" not in conflict_flags:
             conflict_flags.append("advisor_runtime_llm")
 
+    raw_evidence_observations = (clone_context or {}).get("similar_observations", [])
+    evidence_observations = [
+        dict(item)
+        for item in raw_evidence_observations
+        if isinstance(item, dict)
+    ] if isinstance(raw_evidence_observations, list) else []
     response = CloneAdviceResponse(
         interaction_id=interaction_id,
         guidance_summary=summary,
@@ -7690,7 +7861,7 @@ def clone_advice(
         },
         policy=policy_engine.summarize(blocked_count=blocked_count, applied_redactions=redactions, role=auth.role),
         clone_context=clone_context,
-        evidence_observations=(clone_context or {}).get("similar_observations", []),
+        evidence_observations=evidence_observations,
     )
 
     write_agent_interaction(
@@ -8921,6 +9092,7 @@ def ingest_observations(
 class CheckContextRequest(BaseModel):
     file_path: str
     intended_action: str = "edit"
+    session_id: str | None = None
 
 
 class CheckContextResponse(BaseModel):
@@ -8938,6 +9110,15 @@ def check_context(
     """Check timeline for past decisions relevant to a file before modifying it."""
     REQUEST_COUNT.labels(endpoint="check_context", method="POST").inc()
     _enforce_workspace_access(auth, db)
+    record_resume_progress(
+        db,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="file_opened",
+        opened_file=body.file_path,
+        progress_source="check_context",
+    )
 
     # Search all observations whose situation_summary or context_snapshot
     # mention the file path or any of its parent directory components.
@@ -9243,6 +9424,8 @@ def get_system_status(
                     (SELECT COUNT(*) FROM patterns) AS pattern_count,
                     (SELECT COUNT(*) FROM event_embeddings) AS embed_count
             """)).mappings().first()
+            if counts is None:
+                return DatabaseStatusInfo(connected=False)
             return DatabaseStatusInfo(
                 connected=True,
                 event_count=int(counts["event_count"]),
@@ -9368,6 +9551,7 @@ def dashboard_stack_restart(
     db: Session = Depends(get_db),
 ) -> DashboardStackRestartResponse:
     REQUEST_COUNT.labels(endpoint="dashboard_stack_restart", method="POST").inc()
+    _reject_privileged_default_token()
     _enforce_workspace_access(auth, db)
     _reject_advisor_writes(auth)
     requested = (body.stack or "full").strip().lower() or "full"
@@ -9416,8 +9600,12 @@ def dashboard_stack_restart_status(
     return DashboardStackRestartStatusResponse(
         restart_id=restart_id,
         state=str(job.get("state") or "unknown"),
-        started_at=job.get("started_at"),
-        completed_at=job.get("completed_at"),
+        started_at=_coerce_datetime_value(job.get("started_at")),
+        completed_at=(
+            _coerce_datetime_value(job.get("completed_at"))
+            if job.get("completed_at")
+            else None
+        ),
         error=(str(job.get("error")) if job.get("error") else None),
     )
 
@@ -9429,6 +9617,7 @@ def dashboard_update_executor_config(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     REQUEST_COUNT.labels(endpoint="dashboard_update_executor_config", method="PUT").inc()
+    _reject_privileged_default_token()
     _enforce_workspace_access(auth, db)
     _reject_advisor_writes(auth)
 
@@ -9475,9 +9664,9 @@ def dashboard_update_executor_config(
 
     try:
         _upsert_env_values(updates)
-    except Exception:
+    except Exception as exc:
         logger.exception("failed to persist executor config to .env")
-        raise HTTPException(status_code=500, detail="failed to persist executor config to .env")
+        raise HTTPException(status_code=500, detail="failed to persist executor config to .env") from exc
 
     return {
         "ok": True,
@@ -10119,6 +10308,7 @@ def request_execution_permit(
         },
     )
     db.commit()
+    PERMIT_DECISION_COUNT.labels(decision=decision.value, risk_tier=risk_tier.value).inc()
     return ExecutionPermitResponse(
         decision=decision,
         reason=reason,
@@ -10160,6 +10350,7 @@ def resolve_execution_permit(
     else:
         decision = ExecutionPermitDecision.ALLOW if body.approved else ExecutionPermitDecision.BLOCKED
         reason = "confirmed by operator" if body.approved else "denied by operator"
+    PERMIT_DECISION_COUNT.labels(decision=decision.value, risk_tier="resolved").inc()
     db.execute(
         text(
             """
@@ -10701,8 +10892,8 @@ def _normalize_change_summary_map(raw: Any) -> tuple[dict[str, dict[str, Any]], 
     normalized: dict[str, dict[str, Any]] = {}
     redacted_any = False
     for file_path, item in raw.items():
-        path_token, redacted_path = redact_text(str(file_path or "").strip())
-        redacted_any = redacted_any or redacted_path
+        path_token, redacted_path_matches = redact_text(str(file_path or "").strip())
+        redacted_any = redacted_any or bool(redacted_path_matches)
         if not path_token:
             continue
         payload = item if isinstance(item, dict) else {}
@@ -10714,8 +10905,10 @@ def _normalize_change_summary_map(raw: Any) -> tuple[dict[str, dict[str, Any]], 
             removed = max(0, int(payload.get("removed") or payload.get("removed_lines") or 0))
         except Exception:
             removed = 0
-        intent_token, redacted_intent = redact_text(str(payload.get("intent") or "").strip()[:160])
-        redacted_any = redacted_any or redacted_intent
+        intent_token, redacted_intent_matches = redact_text(
+            str(payload.get("intent") or "").strip()[:160]
+        )
+        redacted_any = redacted_any or bool(redacted_intent_matches)
         normalized[path_token[:240]] = {
             "added": added,
             "removed": removed,
@@ -10786,8 +10979,10 @@ def _persist_handoff_record(
     redaction_applied: bool,
     recorded_at: datetime,
 ) -> UUID:
-    payload = milestone.get("payload") if isinstance(milestone.get("payload"), dict) else {}
-    outcome = milestone.get("outcome") if isinstance(milestone.get("outcome"), dict) else {}
+    payload_raw = milestone.get("payload")
+    payload: dict[str, Any] = payload_raw if isinstance(payload_raw, dict) else {}
+    outcome_raw = milestone.get("outcome")
+    outcome: dict[str, Any] = outcome_raw if isinstance(outcome_raw, dict) else {}
     files = list(payload.get("files") or [])[:40]
     decision_text = str(milestone.get("decision") or "")[:500]
     next_step_text = str(outcome.get("next_step") or "")[:300]
@@ -11057,6 +11252,14 @@ def _validate_typed_contract(details_map: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+_TERMINAL_DIRECTIVE_STATES = {
+    DirectiveExecutionState.SUCCEEDED,
+    DirectiveExecutionState.FAILED,
+    DirectiveExecutionState.BLOCKED,
+    DirectiveExecutionState.ABANDONED,
+}
+
+
 @app.post("/v1/takeover/execution/report", response_model=dict)
 def takeover_execution_report(
     body: ExecutionReportRequest,
@@ -11091,13 +11294,37 @@ def takeover_execution_report(
         raise HTTPException(status_code=404, detail="directive not found")
     current = _directive_from_row(row)
     now = datetime.now(tz=UTC)
-    failure_class = None
-    retry_strategy = None
+    failure_class: FailureClass | None = None
+    retry_strategy: RetryStrategy | None = None
     retry_feedback: dict[str, Any] | None = None
     retry_scheduled = False
     retry_directive_id = None
     execution_observation_id: UUID | None = None
     current_meta = dict(current.meta or {}) if isinstance(current.meta, dict) else {}
+
+    # Idempotent replay: the MCP client auto-retries POSTs, so a duplicate
+    # report of an already-terminal directive must replay the recorded result
+    # rather than mint a second retry directive, re-run side effects, or flip
+    # the terminal state.
+    if current.state in _TERMINAL_DIRECTIVE_STATES:
+        prior = current_meta.get("report_result")
+        prior = prior if isinstance(prior, dict) else {}
+        return {
+            "directive_id": str(body.directive_id),
+            "state": current.state.value,
+            "retry_scheduled": bool(prior.get("retry_scheduled", False)),
+            "retry_directive_id": prior.get("retry_directive_id"),
+            "failure_class": prior.get("failure_class"),
+            "retry_strategy": prior.get("retry_strategy"),
+            "retry_feedback": prior.get("retry_feedback", {}),
+            "idempotent_replay": True,
+            "updated_at": (
+                current.updated_at.isoformat()
+                if hasattr(current.updated_at, "isoformat")
+                else now.isoformat()
+            ),
+        }
+
     merged_meta: dict[str, Any] = dict(current_meta)
     details_map = _merge_execution_report_details(body)
     checkpoint_anchor = _latest_editor_checkpoint_anchor(
@@ -11162,7 +11389,10 @@ def takeover_execution_report(
         effective_failure_reason = (
             f"validation_failure: {'; '.join(validation_errors)}"[:500]
         )
-    milestone_outcome = milestone.get("outcome") if isinstance(milestone.get("outcome"), dict) else {}
+    milestone_outcome_raw = milestone.get("outcome")
+    milestone_outcome: dict[str, Any] = (
+        milestone_outcome_raw if isinstance(milestone_outcome_raw, dict) else {}
+    )
     milestone_outcome["status"] = effective_state.value
     milestone["outcome"] = milestone_outcome
     merged_meta["outcome_recorded"] = True
@@ -11206,9 +11436,7 @@ def takeover_execution_report(
             "finished_at": now,
             "failure_class": failure_class.value if failure_class else None,
             "failure_reason": effective_failure_reason,
-            "retry_strategy": retry_strategy.value if hasattr(retry_strategy, "value") else str(retry_strategy)
-            if retry_strategy
-            else None,
+            "retry_strategy": retry_strategy.value if retry_strategy is not None else None,
             "meta": json.dumps(merged_meta),
             "updated_at": now,
             "directive_id": body.directive_id,
@@ -11285,7 +11513,7 @@ def takeover_execution_report(
                     "state": DirectiveExecutionState.PENDING.value,
                     "requires_permit": bool(current.requires_permit),
                     "permit_id": None,
-                    "retry_strategy": retry_strategy.value if hasattr(retry_strategy, "value") else str(retry_strategy),
+                    "retry_strategy": retry_strategy.value,
                     "meta": json.dumps(
                         {
                             "retry_of": str(current.directive_id),
@@ -11341,9 +11569,7 @@ def takeover_execution_report(
             "attempt": int(current.attempt),
             "retry_scheduled": retry_scheduled,
             "failure_class": failure_class.value if failure_class else None,
-            "retry_strategy": retry_strategy.value if hasattr(retry_strategy, "value") else str(retry_strategy)
-            if retry_strategy
-            else None,
+            "retry_strategy": retry_strategy.value if retry_strategy is not None else None,
             "decision_confidence": _safe_float(merged_meta.get("decision_confidence"), default=0.0),
             "context_quality_score": _safe_float(merged_meta.get("context_quality_score"), default=0.0),
             "citation_ids": citation_ids,
@@ -11513,13 +11739,44 @@ def takeover_execution_report(
             enqueue_job("tce_worker.jobs.handoff_outbox.run", str(delivered_outbox.id), 1)
         except Exception:
             logger.warning("failed to enqueue pending handoff outbox", exc_info=True)
+    record_resume_progress(
+        db,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="completed",
+        outcome_status=effective_state.value,
+        progress_source="report_execution",
+    )
+    # Persist a compact replay payload so a retried POST (auto-retried by the
+    # MCP client) replays instead of re-processing. The terminal-state guard
+    # at the top of this endpoint reads report_result back.
+    replay_meta = dict(merged_meta)
+    replay_meta["report_result"] = {
+        "retry_scheduled": retry_scheduled,
+        "retry_directive_id": str(retry_directive_id) if retry_directive_id else None,
+        "failure_class": failure_class.value if failure_class else None,
+        "retry_strategy": retry_strategy.value if retry_strategy is not None else None,
+        "retry_feedback": retry_feedback or {},
+    }
+    db.execute(
+        text("UPDATE directive_executions SET meta = CAST(:meta AS jsonb) WHERE directive_id = :directive_id"),
+        {"meta": json.dumps(replay_meta), "directive_id": body.directive_id},
+    )
+    db.commit()
+    DIRECTIVE_REPORT_COUNT.labels(
+        state=effective_state.value,
+        failure_class=failure_class.value if failure_class else "none",
+    ).inc()
+    if retry_scheduled:
+        DIRECTIVE_RETRY_SCHEDULED_COUNT.inc()
     return {
         "directive_id": str(body.directive_id),
         "state": effective_state.value,
         "retry_scheduled": retry_scheduled,
         "retry_directive_id": str(retry_directive_id) if retry_directive_id else None,
         "failure_class": failure_class.value if failure_class else None,
-        "retry_strategy": retry_strategy.value if hasattr(retry_strategy, "value") else retry_strategy,
+        "retry_strategy": retry_strategy.value if retry_strategy is not None else None,
         "retry_feedback": retry_feedback or {},
         "contract_validation": merged_meta.get("contract_validation"),
         "dependency_preflight": merged_meta.get("dependency_preflight"),
@@ -11779,7 +12036,7 @@ def _load_goal_queue_cache(db: Session, *, auth: AuthContext, state: TakeoverSta
                 payload = goal_cache_deserialize(row.get("payload"))
                 ttl = max(
                     1,
-                    int(((_coerce_datetime_value(row.get("expires_at")) - datetime.now(tz=UTC)).total_seconds())),
+                    int((_coerce_datetime_value(row.get("expires_at")) - datetime.now(tz=UTC)).total_seconds()),
                 )
                 goal_cache_put_l1(key, payload, ttl_seconds=ttl, source="l2")
                 goals_raw = payload.get("goals", [])
@@ -11863,7 +12120,7 @@ def _invalidate_goal_queue_cache(
     removed_l1 = goal_cache_invalidate_l1(None)
     removed_l2 = 0
     try:
-        removed_l2 = int(
+        removed_l2 = _result_rowcount(
             db.execute(
                 text(
                     """
@@ -11878,8 +12135,7 @@ def _invalidate_goal_queue_cache(
                     "workspace_id": auth.workspace_id,
                     "user_id": auth.user_id,
                 },
-            ).rowcount
-            or 0
+            )
         )
     except Exception:
         logger.warning("failed invalidating takeover goal cache", exc_info=True)
@@ -11985,9 +12241,12 @@ def _discover_takeover_goals(
             key = f"event:{title.lower()}"
             if key in candidates and candidates[key]["priority_score"] >= priority:
                 continue
+            safe_title = sanitize_untrusted_objective(title, max_len=140)
             candidates[key] = {
-                "title": title[:140],
-                "description": f"Investigate and resolve: {title[:180]}",
+                "title": safe_title,
+                "description": sanitize_untrusted_objective(
+                    f"Investigate and resolve: {safe_title}", max_len=180
+                ),
                 "source": AutonomyGoalSource.OPEN_DISCOVERY.value,
                 "priority_score": priority,
                 "risk_tier": AutonomyRiskTier.MEDIUM.value if event_type != "ERROR" else AutonomyRiskTier.HIGH.value,
@@ -12109,7 +12368,7 @@ def _discover_takeover_goals(
     for item in ranked:
         goal_id = uuid.uuid4()
         goal_signature = hashlib.sha256(
-            f"{item.get('title', '')}|{item.get('description', '')}".encode("utf-8")
+            f"{item.get('title', '')}|{item.get('description', '')}".encode()
         ).hexdigest()[:24]
         db.execute(
             text(
@@ -12253,9 +12512,9 @@ def _directive_from_row(row: Any) -> DirectiveExecution:
         started_at=_coerce_datetime_value(row.get("started_at")) if row.get("started_at") else None,
         finished_at=_coerce_datetime_value(row.get("finished_at")) if row.get("finished_at") else None,
         expires_at=_coerce_datetime_value(row.get("expires_at")) if row.get("expires_at") else None,
-        failure_class=str(row.get("failure_class")) if row.get("failure_class") else None,
+        failure_class=FailureClass(str(row.get("failure_class"))) if row.get("failure_class") else None,
         failure_reason=str(row.get("failure_reason")) if row.get("failure_reason") else None,
-        retry_strategy=str(row.get("retry_strategy")) if row.get("retry_strategy") else None,
+        retry_strategy=RetryStrategy(str(row.get("retry_strategy"))) if row.get("retry_strategy") else None,
         meta=row.get("meta") if isinstance(row.get("meta"), dict) else {},
         created_at=_coerce_datetime_value(row.get("created_at")),
         updated_at=_coerce_datetime_value(row.get("updated_at")),
@@ -12290,7 +12549,15 @@ def _load_pending_directive(db: Session, *, state: TakeoverState) -> DirectiveEx
         return None
     directive = _directive_from_row(row)
     now_stamp = datetime.now(tz=UTC)
-    if directive.expires_at and directive.expires_at < now_stamp:
+    # expires_at is the CLAIM-WINDOW deadline: it only reaps a PENDING
+    # directive that was never claimed. An IN_PROGRESS directive is actively
+    # being worked and may legitimately run past the claim TTL; it is reaped
+    # only by the stale-work window below (keyed off started_at/updated_at).
+    if (
+        directive.state == DirectiveExecutionState.PENDING
+        and directive.expires_at
+        and directive.expires_at < now_stamp
+    ):
         db.execute(
             text(
                 """
@@ -12304,7 +12571,7 @@ def _load_pending_directive(db: Session, *, state: TakeoverState) -> DirectiveEx
                 "state": DirectiveExecutionState.ABANDONED.value,
                 "finished_at": now_stamp,
                 "updated_at": now_stamp,
-                "failure_reason": "directive expired",
+                "failure_reason": "claim window expired",
                 "directive_id": directive.directive_id,
             },
         )
@@ -12745,8 +13012,8 @@ def _load_learned_workflow_step_templates(
     seen_tasks: set[str] = set()
     threshold = max(0.0, min(1.0, float(min_reliability)))
     for row in rows:
-        graph = row.get("graph") if isinstance(row, dict) else None
-        graph = graph if isinstance(graph, dict) else {}
+        raw_graph = row.get("graph") if isinstance(row, dict) else None
+        graph: dict[str, Any] = raw_graph if isinstance(raw_graph, dict) else {}
         reliability = _template_reliability(graph)
         if reliability < threshold:
             continue
@@ -13522,9 +13789,9 @@ def takeover_step(
             include_open_discovery=settings.takeover_goal_source == "open_discovery",
         )
         if selected_goal is None and discovered_goals:
-            chosen_goal = discovered_goals[0]
+            chosen_goal: TakeoverGoal | None = discovered_goals[0]
             if pinned_active and pinned_objective:
-                pinned_match = None
+                pinned_match: TakeoverGoal | None = None
                 best_overlap = 0.0
                 for candidate in discovered_goals:
                     overlap = _objective_overlap_score(
@@ -13946,9 +14213,12 @@ def takeover_step(
     clone_payload["fast_path_reason"] = fast_path_reason or None
     clone_payload["advisor_failure_reason"] = advisor_failure_reason
     state.takeover_context["last_fast_path_reason"] = fast_path_reason or None
-    policy_retrieval_meta = {}
-    if isinstance(working_set.get("policy"), dict):
-        policy_retrieval_meta = working_set["policy"].get("retrieval", {}) or {}
+    policy_retrieval_meta: dict[str, Any] = {}
+    policy_value = working_set.get("policy")
+    if isinstance(policy_value, dict):
+        retrieval_value = policy_value.get("retrieval")
+        if isinstance(retrieval_value, dict):
+            policy_retrieval_meta = retrieval_value
     if retrieval_triggered:
         raw_source = str(policy_retrieval_meta.get("source") or "").strip()
         if raw_source in {"pgvector_ann", "lexical_only", "hybrid_fallback", "qdrant"}:
@@ -14006,7 +14276,7 @@ def takeover_step(
     if isinstance(contract_payload, dict):
         clone_payload["objective_contract"] = contract_payload
 
-    final_response, enforced, enforcement_reason, classification = ensure_takeover_response(
+    response_text, enforced, enforcement_reason, classification = ensure_takeover_response(
         mode=state.mode,
         text=guidance_text,
         task=resolved_task,
@@ -14016,6 +14286,7 @@ def takeover_step(
         semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
         semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
     )
+    final_response: str | None = response_text
     if not final_response and state.active:
         final_response = build_decisive_response(
             task=resolved_task,
@@ -14647,8 +14918,6 @@ def clone_arbitrate(
 # ---------------------------------------------------------------------------
 # Static file mount for Angular dashboard (must be LAST — catch-all for /dashboard)
 # ---------------------------------------------------------------------------
-import os
-from pathlib import Path
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "dashboard-static"
 if not _DASHBOARD_DIR.exists():

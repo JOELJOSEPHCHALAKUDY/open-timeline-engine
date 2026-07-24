@@ -9,10 +9,10 @@ import subprocess
 import time
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -27,41 +27,49 @@ from tce_shared.autonomy_context import (
     summarize_hit_text,
     summary_coverage_ratio,
 )
-from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence
-from tce_shared.fingerprint import (
-    DEFAULT_FINGERPRINT,
-    apply_feedback_to_fingerprint,
-    feedback_adjusted_alpha,
-    merge_observation_into_fingerprint,
+from tce_shared.autonomy_goals import (
+    adjust_consultative_threshold,
+    classify_risk_tier,
+    continuity_health,
+    evaluate_execution_permit,
+    score_goal,
 )
+from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence
 from tce_shared.events import (
     AgentRole,
-    AutonomyNotice,
     AutonomyGoalSource,
     AutonomyGoalStatus,
+    AutonomyNotice,
     AutonomyPolicyProfile,
     AutonomyRiskTier,
     CloneAdviceRequest,
     CloneAdviceResponse,
     DirectiveExecution,
     DirectiveExecutionState,
-    ExecutionPermitDecision,
-    ExecutionClaimRequest,
-    ExecutionReportRequest,
-    ExecutionStatusResponse,
-    ExecutionPermitRequest,
-    ExecutionPermitResolveRequest,
-    ExecutionPermitResponse,
     EventEnvelope,
     EventFilter,
-    FailureClass,
     EventSearchHit,
     EventSearchRequest,
     EventSearchResponse,
     EventType,
+    ExecutionClaimRequest,
+    ExecutionPermitDecision,
+    ExecutionPermitRequest,
+    ExecutionPermitResolveRequest,
+    ExecutionPermitResponse,
+    ExecutionReportRequest,
+    ExecutionStatusResponse,
+    FailureClass,
     GoalKind,
     OperationMode,
     PatternFeedbackRequest,
+    ResumePacketAnchor,
+    ResumePacketChangeSummary,
+    ResumePacketFileItem,
+    ResumePacketRequest,
+    ResumePacketResponse,
+    ResumePacketRetrievalMeta,
+    RetryStrategy,
     RuntimeModeConfig,
     SafetyDecision,
     TakeoverAutonomyStatusResponse,
@@ -72,21 +80,11 @@ from tce_shared.events import (
     TakeoverFeedbackRequest,
     TakeoverFeedbackResponse,
     TakeoverGoal,
-    TakeoverNoticeAckRequest,
-    TakeoverNoticesResponse,
-    TakeoverGoalsDiscoverRequest,
-    TakeoverGoalsResponse,
-    RetryStrategy,
-    ResumePacketAnchor,
-    ResumePacketChangeSummary,
-    ResumePacketFileItem,
-    ResumePacketRequest,
-    ResumePacketResponse,
-    ResumePacketRetrievalMeta,
     TakeoverLatencyBreakdown,
     TakeoverMode,
     TakeoverNextAction,
-    TakeoverGoalSelectRequest,
+    TakeoverNoticeAckRequest,
+    TakeoverNoticesResponse,
     TakeoverPreloadRequest,
     TakeoverPreloadResponse,
     TakeoverState,
@@ -94,32 +92,11 @@ from tce_shared.events import (
     TakeoverStepResponse,
 )
 from tce_shared.failure_classifier import classify_failure, retry_strategy_for_attempt
-from tce_shared.redaction import apply_redaction_zones, redact_payload, redact_text
-from tce_shared.situation import SITUATION_TYPES, classify_situation
-from tce_shared.takeover import (
-    build_decisive_response,
-    build_next_action,
-    classify_text,
-    compute_decision_confidence,
-    contains_phrase,
-    ensure_takeover_response,
-    evaluate_safety,
-    mode_override,
-    next_expiry,
-    normalize_text,
-    objective_hash,
-    persona_defaults,
-    recent_failure_count,
-    resolve_objective,
-    should_trigger_deliberation,
-    update_recent_outcomes,
-)
-from tce_shared.autonomy_goals import (
-    adjust_consultative_threshold,
-    classify_risk_tier,
-    continuity_health,
-    evaluate_execution_permit,
-    score_goal,
+from tce_shared.fingerprint import (
+    DEFAULT_FINGERPRINT,
+    apply_feedback_to_fingerprint,
+    feedback_adjusted_alpha,
+    merge_observation_into_fingerprint,
 )
 from tce_shared.goal_affect import classify_goal_kind, compute_affective_scores, score_goal_affective
 from tce_shared.goal_cache import (
@@ -141,10 +118,36 @@ from tce_shared.handoff import (
     rank_resume_candidates,
     task_overlap_score,
 )
+from tce_shared.redaction import apply_redaction_zones, redact_payload, redact_text
+from tce_shared.situation import SITUATION_TYPES, classify_situation
+from tce_shared.takeover import (
+    build_decisive_response,
+    build_next_action,
+    classify_text,
+    compute_decision_confidence,
+    contains_phrase,
+    ensure_takeover_response,
+    evaluate_safety,
+    mode_override,
+    next_expiry,
+    normalize_text,
+    objective_hash,
+    persona_defaults,
+    recent_failure_count,
+    resolve_objective,
+    sanitize_untrusted_objective,
+    should_trigger_deliberation,
+    update_recent_outcomes,
+)
 
 from .auth import AuthContext
 from .config import Settings, get_settings
-from .continuity_store import deliver_handoff_safely, enqueue_handoff, record_resume_attempt
+from .continuity_store import (
+    deliver_handoff_safely,
+    enqueue_handoff,
+    record_resume_attempt,
+    record_resume_progress,
+)
 from .store_graph import (
     _ensure_owner_membership,
     _index_graph,
@@ -207,6 +210,13 @@ _CROSS_USER_HANDOFF_RE_LITE = re.compile(
 _CROSS_USER_DIRECT_NAMES_LITE = ("codex", "claude")
 
 
+class _LiteMMRCandidate(TypedDict):
+    score: float
+    hit: EventSearchHit
+    row: sqlite3.Row
+    tokens: set[str]
+
+
 def now_utc() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -218,11 +228,11 @@ def _is_retryable_db_error(exc: Exception) -> bool:
     return any(token in text for token in _RETRYABLE_DB_TOKENS)
 
 
-def _run_sql_retry(
-    fn: Any,
+def _run_sql_retry[T](
+    fn: Callable[[], T],
     *,
     settings: Settings,
-) -> Any:
+) -> T:
     retry_enabled = bool(getattr(settings, "search_retry_enabled", True))
     if not retry_enabled:
         return fn()
@@ -363,7 +373,7 @@ def _sanitize_steps_payload(raw: Any) -> list[dict[str, Any]]:
                 continue
             out.append(
                 {
-                    "order": int(item.get("order") if item.get("order") is not None else idx),
+                    "order": _safe_int(item.get("order")) if item.get("order") is not None else idx,
                     "description": description,
                     "tool": item.get("tool"),
                     "output_ref": item.get("output_ref"),
@@ -470,17 +480,17 @@ def _build_citation_snippets_lite(
                     if len(details) >= 2:
                         break
             source = f"{title} | {'; '.join(details)}" if details else title
-            excerpt = _redacted_excerpt_lite(source, max_chars=snippet_chars)
-            if excerpt:
-                evidence_lookup[event_id] = excerpt
+            evidence_excerpt = _redacted_excerpt_lite(source, max_chars=snippet_chars)
+            if evidence_excerpt:
+                evidence_lookup[event_id] = evidence_excerpt
 
     missing_ids: list[UUID] = []
     snippets: list[dict[str, str]] = []
     for citation_id in ordered_ids:
         event_id = str(citation_id)
-        excerpt = evidence_lookup.get(event_id)
-        if excerpt:
-            snippets.append({"id": event_id, "excerpt": excerpt})
+        cached_excerpt = evidence_lookup.get(event_id)
+        if cached_excerpt:
+            snippets.append({"id": event_id, "excerpt": cached_excerpt})
         else:
             missing_ids.append(citation_id)
 
@@ -495,17 +505,17 @@ def _build_citation_snippets_lite(
             row = row_lookup.get(str(citation_id))
             if row is None:
                 continue
-            excerpt = _citation_excerpt_from_row_lite(row, snippet_chars=snippet_chars)
-            if excerpt:
-                snippets.append({"id": str(citation_id), "excerpt": excerpt})
+            row_excerpt = _citation_excerpt_from_row_lite(row, snippet_chars=snippet_chars)
+            if row_excerpt:
+                snippets.append({"id": str(citation_id), "excerpt": row_excerpt})
 
     snippet_lookup = {item["id"]: item["excerpt"] for item in snippets if item.get("id") and item.get("excerpt")}
     ordered: list[dict[str, str]] = []
     for citation_id in ordered_ids:
         event_id = str(citation_id)
-        excerpt = snippet_lookup.get(event_id)
-        if excerpt:
-            ordered.append({"id": event_id, "excerpt": excerpt})
+        ordered_excerpt = snippet_lookup.get(event_id)
+        if ordered_excerpt:
+            ordered.append({"id": event_id, "excerpt": ordered_excerpt})
     return ordered
 
 
@@ -1078,7 +1088,7 @@ def _mmr_select_lite(
 ) -> list[tuple[float, EventSearchHit, sqlite3.Row]]:
     if top_k <= 0:
         return []
-    candidates = [
+    candidates: list[_LiteMMRCandidate] = [
         {
             "score": score,
             "hit": hit,
@@ -1087,7 +1097,7 @@ def _mmr_select_lite(
         }
         for score, hit, row in scored
     ]
-    selected: list[dict[str, Any]] = []
+    selected: list[_LiteMMRCandidate] = []
     while candidates and len(selected) < top_k:
         best_index = 0
         best_value = float("-inf")
@@ -1552,7 +1562,7 @@ def _run_reflection_lite(
         return
     context_payload = event.context if isinstance(event.context, dict) else {}
     session_id = str(context_payload.get("session_id") or "default")
-    outcome_payload = event.outcome if isinstance(event.outcome, dict) else {}
+    outcome_payload: dict[str, Any] = event.outcome.model_dump(mode="json") if event.outcome else {}
     success = bool(outcome_payload.get("success")) if outcome_payload else False
     goal = str(context_payload.get("objective") or event.title or event.task_type or "Untitled goal")[:240]
     now = now_utc().isoformat()
@@ -1940,31 +1950,33 @@ def store_event(
 
 def event_row_to_envelope(row: sqlite3.Row) -> EventEnvelope:
     event_type = EventType(row["event_type"])
-    return EventEnvelope(
-        schema_version=row["schema_version"],
-        ts=datetime.fromisoformat(row["ts"]),
-        actor=row["actor"],
-        source=row["source"],
-        domain=row["domain"],
-        task_type=row["task_type"],
-        event_type=event_type,
-        title=row["title"],
-        payload=json_loads(row["payload"], {}),
-        context=json_loads(row["context"], {}),
-        inputs=json_loads(row["inputs"], {}),
-        steps=_sanitize_steps_payload(json_loads(row["steps"], [])),
-        decision=_sanitize_decision_payload(json_loads(row["decision"], None)),
-        outcome=_sanitize_outcome_payload(json_loads(row["outcome"], None)),
-        style=_sanitize_style_payload(json_loads(row["style"], None)),
-        links=_sanitize_links_payload(json_loads(row["links"], None)),
-        tags=json_loads(row["tags"], []),
-        sensitivity=row["sensitivity"],
-        redaction_hints=json_loads(row["redaction_hints"], []),
-        source_id=row["source_id"] if "source_id" in row.keys() else None,
-        source_seq=row["source_seq"] if "source_seq" in row.keys() else None,
-        vector_clock=json_loads(row["vector_clock"], {}) if "vector_clock" in row.keys() else {},
-        idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
-        authority_level=row["authority_level"] if "authority_level" in row.keys() else "incidental",
+    return EventEnvelope.model_validate(
+        {
+            "schema_version": row["schema_version"],
+            "ts": datetime.fromisoformat(row["ts"]),
+            "actor": row["actor"],
+            "source": row["source"],
+            "domain": row["domain"],
+            "task_type": row["task_type"],
+            "event_type": event_type,
+            "title": row["title"],
+            "payload": json_loads(row["payload"], {}),
+            "context": json_loads(row["context"], {}),
+            "inputs": json_loads(row["inputs"], {}),
+            "steps": _sanitize_steps_payload(json_loads(row["steps"], [])),
+            "decision": _sanitize_decision_payload(json_loads(row["decision"], None)),
+            "outcome": _sanitize_outcome_payload(json_loads(row["outcome"], None)),
+            "style": _sanitize_style_payload(json_loads(row["style"], None)),
+            "links": _sanitize_links_payload(json_loads(row["links"], None)),
+            "tags": json_loads(row["tags"], []),
+            "sensitivity": row["sensitivity"],
+            "redaction_hints": json_loads(row["redaction_hints"], []),
+            "source_id": row["source_id"] if "source_id" in row.keys() else None,
+            "source_seq": row["source_seq"] if "source_seq" in row.keys() else None,
+            "vector_clock": json_loads(row["vector_clock"], {}) if "vector_clock" in row.keys() else {},
+            "idempotency_key": row["idempotency_key"] if "idempotency_key" in row.keys() else None,
+            "authority_level": row["authority_level"] if "authority_level" in row.keys() else "incidental",
+        }
     )
 
 
@@ -2506,9 +2518,12 @@ def search_events(
 
 
 def _resume_file_items_from_record_lite(record: dict[str, Any], *, query_text: str) -> list[ResumePacketFileItem]:
-    files_raw = record.get("files_json") if isinstance(record.get("files_json"), list) else []
-    anchors_raw = record.get("anchors_json") if isinstance(record.get("anchors_json"), list) else []
-    change_raw = record.get("change_summary_json") if isinstance(record.get("change_summary_json"), dict) else {}
+    files_value = record.get("files_json")
+    files_raw: list[Any] = files_value if isinstance(files_value, list) else []
+    anchors_value = record.get("anchors_json")
+    anchors_raw: list[Any] = anchors_value if isinstance(anchors_value, list) else []
+    change_value = record.get("change_summary_json")
+    change_raw: dict[str, Any] = change_value if isinstance(change_value, dict) else {}
     anchors_by_file: dict[str, list[ResumePacketAnchor]] = {}
     for item in anchors_raw:
         if not isinstance(item, dict):
@@ -2661,9 +2676,11 @@ def get_resume_packet(
             workspace_id=auth.workspace_id,
             requesting_owner_id=auth.user_id,
             target_owner_id=str(selected.get("owner_id") or body.target_owner or auth.user_id),
+            session_id=body.session_id,
             selected_record_id=selected_id,
             query_text=body.query,
             top_file=files[0].path if files else None,
+            recommended_files=[item.path for item in files],
             requested_at=returned_at - timedelta(milliseconds=response.retrieval_meta.latency_ms),
             returned_at=returned_at,
             handoff_ts=selected_ts,
@@ -3179,8 +3196,8 @@ def get_episode(
         limit=500,
     )["episodes"]
     for item in rows:
-        if item["id"] == str(episode_id):
-            return item
+        if isinstance(item, dict) and item.get("id") == str(episode_id):
+            return dict(item)
     return None
 
 
@@ -3303,8 +3320,8 @@ def context_brief(
     merged_citations: list[Any] = []
     seen: set[str] = set()
     for section in (standard_approach, current_state, constraints_preferences, open_loops, artifacts):
-        for item in section:
-            for citation in item["citations"]:
+        for section_item in section:
+            for citation in section_item["citations"]:
                 key = str(citation)
                 if key in seen:
                     continue
@@ -3429,7 +3446,15 @@ def upsert_memory_rule(
         ),
     )
     conn.commit()
-    return list_memory_rules(conn, workspace_id=workspace_id, user_id=user_id, include_inactive=True)["rules"][0]
+    rules = list_memory_rules(
+        conn,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        include_inactive=True,
+    ).get("rules")
+    if not isinstance(rules, list) or not rules or not isinstance(rules[0], dict):
+        raise RuntimeError("memory rule was persisted but could not be reloaded")
+    return dict(rules[0])
 
 
 def deprecate_memory_rule(
@@ -3815,11 +3840,9 @@ def autonomy_readiness(
             f"{float(metrics['avg_context_quality']):.2f} >= {float(thresholds['min_avg_context_quality']):.2f}"
         ),
         "eval_floor": (
-            (
-                "missing retrieval eval window, using bootstrap estimate"
-                if eval_missing
-                else f"{float(metrics['eval_floor']):.2f} >= {float(thresholds['min_eval_floor']):.2f}"
-            )
+            "missing retrieval eval window, using bootstrap estimate"
+            if eval_missing
+            else f"{float(metrics['eval_floor']):.2f} >= {float(thresholds['min_eval_floor']):.2f}"
         ),
         "confidence_alignment": (
             "insufficient calibration samples; collecting live confidence/outcome pairs"
@@ -5807,7 +5830,15 @@ def _load_pending_directive(
         return None
     directive = _directive_from_row(row)
     now_stamp = now_utc()
-    if directive.expires_at and directive.expires_at < now_stamp:
+    # expires_at is the CLAIM-WINDOW deadline: it only reaps a PENDING
+    # directive that was never claimed. An IN_PROGRESS directive is actively
+    # being worked and may legitimately run past the claim TTL; it is reaped
+    # only by the stale-work window below (keyed off started_at/updated_at).
+    if (
+        directive.state == DirectiveExecutionState.PENDING
+        and directive.expires_at
+        and directive.expires_at < now_stamp
+    ):
         conn.execute(
             """
             UPDATE directive_executions
@@ -5818,7 +5849,7 @@ def _load_pending_directive(
                 DirectiveExecutionState.ABANDONED.value,
                 now_stamp.isoformat(),
                 now_stamp.isoformat(),
-                "directive expired",
+                "claim window expired",
                 str(directive.directive_id),
             ),
         )
@@ -6192,9 +6223,12 @@ def discover_takeover_goals(
             success_probability = 0.68
             confidence = 0.7 if event_type == "ERROR" else 0.58
             key = f"event:{title.lower()}"
+            safe_title = sanitize_untrusted_objective(title, max_len=140)
             candidates[key] = {
-                "title": title[:140],
-                "description": f"Investigate and resolve: {title[:180]}",
+                "title": safe_title,
+                "description": sanitize_untrusted_objective(
+                    f"Investigate and resolve: {safe_title}", max_len=180
+                ),
                 "source": AutonomyGoalSource.OPEN_DISCOVERY.value,
                 "priority_score": score_goal(urgency, recency, blocker_impact, success_probability),
                 "risk_tier": AutonomyRiskTier.HIGH.value if event_type == "ERROR" else AutonomyRiskTier.MEDIUM.value,
@@ -6300,7 +6334,7 @@ def discover_takeover_goals(
     for item in ranked:
         goal_id = str(uuid.uuid4())
         goal_signature = hashlib.sha256(
-            f"{item.get('title', '')}|{item.get('description', '')}".encode("utf-8")
+            f"{item.get('title', '')}|{item.get('description', '')}".encode()
         ).hexdigest()[:24]
         conn.execute(
             """
@@ -7115,7 +7149,7 @@ def _latest_editor_checkpoint_anchor_lite(
     if not anchor:
         return None
     anchor.pop("ts", None)
-    return anchor
+    return dict(anchor)
 
 
 def _normalize_execution_milestone_lite(
@@ -7234,8 +7268,10 @@ def _persist_handoff_record_lite(
     recorded_at: datetime,
     settings: Settings,
 ) -> str:
-    payload = milestone.get("payload") if isinstance(milestone.get("payload"), dict) else {}
-    outcome = milestone.get("outcome") if isinstance(milestone.get("outcome"), dict) else {}
+    payload_raw = milestone.get("payload")
+    payload: dict[str, Any] = payload_raw if isinstance(payload_raw, dict) else {}
+    outcome_raw = milestone.get("outcome")
+    outcome: dict[str, Any] = outcome_raw if isinstance(outcome_raw, dict) else {}
     files = list(payload.get("files") or [])[:40]
     decision_text = str(milestone.get("decision") or "")[:500]
     next_step_text = str(outcome.get("next_step") or "")[:300]
@@ -7287,6 +7323,14 @@ def _persist_handoff_record_lite(
     return record_id
 
 
+_TERMINAL_DIRECTIVE_STATES = {
+    DirectiveExecutionState.SUCCEEDED,
+    DirectiveExecutionState.FAILED,
+    DirectiveExecutionState.BLOCKED,
+    DirectiveExecutionState.ABANDONED,
+}
+
+
 def report_execution(
     conn: sqlite3.Connection,
     *,
@@ -7317,6 +7361,30 @@ def report_execution(
     retry_directive_id = None
     execution_observation_id: str | None = None
     current_meta = dict(current.meta or {}) if isinstance(current.meta, dict) else {}
+
+    # Idempotent replay: the MCP client auto-retries POSTs, so a duplicate
+    # report of an already-terminal directive must replay the recorded result
+    # rather than mint a second retry directive, re-run side effects, or flip
+    # the terminal state.
+    if current.state in _TERMINAL_DIRECTIVE_STATES:
+        prior = current_meta.get("report_result")
+        prior = prior if isinstance(prior, dict) else {}
+        return {
+            "directive_id": str(body.directive_id),
+            "state": current.state.value,
+            "retry_scheduled": bool(prior.get("retry_scheduled", False)),
+            "retry_directive_id": prior.get("retry_directive_id"),
+            "failure_class": prior.get("failure_class"),
+            "retry_strategy": prior.get("retry_strategy"),
+            "retry_feedback": prior.get("retry_feedback", {}),
+            "idempotent_replay": True,
+            "updated_at": (
+                current.updated_at.isoformat()
+                if hasattr(current.updated_at, "isoformat")
+                else now.isoformat()
+            ),
+        }
+
     merged_meta: dict[str, Any] = dict(current_meta)
     details_map = _merge_execution_report_details_lite(body)
     checkpoint_anchor = _latest_editor_checkpoint_anchor_lite(
@@ -7381,7 +7449,10 @@ def report_execution(
     if validation_errors:
         effective_state = DirectiveExecutionState.FAILED
         effective_failure_reason = f"validation_failure: {'; '.join(validation_errors)}"[:500]
-    milestone_outcome = milestone.get("outcome") if isinstance(milestone.get("outcome"), dict) else {}
+    milestone_outcome_raw = milestone.get("outcome")
+    milestone_outcome: dict[str, Any] = (
+        milestone_outcome_raw if isinstance(milestone_outcome_raw, dict) else {}
+    )
     milestone_outcome["status"] = effective_state.value
     milestone["outcome"] = milestone_outcome
     merged_meta["outcome_recorded"] = True
@@ -7697,6 +7768,31 @@ def report_execution(
         outbox_id=str(completion_outbox["id"]),
         retention_days=int(settings.handoff_retention_days),
     )
+    record_resume_progress(
+        conn,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="completed",
+        outcome_status=effective_state.value,
+        progress_source="report_execution",
+    )
+    # Persist a compact replay payload so a retried POST (auto-retried by the
+    # MCP client) replays instead of re-processing. The terminal-state guard
+    # at the top of this function reads report_result back.
+    replay_meta = dict(merged_meta)
+    replay_meta["report_result"] = {
+        "retry_scheduled": retry_scheduled,
+        "retry_directive_id": str(retry_directive_id) if retry_directive_id else None,
+        "failure_class": failure_class.value if failure_class else None,
+        "retry_strategy": retry_strategy.value if retry_strategy else None,
+        "retry_feedback": retry_feedback or {},
+    }
+    conn.execute(
+        "UPDATE directive_executions SET meta = ? WHERE directive_id = ?",
+        (json_dumps(replay_meta), str(body.directive_id)),
+    )
+    conn.commit()
     return {
         "directive_id": str(body.directive_id),
         "state": effective_state.value,
@@ -8227,18 +8323,18 @@ def takeover_step(
             settings=settings,
         )
         if selected_goal is None and discovered_goals:
-            chosen_goal = discovered_goals[0]
+            chosen_goal: TakeoverGoal | None = discovered_goals[0]
             if pinned_active and pinned_objective:
-                pinned_match = None
+                pinned_match: TakeoverGoal | None = None
                 best_overlap = 0.0
-                for candidate in discovered_goals:
+                for goal_candidate in discovered_goals:
                     overlap = _objective_overlap_score_lite(
                         pinned_objective,
-                        f"{candidate.title} {candidate.description}",
+                        f"{goal_candidate.title} {goal_candidate.description}",
                     )
                     if overlap > best_overlap:
                         best_overlap = overlap
-                        pinned_match = candidate
+                        pinned_match = goal_candidate
                 if pinned_match is not None and best_overlap >= 0.28:
                     chosen_goal = pinned_match
                 else:
@@ -8558,9 +8654,12 @@ def takeover_step(
     clone_payload["fast_path_reason"] = fast_path_reason or None
     clone_payload["advisor_failure_reason"] = advisor_failure_reason
     state.takeover_context["last_fast_path_reason"] = fast_path_reason or None
-    policy_retrieval_meta = {}
-    if isinstance(working_set.get("policy"), dict):
-        policy_retrieval_meta = working_set["policy"].get("retrieval", {}) or {}
+    policy_retrieval_meta: dict[str, Any] = {}
+    policy_value = working_set.get("policy")
+    if isinstance(policy_value, dict):
+        retrieval_value = policy_value.get("retrieval")
+        if isinstance(retrieval_value, dict):
+            policy_retrieval_meta = retrieval_value
     if retrieval_triggered:
         raw_source = str(policy_retrieval_meta.get("source") or "").strip()
         if raw_source in {"pgvector_ann", "lexical_only", "hybrid_fallback", "qdrant"}:
@@ -8613,7 +8712,7 @@ def takeover_step(
     if isinstance(contract_payload, dict):
         clone_payload["objective_contract"] = contract_payload
 
-    final_response, enforced, enforcement_reason, classification = ensure_takeover_response(
+    response_text, enforced, enforcement_reason, classification = ensure_takeover_response(
         mode=state.mode,
         text=candidate,
         task=resolved_task,
@@ -8623,6 +8722,7 @@ def takeover_step(
         semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
         semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
     )
+    final_response: str | None = response_text
     # If ensure_takeover_response returned empty (edge case), build a
     # decisive fallback so the executor always gets actionable guidance
     # during active takeover instead of null (which causes loops/stops).

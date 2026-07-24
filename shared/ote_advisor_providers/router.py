@@ -16,6 +16,13 @@ def _now() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(default if value is None else value)
+    except (TypeError, ValueError):
+        return default
+
+
 def route_key(provider_id: str, model: str | None) -> str:
     return f"{provider_id.strip().lower()}::{(model or '').strip().lower()}"
 
@@ -66,7 +73,7 @@ def normalize_route(route: dict[str, Any], *, priority: int) -> dict[str, Any] |
         "base_url": str(route.get("base_url") or "").strip() or default_base_url,
         "api_version": str(route.get("api_version") or "").strip() or None,
         "region_hint": str(route.get("region_hint") or "").strip() or default_region_hint,
-        "priority": int(route.get("priority") if route.get("priority") is not None else priority),
+        "priority": _as_int(route.get("priority"), priority),
         "provider_category": _provider_category(provider_id),
     }
 
@@ -190,10 +197,11 @@ def normalize_profile_bundle(
 
 def active_profile(bundle: dict[str, Any]) -> dict[str, Any]:
     active_id = str(bundle.get("active_profile_id") or "").strip()
-    for profile in bundle.get("profiles", []):
+    profiles_raw = bundle.get("profiles")
+    profiles = [item for item in profiles_raw if isinstance(item, dict)] if isinstance(profiles_raw, list) else []
+    for profile in profiles:
         if str(profile.get("profile_id")) == active_id:
             return profile
-    profiles = bundle.get("profiles", [])
     if profiles:
         return profiles[0]
     return normalize_profile({"profile_id": "default", "routes": []})
@@ -201,7 +209,9 @@ def active_profile(bundle: dict[str, Any]) -> dict[str, Any]:
 
 def find_route(profile: dict[str, Any], provider_id: str) -> dict[str, Any] | None:
     target = str(provider_id or "").strip().lower()
-    for route in profile.get("routes", []):
+    routes_raw = profile.get("routes")
+    routes = [item for item in routes_raw if isinstance(item, dict)] if isinstance(routes_raw, list) else []
+    for route in routes:
         if str(route.get("provider_id") or "").strip().lower() == target:
             return route
     return None
@@ -250,7 +260,10 @@ def update_health_state(
 ) -> dict[str, Any]:
     stamp = now or _now()
     key = route_key(str(route.get("provider_id") or ""), str(route.get("model") or ""))
-    current = health.get(key) if isinstance(health.get(key), dict) else _default_health_entry(stamp)
+    current_raw = health.get(key)
+    current: dict[str, Any] = (
+        dict(current_raw) if isinstance(current_raw, dict) else _default_health_entry(stamp)
+    )
     success_prev = float(current.get("success_ewma", 0.80))
     latency_prev = float(current.get("latency_ewma_ms", 350.0))
     alpha = 0.25
@@ -322,9 +335,14 @@ def select_route(
 ) -> dict[str, Any]:
     stamp = now or _now()
     ranked: list[dict[str, Any]] = []
-    for route in profile.get("routes", []):
+    routes_raw = profile.get("routes")
+    routes = [item for item in routes_raw if isinstance(item, dict)] if isinstance(routes_raw, list) else []
+    for route in routes:
         key = route_key(str(route.get("provider_id") or ""), str(route.get("model") or ""))
-        entry = health.get(key) if isinstance(health.get(key), dict) else _default_health_entry(stamp)
+        entry_raw = health.get(key)
+        entry: dict[str, Any] = (
+            dict(entry_raw) if isinstance(entry_raw, dict) else _default_health_entry(stamp)
+        )
         score = route_score(route, entry, now=stamp)
         ranked.append(
             {
@@ -362,9 +380,14 @@ def runtime_status(
 ) -> dict[str, Any]:
     stamp = now or _now()
     rows: list[dict[str, Any]] = []
-    for route in profile.get("routes", []):
+    routes_raw = profile.get("routes")
+    routes = [item for item in routes_raw if isinstance(item, dict)] if isinstance(routes_raw, list) else []
+    for route in routes:
         key = route_key(str(route.get("provider_id") or ""), str(route.get("model") or ""))
-        entry = health.get(key) if isinstance(health.get(key), dict) else _default_health_entry(stamp)
+        entry_raw = health.get(key)
+        entry: dict[str, Any] = (
+            dict(entry_raw) if isinstance(entry_raw, dict) else _default_health_entry(stamp)
+        )
         rows.append(
             {
                 "provider_id": str(route.get("provider_id") or ""),

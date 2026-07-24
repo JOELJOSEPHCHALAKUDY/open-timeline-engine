@@ -115,7 +115,7 @@ def llm_extract_facts(
         predicate = item.get("predicate")
         obj = item.get("object")
         confidence = item.get("confidence", 0.65)
-        if not all(isinstance(v, str) for v in (subject, predicate, obj)):
+        if not isinstance(subject, str) or not isinstance(predicate, str) or not isinstance(obj, str):
             continue
         subject = subject.strip()
         predicate = predicate.strip()

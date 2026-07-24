@@ -32,7 +32,10 @@ services:
     image: redis:7-alpine
     ports:
       - "${TCE_REDIS_PORT:-6379}:6379"
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # noeviction: this instance is the RQ job store — allkeys-lru silently evicts
+    # queued jobs under memory pressure (RQ requires noeviction). Cache keys
+    # (tce:embed:*, tce:emb:*) carry TTLs and their writers tolerate failures.
+    command: redis-server --maxmemory 512mb --maxmemory-policy noeviction
     deploy:
       resources:
         limits:
@@ -66,6 +69,9 @@ services:
       TCE_QDRANT_ENABLED: ${TCE_QDRANT_ENABLED:-true}
       TCE_QDRANT_URL: http://qdrant:6333
       TCE_API_WORKERS: ${TCE_API_WORKERS:-4}
+      # Aggregate metrics across uvicorn workers; without this each scrape
+      # hits one process's registry and counters appear to jump/reset.
+      PROMETHEUS_MULTIPROC_DIR: /dev/shm/tce-prom
       TCE_ENV_FILE: /workspace/.env
       TCE_BEHAVIOR_EVIDENCE_ENABLED: ${TCE_BEHAVIOR_EVIDENCE_ENABLED:-true}
       TCE_BEHAVIOR_FIDELITY_ENABLED: ${TCE_BEHAVIOR_FIDELITY_ENABLED:-true}

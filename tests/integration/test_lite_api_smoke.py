@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -45,7 +46,7 @@ def _event_payload(title: str, sensitivity: int = 1) -> dict:
 
 
 @pytest.fixture()
-def lite_client(tmp_path) -> TestClient:
+def lite_client(tmp_path) -> Iterator[TestClient]:
     settings = get_settings()
     settings.lite_db_path = str(tmp_path / "tce-lite-test.db")
     settings.api_tokens = "lite-test-token"
@@ -84,6 +85,20 @@ def test_lite_ingest_search_and_bundle(lite_client: TestClient) -> None:
     body = bundle.json()
     assert "citations" in body
     assert "policy" in body
+
+
+def test_lite_governance_status_is_honest_about_protocol_only_enforcement(
+    lite_client: TestClient,
+) -> None:
+    response = lite_client.get("/v1/governance/status", headers=_headers())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["runtime"] == "lite"
+    assert body["lifecycle_protocol_enforced"] is True
+    assert body["effective_execution_enforcement"] == "protocol_only"
+    assert body["non_bypassable_execution"] is False
+    assert any("cooperative protocol" in item for item in body["limitations"])
 
 
 def test_lite_advisor_is_readonly(lite_client: TestClient) -> None:

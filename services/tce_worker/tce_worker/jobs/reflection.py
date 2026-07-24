@@ -120,7 +120,8 @@ def run(event_id: str, workspace_id: str | None = None, user_id: str | None = No
         if not row:
             return {"status": "missing", "event_id": event_id}
 
-        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        context_raw = row.get("context")
+        context: dict[str, Any] = context_raw if isinstance(context_raw, dict) else {}
         scoped_workspace = workspace_id or str(context.get("_tce_workspace") or "")
         scoped_user = user_id or str(context.get("_tce_owner") or "")
         if not scoped_workspace or not scoped_user:

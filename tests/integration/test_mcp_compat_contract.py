@@ -2,7 +2,7 @@ from tce_mcp import server
 
 
 def test_mcp_contract_tools_are_exposed() -> None:
-    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}  # type: ignore[attr-defined]
+    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}
     expected = {
         "tce.search_events",
         "tce.get_context_bundle",

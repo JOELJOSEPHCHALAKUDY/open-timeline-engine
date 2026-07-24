@@ -9,15 +9,18 @@ from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 _WARNED = False
+AESGCM: Any
 
 try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+
+    AESGCM = _AESGCM
 except Exception:  # pragma: no cover - optional dependency fallback
     AESGCM = None
 
 
 def _derive_key(secret: str, key_id: str) -> bytes:
-    seed = f"{secret}:{key_id}".encode("utf-8")
+    seed = f"{secret}:{key_id}".encode()
     return hashlib.sha256(seed).digest()
 
 

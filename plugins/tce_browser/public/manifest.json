@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TCE Browser Capture",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "permissions": ["storage", "tabs", "activeTab", "contextMenus"],
   "host_permissions": ["http://localhost:8080/*", "https://*/*", "http://*/*"],
   "background": {

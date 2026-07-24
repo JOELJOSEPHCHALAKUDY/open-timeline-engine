@@ -284,6 +284,32 @@ def normalize_text(value: str | None) -> str:
     return " ".join(cleaned.split())
 
 
+# Imperative override phrases that must never survive as bare instructions when
+# untrusted event text is promoted into an autonomous objective.
+_INJECTION_LEAD_IN = re.compile(
+    r"\b(?:ignore|disregard|forget|override)\b[^.;\n]*?\b(?:previous|prior|earlier|above|all)\b"
+    r"[^.;\n]*?\binstructions?\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_untrusted_objective(value: str | None, *, max_len: int = 180) -> str:
+    """Neutralize untrusted text (e.g. an event title) promoted to an objective.
+
+    Collapses to a single line, defangs prompt-injection lead-ins, and caps
+    length. This is not a substitute for delimiting the objective as data at
+    the executor boundary — it is defense in depth on the way in.
+    """
+    if not value:
+        return ""
+    collapsed = " ".join(str(value).split())
+    defanged = _INJECTION_LEAD_IN.sub("[redacted-directive]", collapsed)
+    defanged = " ".join(defanged.split())
+    if len(defanged) > max_len:
+        defanged = defanged[:max_len].rstrip()
+    return defanged
+
+
 def persona_defaults(persona_mode: str) -> tuple[str, str]:
     normalized = persona_mode.strip().lower()
     if normalized == "naruto":
@@ -1204,6 +1230,45 @@ def build_next_action(
     }
 
 
+# "can't"/"won't" collapse to cant/wont in _tokenize_normalized; include them
+# so a negated confirmation ("I can't confirm this") never releases the gate.
+_CONFIRM_NEGATION_TOKENS = {"not", "never", "no", "dont", "cant", "wont", "without", "cannot"}
+
+
+def _keyword_span_indices(tokens: list[str], key_tokens: list[str]) -> list[int]:
+    if not key_tokens:
+        return []
+    span = len(key_tokens)
+    return [idx for idx in range(len(tokens) - span + 1) if tokens[idx : idx + span] == key_tokens]
+
+
+def _confirmation_is_affirmative(normalized_message: str, keyword: str) -> bool:
+    """True only when the confirm keyword appears as a whole word and is not negated.
+
+    Guards against substring leaks ("confirmation") and negated forms
+    ("don't confirm", "I can't confirm this", "no confirm").
+    """
+    key_tokens = _tokenize_normalized(normalize_text(keyword))
+    if not key_tokens:
+        return False
+    tokens = _tokenize_normalized(normalized_message)
+    for idx in _keyword_span_indices(tokens, key_tokens):
+        start = max(0, idx - 3)
+        if any(tokens[pos] in _CONFIRM_NEGATION_TOKENS for pos in range(start, idx)):
+            continue
+        return True
+    return False
+
+
+def _keyword_present_whole_word(normalized_message: str, keyword: str) -> bool:
+    """Whole-word presence check (used for denials, which default to the safe side)."""
+    key_tokens = _tokenize_normalized(normalize_text(keyword))
+    if not key_tokens:
+        return False
+    tokens = _tokenize_normalized(normalized_message)
+    return bool(_keyword_span_indices(tokens, key_tokens))
+
+
 def evaluate_safety(
     policy: TakeoverPolicy,
     message: str,
@@ -1217,10 +1282,12 @@ def evaluate_safety(
     confirm_keyword = normalize_text(policy.confirm_keyword)
     deny_keyword = normalize_text(policy.deny_keyword)
     if isinstance(pending, dict):
-        if confirm_keyword and confirm_keyword in normalized_message:
-            return SafetyDecision.ALLOW, "confirmed_high_risk"
-        if deny_keyword and deny_keyword in normalized_message:
+        # Denial is checked first and wins over a co-occurring confirm; the
+        # gate defaults to CONFIRM_REQUIRED so anything ambiguous stays paused.
+        if deny_keyword and _keyword_present_whole_word(normalized_message, deny_keyword):
             return SafetyDecision.BLOCKED, "denied_high_risk"
+        if confirm_keyword and _confirmation_is_affirmative(normalized_message, confirm_keyword):
+            return SafetyDecision.ALLOW, "confirmed_high_risk"
         return SafetyDecision.CONFIRM_REQUIRED, "awaiting_high_risk_confirmation"
     risk = high_risk_reason(message) or high_risk_reason(final_response)
     if not risk:

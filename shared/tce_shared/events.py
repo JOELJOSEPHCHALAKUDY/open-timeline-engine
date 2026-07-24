@@ -845,15 +845,23 @@ class CompletionCaptureResponse(BaseModel):
 
 class ResumeFeedbackRequest(BaseModel):
     packet_id: UUID
+    phase: str = Field(default="feedback", pattern="^(file_opened|productive|completed|feedback)$")
     opened_file: str | None = Field(default=None, max_length=240)
-    correct_file: bool
-    correction_required: bool = False
+    correct_file: bool | None = None
+    correct_anchor: bool | None = None
+    opened_file_rank: int | None = Field(default=None, ge=1, le=40)
+    correction_required: bool | None = None
     correction_reason: str = Field(default="", max_length=500)
+    archaeology_tool_calls: int | None = Field(default=None, ge=0, le=10000)
+    archaeology_tokens: int | None = Field(default=None, ge=0, le=10_000_000)
+    outcome_status: str | None = Field(default=None, max_length=40)
+    progress_source: str = Field(default="manual", max_length=64)
 
 
 class ResumeFeedbackResponse(BaseModel):
     packet_id: UUID
     recorded: bool
+    phase: str = "feedback"
     feedback_at: datetime
 
 
@@ -864,14 +872,51 @@ class ContinuityPilotStatusResponse(BaseModel):
     handoff_capture_coverage: float
     resume_attempt_count: int
     feedback_count: int
+    productive_resume_count: int = 0
+    completed_resume_count: int = 0
     correct_file_rate: float | None = None
+    correct_file_at_1_rate: float | None = None
+    correct_file_at_3_rate: float | None = None
+    correct_anchor_rate: float | None = None
     correction_rate: float | None = None
+    # Deprecated compatibility fields. They measure handoff age at request time.
     median_time_to_resume_ms: float | None = None
     p95_time_to_resume_ms: float | None = None
+    median_handoff_age_at_resume_ms: float | None = None
+    p95_handoff_age_at_resume_ms: float | None = None
+    median_time_to_first_file_ms: float | None = None
+    p95_time_to_first_file_ms: float | None = None
+    median_active_resume_ms: float | None = None
+    p95_active_resume_ms: float | None = None
+    median_completion_after_resume_ms: float | None = None
+    p95_completion_after_resume_ms: float | None = None
     median_retrieval_latency_ms: float | None = None
+    median_archaeology_tool_calls: float | None = None
+    median_archaeology_tokens: float | None = None
     outbox_pending_count: int = 0
     outbox_dead_count: int = 0
     generated_at: datetime
+
+
+class GovernanceStatusResponse(BaseModel):
+    runtime: str
+    runtime_profile: str
+    auth_mode: str
+    identity_claims_mode: str
+    workspace_access_mode: str
+    audit_write_mode: str
+    mcp_tool_profile: str
+    requested_execution_enforcement: str
+    effective_execution_enforcement: str
+    lifecycle_protocol_enforced: bool
+    host_mutation_interception: bool
+    interception_provider: str | None = None
+    non_bypassable_execution: bool
+    server_boundary_checks: dict[str, bool] = Field(default_factory=dict)
+    server_boundary_secure: bool
+    production_autonomy_ready: bool
+    limitations: list[str] = Field(default_factory=list)
+    schema_version: str = "v1"
 
 
 class ExecutionStatusResponse(BaseModel):

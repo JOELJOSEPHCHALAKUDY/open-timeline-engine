@@ -25,10 +25,11 @@ Strategy to force low confidence:
 Also: Use "investigate"/"research"/"analyze" keywords to force deliberation hints.
 """
 
-import requests
-import time
 import json
+import time
 from datetime import datetime
+
+import requests
 
 API_BASE = "http://localhost:8080/v1"
 HEADERS = {
@@ -117,12 +118,12 @@ def claim_and_report_failure(session_id, directive_id):
                   "details": {"summary": "Stress test intentional failure to lower outcome stability"}},
             headers=HEADERS, timeout=10)
         return resp2.status_code == 200
-    except:
+    except requests.RequestException:
         return False
 
 def run_test():
     print(f"{'='*90}")
-    print(f"TCE TAKEOVER LLM TRIGGER TEST — Forcing Low Confidence")
+    print("TCE TAKEOVER LLM TRIGGER TEST — Forcing Low Confidence")
     print(f"Started: {datetime.now().isoformat()}")
     print(f"{'='*90}")
 
@@ -143,7 +144,7 @@ def run_test():
     # Report failure on the directive to start poisoning outcomes
     if r.get("directive_id"):
         claim_and_report_failure(session_id, r["directive_id"])
-        print(f"       → Reported FAILURE on directive to lower outcome stability")
+        print("       → Reported FAILURE on directive to lower outcome stability")
 
     time.sleep(0.2)
 
@@ -318,7 +319,7 @@ def run_test():
     # Save
     with open("/tmp/tce_llm_trigger_results.json", "w") as f:
         json.dump(results, f, indent=2, default=str)
-    print(f"Results saved to /tmp/tce_llm_trigger_results.json")
+    print("Results saved to /tmp/tce_llm_trigger_results.json")
 
 if __name__ == "__main__":
     run_test()

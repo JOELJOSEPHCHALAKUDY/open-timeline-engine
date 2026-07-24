@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 
 import pytest
-
 from tce_model_gateway import OllamaGateway
 from tce_model_gateway.factory import create_gateway
 

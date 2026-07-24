@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import errno
+import json
 import os
 import re
 import shlex
@@ -10,30 +10,45 @@ import subprocess
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from pydantic import BaseModel
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from ote_advisor_providers import get_provider, list_provider_metadata, resolve_fallback_chain
 from ote_advisor_providers.base import ProviderAttemptResult, ProviderRequest
 from ote_advisor_providers.router import (
     active_profile as advisor_active_profile,
+)
+from ote_advisor_providers.router import (
     enforce_required_category_coverage as advisor_enforce_required_category_coverage,
+)
+from ote_advisor_providers.router import (
     normalize_profile as advisor_normalize_profile,
+)
+from ote_advisor_providers.router import (
     normalize_profile_bundle as advisor_normalize_profile_bundle,
+)
+from ote_advisor_providers.router import (
     resolve_chain_from_profile as advisor_resolve_chain_from_profile,
+)
+from ote_advisor_providers.router import (
     runtime_status as advisor_runtime_status,
+)
+from ote_advisor_providers.router import (
     update_health_state as advisor_update_health_state,
 )
-from tce_shared.dashboard import timeline_dashboard_html
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from pydantic import BaseModel
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
     behavior_storage_gate,
@@ -42,7 +57,6 @@ from tce_shared.behavior_fidelity import (
     normalize_behavior_evidence,
     predict_behavior,
 )
-from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.behavior_pilot import (
     assign_behavior_pilot_variant,
     behavior_pilot_outcome_digest,
@@ -50,19 +64,20 @@ from tce_shared.behavior_pilot import (
     prepare_behavior_pilot_context,
     sanitize_behavior_pilot_payload,
 )
-from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
+from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.dashboard import timeline_dashboard_html
 from tce_shared.events import (
     AgentRole,
-    AutonomyNotice,
     AutonomyGoalStatus,
+    AutonomyNotice,
     BehaviorCalibrationAnswerRequest,
     BehaviorCalibrationScenariosResponse,
     BehaviorEvaluationListResponse,
     BehaviorEvaluationRequest,
     BehaviorEvaluationResponse,
-    BehaviorEvidenceSource,
     BehaviorEvidenceRequest,
     BehaviorEvidenceResponse,
+    BehaviorEvidenceSource,
     BehaviorPilotAssignmentRequest,
     BehaviorPilotAssignmentResponse,
     BehaviorPilotOutcomeRequest,
@@ -77,57 +92,59 @@ from tce_shared.events import (
     CapabilityConsumeResponse,
     CapabilityGrantRequest,
     CapabilityGrantResponse,
+    CloneAdviceRequest,
+    CloneAdviceResponse,
+    CompletionCaptureRequest,
+    CompletionCaptureResponse,
+    ContinuityPilotStatusResponse,
     CounterfactualCreateRequest,
     CounterfactualItem,
     CounterfactualListResponse,
     CounterfactualResolveRequest,
-    CompletionCaptureRequest,
-    CompletionCaptureResponse,
-    ContinuityPilotStatusResponse,
-    MemoryReviewItem,
-    MemoryReviewListResponse,
-    MemoryReviewResolveRequest,
-    ProcessMiningRequest,
-    ProcessMiningResponse,
-    ProcessModelItem,
-    CloneAdviceRequest,
-    CloneAdviceResponse,
     DirectiveExecution,
-    ExecutionClaimRequest,
-    ExecutionReportRequest,
-    ExecutionStatusResponse,
-    ExecutionPermitRequest,
-    ExecutionPermitResolveRequest,
-    ExecutionPermitResponse,
     EventEnvelope,
     EventSearchRequest,
     EventType,
-    TakeoverFeedbackRequest,
-    TakeoverFeedbackResponse,
-    TakeoverPreloadRequest,
-    TakeoverPreloadResponse,
+    ExecutionClaimRequest,
+    ExecutionPermitRequest,
+    ExecutionPermitResolveRequest,
+    ExecutionPermitResponse,
+    ExecutionReportRequest,
+    ExecutionStatusResponse,
+    GovernanceStatusResponse,
+    MemoryReviewItem,
+    MemoryReviewListResponse,
+    MemoryReviewResolveRequest,
     PatternFeedbackRequest,
-    ResumePacketRequest,
-    ResumePacketResponse,
+    ProcessMiningRequest,
+    ProcessMiningResponse,
+    ProcessModelItem,
     ResumeFeedbackRequest,
     ResumeFeedbackResponse,
+    ResumePacketRequest,
+    ResumePacketResponse,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
     TakeoverAutonomyTickResponse,
+    TakeoverFeedbackRequest,
+    TakeoverFeedbackResponse,
     TakeoverGoal,
     TakeoverGoalCacheInvalidateRequest,
     TakeoverGoalCacheStatusResponse,
-    TakeoverNoticeAckRequest,
-    TakeoverNoticesResponse,
     TakeoverGoalsDiscoverRequest,
+    TakeoverGoalSelectRequest,
     TakeoverGoalsPrecomputeRequest,
     TakeoverGoalsResponse,
-    TakeoverGoalSelectRequest,
+    TakeoverNoticeAckRequest,
+    TakeoverNoticesResponse,
+    TakeoverPreloadRequest,
+    TakeoverPreloadResponse,
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
 )
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
+from tce_shared.governance import build_governance_status
 from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_text
@@ -139,7 +156,6 @@ from .behavior_control_store import (
     create_memory_review,
     issue_capability_grant,
     list_counterfactuals,
-    list_memory_reviews as list_behavior_memory_reviews,
     list_process_models,
     load_process_source_rows,
     mine_and_time,
@@ -149,77 +165,148 @@ from .behavior_control_store import (
     save_shadow_prediction,
     shadow_status,
 )
+from .behavior_control_store import (
+    list_memory_reviews as list_behavior_memory_reviews,
+)
 from .behavior_pilot_store import (
     BehaviorPilotConflict,
     BehaviorPilotExpired,
     BehaviorPilotNotFound,
+)
+from .behavior_pilot_store import (
     create_or_get_assignment_lite as create_or_get_behavior_pilot_assignment,
+)
+from .behavior_pilot_store import (
     list_pilot_rows_lite as list_behavior_pilot_rows,
+)
+from .behavior_pilot_store import (
     record_outcome_lite as record_behavior_pilot_outcome,
 )
 from .config import get_settings
-from .continuity_store import deliver_handoff_safely, drain_pending_handoffs, enqueue_handoff, pilot_metrics
+from .continuity_store import (
+    deliver_handoff_safely,
+    drain_pending_handoffs,
+    enqueue_handoff,
+    pilot_metrics,
+    record_resume_progress,
+)
 from .db import get_db, init_db
+from .store import (
+    acknowledge_takeover_notice as store_acknowledge_takeover_notice,
+)
 from .store import (
     activity_summary,
     build_clone_advice,
     build_clone_arbitration,
     context_bundle,
+    discover_takeover_goals,
     get_event,
     get_resume_packet,
-    graph_health_status_lite as store_graph_health_status,
+    invalidate_takeover_goal_cache,
     json_dumps,
     json_loads,
+    latest_fidelity_gate_lite,
+    list_fidelity_runs_lite,
     list_patterns,
+    list_takeover_goals,
+    load_behavior_evidence_by_id_lite,
+    load_behavior_evidence_lite,
     load_fingerprint_lite,
-    lifecycle_status as store_lifecycle_status,
-    runtime_mode,
+    request_execution_permit_lite,
+    resolve_execution_permit_lite,
     run_lifecycle_maintenance,
-    save_fingerprint_lite,
+    runtime_mode,
     save_behavior_evidence_lite,
     save_fidelity_run_lite,
-    load_behavior_evidence_lite,
-    load_behavior_evidence_by_id_lite,
-    list_fidelity_runs_lite,
-    latest_fidelity_gate_lite,
+    save_fingerprint_lite,
     save_observation_lite,
     search_events,
+    select_takeover_goal,
     set_runtime_mode,
     store_event,
     submit_pattern_feedback,
-    discover_takeover_goals,
-    invalidate_takeover_goal_cache,
-    list_takeover_goals,
-    select_takeover_goal,
-    request_execution_permit_lite,
-    resolve_execution_permit_lite,
-    takeover_autonomy_status as store_takeover_autonomy_status,
-    autonomy_readiness as store_autonomy_readiness,
-    autonomy_project_kpis as store_autonomy_project_kpis,
-    takeover_state as store_takeover_state,
-    takeover_step as store_takeover_step,
-    takeover_preload as store_takeover_preload,
-    takeover_feedback as store_takeover_feedback,
-    takeover_goal_cache_status as store_takeover_goal_cache_status,
-    takeover_autonomy_tick as store_takeover_autonomy_tick,
-    list_takeover_notices as store_list_takeover_notices,
-    acknowledge_takeover_notice as store_acknowledge_takeover_notice,
-    claim_execution as store_claim_execution,
-    context_retrieval_status as store_context_retrieval_status,
-    context_brief as store_context_brief,
-    deprecate_memory_rule as store_deprecate_memory_rule,
-    forget_memory as store_forget_memory,
-    get_episode as store_get_episode,
-    list_episodes as store_list_episodes,
-    list_memory_rules as store_list_memory_rules,
-    annotate_event as store_annotate_event,
-    report_execution as store_report_execution,
-    retrieval_eval_status as store_retrieval_eval_status,
-    run_retrieval_eval as store_run_retrieval_eval,
-    execution_status as store_execution_status,
-    reset_takeover_state as store_reset_takeover_state,
-    upsert_memory_rule as store_upsert_memory_rule,
     write_audit,
+)
+from .store import (
+    annotate_event as store_annotate_event,
+)
+from .store import (
+    autonomy_project_kpis as store_autonomy_project_kpis,
+)
+from .store import (
+    autonomy_readiness as store_autonomy_readiness,
+)
+from .store import (
+    claim_execution as store_claim_execution,
+)
+from .store import (
+    context_brief as store_context_brief,
+)
+from .store import (
+    context_retrieval_status as store_context_retrieval_status,
+)
+from .store import (
+    deprecate_memory_rule as store_deprecate_memory_rule,
+)
+from .store import (
+    execution_status as store_execution_status,
+)
+from .store import (
+    forget_memory as store_forget_memory,
+)
+from .store import (
+    get_episode as store_get_episode,
+)
+from .store import (
+    graph_health_status_lite as store_graph_health_status,
+)
+from .store import (
+    lifecycle_status as store_lifecycle_status,
+)
+from .store import (
+    list_episodes as store_list_episodes,
+)
+from .store import (
+    list_memory_rules as store_list_memory_rules,
+)
+from .store import (
+    list_takeover_notices as store_list_takeover_notices,
+)
+from .store import (
+    report_execution as store_report_execution,
+)
+from .store import (
+    reset_takeover_state as store_reset_takeover_state,
+)
+from .store import (
+    retrieval_eval_status as store_retrieval_eval_status,
+)
+from .store import (
+    run_retrieval_eval as store_run_retrieval_eval,
+)
+from .store import (
+    takeover_autonomy_status as store_takeover_autonomy_status,
+)
+from .store import (
+    takeover_autonomy_tick as store_takeover_autonomy_tick,
+)
+from .store import (
+    takeover_feedback as store_takeover_feedback,
+)
+from .store import (
+    takeover_goal_cache_status as store_takeover_goal_cache_status,
+)
+from .store import (
+    takeover_preload as store_takeover_preload,
+)
+from .store import (
+    takeover_state as store_takeover_state,
+)
+from .store import (
+    takeover_step as store_takeover_step,
+)
+from .store import (
+    upsert_memory_rule as store_upsert_memory_rule,
 )
 from .store_graph import (
     graph_for_event,
@@ -230,6 +317,27 @@ from .store_graph import (
 )
 from .types import (
     ActivitySummaryResponse,
+    AdvisorConfigResponse,
+    AdvisorConfigUpdateRequest,
+    AdvisorLiveModelsRequest,
+    AdvisorLocalOllamaPullRequest,
+    AdvisorLocalOllamaPullResponse,
+    AdvisorLocalOllamaPullStatusResponse,
+    AdvisorModelsResponse,
+    AdvisorProfileItem,
+    AdvisorProviderItem,
+    AdvisorProvidersResponse,
+    AdvisorRouteItem,
+    AdvisorRouteVerifyRequest,
+    AdvisorRuntimeProbeRequest,
+    AdvisorRuntimeProbeResponse,
+    AdvisorRuntimeStatusResponse,
+    AdvisorRuntimeStatusRoute,
+    AdvisorSwitchRequest,
+    AdvisorSwitchResponse,
+    AdvisorVerifyAttempt,
+    AdvisorVerifyRequest,
+    AdvisorVerifyResponse,
     ApiStatusInfo,
     BatchIngestRequest,
     BatchIngestResponse,
@@ -237,27 +345,13 @@ from .types import (
     CloneArbitrationResponse,
     CloneScoreBreakdown,
     CloneScoreResponse,
+    ContextBriefRequest,
+    ContextBriefResponse,
     ContextBundleRequest,
     ContextBundleResponse,
-    DatabaseStatusInfo,
-    FingerprintResponse,
-    GraphEntitySearchResponse,
-    GraphEventResponse,
-    HealthResponse,
-    IngestResponse,
-    ObservationItem,
-    ObservationListResponse,
-    PatternItem,
-    RuntimeModeConfig,
-    RuntimeModeInfo,
-    RuntimeModeSetRequest,
-    ServiceStatusInfo,
-    SystemStatusResponse,
-    TeamMembershipUpsertRequest,
-    DashboardClientConfigResponse,
     DashboardAgentRole,
     DashboardAgentRolesResponse,
-    DashboardIdentityInfo,
+    DashboardClientConfigResponse,
     DashboardGoalIntelligenceItem,
     DashboardGoalsIntelligenceResponse,
     DashboardGoalsIntelligenceSummary,
@@ -266,51 +360,62 @@ from .types import (
     DashboardHumanScoreRecomputeRequest,
     DashboardHumanScoreResponse,
     DashboardHumanScoreSubscores,
+    DashboardIdentityInfo,
+    DashboardStackRestartRequest,
+    DashboardStackRestartResponse,
+    DashboardStackRestartStatusResponse,
+    DatabaseStatusInfo,
     EpisodeItem,
     EpisodeListResponse,
     EventAnnotationRequest,
     EventAnnotationResponse,
-    ContextBriefRequest,
-    ContextBriefResponse,
-    MemoryRuleItem,
-    MemoryRuleUpsertRequest,
-    MemoryRuleListResponse,
-    MemoryRuleDeprecateResponse,
+    FingerprintResponse,
+    GoalEmotionValue,
+    GoalRelationEdge,
+    GraphEntitySearchResponse,
+    GraphEventResponse,
+    HealthResponse,
+    IngestResponse,
     MemoryForgetRequest,
     MemoryForgetResponse,
+    MemoryRuleDeprecateResponse,
+    MemoryRuleItem,
+    MemoryRuleListResponse,
+    MemoryRuleUpsertRequest,
+    ObservationItem,
+    ObservationListResponse,
+    PatternItem,
     RetrievalEvalRunRequest,
     RetrievalEvalRunResponse,
     RetrievalEvalStatusResponse,
-    GoalEmotionValue,
-    GoalRelationEdge,
-    AdvisorProviderItem,
-    AdvisorProvidersResponse,
-    AdvisorModelsResponse,
-    AdvisorLiveModelsRequest,
-    AdvisorRouteVerifyRequest,
-    AdvisorLocalOllamaPullRequest,
-    AdvisorLocalOllamaPullResponse,
-    AdvisorLocalOllamaPullStatusResponse,
-    AdvisorVerifyRequest,
-    AdvisorVerifyAttempt,
-    AdvisorVerifyResponse,
-    AdvisorConfigUpdateRequest,
-    AdvisorConfigResponse,
-    AdvisorProfileItem,
-    AdvisorRouteItem,
-    AdvisorRuntimeProbeRequest,
-    AdvisorRuntimeProbeResponse,
-    AdvisorRuntimeStatusResponse,
-    AdvisorRuntimeStatusRoute,
-    AdvisorSwitchRequest,
-    AdvisorSwitchResponse,
-    DashboardStackRestartRequest,
-    DashboardStackRestartResponse,
-    DashboardStackRestartStatusResponse,
+    RuntimeModeConfig,
+    RuntimeModeInfo,
+    RuntimeModeSetRequest,
+    ServiceStatusInfo,
+    SystemStatusResponse,
+    TeamMembershipUpsertRequest,
 )
 
 settings = get_settings()
-app = FastAPI(title="Open Timeline Engine Lite API", version="0.3.0")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    init_db()
+    connection_scope = get_db()
+    conn = next(connection_scope)
+    try:
+        drain_pending_handoffs(conn, retention_days=int(settings.handoff_retention_days))
+    finally:
+        connection_scope.close()
+    yield
+
+
+app = FastAPI(
+    title="Open Timeline Engine Lite API",
+    version="0.4.0",
+    lifespan=_lifespan,
+)
 _APP_START_TIME = time.monotonic()
 app.add_middleware(
     CORSMiddleware,
@@ -1097,7 +1202,7 @@ def _lite_config_response_from_raw(config_raw: dict[str, Any]) -> AdvisorConfigR
         advisor_custom_api_key_ref=config_raw.get("advisor_custom_api_key_ref"),
         advisor_provider_timeout_ms=int(config_raw.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
         advisor_provider_retry_max=int(config_raw.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max),
-        custom_headers=config_raw.get("custom_headers") if isinstance(config_raw.get("custom_headers"), dict) else {},
+        custom_headers=_normalized_custom_headers(config_raw.get("custom_headers")),
         key_storage_backend=str(config_raw.get("key_storage_backend") or ""),
         key_present=bool(config_raw.get("key_present", False)),
         profile_id=str(config_raw.get("profile_id") or "default"),
@@ -1108,6 +1213,18 @@ def _lite_config_response_from_raw(config_raw: dict[str, Any]) -> AdvisorConfigR
         profiles=profiles,
         updated_at=updated_at,
     )
+
+
+def _normalized_custom_headers(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, raw_value in value.items():
+        normalized_key = str(key).strip().lower()
+        normalized_value = str(raw_value).strip()
+        if normalized_key in settings.advisor_custom_headers_allowlist_set and normalized_value:
+            normalized[normalized_key] = normalized_value
+    return normalized
 
 
 def _start_ollama_pull_job(*, model: str, base_url: str) -> str:
@@ -2152,8 +2269,15 @@ def _parse_container_stats(stats: dict[str, Any], project: str, service_name: st
 
 def _docker_service_stats() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     now = time.monotonic()
-    if _docker_stats_cache["data"] is not None and (now - _docker_stats_cache["ts"]) < _DOCKER_CACHE_TTL:
-        return _docker_stats_cache["data"]
+    cached = _docker_stats_cache["data"]
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and isinstance(cached[0], list)
+        and isinstance(cached[1], dict)
+        and (now - float(_docker_stats_cache["ts"])) < _DOCKER_CACHE_TTL
+    ):
+        return cached[0], cached[1]
 
     socket_path = os.getenv("TCE_DOCKER_SOCKET", "/var/run/docker.sock")
     if not os.path.exists(socket_path):
@@ -2225,7 +2349,10 @@ def _docker_service_stats() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     timeout=_DOCKER_STATS_REQUEST_TIMEOUT_SECONDS,
                 )
                 resp.raise_for_status()
-                return resp.json()
+                payload = resp.json()
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Docker stats endpoint returned a non-object payload")
+                return payload
 
             futures = {
                 _DOCKER_STATS_EXECUTOR.submit(_fetch_stats, cid): (cid, proj, svc, cname)
@@ -2481,17 +2608,6 @@ def _auto_capture_interaction(
         store_event(conn, event, settings, auth)
     except Exception:
         return
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
-    connection_scope = get_db()
-    conn = next(connection_scope)
-    try:
-        drain_pending_handoffs(conn, retention_days=int(settings.handoff_retention_days))
-    finally:
-        connection_scope.close()
 
 
 @app.middleware("http")
@@ -2768,6 +2884,15 @@ def capture_completion(
         outbox_id=str(outbox["id"]),
         retention_days=int(settings.handoff_retention_days),
     )
+    record_resume_progress(
+        conn,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="completed",
+        outcome_status=body.state,
+        progress_source="complete_task",
+    )
     return CompletionCaptureResponse(
         outbox_id=UUID(str(delivered["id"])),
         delivery_status=str(delivered["status"]),
@@ -2785,36 +2910,32 @@ def capture_resume_feedback(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> ResumeFeedbackResponse:
     _enforce_workspace_access(auth, conn)
-    row = conn.execute(
-        """
-        SELECT packet_id FROM continuity_resume_attempts
-        WHERE packet_id = ? AND workspace_id = ? AND requesting_owner_id = ?
-        """,
-        (str(body.packet_id), auth.workspace_id, auth.user_id),
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="resume packet not found")
-    opened_file, _ = redact_text(str(body.opened_file or "")[:240])
-    correction_reason, _ = redact_text(body.correction_reason[:500])
-    now = datetime.now(tz=UTC)
-    conn.execute(
-        """
-        UPDATE continuity_resume_attempts
-        SET opened_file = ?, correct_file = ?, correction_required = ?,
-            correction_reason = ?, feedback_at = ?
-        WHERE packet_id = ?
-        """,
-        (
-            opened_file or None,
-            1 if body.correct_file else 0,
-            1 if body.correction_required else 0,
-            correction_reason,
-            now.isoformat(),
-            str(body.packet_id),
-        ),
+    progress = record_resume_progress(
+        conn,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        packet_id=str(body.packet_id),
+        phase=body.phase,
+        opened_file=body.opened_file,
+        correct_file=body.correct_file,
+        correct_anchor=body.correct_anchor,
+        opened_file_rank=body.opened_file_rank,
+        correction_required=body.correction_required,
+        correction_reason=body.correction_reason,
+        archaeology_tool_calls=body.archaeology_tool_calls,
+        archaeology_tokens=body.archaeology_tokens,
+        outcome_status=body.outcome_status,
+        progress_source=body.progress_source,
     )
-    conn.commit()
-    return ResumeFeedbackResponse(packet_id=body.packet_id, recorded=True, feedback_at=now)
+    if progress is None:
+        raise HTTPException(status_code=404, detail="resume packet not found")
+    now = datetime.now(tz=UTC)
+    return ResumeFeedbackResponse(
+        packet_id=body.packet_id,
+        recorded=True,
+        phase=progress[1],
+        feedback_at=now,
+    )
 
 
 @app.get("/v1/continuity/pilot/status", response_model=ContinuityPilotStatusResponse)
@@ -2842,6 +2963,29 @@ def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]
         "behavior_subject_id": auth.behavior_subject_id,
         "identity_claims_mode": settings.identity_claims_mode,
     }
+
+
+@app.get("/v1/governance/status", response_model=GovernanceStatusResponse)
+def governance_status(
+    _auth: AuthContext = Depends(get_auth_context),
+) -> GovernanceStatusResponse:
+    return GovernanceStatusResponse(
+        **build_governance_status(
+            runtime="lite",
+            runtime_profile=settings.runtime_profile,
+            auth_mode=settings.auth_mode,
+            identity_claims_mode=settings.identity_claims_mode,
+            workspace_access_mode=settings.workspace_access_mode,
+            audit_write_mode=settings.audit_write_mode,
+            cors_origins=settings.cors_origins,
+            api_tokens=settings.token_set,
+            capability_broker_enabled=settings.behavior_capability_broker_enabled,
+            mcp_tool_profile=settings.mcp_tool_profile,
+            requested_execution_enforcement=settings.execution_enforcement_level,
+            execution_interception_attested=settings.execution_interception_attested,
+            execution_interception_provider=settings.execution_interception_provider,
+        )
+    )
 
 
 @app.get("/v1/context/retrieval/status", response_model=dict)
@@ -2910,12 +3054,7 @@ def setup_advisor_models(
         route=route,
         config=config,
     )
-    custom_headers_raw = config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
+    custom_headers = _normalized_custom_headers(config.get("custom_headers"))
     req = ProviderRequest(
         model=str((route or {}).get("model") or config.get("advisor_custom_model") or config.get("advisor_primary_model") or "").strip() or None,
         api_key=api_key or None,
@@ -2979,16 +3118,18 @@ def setup_advisor_models_live(
             requires_api_key=True,
             connection_type=_provider_connection_type(provider_id),
         )
-    custom_headers_raw = config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
+    custom_headers = _normalized_custom_headers(config.get("custom_headers"))
     req = ProviderRequest(
         model=None,
         api_key=api_key or None,
-        base_url=str((body.base_url or "").strip() or (route or {}).get("base_url") or config.get("advisor_custom_base_url") or _provider_default_base_url(provider_id, adapter.metadata.default_base_url) or "").strip() or None,
+        base_url=str(
+            (body.base_url or "").strip()
+            or (route or {}).get("base_url")
+            or config.get("advisor_custom_base_url")
+            or _provider_default_base_url(provider_id, adapter.metadata.default_base_url)
+            or ""
+        ).strip()
+        or None,
         api_version=str((route or {}).get("api_version") or config.get("api_version") or adapter.metadata.api_version or "").strip() or None,
         timeout_ms=int(body.timeout_ms or config.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
         custom_headers=custom_headers,
@@ -3036,16 +3177,18 @@ def setup_advisor_route_verify(
         explicit_key_ref=body.api_key_ref,
         provided_key=body.api_key,
     )
-    custom_headers_raw = body.custom_headers or (config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {})
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
+    custom_headers = _normalized_custom_headers(body.custom_headers or config.get("custom_headers"))
     req = ProviderRequest(
         model=(body.model or "").strip() or str((route or {}).get("model") or "").strip() or None,
         api_key=api_key or None,
-        base_url=(body.base_url or "").strip() or str((route or {}).get("base_url") or config.get("advisor_custom_base_url") or _provider_default_base_url(provider_id, adapter.metadata.default_base_url) or "").strip() or None,
+        base_url=(body.base_url or "").strip()
+        or str(
+            (route or {}).get("base_url")
+            or config.get("advisor_custom_base_url")
+            or _provider_default_base_url(provider_id, adapter.metadata.default_base_url)
+            or ""
+        ).strip()
+        or None,
         api_version=(body.api_version or "").strip() or str((route or {}).get("api_version") or config.get("api_version") or adapter.metadata.api_version or "").strip() or None,
         timeout_ms=int(body.timeout_ms or config.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
         custom_headers=custom_headers,
@@ -3130,14 +3273,7 @@ def setup_advisor_verify(
         raise HTTPException(status_code=400, detail="no valid advisor provider in chain")
     timeout_ms = int(body.timeout_ms or config.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms)
     retry_max = max(1, int(body.retry_max or config.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max))
-    custom_headers_raw = body.custom_headers or (
-        config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
-    )
-    custom_headers: dict[str, str] = {}
-    for key, value in custom_headers_raw.items():
-        k = str(key).strip().lower()
-        if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
-            custom_headers[k] = str(value)
+    custom_headers = _normalized_custom_headers(body.custom_headers or config.get("custom_headers"))
     attempts: list[AdvisorVerifyAttempt] = []
     selected_provider = chain[0]
     selected_model = (body.model or "").strip() or None
@@ -3276,7 +3412,7 @@ def setup_advisor_config(
         if k in settings.advisor_custom_headers_allowlist_set and str(value).strip():
             custom_headers[k] = str(value)
     key_ref = (body.advisor_custom_api_key_ref or settings.advisor_custom_api_key_ref).strip()
-    payload = {
+    payload: dict[str, Any] = {
         "advisor_primary_provider": primary,
         "advisor_primary_model": (body.advisor_primary_model or "").strip() or None,
         "advisor_fallback_chain": fallback,
@@ -3291,7 +3427,7 @@ def setup_advisor_config(
         "key_present": False,
         "updated_at": datetime.now(tz=UTC).isoformat(),
     }
-    routes_in = [
+    routes_in: list[dict[str, Any]] = [
         item.model_dump(mode="json")
         for item in body.routes
     ] if body.routes else [
@@ -3383,7 +3519,8 @@ def setup_advisor_config(
     payload["profiles"] = list(profile_bundle.get("profiles") or [])
     env_key_present = False
     seen_key_providers: set[str] = set()
-    for route in payload["routes"]:
+    active_routes = payload.get("routes")
+    for route in active_routes if isinstance(active_routes, list) else []:
         if not isinstance(route, dict):
             continue
         provider_id = str(route.get("provider_id") or "").strip().lower()
@@ -3402,20 +3539,28 @@ def setup_advisor_config(
     try:
         _persist_advisor_config_to_env(
             primary_provider=primary,
-            primary_model=payload.get("advisor_primary_model"),
-            fallback_chain=list(payload.get("advisor_fallback_chain") or []),
-            custom_base_url=payload.get("advisor_custom_base_url"),
-            custom_model=payload.get("advisor_custom_model"),
-            custom_api_key_ref=payload.get("advisor_custom_api_key_ref"),
+            primary_model=str(payload.get("advisor_primary_model") or "") or None,
+            fallback_chain=[
+                str(item)
+                for item in payload.get("advisor_fallback_chain", [])
+                if isinstance(item, str)
+            ],
+            custom_base_url=str(payload.get("advisor_custom_base_url") or "") or None,
+            custom_model=str(payload.get("advisor_custom_model") or "") or None,
+            custom_api_key_ref=str(payload.get("advisor_custom_api_key_ref") or "") or None,
             provider_timeout_ms=int(payload.get("advisor_provider_timeout_ms") or settings.advisor_provider_timeout_ms),
             provider_retry_max=int(payload.get("advisor_provider_retry_max") or settings.advisor_provider_retry_max),
             api_key=body.api_key,
             api_key_ref=key_ref,
-            routes=list(payload.get("routes") or []),
-            active_profile_id=payload.get("active_profile_id"),
+            routes=[
+                dict(item)
+                for item in payload.get("routes", [])
+                if isinstance(item, dict)
+            ],
+            active_profile_id=str(payload.get("active_profile_id") or "") or None,
         )
-    except Exception:
-        raise HTTPException(status_code=500, detail="failed to persist advisor config to .env")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="failed to persist advisor config to .env") from exc
     _lite_purge_advisor_secret_runtime_settings(conn)
     _lite_upsert_runtime_setting(conn, _lite_advisor_setup_key(auth.workspace_id, auth.user_id), payload)
     _lite_upsert_runtime_setting(conn, _lite_advisor_profiles_key(auth.workspace_id, auth.user_id), profile_bundle)
@@ -3464,8 +3609,8 @@ def setup_advisor_switch(
                     "TCE_ADVISOR_ROUTES_JSON": json.dumps(config["routes"], separators=(",", ":")),
                 }
             )
-        except Exception:
-            raise HTTPException(status_code=500, detail="failed to persist active advisor profile to .env")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="failed to persist active advisor profile to .env") from exc
         _lite_upsert_runtime_setting(conn, _lite_advisor_setup_key(auth.workspace_id, auth.user_id), config)
         conn.commit()
     return AdvisorSwitchResponse(
@@ -3499,11 +3644,11 @@ def setup_advisor_runtime_status(
         routing_mode=str(status.get("routing_mode") or "adaptive"),
         failure_policy=str(status.get("failure_policy") or "risk_aware_fail_safe"),
         category_coverage=list(status.get("category_coverage") or []),
-        advisor_total_budget_ms=int(
+        advisor_total_budget_ms=_safe_int(
             status.get("advisor_total_budget_ms")
             or getattr(settings, "effective_advisor_total_budget_ms", settings.advisor_total_budget_ms)
         ),
-        advisor_attempt_timeout_ms=int(
+        advisor_attempt_timeout_ms=_safe_int(
             status.get("advisor_attempt_timeout_ms")
             or getattr(settings, "effective_advisor_attempt_timeout_ms", settings.advisor_attempt_timeout_ms)
         ),
@@ -3541,7 +3686,7 @@ def setup_advisor_runtime_probe(
     probe_deadline = time.monotonic() + (
         max(1.0, (max(200, timeout_ms) * max(1, len(routes)) / 1000.0) + 0.75)
     )
-    custom_headers = config.get("custom_headers") if isinstance(config.get("custom_headers"), dict) else {}
+    custom_headers = _normalized_custom_headers(config.get("custom_headers"))
     attempts_by_index: dict[int, AdvisorVerifyAttempt] = {}
     prepared_routes: dict[int, dict[str, Any]] = {}
     for idx, raw_route in enumerate(routes):
@@ -3632,8 +3777,8 @@ def setup_advisor_runtime_probe(
         if idx in attempts_by_index:
             attempts.append(attempts_by_index[idx])
             continue
-        prepared = prepared_routes.get(idx)
-        if not prepared:
+        prepared_route = prepared_routes.get(idx)
+        if not prepared_route:
             attempts.append(
                 AdvisorVerifyAttempt(
                     provider_id="unknown",
@@ -3645,7 +3790,7 @@ def setup_advisor_runtime_probe(
                 )
             )
             continue
-        provider_id = str(prepared["provider_id"])
+        provider_id = str(prepared_route["provider_id"])
         adapter = prepared["adapter"]
         req = prepared["request"]
         result = verify_results.get(idx) or ProviderAttemptResult(
@@ -5872,6 +6017,7 @@ def ingest_observations(
 class CheckContextRequest(_PydanticBaseModel):
     file_path: str
     intended_action: str = "edit"
+    session_id: str | None = None
 
 
 class CheckContextResponse(_PydanticBaseModel):
@@ -5889,6 +6035,15 @@ def check_context(
     """Check timeline for past decisions relevant to a file before modifying it."""
     REQUEST_COUNT.labels(endpoint="check_context", method="POST").inc()
     _enforce_workspace_access(auth, conn)
+    record_resume_progress(
+        conn,
+        workspace_id=auth.workspace_id,
+        requesting_owner_id=auth.user_id,
+        session_id=body.session_id,
+        phase="file_opened",
+        opened_file=body.file_path,
+        progress_source="check_context",
+    )
 
     path_parts = [p for p in body.file_path.replace("\\", "/").split("/") if p]
     search_terms = [body.file_path]
@@ -6299,8 +6454,8 @@ def dashboard_stack_restart_status(
     return DashboardStackRestartStatusResponse(
         restart_id=restart_id,
         state=str(job.get("state") or "unknown"),
-        started_at=job.get("started_at"),
-        completed_at=job.get("completed_at"),
+        started_at=_parse_dt(job.get("started_at")) or datetime.now(tz=UTC),
+        completed_at=_parse_dt(job.get("completed_at")),
         error=(str(job.get("error")) if job.get("error") else None),
     )
 
@@ -6359,8 +6514,8 @@ def dashboard_update_executor_config(
 
     try:
         _upsert_env_values(updates)
-    except Exception:
-        raise HTTPException(status_code=500, detail="failed to persist executor config to .env")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="failed to persist executor config to .env") from exc
 
     return {
         "ok": True,

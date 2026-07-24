@@ -178,3 +178,15 @@ The dashboard now exposes higher-order goal intelligence and a persisted human-l
 UI entry point:
 
 - `http://localhost:8080/dashboard/goal-intelligence`
+
+## V10 — Continuity Production & Behavior Fidelity (2026-07)
+
+Largest layer since Dashboard Intelligence; spans five migrations (`20260721_0028` … `20260723_0032`):
+
+- Behavior fidelity v1 (`0028`): behavioral evidence capture with statistical gating (Wilson intervals, calibration error, abstention-first prediction). Reference: `docs/behavior-fidelity.md`.
+- Behavior control plane (`0029`): capability registry with fail-closed semantics for unknown capabilities.
+- Continuity production (`0030`): `handoff_records` / `handoff_outbox` with idempotent worker delivery (`UNIQUE completion_key`). Runbook: `docs/runbooks/continuity-pilot.md`.
+- Behavior projection pilot (`0031`): governed deterministic projections with HMAC pilot assignment. Runbook: `docs/runbooks/behavior-projection-pilot.md`.
+- Continuity active resume (`0032`): resume-attempt tracking for cross-session continuity.
+
+v0.4.0 hardening (see CHANGELOG): repo-wide ruff+mypy baseline enforced in CI, coverage floor, pip-audit gate, OpenAPI full/lite parity gate, bound-identity lite-MCP e2e job, MCP least-privilege tool profiles, governance status module, runtime env profiles.

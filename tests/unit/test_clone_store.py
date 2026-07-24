@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from tce_api.clone_store import (
-    query_similar_observations,
     build_session_context_from_state,
 )
 

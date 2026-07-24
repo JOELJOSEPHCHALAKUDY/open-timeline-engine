@@ -10,6 +10,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from tce_shared.autonomy_context import SUMMARY_VERSION, summarize_event_record
+from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
 from tce_shared.redaction import redact_payload, redact_text
 
@@ -270,9 +271,11 @@ def record_resume_attempt(
     workspace_id: str,
     requesting_owner_id: str,
     target_owner_id: str,
+    session_id: str,
     selected_record_id: uuid.UUID,
     query_text: str,
     top_file: str | None,
+    recommended_files: list[str],
     requested_at: datetime,
     returned_at: datetime,
     handoff_ts: datetime,
@@ -283,6 +286,7 @@ def record_resume_attempt(
             workspace_id=workspace_id,
             requesting_owner_id=requesting_owner_id,
             target_owner_id=target_owner_id,
+            session_id=str(session_id or "default")[:160],
             selected_record_id=selected_record_id,
             query_text=query_text[:500],
             top_file=(top_file or "")[:240] or None,
@@ -290,9 +294,71 @@ def record_resume_attempt(
             returned_at=returned_at,
             latency_ms=max(0, int((returned_at - requested_at).total_seconds() * 1000)),
             time_since_handoff_ms=max(0, int((requested_at - handoff_ts).total_seconds() * 1000)),
+            recommended_files_json=[str(value)[:240] for value in recommended_files[:40]],
         )
     )
     db.commit()
+
+
+def record_resume_progress(
+    db: Session,
+    *,
+    workspace_id: str,
+    requesting_owner_id: str,
+    packet_id: uuid.UUID | None = None,
+    session_id: str | None = None,
+    phase: str,
+    opened_file: str | None = None,
+    correct_file: bool | None = None,
+    correct_anchor: bool | None = None,
+    opened_file_rank: int | None = None,
+    correction_required: bool | None = None,
+    correction_reason: str | None = None,
+    archaeology_tool_calls: int | None = None,
+    archaeology_tokens: int | None = None,
+    outcome_status: str | None = None,
+    progress_source: str = "manual",
+    max_age_hours: int = 24,
+) -> tuple[ContinuityResumeAttempt, str] | None:
+    statement = select(ContinuityResumeAttempt).where(
+        ContinuityResumeAttempt.workspace_id == workspace_id,
+        ContinuityResumeAttempt.requesting_owner_id == requesting_owner_id,
+        ContinuityResumeAttempt.requested_at >= datetime.now(tz=UTC) - timedelta(hours=max(1, max_age_hours)),
+    )
+    if packet_id is not None:
+        statement = statement.where(ContinuityResumeAttempt.packet_id == packet_id)
+    if session_id:
+        statement = statement.where(ContinuityResumeAttempt.session_id == str(session_id)[:160])
+    row = db.execute(statement.order_by(ContinuityResumeAttempt.requested_at.desc()).limit(1)).scalar_one_or_none()
+    if row is None:
+        return None
+    safe_file, _ = redact_text(str(opened_file or "")[:240])
+    safe_reason, _ = redact_text(str(correction_reason or "")[:500])
+    patch = progress_patch(
+        {
+            "recommended_files_json": row.recommended_files_json,
+            "first_file_opened_at": row.first_file_opened_at,
+            "productive_at": row.productive_at,
+            "completed_at": row.completed_at,
+        },
+        phase=phase,
+        now=datetime.now(tz=UTC),
+        opened_file=safe_file or None,
+        correct_file=correct_file,
+        correct_anchor=correct_anchor,
+        opened_file_rank=opened_file_rank,
+        correction_required=correction_required,
+        correction_reason=safe_reason if correction_reason is not None else None,
+        archaeology_tool_calls=archaeology_tool_calls,
+        archaeology_tokens=archaeology_tokens,
+        outcome_status=outcome_status,
+        progress_source=progress_source,
+    )
+    normalized_phase = str(patch.pop("phase"))
+    for key, value in patch.items():
+        setattr(row, key, value)
+    db.commit()
+    return row, normalized_phase
 
 
 def pilot_metrics(db: Session, *, workspace_id: str, days: int) -> dict[str, Any]:
@@ -340,35 +406,37 @@ def pilot_metrics(db: Session, *, workspace_id: str, days: int) -> dict[str, Any
         ),
         {"workspace_id": workspace_id, "since": since},
     ).mappings().one()
-    attempts = db.execute(
-        text(
-            """
-            SELECT COUNT(*) AS attempts,
-                   COUNT(*) FILTER (WHERE feedback_at IS NOT NULL) AS feedback,
-                   AVG(CASE WHEN correct_file IS TRUE THEN 1.0 WHEN correct_file IS FALSE THEN 0.0 END) AS correct_rate,
-                   AVG(CASE WHEN correction_required IS TRUE THEN 1.0 WHEN correction_required IS FALSE THEN 0.0 END) AS correction_rate,
-                   percentile_cont(0.5) WITHIN GROUP (ORDER BY time_since_handoff_ms) AS median_resume,
-                   percentile_cont(0.95) WITHIN GROUP (ORDER BY time_since_handoff_ms) AS p95_resume,
-                   percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS median_latency
-            FROM continuity_resume_attempts
-            WHERE workspace_id = :workspace_id AND requested_at >= :since
-            """
-        ),
-        {"workspace_id": workspace_id, "since": since},
-    ).mappings().one()
+    attempt_rows = db.execute(
+        select(ContinuityResumeAttempt).where(
+            ContinuityResumeAttempt.workspace_id == workspace_id,
+            ContinuityResumeAttempt.requested_at >= since,
+        )
+    ).scalars().all()
+    attempt_metrics = summarize_attempts(
+        {
+            "requested_at": row.requested_at,
+            "latency_ms": row.latency_ms,
+            "time_since_handoff_ms": row.time_since_handoff_ms,
+            "first_file_opened_at": row.first_file_opened_at,
+            "productive_at": row.productive_at,
+            "completed_at": row.completed_at,
+            "opened_file_rank": row.opened_file_rank,
+            "correct_file": row.correct_file,
+            "correct_anchor": row.correct_anchor,
+            "correction_required": row.correction_required,
+            "archaeology_tool_calls": row.archaeology_tool_calls,
+            "archaeology_tokens": row.archaeology_tokens,
+            "feedback_at": row.feedback_at,
+        }
+        for row in attempt_rows
+    )
     eligible = int(coverage.get("eligible") or 0)
     captured = int(coverage.get("captured") or 0)
     return {
         "eligible_completion_count": eligible,
         "captured_completion_count": captured,
         "handoff_capture_coverage": float(captured / eligible) if eligible else 0.0,
-        "resume_attempt_count": int(attempts.get("attempts") or 0),
-        "feedback_count": int(attempts.get("feedback") or 0),
-        "correct_file_rate": float(attempts["correct_rate"]) if attempts.get("correct_rate") is not None else None,
-        "correction_rate": float(attempts["correction_rate"]) if attempts.get("correction_rate") is not None else None,
-        "median_time_to_resume_ms": float(attempts["median_resume"]) if attempts.get("median_resume") is not None else None,
-        "p95_time_to_resume_ms": float(attempts["p95_resume"]) if attempts.get("p95_resume") is not None else None,
-        "median_retrieval_latency_ms": float(attempts["median_latency"]) if attempts.get("median_latency") is not None else None,
         "outbox_pending_count": int(outbox.get("pending") or 0),
         "outbox_dead_count": int(outbox.get("dead") or 0),
+        **attempt_metrics,
     }

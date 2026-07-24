@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from tce_shared.handoff import normalize_milestone_v1
-from tce_shared.handoff import rank_resume_candidates
+from tce_shared.handoff import normalize_milestone_v1, rank_resume_candidates
 
 
 def test_normalize_milestone_v1_valid_payload() -> None:

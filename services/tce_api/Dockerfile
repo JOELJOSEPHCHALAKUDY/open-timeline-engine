@@ -21,4 +21,4 @@ RUN pip install --no-cache-dir /app/shared /app/services/tce_api
 COPY --from=dashboard-build /dashboard/dist/dashboard/browser /app/dashboard-static
 
 ENV PYTHONPATH=/app/shared:/app/services/tce_api
-CMD ["sh", "-c", "uvicorn tce_api.main:app --host 0.0.0.0 --port 8080 --workers ${TCE_API_WORKERS:-4}"]
+CMD ["sh", "-c", "if [ -n \"$PROMETHEUS_MULTIPROC_DIR\" ]; then mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && rm -f \"$PROMETHEUS_MULTIPROC_DIR\"/*.db; fi; exec uvicorn tce_api.main:app --host 0.0.0.0 --port 8080 --workers ${TCE_API_WORKERS:-4}"]

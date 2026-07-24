@@ -14,7 +14,6 @@ from tce_shared.policy import ConsumerContext
 from .config import get_settings
 from .db import get_session_factory
 from .graph import graph_snapshot_for_events
-from .models import Pattern
 from .policy import PolicyEngine
 from .schemas import ContextBundleRequest, ContextBundleResponse, EvidenceEvent, PatternItem
 from .search import run_search

@@ -12,7 +12,7 @@ class OpenAIGateway(ModelGateway):
         api_key: str,
         embed_model: str,
         extract_model: str,
-        timeout: int = 30,
+        timeout: float = 30,
         base_url: str | None = None,
     ) -> None:
         from openai import OpenAI

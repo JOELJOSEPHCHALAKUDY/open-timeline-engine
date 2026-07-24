@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -49,7 +50,7 @@ def _event_payload(
 
 
 @pytest.fixture()
-def lite_client_graph(tmp_path) -> TestClient:
+def lite_client_graph(tmp_path) -> Iterator[TestClient]:
     settings = get_settings()
     settings.lite_db_path = str(tmp_path / "tce-lite-graph.db")
     settings.api_tokens = "lite-test-token"

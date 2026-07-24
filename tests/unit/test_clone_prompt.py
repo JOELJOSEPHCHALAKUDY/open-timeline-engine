@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from tce_shared.fingerprint import DEFAULT_FINGERPRINT
 from tce_api.clone_prompt import build_clone_prompt
+from tce_shared.fingerprint import DEFAULT_FINGERPRINT
 
 
 def test_prompt_contains_all_layers():

@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from tce_shared.autonomy_context import SUMMARY_VERSION, summarize_event_record
+from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
 from tce_shared.redaction import redact_payload, redact_text
 
@@ -325,9 +326,11 @@ def record_resume_attempt(
     workspace_id: str,
     requesting_owner_id: str,
     target_owner_id: str,
+    session_id: str,
     selected_record_id: str,
     query_text: str,
     top_file: str | None,
+    recommended_files: list[str],
     requested_at: datetime,
     returned_at: datetime,
     handoff_ts: datetime,
@@ -336,9 +339,9 @@ def record_resume_attempt(
         """
         INSERT INTO continuity_resume_attempts(
             id, packet_id, workspace_id, requesting_owner_id, target_owner_id,
-            selected_record_id, query_text, top_file, requested_at, returned_at,
-            latency_ms, time_since_handoff_ms
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            session_id, selected_record_id, query_text, top_file, requested_at, returned_at,
+            latency_ms, time_since_handoff_ms, recommended_files_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid.uuid4()),
@@ -346,6 +349,7 @@ def record_resume_attempt(
             workspace_id,
             requesting_owner_id,
             target_owner_id,
+            str(session_id or "default")[:160],
             selected_record_id,
             query_text[:500],
             (top_file or "")[:240] or None,
@@ -353,17 +357,101 @@ def record_resume_attempt(
             returned_at.isoformat(),
             max(0, int((returned_at - requested_at).total_seconds() * 1000)),
             max(0, int((requested_at - handoff_ts).total_seconds() * 1000)),
+            _dumps([str(value)[:240] for value in recommended_files[:40]]),
         ),
     )
     conn.commit()
 
 
-def _percentile(values: list[int], fraction: float) -> float | None:
-    if not values:
+def record_resume_progress(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    requesting_owner_id: str,
+    packet_id: str | None = None,
+    session_id: str | None = None,
+    phase: str,
+    opened_file: str | None = None,
+    correct_file: bool | None = None,
+    correct_anchor: bool | None = None,
+    opened_file_rank: int | None = None,
+    correction_required: bool | None = None,
+    correction_reason: str | None = None,
+    archaeology_tool_calls: int | None = None,
+    archaeology_tokens: int | None = None,
+    outcome_status: str | None = None,
+    progress_source: str = "manual",
+    max_age_hours: int = 24,
+) -> tuple[sqlite3.Row, str] | None:
+    clauses = ["workspace_id = ?", "requesting_owner_id = ?", "requested_at >= ?"]
+    params: list[Any] = [
+        workspace_id,
+        requesting_owner_id,
+        (datetime.now(tz=UTC) - timedelta(hours=max(1, max_age_hours))).isoformat(),
+    ]
+    if packet_id:
+        clauses.append("packet_id = ?")
+        params.append(str(packet_id))
+    if session_id:
+        clauses.append("session_id = ?")
+        params.append(str(session_id)[:160])
+    row = conn.execute(
+        f"""
+        SELECT * FROM continuity_resume_attempts
+        WHERE {" AND ".join(clauses)}
+        ORDER BY requested_at DESC LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row is None:
         return None
-    ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * fraction))))
-    return float(ordered[index])
+    safe_file, _ = redact_text(str(opened_file or "")[:240])
+    safe_reason, _ = redact_text(str(correction_reason or "")[:500])
+    patch = progress_patch(
+        {
+            "recommended_files_json": row["recommended_files_json"],
+            "first_file_opened_at": row["first_file_opened_at"],
+            "productive_at": row["productive_at"],
+            "completed_at": row["completed_at"],
+        },
+        phase=phase,
+        now=datetime.now(tz=UTC),
+        opened_file=safe_file or None,
+        correct_file=correct_file,
+        correct_anchor=correct_anchor,
+        opened_file_rank=opened_file_rank,
+        correction_required=correction_required,
+        correction_reason=safe_reason if correction_reason is not None else None,
+        archaeology_tool_calls=archaeology_tool_calls,
+        archaeology_tokens=archaeology_tokens,
+        outcome_status=outcome_status,
+        progress_source=progress_source,
+    )
+    normalized_phase = str(patch.pop("phase"))
+    bool_fields = {"correct_file", "correct_anchor", "correction_required"}
+    datetime_fields = {"first_file_opened_at", "productive_at", "completed_at", "feedback_at"}
+    assignments: list[str] = []
+    values: list[Any] = []
+    for key, value in patch.items():
+        assignments.append(f"{key} = ?")
+        if key in bool_fields and value is not None:
+            values.append(1 if value else 0)
+        elif key in datetime_fields and isinstance(value, datetime):
+            values.append(value.isoformat())
+        else:
+            values.append(value)
+    values.append(str(row["id"]))
+    conn.execute(
+        f"UPDATE continuity_resume_attempts SET {', '.join(assignments)} WHERE id = ?",
+        values,
+    )
+    conn.commit()
+    updated = conn.execute(
+        "SELECT * FROM continuity_resume_attempts WHERE id = ?",
+        (str(row["id"]),),
+    ).fetchone()
+    assert updated is not None
+    return updated, normalized_phase
 
 
 def pilot_metrics(conn: sqlite3.Connection, *, workspace_id: str, days: int) -> dict[str, Any]:
@@ -415,27 +503,21 @@ def pilot_metrics(conn: sqlite3.Connection, *, workspace_id: str, days: int) -> 
     ).fetchone()
     attempts = conn.execute(
         """
-        SELECT latency_ms, time_since_handoff_ms, correct_file, correction_required, feedback_at
+        SELECT requested_at, latency_ms, time_since_handoff_ms, first_file_opened_at,
+               productive_at, completed_at, opened_file_rank, correct_file, correct_anchor,
+               correction_required, archaeology_tool_calls, archaeology_tokens, feedback_at
         FROM continuity_resume_attempts WHERE workspace_id = ? AND requested_at >= ?
         """,
         (workspace_id, since.isoformat()),
     ).fetchall()
     eligible = int(coverage["eligible"] or 0) if coverage else 0
     captured = int(coverage["captured"] or 0) if coverage else 0
-    feedback = [row for row in attempts if row["feedback_at"] is not None]
-    correct = [int(row["correct_file"]) for row in feedback if row["correct_file"] is not None]
-    corrections = [int(row["correction_required"]) for row in feedback if row["correction_required"] is not None]
+    attempt_metrics = summarize_attempts(dict(row) for row in attempts)
     return {
         "eligible_completion_count": eligible,
         "captured_completion_count": captured,
         "handoff_capture_coverage": float(captured / eligible) if eligible else 0.0,
-        "resume_attempt_count": len(attempts),
-        "feedback_count": len(feedback),
-        "correct_file_rate": float(sum(correct) / len(correct)) if correct else None,
-        "correction_rate": float(sum(corrections) / len(corrections)) if corrections else None,
-        "median_time_to_resume_ms": _percentile([int(row["time_since_handoff_ms"]) for row in attempts], 0.5),
-        "p95_time_to_resume_ms": _percentile([int(row["time_since_handoff_ms"]) for row in attempts], 0.95),
-        "median_retrieval_latency_ms": _percentile([int(row["latency_ms"]) for row in attempts], 0.5),
         "outbox_pending_count": int(outbox["pending"] or 0) if outbox else 0,
         "outbox_dead_count": int(outbox["dead"] or 0) if outbox else 0,
+        **attempt_metrics,
     }

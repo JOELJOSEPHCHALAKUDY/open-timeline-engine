@@ -2,7 +2,7 @@ from tce_mcp import server
 
 
 def test_codex_tools_present():
-    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}  # type: ignore[attr-defined]
+    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}
     assert "tce.search_events" in tool_names
     assert "tce.get_context_bundle" in tool_names
     assert "tce.get_patterns" in tool_names

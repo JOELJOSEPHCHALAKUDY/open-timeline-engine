@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import requests
 from redis import Redis
@@ -9,6 +10,8 @@ from sqlalchemy import text
 
 from ..config import get_settings
 from ..db import SessionLocal
+
+type JsonValue = None | bool | int | float | str | Sequence[JsonValue] | Mapping[str, JsonValue]
 
 
 def _qdrant_base_url() -> str:
@@ -58,7 +61,7 @@ def _ensure_collection(
             return True
         if probe.status_code not in {400, 404}:
             return False
-        payload = {
+        payload: JsonValue = {
             "vectors": {
                 "size": int(vector_size),
                 "distance": "Cosine",
@@ -69,7 +72,7 @@ def _ensure_collection(
             json=payload,
             timeout=timeout,
         )
-        return create.status_code < 300
+        return bool(create.status_code < 300)
     except Exception:
         return False
 
@@ -122,7 +125,7 @@ def sync_event_embedding(event_id: str) -> dict[str, Any]:
     if not vector:
         return {"status": "invalid_vector", "event_id": event_id}
 
-    point = {
+    point: JsonValue = {
         "id": str(row.get("event_id") or ""),
         "vector": vector,
         "payload": {
@@ -174,7 +177,8 @@ def run(max_batches: int | None = None, batch_size: int | None = None) -> dict[s
 
     redis_conn = Redis.from_url(settings.redis_url)
     cursor_ts_key, cursor_event_id_key = _cursor_keys(collection)
-    cursor_ts = _parse_cursor_ts(redis_conn.get(cursor_ts_key))
+    cursor_ts_raw = cast(bytes | str | None, redis_conn.get(cursor_ts_key))
+    cursor_ts = _parse_cursor_ts(cursor_ts_raw)
     cursor_event_id_raw = redis_conn.get(cursor_event_id_key)
     cursor_event_id = (cursor_event_id_raw.decode() if isinstance(cursor_event_id_raw, (bytes, bytearray)) else str(cursor_event_id_raw or "")).strip()
 
@@ -222,7 +226,7 @@ def run(max_batches: int | None = None, batch_size: int | None = None) -> dict[s
                 batches_done += 1
                 total_rows += len(rows)
 
-                points: list[dict[str, Any]] = []
+                points: list[JsonValue] = []
                 expected_vector_size: int | None = None
                 for row in rows:
                     vector = _parse_vector_text(row.get("embedding_text"))

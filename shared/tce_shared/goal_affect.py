@@ -23,7 +23,7 @@ def _recency_decay(ts: datetime | None, half_life_days: float) -> float:
     age_days = max(0.0, (now - ts.astimezone(UTC)).total_seconds() / 86400.0)
     if half_life_days <= 0:
         return 0.0
-    return 0.5 ** (age_days / half_life_days)
+    return math.pow(0.5, age_days / half_life_days)
 
 
 def compute_affective_scores(
@@ -87,7 +87,7 @@ def compute_affective_scores(
     )
     trigger_match = 1.0 if frustration_triggers else 0.0
     anger = _clamp(math.tanh((0.4 * pain * math.log1p(max(1, failure_streak))) + (0.2 * trigger_match)))
-    risk_pref = str(((fp.get("decision_making") or {}).get("risk_tolerance", "moderate"))).lower()
+    risk_pref = str((fp.get("decision_making") or {}).get("risk_tolerance", "moderate")).lower()
     risk_modifier = 1.2 if risk_pref in {"conservative", "safe"} else 0.95 if risk_pref in {"aggressive", "bold"} else 1.0
     uncertainty = _clamp(1.0 - confidence)
     anxiety_raw = (0.3 * blocker_impact * uncertainty) + (0.25 * (1.0 - success_probability))
@@ -106,7 +106,7 @@ def compute_affective_scores(
     top_concerns = ((fp.get("priorities") or {}).get("top_recurring_concerns") or [])
     identity = _clamp(0.35 + (0.25 if top_concerns else 0.0) + (0.25 * rehearsal_strength))
     guilt = _clamp((0.4 * (1.0 - recency)) + (0.3 * (1.0 - momentum)) + (0.3 * social)) * (1.0 - happy)
-    multitask = str(((fp.get("context_switching") or {}).get("multitask_tolerance", "moderate"))).lower()
+    multitask = str((fp.get("context_switching") or {}).get("multitask_tolerance", "moderate")).lower()
     multitask_penalty = 0.6 if multitask in {"low", "strict"} else 0.45 if multitask == "moderate" else 0.3
     cognitive_load = _clamp((0.4 * blocker_impact) + (0.35 * (1.0 - success_probability)) + (0.25 * multitask_penalty))
     overwhelm = _clamp((0.45 * anxiety) + (0.3 * distraction) + (0.25 * cognitive_load))

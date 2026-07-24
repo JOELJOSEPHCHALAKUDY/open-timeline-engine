@@ -59,7 +59,7 @@ def create_gateway(settings: Any) -> ModelGateway:
     timeout_seconds = max(2.0, timeout_seconds)
 
     if provider == "ollama":
-        inner = OllamaGateway(
+        inner: ModelGateway = OllamaGateway(
             base_url=settings.ollama_url,
             embed_model=settings.embed_model,
             extract_model=settings.extract_model,

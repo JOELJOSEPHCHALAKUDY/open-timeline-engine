@@ -23,15 +23,39 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
-          pip install pytest ruff mypy httpx
+          pip install pytest pytest-cov ruff mypy httpx pip-audit
       - name: Lint (changed core paths)
         run: python .github/ci/ruff_changed.py
       - name: Type check
         run: python .github/ci/mypy_changed.py
+      - name: Repository quality baseline
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          ruff check .
+          MYPYPATH=shared mypy shared services scripts tests
+      - name: Unit, security, and MCP firewall tests with coverage baseline
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          pytest tests/unit tests/security tests/mcp -q
+          --cov=shared/tce_shared
+          --cov=services/tce_api/tce_api
+          --cov=services/tce_lite_api/tce_lite_api
+          --cov=services/tce_mcp/tce_mcp
+          --cov=services/tce_worker/tce_worker
+          --cov-report=term
+          --cov-fail-under=28
+      - name: Dependency vulnerability gate
+        if: matrix.os == 'ubuntu-latest'
+        run: pip-audit --local --progress-spinner=off
       - name: Unit tests
+        if: matrix.os != 'ubuntu-latest'
         run: pytest tests/unit -q
       - name: Security tests
+        if: matrix.os != 'ubuntu-latest'
         run: pytest tests/security -q
+      - name: MCP firewall tests
+        if: matrix.os != 'ubuntu-latest'
+        run: pytest tests/mcp -q
 
   integration-migration:
     runs-on: ubuntu-latest
@@ -68,11 +92,16 @@ jobs:
           pip install alembic pytest
       - name: Migration smoke
         run: alembic -c infra/alembic.ini upgrade head
+      - name: Latest migration round trip
+        run: |
+          alembic -c infra/alembic.ini downgrade 20260722_0031
+          alembic -c infra/alembic.ini upgrade head
       - name: Export OpenAPI contracts
         run: |
           PYTHONPATH=shared:services/tce_api:services/tce_lite_api python scripts/export_openapi.py
           test -s docs/openapi/tce_api.v1.json
           test -s docs/openapi/tce_lite_api.v1.json
+          python .github/ci/openapi_parity.py docs/openapi/tce_api.v1.json docs/openapi/tce_lite_api.v1.json
       - name: Integration tests
         run: pytest tests/integration -q
 
@@ -159,6 +188,44 @@ jobs:
       - name: Stop Full stack
         if: always()
         run: docker compose --env-file .env -f infra/docker-compose.yml down -v
+
+  lite-mcp-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Lite and MCP clients
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e shared -e services/tce_lite_api -e services/tce_mcp pytest requests uvicorn
+      - name: Start bound-identity Lite API
+        shell: bash
+        env:
+          TCE_API_TOKENS: e2e-codex-token,e2e-claude-token
+          TCE_IDENTITY_CLAIMS_MODE: enforce
+          TCE_IDENTITY_CLAIMS_JSON: '{"bearer:aaca686ae7a5100c8dedfa71d1c38a2eea51cd1980c80c1367c8a30b348ab3af":{"consumer":"codex-executor","role":"executor","workspace_id":"e2e-workspace","user_id":"codex-executor","behavior_subject_id":"e2e-human"},"bearer:a3d07c69c6535b4dfc8ba93e5cbdbf9fa86574acf010ba355e833980ad170a6c":{"consumer":"claude-executor","role":"executor","workspace_id":"e2e-workspace","user_id":"claude-executor","behavior_subject_id":"e2e-human"}}'
+          TCE_LITE_DB_PATH: /tmp/tce-lite-mcp-e2e.db
+          TCE_BEHAVIOR_PROJECTIONS_ENABLED: 'true'
+          TCE_BEHAVIOR_PROJECTION_PILOT_ENABLED: 'true'
+        run: |
+          nohup uvicorn tce_lite_api.main:app --host 127.0.0.1 --port 8080 >/tmp/tce-lite-mcp-e2e.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/v1/health >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/tce-lite-mcp-e2e.log
+          exit 1
+      - name: Real Lite and stdio MCP E2E
+        env:
+          TCE_E2E_BASE_URL: http://127.0.0.1:8080
+          TCE_E2E_CODEX_TOKEN: e2e-codex-token
+          TCE_E2E_CLAUDE_TOKEN: e2e-claude-token
+        run: pytest tests/e2e/test_mcp_continuity_live.py -q
+      - name: Lite MCP E2E log
+        if: always()
+        run: cat /tmp/tce-lite-mcp-e2e.log
 
   load-tests:
     runs-on: ubuntu-latest

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+from typing import Literal, cast
 
 from mcp.server.fastmcp import FastMCP
 
 from . import tools
 from .config import get_settings
 from .otel import setup_otel
+from .tool_profiles import apply_tool_profile
 
 mcp = FastMCP("tce")
 
@@ -136,23 +138,45 @@ def complete_task(
 @mcp.tool(name="tce.report_resume_feedback", description="Record correct-file and correction feedback for a resume packet")
 def report_resume_feedback(
     packet_id: str,
-    correct_file: bool,
-    correction_required: bool = False,
+    phase: str = "feedback",
+    correct_file: bool | None = None,
+    correct_anchor: bool | None = None,
+    opened_file_rank: int | None = None,
+    correction_required: bool | None = None,
     opened_file: str | None = None,
     correction_reason: str = "",
+    archaeology_tool_calls: int | None = None,
+    archaeology_tokens: int | None = None,
+    outcome_status: str | None = None,
+    progress_source: str = "manual",
 ) -> dict:
     return tools.report_resume_feedback(
         packet_id=packet_id,
+        phase=phase,
         correct_file=correct_file,
+        correct_anchor=correct_anchor,
+        opened_file_rank=opened_file_rank,
         correction_required=correction_required,
         opened_file=opened_file,
         correction_reason=correction_reason,
+        archaeology_tool_calls=archaeology_tool_calls,
+        archaeology_tokens=archaeology_tokens,
+        outcome_status=outcome_status,
+        progress_source=progress_source,
     )
 
 
 @mcp.tool(name="tce.get_continuity_pilot", description="Get longitudinal continuity pilot metrics for the active workspace")
 def get_continuity_pilot(days: int = 30) -> dict:
     return tools.get_continuity_pilot(days=days)
+
+
+@mcp.tool(
+    name="tce.get_governance_status",
+    description="Report effective server and execution enforcement strength without overstating host controls",
+)
+def get_governance_status() -> dict:
+    return tools.get_governance_status()
 
 
 @mcp.tool(name="tce.get_context_brief", description="Get deterministic context brief with citations")
@@ -663,8 +687,16 @@ def get_activity_summary(period: str = "today", domain: str | None = None, max_e
         "past_decisions before proceeding."
     ),
 )
-def check_context(file_path: str, intended_action: str = "edit") -> dict:
-    return tools.check_context(file_path=file_path, intended_action=intended_action)
+def check_context(
+    file_path: str,
+    intended_action: str = "edit",
+    session_id: str | None = None,
+) -> dict:
+    return tools.check_context(
+        file_path=file_path,
+        intended_action=intended_action,
+        session_id=session_id,
+    )
 
 
 @mcp.tool(name="tce.get_lifecycle_status", description="Get event lifecycle/retention status")
@@ -677,7 +709,15 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
     return tools.run_lifecycle(retention_days=retention_days, dry_run=dry_run)
 
 
-@mcp.tool(name="tce.takeover_step", description="Run one takeover engine step with enforcement and safety checks. IMPORTANT: When the result contains has_directive=true, you MUST immediately use tools (read files, edit files, run commands) to work on state.takeover_context.objective. Do NOT narrate or describe the result — take action. IMPORTANT: Before editing ANY file, call tce.check_context first. If result contains persona_ack, show ONLY that text to the user before taking action.")
+@mcp.tool(
+    name="tce.takeover_step",
+    description=(
+        "Run one takeover engine step with enforcement and safety checks. IMPORTANT: When the result contains "
+        "has_directive=true, immediately use tools (read files, edit files, run commands) to work on "
+        "state.takeover_context.objective. Do not narrate the result; take action. Before editing any file, call "
+        "tce.check_context first. If result contains persona_ack, show only that text before taking action."
+    ),
+)
 def takeover_step(
     message: str,
     session_id: str = "default",
@@ -942,11 +982,15 @@ def reset_takeover_state(
     )
 
 
+TOOL_PROFILE_STATUS = apply_tool_profile(mcp, get_settings().mcp_tool_profile)
+
+
 def main() -> None:
     setup_otel("tce-mcp")
-    transport = str(os.getenv("TCE_MCP_TRANSPORT", "stdio") or "stdio").strip().lower()
-    if transport not in {"stdio", "sse", "streamable-http"}:
-        transport = "stdio"
+    transport_value = str(os.getenv("TCE_MCP_TRANSPORT", "stdio") or "stdio").strip().lower()
+    if transport_value not in {"stdio", "sse", "streamable-http"}:
+        transport_value = "stdio"
+    transport = cast(Literal["stdio", "sse", "streamable-http"], transport_value)
     mount_path = str(os.getenv("TCE_MCP_MOUNT_PATH", "") or "").strip() or None
     if mount_path is not None:
         mcp.run(transport=transport, mount_path=mount_path)
