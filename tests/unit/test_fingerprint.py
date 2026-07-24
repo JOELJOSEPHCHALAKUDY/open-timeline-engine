@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from tce_shared.fingerprint import (
     DEFAULT_FINGERPRINT,
-    merge_observation_into_fingerprint,
     extract_communication_signals,
+    merge_observation_into_fingerprint,
 )
 
 

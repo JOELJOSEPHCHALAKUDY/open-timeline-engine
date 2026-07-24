@@ -2,7 +2,7 @@ from tce_mcp import server
 
 
 def test_takeover_tools_present() -> None:
-    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}  # type: ignore[attr-defined]
+    tool_names = {tool.name for tool in server.mcp._tool_manager.list_tools()}
     assert "tce.takeover_step" in tool_names
     assert "tce.takeover_preload" in tool_names
     assert "tce.takeover_feedback" in tool_names

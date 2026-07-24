@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     llm_extraction: bool = False
     auth_mode: str = "dual"
     api_tokens: str = "local-dev-token"
+    # Privileged endpoints (docker-socket stack restart, .env writers) refuse
+    # to run while a well-known default token is configured, unless this is
+    # explicitly set for a dev-only install.
+    allow_default_token: bool = False
     mtls_required: bool = False
     block_sensitivity: int = 3
     enable_payload_encryption: bool = False
@@ -67,6 +71,11 @@ class Settings(BaseSettings):
     identity_claims_mode: str = "compat"
     identity_claims_json: str = "{}"
     audit_write_mode: str = "async"
+    runtime_profile: str = "local-full"
+    mcp_tool_profile: str = "core"
+    execution_enforcement_level: str = "protocol_only"
+    execution_interception_attested: bool = False
+    execution_interception_provider: str = ""
     behavior_subject_bindings: str = ""
     cold_start_min_events: int = 3
     cold_start_min_patterns: int = 2
@@ -301,7 +310,10 @@ class Settings(BaseSettings):
     dashboard_stack_restart_helper_image: str = "docker:27-cli"
     dashboard_stack_restart_timeout_seconds: int = 240
     dashboard_stack_restart_log_tail_lines: int = 120
-    cors_allow_origins: str = "*"
+    # Explicit dashboard-dev origins, not "*": the API carries privileged,
+    # token-authenticated endpoints and must not be reachable from arbitrary
+    # web pages. Production dashboard is served same-origin and needs no CORS.
+    cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
 
     @property

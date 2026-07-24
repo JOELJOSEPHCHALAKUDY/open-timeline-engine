@@ -311,6 +311,33 @@ def _ensure_behavior_fidelity_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_continuity_v04_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        "session_id": "TEXT NOT NULL DEFAULT 'default'",
+        "recommended_files_json": "TEXT NOT NULL DEFAULT '[]'",
+        "opened_file_rank": "INTEGER",
+        "first_file_opened_at": "TEXT",
+        "productive_at": "TEXT",
+        "completed_at": "TEXT",
+        "correct_anchor": "INTEGER",
+        "archaeology_tool_calls": "INTEGER",
+        "archaeology_tokens": "INTEGER",
+        "outcome_status": "TEXT",
+        "progress_source": "TEXT NOT NULL DEFAULT 'resume_packet'",
+    }
+    for name, ddl in columns.items():
+        if not _column_exists(conn, "continuity_resume_attempts", name):
+            conn.execute(f"ALTER TABLE continuity_resume_attempts ADD COLUMN {name} {ddl}")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_continuity_resume_session
+            ON continuity_resume_attempts (
+                workspace_id, requesting_owner_id, session_id, requested_at DESC
+            )
+        """
+    )
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -958,6 +985,7 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
             workspace_id TEXT NOT NULL,
             requesting_owner_id TEXT NOT NULL,
             target_owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT 'default',
             selected_record_id TEXT NOT NULL,
             query_text TEXT NOT NULL,
             top_file TEXT,
@@ -965,10 +993,20 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
             returned_at TEXT NOT NULL,
             latency_ms INTEGER NOT NULL DEFAULT 0,
             time_since_handoff_ms INTEGER NOT NULL DEFAULT 0,
+            recommended_files_json TEXT NOT NULL DEFAULT '[]',
             opened_file TEXT,
+            opened_file_rank INTEGER,
+            first_file_opened_at TEXT,
+            productive_at TEXT,
+            completed_at TEXT,
             correct_file INTEGER,
+            correct_anchor INTEGER,
             correction_required INTEGER,
             correction_reason TEXT NOT NULL DEFAULT '',
+            archaeology_tool_calls INTEGER,
+            archaeology_tokens INTEGER,
+            outcome_status TEXT,
+            progress_source TEXT NOT NULL DEFAULT 'resume_packet',
             feedback_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_continuity_resume_scope
@@ -1412,6 +1450,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE events ADD COLUMN summary_updated_at TEXT NOT NULL DEFAULT ''")
         _ensure_takeover_v3_schema(conn)
         _ensure_behavior_fidelity_schema(conn)
+        _ensure_continuity_v04_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     lite_db_path: str = "/data/tce-lite.db"
+    auth_mode: str = "bearer"
     api_tokens: str = "local-dev-token"
     block_sensitivity: int = 3
     default_operation_mode: str = "timeline_only"
@@ -47,6 +48,11 @@ class Settings(BaseSettings):
     identity_claims_mode: str = "compat"
     identity_claims_json: str = "{}"
     audit_write_mode: str = "durable"
+    runtime_profile: str = "local-lite"
+    mcp_tool_profile: str = "core"
+    execution_enforcement_level: str = "protocol_only"
+    execution_interception_attested: bool = False
+    execution_interception_provider: str = ""
     behavior_subject_bindings: str = ""
     cold_start_min_events: int = 3
     cold_start_min_patterns: int = 2
@@ -266,7 +272,7 @@ class Settings(BaseSettings):
     dashboard_stack_restart_log_tail_lines: int = 120
     log_level: str = "INFO"
     redaction_zone_paths: str = Field(default="")
-    cors_allow_origins: str = "*"
+    cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
 
     @property

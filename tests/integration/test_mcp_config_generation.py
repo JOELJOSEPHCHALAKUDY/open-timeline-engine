@@ -4,10 +4,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 
-def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _load_json(path: Path) -> dict[str, Any]:
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    return loaded
 
 
 def test_configure_mcp_clients_generates_generic_pack(tmp_path) -> None:

@@ -231,7 +231,8 @@ def run(event_id: str, workspace_id: str | None = None, user_id: str | None = No
                 },
             )
 
-        lessons = extracted.get("lessons") if isinstance(extracted.get("lessons"), dict) else {}
+        lessons_raw = extracted.get("lessons")
+        lessons: dict[str, Any] = lessons_raw if isinstance(lessons_raw, dict) else {}
         db.execute(
             text(
                 """
@@ -267,4 +268,3 @@ def run(event_id: str, workspace_id: str | None = None, user_id: str | None = No
             "workspace_id": scoped_workspace,
             "user_id": scoped_user,
         }
-

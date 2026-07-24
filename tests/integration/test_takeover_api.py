@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -42,7 +43,7 @@ def _seed_event_payload() -> dict:
 
 
 @pytest.fixture()
-def lite_client(tmp_path) -> TestClient:
+def lite_client(tmp_path) -> Iterator[TestClient]:
     settings = get_settings()
     settings.lite_db_path = str(tmp_path / "tce-lite-takeover-test.db")
     settings.api_tokens = "lite-test-token"

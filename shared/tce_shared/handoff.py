@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import math
 import re
+from datetime import UTC, datetime
 from typing import Any
 
-from .redaction import redact_payload, redact_text
+from .redaction import redact_text
 
 _VALID_MODES = {"shadow", "warn", "enforce"}
 _VALID_OUTCOME_STATUS = {"succeeded", "failed", "blocked"}

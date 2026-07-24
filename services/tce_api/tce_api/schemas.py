@@ -443,6 +443,8 @@ class MemoryRuleItem(BaseModel):
     statement: str
     priority: int = Field(default=2, ge=0, le=3)
     active: bool = True
+    evergreen: bool = True
+    expires_at: datetime | None = None
     source_episode_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
@@ -453,6 +455,8 @@ class MemoryRuleUpsertRequest(BaseModel):
     rule_type: str
     statement: str
     priority: int = Field(default=2, ge=0, le=3)
+    evergreen: bool = True
+    expires_at: datetime | None = None
     source_episode_id: UUID | None = None
 
 

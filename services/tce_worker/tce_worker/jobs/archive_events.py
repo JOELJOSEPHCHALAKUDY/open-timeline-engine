@@ -16,6 +16,10 @@ from .graph_health import run as run_graph_health
 _PARTITION_RE = re.compile(r"^events_v2_(\d{6})$")
 
 
+def _rowcount(result: Any) -> int:
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 def _month_end_from_partition(partition_name: str) -> datetime | None:
     match = _PARTITION_RE.match(partition_name)
     if not match:
@@ -289,19 +293,19 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
                     ),
                     {"cutoff": cutoff, "max_rows": max_rows},
                 )
-                summary["default_rows_deleted"] = int(deleted_default.rowcount or 0)
+                summary["default_rows_deleted"] = _rowcount(deleted_default)
             else:
                 summary["default_rows_deleted"] = 0
             deleted_audit = db.execute(
                 text("DELETE FROM audit_log WHERE ts < :cutoff"),
                 {"cutoff": now - timedelta(days=int(settings.audit_retention_days))},
             )
-            summary["audit_rows_deleted"] = int(deleted_audit.rowcount or 0)
+            summary["audit_rows_deleted"] = _rowcount(deleted_audit)
             deleted_interactions = db.execute(
                 text("DELETE FROM agent_interactions WHERE ts < :cutoff"),
                 {"cutoff": now - timedelta(days=int(settings.interaction_retention_days))},
             )
-            summary["interaction_rows_deleted"] = int(deleted_interactions.rowcount or 0)
+            summary["interaction_rows_deleted"] = _rowcount(deleted_interactions)
             handoff_cutoff = now - timedelta(days=max(1, int(getattr(settings, "handoff_retention_days", 90))))
             deleted_handoff = db.execute(
                 text(
@@ -313,7 +317,7 @@ def run(retention_days: int | None = None, dry_run: bool | None = None) -> dict[
                 ),
                 {"now": now, "handoff_cutoff": handoff_cutoff},
             )
-            summary["handoff_rows_deleted"] = int(deleted_handoff.rowcount or 0)
+            summary["handoff_rows_deleted"] = _rowcount(deleted_handoff)
             behavior_cutoff = now - timedelta(
                 days=max(1, int(getattr(settings, "behavior_control_retention_days", 365)))
             )

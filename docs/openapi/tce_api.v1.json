@@ -3355,6 +3355,17 @@
             "default": "edit",
             "title": "Intended Action",
             "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
           }
         },
         "required": [
@@ -4126,6 +4137,44 @@
             "title": "Captured Completion Count",
             "type": "integer"
           },
+          "completed_resume_count": {
+            "default": 0,
+            "title": "Completed Resume Count",
+            "type": "integer"
+          },
+          "correct_anchor_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correct Anchor Rate"
+          },
+          "correct_file_at_1_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correct File At 1 Rate"
+          },
+          "correct_file_at_3_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correct File At 3 Rate"
+          },
           "correct_file_rate": {
             "anyOf": [
               {
@@ -4165,6 +4214,61 @@
             "title": "Handoff Capture Coverage",
             "type": "number"
           },
+          "median_active_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Active Resume Ms"
+          },
+          "median_archaeology_tokens": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Archaeology Tokens"
+          },
+          "median_archaeology_tool_calls": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Archaeology Tool Calls"
+          },
+          "median_completion_after_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Completion After Resume Ms"
+          },
+          "median_handoff_age_at_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Handoff Age At Resume Ms"
+          },
           "median_retrieval_latency_ms": {
             "anyOf": [
               {
@@ -4175,6 +4279,17 @@
               }
             ],
             "title": "Median Retrieval Latency Ms"
+          },
+          "median_time_to_first_file_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Time To First File Ms"
           },
           "median_time_to_resume_ms": {
             "anyOf": [
@@ -4197,6 +4312,50 @@
             "title": "Outbox Pending Count",
             "type": "integer"
           },
+          "p95_active_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Active Resume Ms"
+          },
+          "p95_completion_after_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Completion After Resume Ms"
+          },
+          "p95_handoff_age_at_resume_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Handoff Age At Resume Ms"
+          },
+          "p95_time_to_first_file_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95 Time To First File Ms"
+          },
           "p95_time_to_resume_ms": {
             "anyOf": [
               {
@@ -4207,6 +4366,11 @@
               }
             ],
             "title": "P95 Time To Resume Ms"
+          },
+          "productive_resume_count": {
+            "default": 0,
+            "title": "Productive Resume Count",
+            "type": "integer"
           },
           "resume_attempt_count": {
             "title": "Resume Attempt Count",
@@ -6583,6 +6747,114 @@
         "title": "GoalRelationEdge",
         "type": "object"
       },
+      "GovernanceStatusResponse": {
+        "properties": {
+          "audit_write_mode": {
+            "title": "Audit Write Mode",
+            "type": "string"
+          },
+          "auth_mode": {
+            "title": "Auth Mode",
+            "type": "string"
+          },
+          "effective_execution_enforcement": {
+            "title": "Effective Execution Enforcement",
+            "type": "string"
+          },
+          "host_mutation_interception": {
+            "title": "Host Mutation Interception",
+            "type": "boolean"
+          },
+          "identity_claims_mode": {
+            "title": "Identity Claims Mode",
+            "type": "string"
+          },
+          "interception_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interception Provider"
+          },
+          "lifecycle_protocol_enforced": {
+            "title": "Lifecycle Protocol Enforced",
+            "type": "boolean"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Limitations",
+            "type": "array"
+          },
+          "mcp_tool_profile": {
+            "title": "Mcp Tool Profile",
+            "type": "string"
+          },
+          "non_bypassable_execution": {
+            "title": "Non Bypassable Execution",
+            "type": "boolean"
+          },
+          "production_autonomy_ready": {
+            "title": "Production Autonomy Ready",
+            "type": "boolean"
+          },
+          "requested_execution_enforcement": {
+            "title": "Requested Execution Enforcement",
+            "type": "string"
+          },
+          "runtime": {
+            "title": "Runtime",
+            "type": "string"
+          },
+          "runtime_profile": {
+            "title": "Runtime Profile",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "server_boundary_checks": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Server Boundary Checks",
+            "type": "object"
+          },
+          "server_boundary_secure": {
+            "title": "Server Boundary Secure",
+            "type": "boolean"
+          },
+          "workspace_access_mode": {
+            "title": "Workspace Access Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime",
+          "runtime_profile",
+          "auth_mode",
+          "identity_claims_mode",
+          "workspace_access_mode",
+          "audit_write_mode",
+          "mcp_tool_profile",
+          "requested_execution_enforcement",
+          "effective_execution_enforcement",
+          "lifecycle_protocol_enforced",
+          "host_mutation_interception",
+          "non_bypassable_execution",
+          "server_boundary_secure",
+          "production_autonomy_ready"
+        ],
+        "title": "GovernanceStatusResponse",
+        "type": "object"
+      },
       "GraphEntitySearchResponse": {
         "properties": {
           "entities": {
@@ -6982,6 +7254,23 @@
             "title": "Created At",
             "type": "string"
           },
+          "evergreen": {
+            "default": true,
+            "title": "Evergreen",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
@@ -7065,6 +7354,23 @@
       },
       "MemoryRuleUpsertRequest": {
         "properties": {
+          "evergreen": {
+            "default": true,
+            "title": "Evergreen",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
           "priority": {
             "default": 2,
             "maximum": 3.0,
@@ -7473,9 +7779,53 @@
       },
       "ResumeFeedbackRequest": {
         "properties": {
+          "archaeology_tokens": {
+            "anyOf": [
+              {
+                "maximum": 10000000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archaeology Tokens"
+          },
+          "archaeology_tool_calls": {
+            "anyOf": [
+              {
+                "maximum": 10000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archaeology Tool Calls"
+          },
+          "correct_anchor": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correct Anchor"
+          },
           "correct_file": {
-            "title": "Correct File",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correct File"
           },
           "correction_reason": {
             "default": "",
@@ -7484,9 +7834,15 @@
             "type": "string"
           },
           "correction_required": {
-            "default": false,
-            "title": "Correction Required",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correction Required"
           },
           "opened_file": {
             "anyOf": [
@@ -7500,15 +7856,51 @@
             ],
             "title": "Opened File"
           },
+          "opened_file_rank": {
+            "anyOf": [
+              {
+                "maximum": 40.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opened File Rank"
+          },
+          "outcome_status": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome Status"
+          },
           "packet_id": {
             "format": "uuid",
             "title": "Packet Id",
             "type": "string"
+          },
+          "phase": {
+            "default": "feedback",
+            "pattern": "^(file_opened|productive|completed|feedback)$",
+            "title": "Phase",
+            "type": "string"
+          },
+          "progress_source": {
+            "default": "manual",
+            "maxLength": 64,
+            "title": "Progress Source",
+            "type": "string"
           }
         },
         "required": [
-          "packet_id",
-          "correct_file"
+          "packet_id"
         ],
         "title": "ResumeFeedbackRequest",
         "type": "object"
@@ -7523,6 +7915,11 @@
           "packet_id": {
             "format": "uuid",
             "title": "Packet Id",
+            "type": "string"
+          },
+          "phase": {
+            "default": "feedback",
+            "title": "Phase",
             "type": "string"
           },
           "recorded": {
@@ -9500,7 +9897,7 @@
   },
   "info": {
     "title": "Open Timeline Engine API",
-    "version": "0.3.0"
+    "version": "0.4.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -18018,6 +18415,148 @@
           }
         },
         "summary": "Get Fingerprint"
+      }
+    },
+    "/v1/governance/status": {
+      "get": {
+        "operationId": "governance_status_v1_governance_status_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GovernanceStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Governance Status"
       }
     },
     "/v1/graph/entities": {

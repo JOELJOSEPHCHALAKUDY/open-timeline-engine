@@ -114,14 +114,29 @@ def test_transactional_completion_resume_feedback_and_identity_binding(client: T
     assert packet["files"][0]["path"] == "services/tce_api/tce_api/continuity_store.py"
     assert packet["files"][0]["anchors"][0]["symbol"] == "deliver_handoff"
 
+    opened = client.post(
+        "/v1/clone/check-context",
+        headers=_auth("claude-token"),
+        json={
+            "file_path": packet["files"][0]["path"],
+            "intended_action": "edit",
+            "session_id": "shared-session",
+        },
+    )
+    assert opened.status_code == 200
+
     feedback = client.post(
         "/v1/continuity/pilot/feedback",
         headers=_auth("claude-token"),
         json={
             "packet_id": packet["packet_id"],
+            "phase": "completed",
             "opened_file": packet["files"][0]["path"],
             "correct_file": True,
+            "correct_anchor": True,
             "correction_required": False,
+            "archaeology_tool_calls": 2,
+            "archaeology_tokens": 300,
         },
     )
     assert feedback.status_code == 200
@@ -129,6 +144,14 @@ def test_transactional_completion_resume_feedback_and_identity_binding(client: T
     assert pilot.status_code == 200
     assert pilot.json()["handoff_capture_coverage"] == 1.0
     assert pilot.json()["correct_file_rate"] == 1.0
+    assert pilot.json()["correct_file_at_1_rate"] == 1.0
+    assert pilot.json()["correct_anchor_rate"] == 1.0
+    assert pilot.json()["productive_resume_count"] == 1
+    assert pilot.json()["completed_resume_count"] == 1
+    assert pilot.json()["median_time_to_first_file_ms"] is not None
+    assert pilot.json()["median_active_resume_ms"] is not None
+    assert pilot.json()["median_archaeology_tool_calls"] == 2
+    assert pilot.json()["median_archaeology_tokens"] == 300
 
 
 def test_committed_outbox_replays_after_delivery_interruption(client: TestClient) -> None:
@@ -172,6 +195,87 @@ def test_committed_outbox_replays_after_delivery_interruption(client: TestClient
         assert recovered.execute("SELECT COUNT(*) AS count FROM handoff_records WHERE event_id = (SELECT event_id FROM handoff_outbox WHERE id = ?)", (outbox_id,)).fetchone()["count"] == 1
     finally:
         recovered.close()
+
+
+def test_outbox_delivery_failure_is_atomic_and_recoverable(client: TestClient) -> None:
+    settings = get_settings()
+    conn = sqlite3.connect(settings.lite_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        outbox = enqueue_handoff(
+            conn,
+            workspace_id="shared",
+            owner_id="codex-executor",
+            behavior_subject_id="human",
+            session_id="failure-injection",
+            directive_id=None,
+            completion_key="test:continuity:failure-injection",
+            terminal_state="succeeded",
+            milestone={
+                "title": "Recover an interrupted projection",
+                "payload": {"files": ["src/recovery.py"]},
+                "decision": "Exercise the durable retry path",
+                "outcome": {"status": "succeeded", "next_step": "Repair and replay"},
+                # dict(["invalid"]) raises during delivery after the outbox is committed.
+                "git": ["invalid"],
+                "milestone_schema": "v1",
+            },
+            source="failure-injection",
+            redaction_applied=False,
+        )
+        outbox_id = str(outbox["id"])
+        event_id = str(outbox["event_id"])
+        handoff_id = str(outbox["handoff_record_id"])
+        conn.commit()
+
+        failed = drain_pending_handoffs(conn, retention_days=90)
+        assert failed == {"processed": 1, "delivered": 0, "pending": 1, "dead": 0}
+        failed_row = conn.execute(
+            "SELECT status, attempts, last_error FROM handoff_outbox WHERE id = ?",
+            (outbox_id,),
+        ).fetchone()
+        assert failed_row["status"] == "pending"
+        assert failed_row["attempts"] == 1
+        assert failed_row["last_error"]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE id = ?", (event_id,)).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM handoff_records WHERE id = ?",
+            (handoff_id,),
+        ).fetchone()[0] == 0
+
+        milestone = json.loads(
+            conn.execute(
+                "SELECT milestone_json FROM handoff_outbox WHERE id = ?",
+                (outbox_id,),
+            ).fetchone()[0]
+        )
+        milestone["git"] = {"branch": "recovery"}
+        conn.execute(
+            """
+            UPDATE handoff_outbox
+            SET milestone_json = ?, next_attempt_at = '2000-01-01T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (json.dumps(milestone), outbox_id),
+        )
+        conn.commit()
+
+        recovered = drain_pending_handoffs(conn, retention_days=90)
+        assert recovered == {"processed": 1, "delivered": 1, "pending": 0, "dead": 0}
+        delivered_row = conn.execute(
+            "SELECT status, attempts, last_error FROM handoff_outbox WHERE id = ?",
+            (outbox_id,),
+        ).fetchone()
+        assert delivered_row["status"] == "delivered"
+        assert delivered_row["attempts"] == 2
+        assert delivered_row["last_error"] is None
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE id = ?", (event_id,)).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM handoff_records WHERE id = ?",
+            (handoff_id,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_mutating_grant_requires_completion_before_next_mutation(client: TestClient) -> None:

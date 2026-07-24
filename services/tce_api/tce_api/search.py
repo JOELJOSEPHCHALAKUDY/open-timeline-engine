@@ -8,10 +8,11 @@ import math
 import random
 import re
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 from sqlalchemy import text
@@ -77,6 +78,12 @@ _CROSS_USER_HANDOFF_RE = re.compile(
     r"\b(continue|resume|pick up|handoff|hand off|follow up)\b.*\b(codex|claude)\b"
 )
 _CROSS_USER_DIRECT_NAMES = ("codex", "claude")
+
+
+class _MMRCandidate(TypedDict):
+    score: float
+    row: dict[str, Any]
+    tokens: set[str]
 
 
 def _normalize_title(value: Any) -> str:
@@ -283,14 +290,14 @@ def _collapse_whitespace(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
-def _run_with_retry(
-    fn: Any,
+def _run_with_retry[T](
+    fn: Callable[[], T],
     *,
     attempts: int,
     base_backoff_ms: int,
     max_retry_budget_ms: int,
     jitter_ratio: float = 0.0,
-) -> Any:
+) -> T:
     attempts = max(1, int(attempts))
     jitter_ratio = max(0.0, min(1.0, float(jitter_ratio)))
     started = monotonic()
@@ -467,7 +474,10 @@ def _get_cached_embedding(query: str) -> list[float] | None:
             return None
         raw = redis_client.get(key)
         if raw:
-            embedding = json.loads(raw)
+            decoded = json.loads(raw)
+            if not isinstance(decoded, list):
+                return None
+            embedding = [float(value) for value in decoded]
             _EMBED_MEMO[key] = (now + _EMBED_CACHE_TTL, embedding)
             return embedding
     except Exception:
@@ -704,7 +714,7 @@ def _mmr_select(
 ) -> list[tuple[float, dict[str, Any]]]:
     if top_k <= 0:
         return []
-    candidates = [
+    candidates: list[_MMRCandidate] = [
         {
             "score": score,
             "row": row,
@@ -712,7 +722,7 @@ def _mmr_select(
         }
         for score, row in scored_events
     ]
-    selected: list[dict[str, Any]] = []
+    selected: list[_MMRCandidate] = []
     while candidates and len(selected) < top_k:
         best_idx = 0
         best_mmr = float("-inf")
@@ -967,7 +977,7 @@ def run_search(
     limit = search_request.k * 3
     base_where_sql = " AND ".join(where_parts)
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     vector_similarity_lookup: dict[Any, float] = {}
     query_embedding: list[float] | None = None
     entity_event_ids: set[Any] = set()
@@ -999,7 +1009,10 @@ def run_search(
             ORDER BY ts DESC
             LIMIT :row_limit
         """
-        rows = db.execute(text(sql), {**params, "row_limit": limit}).mappings().all()
+        rows = [
+            dict(row)
+            for row in db.execute(text(sql), {**params, "row_limit": limit}).mappings().all()
+        ]
     else:
         text_query = f"%{query_text}%"
         lexical_terms = [text_query]
@@ -1049,10 +1062,11 @@ def run_search(
                 ORDER BY ts DESC
                 LIMIT :row_limit
             """
-            return db.execute(
+            result = db.execute(
                 text(lexical_sql),
                 {**params, "lexical_terms": terms, "row_limit": limit},
             ).mappings().all()
+            return [dict(row) for row in result]
 
         retry_enabled = bool(getattr(settings, "search_retry_enabled", True))
         retry_attempts = max(1, int(getattr(settings, "search_retry_max_attempts", 2)))

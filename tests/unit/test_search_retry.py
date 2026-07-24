@@ -121,7 +121,7 @@ class _MappingsResult:
     def __init__(self, rows: list[dict[str, str]]) -> None:
         self._rows = rows
 
-    def mappings(self) -> "_MappingsResult":
+    def mappings(self) -> _MappingsResult:
         return self
 
     def all(self) -> list[dict[str, str]]:
@@ -193,7 +193,7 @@ def test_expand_owner_scope_from_rows_uses_workspace_owners() -> None:
         {"context": {"_tce_workspace": "personal"}},
     ]
     expanded = _expand_owner_scope_from_rows(
-        rows,  # type: ignore[arg-type]
+        rows,
         workspace_id="personal",
         current_scope={"joeljoseph"},
     )

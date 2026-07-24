@@ -135,7 +135,7 @@ def test_pattern_feedback_signal_prefers_positive() -> None:
             _Result(rows=[{"positive_outcome": 4, "negative_outcome": 0}]),
         ]
     )
-    signal = patterns._pattern_feedback_signal(db, event_ids=[uuid4()])  # type: ignore[attr-defined]
+    signal = patterns._pattern_feedback_signal(db, event_ids=[uuid4()])
     assert signal > 0.5
 
 
@@ -146,5 +146,5 @@ def test_pattern_feedback_signal_prefers_negative() -> None:
             _Result(rows=[{"positive_outcome": 0, "negative_outcome": 3}]),
         ]
     )
-    signal = patterns._pattern_feedback_signal(db, event_ids=[uuid4()])  # type: ignore[attr-defined]
+    signal = patterns._pattern_feedback_signal(db, event_ids=[uuid4()])
     assert signal < 0.5

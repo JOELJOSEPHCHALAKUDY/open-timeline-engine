@@ -3,15 +3,25 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE="$ROOT/infra/docker-compose.yml"
+E2E_OVERRIDE="$ROOT/infra/docker-compose.e2e.override.yml"
+# Dedicated compose project: `down -v` must only ever touch e2e volumes,
+# never the dev stack's project ("open-timeline-engine") and its postgres_data.
+E2E_PROJECT="${E2E_COMPOSE_PROJECT:-tce-e2e}"
 E2E_API_PORT="${E2E_API_PORT:-18080}"
 E2E_POSTGRES_PORT="${E2E_POSTGRES_PORT:-15432}"
 E2E_REDIS_PORT="${E2E_REDIS_PORT:-16379}"
 API="${TCE_API_BASE_URL:-http://localhost:${E2E_API_PORT}}"
 TOKEN="${TCE_API_TOKEN:-local-dev-token}"
 
+if [ "$E2E_PROJECT" = "open-timeline-engine" ]; then
+  echo "refusing to run e2e against the dev compose project 'open-timeline-engine'"
+  exit 1
+fi
+
 compose_cmd() {
   TCE_API_PORT="$E2E_API_PORT" TCE_POSTGRES_PORT="$E2E_POSTGRES_PORT" TCE_REDIS_PORT="$E2E_REDIS_PORT" \
-    docker compose -f "$COMPOSE" "$@"
+    E2E_API_PORT="$E2E_API_PORT" \
+    docker compose -p "$E2E_PROJECT" -f "$COMPOSE" -f "$E2E_OVERRIDE" "$@"
 }
 
 cleanup() {

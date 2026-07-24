@@ -9,9 +9,9 @@ from tce_shared.takeover import (
     compute_decision_confidence,
     ensure_takeover_response,
     evaluate_safety,
+    resolve_objective,
     should_trigger_deliberation,
     update_recent_outcomes,
-    resolve_objective,
 )
 
 

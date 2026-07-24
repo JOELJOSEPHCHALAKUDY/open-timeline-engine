@@ -1,6 +1,6 @@
 [project]
 name = "open-timeline-engine"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-first timeline context engine"
 readme = "README.md"
 requires-python = ">=3.12"

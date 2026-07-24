@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     mcp_http_retry_backoff_seconds: float = 0.4
     mcp_http_retry_statuses: str = "429,500,502,503,504"
     mcp_http_timeout_seconds: float = 90.0
+    mcp_tool_profile: str = "all"
 
     @property
     def mcp_effective_session_id(self) -> str:

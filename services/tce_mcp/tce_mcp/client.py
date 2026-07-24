@@ -146,6 +146,11 @@ class TCEApiClient:
         response.raise_for_status()
         return self._json_dict(response)
 
+    def governance_status(self) -> dict[str, Any]:
+        response = self._get("/v1/governance/status")
+        response.raise_for_status()
+        return self._json_dict(response)
+
     def context_brief(self, body: dict[str, Any]) -> dict[str, Any]:
         response = self._post("/v1/context/brief", body)
         response.raise_for_status()
@@ -522,8 +527,16 @@ class TCEApiClient:
         response.raise_for_status()
         return self._json_dict(response)
 
-    def check_context(self, file_path: str, intended_action: str = "edit") -> dict[str, Any]:
-        response = self._post("/v1/clone/check-context", {"file_path": file_path, "intended_action": intended_action})
+    def check_context(
+        self,
+        file_path: str,
+        intended_action: str = "edit",
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"file_path": file_path, "intended_action": intended_action}
+        if session_id:
+            body["session_id"] = session_id
+        response = self._post("/v1/clone/check-context", body)
         response.raise_for_status()
         return self._json_dict(response)
 

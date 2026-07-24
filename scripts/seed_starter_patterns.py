@@ -61,12 +61,12 @@ def main() -> None:
     inserted_workflows = 0
 
     with Session(engine) as db:
-        for seed in SEED_PATTERNS:
+        for pattern_seed in SEED_PATTERNS:
             existing = db.execute(
                 select(Pattern).where(
-                    Pattern.domain == seed["domain"],
-                    Pattern.pattern_type == seed["pattern_type"],
-                    Pattern.statement == seed["statement"],
+                    Pattern.domain == pattern_seed["domain"],
+                    Pattern.pattern_type == pattern_seed["pattern_type"],
+                    Pattern.statement == pattern_seed["statement"],
                 )
             ).scalar_one_or_none()
             if existing:
@@ -74,9 +74,9 @@ def main() -> None:
 
             db.add(
                 Pattern(
-                    domain=seed["domain"],
-                    pattern_type=seed["pattern_type"],
-                    statement=seed["statement"],
+                    domain=pattern_seed["domain"],
+                    pattern_type=pattern_seed["pattern_type"],
+                    statement=pattern_seed["statement"],
                     evidence_event_ids=[],
                     confidence=0.52,
                     updated_at=datetime.now(tz=UTC),
@@ -86,11 +86,11 @@ def main() -> None:
             )
             inserted_patterns += 1
 
-        for seed in SEED_WORKFLOWS:
+        for workflow_seed in SEED_WORKFLOWS:
             existing = db.execute(
                 select(WorkflowTemplate).where(
-                    WorkflowTemplate.domain == seed["domain"],
-                    WorkflowTemplate.name == seed["name"],
+                    WorkflowTemplate.domain == workflow_seed["domain"],
+                    WorkflowTemplate.name == workflow_seed["name"],
                 )
             ).scalar_one_or_none()
             if existing:
@@ -98,10 +98,10 @@ def main() -> None:
 
             db.add(
                 WorkflowTemplate(
-                    name=seed["name"],
-                    domain=seed["domain"],
-                    graph=seed["graph"],
-                    triggers=seed["triggers"],
+                    name=workflow_seed["name"],
+                    domain=workflow_seed["domain"],
+                    graph=workflow_seed["graph"],
+                    triggers=workflow_seed["triggers"],
                     version=1,
                     updated_at=datetime.now(tz=UTC),
                 )

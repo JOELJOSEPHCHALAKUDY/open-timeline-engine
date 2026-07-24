@@ -12,11 +12,11 @@ with the takeover_step endpoint, tracking:
 - Error/failure rates
 """
 
-import requests
-import time
 import json
-import sys
+import time
 from datetime import datetime
+
+import requests
 
 API_BASE = "http://localhost:8080/v1"
 SESSION_ID = "stress-test-150-auto"
@@ -233,7 +233,6 @@ def call_takeover_step(session_id, message, turn_num):
         state = data.get("state", {})
         tc = state.get("takeover_context", {})
         sg = data.get("selected_goal", {}) or {}
-        pe = data.get("pending_execution", {}) or {}
         lb = data.get("latency_breakdown_ms", {}) or {}
 
         # API uses "note" field for directive content (not "has_directive")
@@ -319,7 +318,7 @@ def call_report_execution(session_id, directive_id, state="succeeded"):
         "directive_id": directive_id,
         "state": state,
         "result": "success" if state == "succeeded" else "failure",
-        "details": {"summary": f"Stress test turn completed"}
+        "details": {"summary": "Stress test turn completed"}
     }
     try:
         resp = requests.post(f"{API_BASE}/takeover/execution/report", json=payload, headers=HEADERS, timeout=10)
@@ -330,7 +329,7 @@ def call_report_execution(session_id, directive_id, state="succeeded"):
 def run_stress_test():
     """Run the 150-turn stress test."""
     print(f"{'='*80}")
-    print(f"TCE TAKEOVER 150-TURN STRESS TEST")
+    print("TCE TAKEOVER 150-TURN STRESS TEST")
     print(f"Session: {SESSION_ID}")
     print(f"Started: {datetime.now().isoformat()}")
     print(f"{'='*80}\n")
@@ -341,9 +340,7 @@ def run_stress_test():
     directives_claimed = 0
     directives_reported = 0
     state_drops = 0
-    mode_changes = []
     last_active = None
-    consecutive_vague = 0
     goal_changes = 0
     last_goal_id = None
     cache_hits = 0
@@ -421,34 +418,34 @@ def run_stress_test():
     retrieval_latencies = [r.get("retrieval_latency_ms", 0) for r in ok_results if r.get("retrieval_latency_ms")]
 
     print(f"\n{'='*80}")
-    print(f"STRESS TEST RESULTS")
+    print("STRESS TEST RESULTS")
     print(f"{'='*80}")
-    print(f"\n📊 TURN METRICS:")
+    print("\n📊 TURN METRICS:")
     print(f"  Total turns attempted: {TARGET_TURNS}")
     print(f"  Successful turns: {len(ok_results)} ({len(ok_results)/TARGET_TURNS*100:.1f}%)")
     print(f"  Failed turns: {len(errors)} ({len(errors)/TARGET_TURNS*100:.1f}%)")
     print(f"  Timeout turns: {sum(1 for r in results if r['status'] == 'timeout')}")
 
-    print(f"\n🔄 STATE CONTINUITY:")
+    print("\n🔄 STATE CONTINUITY:")
     print(f"  Turns with active=True: {len(active_results)} ({len(active_results)/max(len(ok_results),1)*100:.1f}%)")
     print(f"  State drops (active→inactive): {state_drops}")
     print(f"  Final state active: {results[-1].get('active') if results else 'N/A'}")
     print(f"  Final mode: {results[-1].get('mode') if results else 'N/A'}")
 
-    print(f"\n📋 DIRECTIVE LIFECYCLE:")
+    print("\n📋 DIRECTIVE LIFECYCLE:")
     print(f"  Directives issued: {directives_issued}")
     print(f"  Directives claimed: {directives_claimed}")
     print(f"  Directives reported: {directives_reported}")
     print(f"  Directive success rate: {directives_reported/max(directives_issued,1)*100:.1f}%")
 
-    print(f"\n🎯 GOAL TRACKING:")
+    print("\n🎯 GOAL TRACKING:")
     print(f"  Goal changes: {goal_changes}")
     print(f"  Cache hits: {cache_hits}")
     print(f"  Cache misses: {cache_misses}")
     print(f"  Cache hit rate: {cache_hits/max(cache_hits+cache_misses,1)*100:.1f}%")
 
     if latencies:
-        print(f"\n⏱️  LATENCY (e2e request):")
+        print("\n⏱️  LATENCY (e2e request):")
         print(f"  Min: {min(latencies):.0f}ms")
         print(f"  Max: {max(latencies):.0f}ms")
         print(f"  Avg: {sum(latencies)/len(latencies):.0f}ms")
@@ -457,13 +454,13 @@ def run_stress_test():
         print(f"  p99: {sorted(latencies)[int(len(latencies)*0.99)]:.0f}ms")
 
     if api_latencies:
-        print(f"\n⏱️  LATENCY (API internal):")
+        print("\n⏱️  LATENCY (API internal):")
         print(f"  Min: {min(api_latencies):.0f}ms")
         print(f"  Max: {max(api_latencies):.0f}ms")
         print(f"  Avg: {sum(api_latencies)/len(api_latencies):.0f}ms")
 
     if retrieval_latencies:
-        print(f"\n⏱️  RETRIEVAL LATENCY:")
+        print("\n⏱️  RETRIEVAL LATENCY:")
         print(f"  Min: {min(retrieval_latencies):.0f}ms")
         print(f"  Max: {max(retrieval_latencies):.0f}ms")
         print(f"  Avg: {sum(retrieval_latencies)/len(retrieval_latencies):.0f}ms")
@@ -473,7 +470,7 @@ def run_stress_test():
     if safety_decisions:
         from collections import Counter
         safety_counts = Counter(safety_decisions)
-        print(f"\n🛡️  SAFETY DECISIONS:")
+        print("\n🛡️  SAFETY DECISIONS:")
         for decision, count in safety_counts.most_common():
             print(f"  {decision}: {count}")
 
@@ -482,7 +479,7 @@ def run_stress_test():
     if classifications:
         from collections import Counter
         class_counts = Counter(classifications)
-        print(f"\n🏷️  CLASSIFICATIONS:")
+        print("\n🏷️  CLASSIFICATIONS:")
         for cls, count in class_counts.most_common():
             print(f"  {cls}: {count}")
 
@@ -490,7 +487,7 @@ def run_stress_test():
     continuity_ok = [r.get("continuity_ok") for r in ok_results if r.get("continuity_ok") is not None]
     if continuity_ok:
         ok_count = sum(1 for c in continuity_ok if c)
-        print(f"\n🔗 CONTINUITY:")
+        print("\n🔗 CONTINUITY:")
         print(f"  OK: {ok_count}/{len(continuity_ok)} ({ok_count/len(continuity_ok)*100:.1f}%)")
         print(f"  Broken: {len(continuity_ok) - ok_count}")
 
@@ -499,19 +496,19 @@ def run_stress_test():
     if decision_sources:
         from collections import Counter
         ds_counts = Counter(decision_sources)
-        print(f"\n🧠 LLM / DECISION SOURCE ANALYSIS:")
+        print("\n🧠 LLM / DECISION SOURCE ANALYSIS:")
         for src, count in ds_counts.most_common():
             print(f"  {src}: {count}")
         fast_path_count = ds_counts.get("fast_path", 0)
         deliberation_count = sum(v for k, v in ds_counts.items() if k != "fast_path")
-        print(f"  ---")
+        print("  ---")
         print(f"  Fast path (no LLM): {fast_path_count} ({fast_path_count/max(len(decision_sources),1)*100:.1f}%)")
         print(f"  Deliberation (LLM): {deliberation_count} ({deliberation_count/max(len(decision_sources),1)*100:.1f}%)")
 
     clone_advice_count = sum(1 for r in ok_results if r.get("has_clone_advice"))
     clone_confidences = [r.get("clone_confidence") for r in ok_results if r.get("clone_confidence") is not None]
     clone_evidences = [r.get("clone_evidence") for r in ok_results if r.get("clone_evidence")]
-    print(f"\n🤖 CLONE ADVICE (LLM indicator):")
+    print("\n🤖 CLONE ADVICE (LLM indicator):")
     print(f"  Turns with clone_advice present: {clone_advice_count}/{len(ok_results)}")
     if clone_confidences:
         print(f"  Clone confidence: min={min(clone_confidences):.3f}, max={max(clone_confidences):.3f}, avg={sum(clone_confidences)/len(clone_confidences):.3f}")
@@ -523,7 +520,7 @@ def run_stress_test():
     # Decision confidence analysis
     confidences = [r.get("decision_confidence") for r in ok_results if r.get("decision_confidence") is not None]
     if confidences:
-        print(f"\n📊 DECISION CONFIDENCE:")
+        print("\n📊 DECISION CONFIDENCE:")
         print(f"  Min: {min(confidences):.3f}")
         print(f"  Max: {max(confidences):.3f}")
         print(f"  Avg: {sum(confidences)/len(confidences):.3f}")
@@ -534,14 +531,14 @@ def run_stress_test():
 
     # Latency spike analysis (LLM calls show as >500ms)
     high_latency = [r for r in ok_results if r.get("api_latency_ms", 0) > 500]
-    print(f"\n⚡ LATENCY SPIKES (>500ms API = likely LLM call):")
+    print("\n⚡ LATENCY SPIKES (>500ms API = likely LLM call):")
     print(f"  Count: {len(high_latency)}/{len(ok_results)}")
     for r in high_latency[:10]:
         print(f"  Turn {r['turn']}: {r.get('api_latency_ms')}ms api, decision_source={r.get('decision_source')}, clone_advice={r.get('has_clone_advice')}")
 
     # Error details
     if errors:
-        print(f"\n❌ ERROR DETAILS:")
+        print("\n❌ ERROR DETAILS:")
         for err in errors[:10]:
             print(f"  Turn {err['turn']}: {err['status']} - {err.get('error', 'unknown')[:100]}")
         if len(errors) > 10:
@@ -550,7 +547,7 @@ def run_stress_test():
     # Turn count tracking
     turn_counts = [r.get("turn_count") for r in ok_results if r.get("turn_count") is not None]
     if turn_counts:
-        print(f"\n📈 TURN COUNT TRACKING (server-side):")
+        print("\n📈 TURN COUNT TRACKING (server-side):")
         print(f"  First: {turn_counts[0]}")
         print(f"  Last: {turn_counts[-1]}")
         print(f"  Max: {max(turn_counts)}")

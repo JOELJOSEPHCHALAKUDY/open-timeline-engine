@@ -58,6 +58,19 @@ class CachedGateway(ModelGateway):
         h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
         return f"tce:emb:{h}"
 
+    @staticmethod
+    def _decode_embedding(raw: Any) -> list[float] | None:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(decoded, list):
+            return None
+        try:
+            return [float(value) for value in decoded]
+        except (TypeError, ValueError):
+            return None
+
     def embed(self, text: str) -> list[float]:
         r = self._get_redis()
         if r is not None:
@@ -65,7 +78,9 @@ class CachedGateway(ModelGateway):
             try:
                 cached = r.get(key)
                 if cached is not None:
-                    return json.loads(cached)
+                    decoded = self._decode_embedding(cached)
+                    if decoded is not None:
+                        return decoded
             except Exception:
                 pass
         result = self._inner.embed(text)
@@ -83,7 +98,9 @@ class CachedGateway(ModelGateway):
             try:
                 cached = await asyncio.to_thread(r.get, key)
                 if cached is not None:
-                    return json.loads(cached)
+                    decoded = self._decode_embedding(cached)
+                    if decoded is not None:
+                        return decoded
             except Exception:
                 pass
         result = await self._inner.aembed(text)
@@ -102,7 +119,7 @@ class CachedGateway(ModelGateway):
 
 
 class OllamaGateway(ModelGateway):
-    def __init__(self, base_url: str, embed_model: str, extract_model: str, timeout: int = 30) -> None:
+    def __init__(self, base_url: str, embed_model: str, extract_model: str, timeout: float = 30) -> None:
         self.base_url = base_url.rstrip("/")
         self.embed_model = embed_model
         self.extract_model = extract_model

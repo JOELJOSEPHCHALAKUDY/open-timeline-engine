@@ -252,7 +252,7 @@ def _should_use_semantic_fallback(
         )
     except Exception:
         return False
-    return obs_count >= settings.obs_semantic_min_observations
+    return obs_count >= int(settings.obs_semantic_min_observations)
 
 
 def _embedding_as_vector_literal(embedding: list[float]) -> str:
@@ -267,7 +267,9 @@ def _get_cached_observation_embedding(query: str, settings: Any) -> list[float] 
         key = f"tce:obs-embed:{hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]}"
         raw = cache.get(key)
         if raw:
-            return json.loads(raw)
+            decoded = json.loads(raw)
+            if isinstance(decoded, list):
+                return [float(value) for value in decoded]
     except Exception:
         return None
     return None
@@ -527,7 +529,7 @@ def save_observation(db: Session, observation: dict[str, Any]) -> UUID:
         outcome_sentiment=observation.get("outcome_sentiment"),
     )
     db.commit()
-    return observation_id
+    return UUID(str(observation_id))
 
 
 def build_session_context_from_state(takeover_context: dict[str, Any]) -> dict[str, Any]:

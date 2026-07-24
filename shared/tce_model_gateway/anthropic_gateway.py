@@ -9,7 +9,7 @@ from .gateway import ModelGateway
 class AnthropicGateway(ModelGateway):
     """Anthropic-backed gateway. Extraction-only — embed() raises NotImplementedError."""
 
-    def __init__(self, api_key: str, extract_model: str, timeout: int = 30) -> None:
+    def __init__(self, api_key: str, extract_model: str, timeout: float = 30) -> None:
         from anthropic import Anthropic
 
         self.client = Anthropic(api_key=api_key, timeout=timeout)
@@ -27,7 +27,7 @@ class AnthropicGateway(ModelGateway):
             max_tokens=2000,
             messages=[{"role": "user", "content": f"Schema:{schema_name}\n{prompt}\n\nRespond ONLY with valid JSON."}],
         )
-        raw = response.content[0].text if response.content else "{}"
+        raw = str(getattr(response.content[0], "text", "{}")) if response.content else "{}"
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):

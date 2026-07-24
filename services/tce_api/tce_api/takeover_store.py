@@ -7,7 +7,6 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-
 from tce_shared.events import (
     AutonomyPolicyProfile,
     SafetyDecision,
