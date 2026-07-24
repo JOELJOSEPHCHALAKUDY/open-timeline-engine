@@ -33,7 +33,9 @@ warn_return_any = true
 exclude = "(^|/)(build|dist|node_modules|\\.venv)/"
 
 [[tool.mypy.overrides]]
-module = ["requests", "requests.*", "pgvector", "pgvector.*"]
+# locust is an optional load-test dependency, installed only in the load-tests CI
+# job, so the type-check job cannot resolve it — treat it as untyped there.
+module = ["requests", "requests.*", "pgvector", "pgvector.*", "locust", "locust.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
