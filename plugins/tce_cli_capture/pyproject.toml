@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
   "typer>=0.12,<1",
   "requests>=2.33,<3",
-  "pydantic>=2.8,<3",
+  "pydantic>=2.13.4,<3",
   "platformdirs>=4.2,<5"
 ]
 
