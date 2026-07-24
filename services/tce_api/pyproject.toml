@@ -30,5 +30,5 @@ dependencies = [
 tce-tokenctl = "tce_api.token_cli:app"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
