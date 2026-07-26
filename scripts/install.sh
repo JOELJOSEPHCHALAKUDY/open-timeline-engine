@@ -1925,9 +1925,20 @@ elif [ -t 0 ] && [ "$ASSUME_YES" != "true" ]; then
       ;;
   esac
 else
-  OPERATION_MODE="timeline_only"
+  OPERATION_MODE="$(env_value_or_default "TCE_DEFAULT_OPERATION_MODE" "timeline_only")"
 fi
 echo "Selected behavior: ${OPERATION_MODE}"
+echo
+
+MCP_TOOL_PROFILE="$(env_value_or_default "TCE_MCP_TOOL_PROFILE" "core")"
+if [ "$OPERATION_MODE" = "clone_advisor" ]; then
+  case "$MCP_TOOL_PROFILE" in
+    core|continuity)
+      MCP_TOOL_PROFILE="autonomy"
+      ;;
+  esac
+fi
+echo "Selected MCP tool profile: ${MCP_TOOL_PROFILE}"
 echo
 
 if [ -t 0 ] && [ "$ASSUME_YES" != "true" ]; then
@@ -2443,6 +2454,7 @@ advisor_routes_json="$(build_advisor_routes_json "$ADVISOR_PRIMARY_PROVIDER" "$A
 set_env_key "TCE_API_TOKEN" "$api_token"
 set_env_key "TCE_API_TOKENS" "$api_token"
 set_env_key "TCE_DEFAULT_OPERATION_MODE" "$OPERATION_MODE"
+set_env_key "TCE_MCP_TOOL_PROFILE" "$MCP_TOOL_PROFILE"
 set_env_key "TCE_ADVISOR_PERSONA_MODE" "$PERSONA_MODE"
 set_env_key "TCE_ADVISOR_REAL_TAKEOVER" "$REAL_TAKEOVER"
 set_env_key "TCE_ADVISOR_REAL_TAKEOVER_MODE" "$REAL_TAKEOVER_MODE"

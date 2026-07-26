@@ -2,7 +2,7 @@
 
 ## Public release track
 
-- Current pre-1.0 public version: `v0.3.0`
+- Current pre-1.0 public version: `v0.4.0`
 - Public versioning uses SemVer for release communication.
 - API path version (`/v1`) is a contract version and does not imply product `1.x`.
 
@@ -16,7 +16,7 @@
 
 - `0.x`: beta period, rapid iteration
 - `1.x`: stable API/MCP contracts with deprecation windows
-- Current beta target: `0.3.0`
+- Current beta target: `0.4.0`
 
 ## Compatibility
 
@@ -27,7 +27,10 @@
 
 Track all user-visible behavior changes in `CHANGELOG.md`.
 
-## Docs sync update
+## v0.4 evidence
 
-- Added Milestone V7.2 workflow-memory hint behavior documentation.
-- Added dashboard known-gap documentation for workflow/retrieval/context-brief UX coverage.
+- Release changes: [`../CHANGELOG.md`](../CHANGELOG.md)
+- Reproducible proof and limitations: [`releases/0.4.0-proof.md`](releases/0.4.0-proof.md)
+- Continuity pilot protocol: [`runbooks/continuity-pilot.md`](runbooks/continuity-pilot.md)
+
+`v0.4.0` establishes quality, parity, security, profile, and measurement gates. It does not claim that TCE has proven human cloning or improved continuity; those claims remain gated on a longitudinal pilot.

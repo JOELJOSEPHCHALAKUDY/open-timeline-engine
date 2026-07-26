@@ -11,6 +11,16 @@ Profiles:
 
 The installer applies a selected profile before preserving explicit user overrides. `TCE_RUNTIME_PROFILE` records the active profile, while `TCE_MCP_TOOL_PROFILE` controls which MCP capability set is exposed.
 
+MCP profiles are monotonic capability sets:
+
+- `core`: 10-tool timeline/continuity default.
+- `continuity`: `core` plus memory maintenance and inspection.
+- `autonomy`: `continuity` plus takeover and permit/claim/report.
+- `research`: `autonomy` plus evaluation, drift, and experimental tools.
+- `admin` / `all`: the complete compatibility surface, available only by explicit configuration.
+
+The setup wizard maps `timeline_only` to `core` and upgrades `clone_advisor` from `core`/`continuity` to `autonomy`. Generated Codex, Claude, Cursor, and generic MCP configs carry the selected profile explicitly. Regenerate configs and restart executors after a profile change.
+
 Security invariants:
 
 - No profile contains a token or provider key.

@@ -13,11 +13,14 @@
 - Type-hygiene refactor pass across `tce_api`, `tce_lite_api`, `tce_mcp`, `tce_worker`, and `shared` to reach the mypy baseline.
 - Documentation: synced policy/docs for V7.2 workflow-memory hints; documented dashboard coverage gaps (workflow templates page, retrieval-eval UI, context-brief UI, route health history).
 - Hardening follow-ups (post-audit): e2e smoke scripts isolated to their own compose project (no longer able to wipe the dev database), Redis switched to `noeviction` for the RQ job store, privileged endpoints refuse the default token (`TCE_ALLOW_DEFAULT_TOKEN`), CORS default narrowed off `*`, Prometheus multiprocess metrics + directive-outcome counters, `tests/mcp` firewall sentinels wired into CI, negation-aware safety-confirm matching, idempotent `report_execution`, claim-TTL split from execution deadline, untrusted event titles sanitized and objectives delimited as data at the MCP boundary, and an opt-in nightly backup cron with rewritten DR runbooks.
+- Follow-up verification: generated MCP client configs now carry the selected least-privilege tool profile, clone-advisor wizard installs select `autonomy`, non-interactive installs preserve runtime-profile behavior, `research` is a cumulative superset, and profile invariants have regression coverage.
+- Refreshed the npm lockfile to `brace-expansion` 5.0.8 after a new advisory; both Python and Node dependency audits are clean at verification time.
+- Public docs now identify `v0.4.0`, distinguish active resume time from handoff age, and state governance and longitudinal-proof limitations explicitly.
 - Validation run for this release:
 - `ruff check .` -> clean
 - `MYPYPATH=shared mypy shared services scripts tests` -> clean (203 files)
-- `pytest tests/unit tests/security tests/mcp -q` -> `209 passed`
-- `pytest tests/integration -q` -> `52 passed, 1 skipped`
+- `pytest tests/unit tests/security tests/mcp -q` -> `212 passed`
+- `pytest tests/integration -q` -> `53 passed, 1 skipped`
 - Coverage baseline -> `30.5%` (floor 28%)
 
 ## 0.3.0

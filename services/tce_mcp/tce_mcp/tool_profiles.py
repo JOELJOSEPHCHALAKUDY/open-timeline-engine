@@ -58,7 +58,7 @@ AUTONOMY_TOOLS = CONTINUITY_TOOLS | {
     "tce.takeover_step",
 }
 
-RESEARCH_TOOLS = CONTINUITY_TOOLS | {
+RESEARCH_TOOLS = AUTONOMY_TOOLS | {
     "tce.answer_behavior_calibration",
     "tce.assign_behavior_projection_pilot",
     "tce.get_behavior_calibration",

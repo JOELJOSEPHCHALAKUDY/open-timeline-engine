@@ -1,6 +1,6 @@
 # Open Timeline Engine Docs
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V4`–`V9.x` labels in this docs set are internal milestones.
 
 This is the canonical documentation index for Open Timeline Engine.

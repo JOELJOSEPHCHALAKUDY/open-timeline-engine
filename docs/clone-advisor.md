@@ -1,6 +1,6 @@
 # Clone Advisor Guide
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V4`–`V9` labels in this guide are internal milestones.
 
 Use one or more executor AIs at the same time:
@@ -32,6 +32,8 @@ Enable clone mode:
 ```bash
 ./scripts/set_mode.sh clone_advisor
 ```
+
+The executor also needs `TCE_MCP_TOOL_PROFILE=autonomy` (or `research`) so takeover and lifecycle tools are exposed. Wizard installs select this automatically. For an existing installation, update `.env`, regenerate MCP client config, and restart the executor.
 
 Fallback mode:
 

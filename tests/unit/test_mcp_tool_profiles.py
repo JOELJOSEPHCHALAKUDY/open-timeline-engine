@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 from tce_mcp.tool_profiles import (
+    AUTONOMY_TOOLS,
+    CONTINUITY_TOOLS,
     CORE_TOOLS,
+    RESEARCH_TOOLS,
     apply_tool_profile,
     exposed_tool_names,
     normalize_tool_profile,
@@ -44,3 +47,11 @@ def test_all_and_admin_preserve_complete_surface() -> None:
 
         assert {tool.name for tool in server._tool_manager.list_tools()} == before
         assert status["removed_tools"] == []
+
+
+def test_profiles_form_a_monotonic_capability_ladder() -> None:
+    assert CORE_TOOLS < CONTINUITY_TOOLS
+    assert CONTINUITY_TOOLS < AUTONOMY_TOOLS
+    assert AUTONOMY_TOOLS < RESEARCH_TOOLS
+    assert "tce.takeover_step" in AUTONOMY_TOOLS
+    assert "tce.run_behavior_fidelity_eval" in RESEARCH_TOOLS

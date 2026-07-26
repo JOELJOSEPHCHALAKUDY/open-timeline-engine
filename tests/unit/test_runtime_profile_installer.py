@@ -65,3 +65,23 @@ def test_profile_application_rejects_unknown_profile(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "Invalid runtime profile" in result.stderr
+
+
+def test_research_profile_selects_research_tools_and_clone_advisor(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+
+    subprocess.run(
+        [str(SCRIPT), "--profile", "research", "--env-file", str(env_file), "--overwrite"],
+        check=True,
+        cwd=ROOT,
+    )
+
+    values = _values(env_file)
+    assert values["TCE_MCP_TOOL_PROFILE"] == "research"
+    assert values["TCE_DEFAULT_OPERATION_MODE"] == "clone_advisor"
+
+
+def test_noninteractive_installer_preserves_profile_operation_mode() -> None:
+    installer = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+    assert 'OPERATION_MODE="$(env_value_or_default "TCE_DEFAULT_OPERATION_MODE" "timeline_only")"' in installer

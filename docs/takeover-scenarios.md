@@ -1,6 +1,6 @@
 # Takeover Scenarios
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V4`/`V5`/`V6`/`V7`/`V8` labels below are internal milestones.
 
 This document defines deterministic takeover behavior across CLI, API, MCP, VSCode, and Browser flows.

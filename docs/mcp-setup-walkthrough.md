@@ -1,6 +1,6 @@
 # MCP Setup Walkthrough
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V7.2`/`V8`/`V9.x` terms in this walkthrough are internal milestones.
 
 This walkthrough configures Open Timeline Engine MCP for Codex Desktop, Claude Desktop, Cursor, and generic MCP clients.
