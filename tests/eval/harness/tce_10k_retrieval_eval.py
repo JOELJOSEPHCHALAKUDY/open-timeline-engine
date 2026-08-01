@@ -208,6 +208,9 @@ def run_one(base_url: str, token: str, scenario: dict[str, Any], timeout: float)
     hit_ids: list[str] = []
     hit_titles: list[str] = []
     metadata: dict[str, Any] = {}
+    policy: dict[str, Any] = {}
+    blocked = 0
+    retrieval_reason = ""
     try:
         response = get_session().post(f"{base_url}/v1/search", headers=headers, json=payload, timeout=timeout)
         status_code = response.status_code
@@ -217,6 +220,9 @@ def run_one(base_url: str, token: str, scenario: dict[str, Any], timeout: float)
             hit_ids = [str(hit.get("id") or "") for hit in hits]
             hit_titles = [normalize_title(str(hit.get("title") or "")) for hit in hits]
             metadata = body.get("metadata") or {}
+            policy = body.get("policy", {}) or {}
+            blocked = int(body.get("blocked", 0) or 0)
+            retrieval_reason = str((policy.get("retrieval", {}) or {}).get("reason") or "")
         else:
             error_class = f"http_{status_code}"
     except requests.Timeout:
@@ -247,7 +253,10 @@ def run_one(base_url: str, token: str, scenario: dict[str, Any], timeout: float)
         "equivalent_rank": equivalent_rank,
         "cross_user_scope_applied": bool(metadata.get("cross_user_scope_applied", False)),
         "planner_used": bool(metadata.get("planner_used", False)),
-        "retrieval_source": str((((metadata.get("policy") or {}).get("retrieval") or {}).get("retrieval_source") or "")),
+        "retrieval_source": str((policy.get("retrieval", {}) or {}).get("source") or ""),
+        "lexical_channel": str((policy.get("retrieval", {}) or {}).get("lexical_channel") or ""),
+        "retrieval_reason": retrieval_reason,
+        "blocked": blocked,
     }
 
 
@@ -286,6 +295,9 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             },
             "cross_user_scope_rate": round(sum(item["cross_user_scope_applied"] for item in items) / denominator, 6),
             "planner_used_rate": round(sum(item["planner_used"] for item in items) / denominator, 6),
+            "retrieval_source_counts": dict(Counter(item["retrieval_source"] or "<empty>" for item in items)),
+            "lexical_channel_counts": dict(Counter(item["lexical_channel"] or "<empty>" for item in items)),
+            "blocked_mean": statistics.fmean(item.get("blocked", 0) for item in items) if items else 0.0,
         }
 
     by_variant = {
@@ -380,7 +392,7 @@ def main() -> int:
 
     elapsed = time.perf_counter() - started
     report = {
-        "schema": "tce-retrieval-eval-v1",
+        "schema": "tce-retrieval-eval-v2",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "isolation": {
             "database": "tce_eval_10k",
