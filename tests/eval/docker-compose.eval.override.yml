@@ -1,0 +1,27 @@
+services:
+  postgres:
+    ports: !override
+      - "15433:5432"
+  redis:
+    ports: !override
+      - "16380:6379"
+  ollama:
+    ports: !override
+      - "11435:11434"
+  tce-migrate:
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce_eval_10k
+  tce-api:
+    ports: !override
+      - "18080:8080"
+    environment:
+      TCE_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/tce_eval_10k
+      TCE_REDIS_URL: redis://redis:6379/15
+      TCE_OLLAMA_URL: ${TCE_EVAL_OLLAMA_URL:-http://ollama:11434}
+      TCE_AUTO_CAPTURE_INTERACTIONS: "false"
+      TCE_SEARCH_QUERY_EXPANSION_ENABLED: "false"
+      TCE_INTENT_RETRIEVAL_ENABLED: "false"
+      TCE_QDRANT_ENABLED: "false"
+      TCE_API_WORKERS: "4"
+      TCE_AUDIT_WRITE_MODE: "async"
+      TCE_RATE_LIMIT_REQUESTS_PER_MINUTE: "20000"

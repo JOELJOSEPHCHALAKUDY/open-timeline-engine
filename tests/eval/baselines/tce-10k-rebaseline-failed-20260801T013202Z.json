@@ -1,0 +1,929 @@
+{
+  "configuration": {
+    "concurrency": 8,
+    "k": 10,
+    "scenario_count": 10000,
+    "seed": 20260730,
+    "timeout_seconds": 20.0,
+    "warmup_requests_excluded": 40
+  },
+  "generated_at": "2026-08-01T01:32:02.546725+00:00",
+  "isolation": {
+    "api": "http://127.0.0.1:18080",
+    "database": "tce_eval_10k",
+    "production_data_mutated": false,
+    "redis_db": 15
+  },
+  "limitations": [
+    "Synthetic retrieval variants measure recall and serving performance, not longitudinal human-behavior fidelity.",
+    "Strict event-id recall penalizes duplicate user inputs; equivalent-memory recall accepts identical imported memories.",
+    "Source filtering isolates platform history and does not measure unrestricted corpus discovery."
+  ],
+  "results": {
+    "ambiguous": {
+      "blocked_mean": 0.0,
+      "count": 1809,
+      "cross_user_scope_rate": 0.25539,
+      "equivalent_memory": {
+        "mrr_at_10": 0.432643,
+        "top1": 0.38419,
+        "top10": 0.542289,
+        "top5": 0.493643
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 1170.89,
+        "mean": 214.42,
+        "p50": 192.84,
+        "p95": 419.56,
+        "p99": 644.13
+      },
+      "lexical_channel_counts": {
+        "<empty>": 1809
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 1809
+      },
+      "strict_event": {
+        "mrr_at_10": 0.111713,
+        "top1": 0.054174,
+        "top10": 0.256495,
+        "top5": 0.186291
+      }
+    },
+    "by_source": {
+      "tce-chat-backfill-claude": {
+        "blocked_mean": 0.0,
+        "count": 3483,
+        "cross_user_scope_rate": 0.248636,
+        "equivalent_memory": {
+          "mrr_at_10": 0.430748,
+          "top1": 0.341659,
+          "top10": 0.637956,
+          "top5": 0.547229
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 980.17,
+          "mean": 193.41,
+          "p50": 170.75,
+          "p95": 360.21,
+          "p99": 554.83
+        },
+        "lexical_channel_counts": {
+          "<empty>": 3483
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 3483
+        },
+        "strict_event": {
+          "mrr_at_10": 0.332277,
+          "top1": 0.239449,
+          "top10": 0.549526,
+          "top5": 0.454206
+        }
+      },
+      "tce-chat-backfill-codex": {
+        "blocked_mean": 0.0,
+        "count": 6517,
+        "cross_user_scope_rate": 0.253644,
+        "equivalent_memory": {
+          "mrr_at_10": 0.416619,
+          "top1": 0.305662,
+          "top10": 0.705079,
+          "top5": 0.554396
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 1170.89,
+          "mean": 270.27,
+          "p50": 245.66,
+          "p95": 475.66,
+          "p99": 658.61
+        },
+        "lexical_channel_counts": {
+          "<empty>": 6517
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 6517
+        },
+        "strict_event": {
+          "mrr_at_10": 0.380163,
+          "top1": 0.268682,
+          "top10": 0.673009,
+          "top5": 0.518797
+        }
+      }
+    },
+    "by_variant": {
+      "cross_user_explicit": {
+        "blocked_mean": 0.0,
+        "count": 2500,
+        "cross_user_scope_rate": 1.0,
+        "equivalent_memory": {
+          "mrr_at_10": 0.330195,
+          "top1": 0.2368,
+          "top10": 0.5896,
+          "top5": 0.4456
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 1108.86,
+          "mean": 259.06,
+          "p50": 237.79,
+          "p95": 473.8,
+          "p99": 667.95
+        },
+        "lexical_channel_counts": {
+          "<empty>": 2500
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 2500
+        },
+        "strict_event": {
+          "mrr_at_10": 0.285324,
+          "top1": 0.1888,
+          "top10": 0.55,
+          "top5": 0.4068
+        }
+      },
+      "exact": {
+        "blocked_mean": 0.0,
+        "count": 2500,
+        "cross_user_scope_rate": 0.0016,
+        "equivalent_memory": {
+          "mrr_at_10": 0.556445,
+          "top1": 0.4408,
+          "top10": 0.856,
+          "top5": 0.6924
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 1170.89,
+          "mean": 241.49,
+          "p50": 219.91,
+          "p95": 455.12,
+          "p99": 606.01
+        },
+        "lexical_channel_counts": {
+          "<empty>": 2500
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 2500
+        },
+        "strict_event": {
+          "mrr_at_10": 0.476651,
+          "top1": 0.36,
+          "top10": 0.7824,
+          "top5": 0.612
+        }
+      },
+      "noisy_partial": {
+        "blocked_mean": 0.0,
+        "count": 2500,
+        "cross_user_scope_rate": 0.0052,
+        "equivalent_memory": {
+          "mrr_at_10": 0.296515,
+          "top1": 0.2132,
+          "top10": 0.4996,
+          "top5": 0.4088
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 1093.43,
+          "mean": 241.65,
+          "p50": 215.89,
+          "p95": 441.3,
+          "p99": 609.02
+        },
+        "lexical_channel_counts": {
+          "<empty>": 2500
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 2500
+        },
+        "strict_event": {
+          "mrr_at_10": 0.257976,
+          "top1": 0.1712,
+          "top10": 0.47,
+          "top5": 0.3752
+        }
+      },
+      "rare_keywords": {
+        "blocked_mean": 0.0,
+        "count": 2500,
+        "cross_user_scope_rate": 0.0008,
+        "equivalent_memory": {
+          "mrr_at_10": 0.503007,
+          "top1": 0.382,
+          "top10": 0.7816,
+          "top5": 0.6608
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 1093.95,
+          "mean": 231.79,
+          "p50": 210.69,
+          "p95": 431.29,
+          "p99": 603.08
+        },
+        "lexical_channel_counts": {
+          "<empty>": 2500
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 2500
+        },
+        "strict_event": {
+          "mrr_at_10": 0.433986,
+          "top1": 0.314,
+          "top10": 0.7176,
+          "top5": 0.5912
+        }
+      }
+    },
+    "equivalent_miss_count": 3183,
+    "equivalent_miss_sample_hashes": [
+      "0520795b54d4",
+      "4e6278977a6a",
+      "137a57f6dbc2",
+      "4ef4ff3f2610",
+      "dcfeac82cd6a",
+      "2efbd4a84207",
+      "a5aa223e233d",
+      "7caea2a1449e",
+      "4776c6062f3a",
+      "9fdaf897263e",
+      "584de895d927",
+      "1b98cf62e99e",
+      "5516021d4c7e",
+      "c4aa3e18670f",
+      "4da0b7f9bf41",
+      "33293cb3826a",
+      "4409e8f2ba69",
+      "9863fd873c9b",
+      "3320d6b6faf4",
+      "2c529232eaff",
+      "50664402687b",
+      "9991478d74ff",
+      "34d988d61f01",
+      "d1a585f927a8",
+      "8e5b29f53a0b"
+    ],
+    "error_counts": {},
+    "http_status_counts": {
+      "200": 10000
+    },
+    "latency_sample_count": 10000,
+    "overall": {
+      "blocked_mean": 0.0,
+      "count": 10000,
+      "cross_user_scope_rate": 0.2519,
+      "equivalent_memory": {
+        "mrr_at_10": 0.421541,
+        "top1": 0.3182,
+        "top10": 0.6817,
+        "top5": 0.5519
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 1170.89,
+        "mean": 243.5,
+        "p50": 220.75,
+        "p95": 451.61,
+        "p99": 622.55
+      },
+      "lexical_channel_counts": {
+        "<empty>": 10000
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 10000
+      },
+      "strict_event": {
+        "mrr_at_10": 0.363484,
+        "top1": 0.2585,
+        "top10": 0.63,
+        "top5": 0.4963
+      }
+    },
+    "slowest_scenarios": [
+      {
+        "latency_ms": 1170.89,
+        "scenario_hash": "b62d8c6d1dc0",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 1116.15,
+        "scenario_hash": "cebcac1fa462",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 1108.86,
+        "scenario_hash": "7515473de893",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 1093.95,
+        "scenario_hash": "ceb5a5ca1ca0",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 1093.43,
+        "scenario_hash": "173b37e7e3e1",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 1089.83,
+        "scenario_hash": "34d988d61f01",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 1063.07,
+        "scenario_hash": "d1a585f927a8",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 1020.09,
+        "scenario_hash": "ae4aaef2f108",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 1004.27,
+        "scenario_hash": "b80d98d89d34",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 994.3,
+        "scenario_hash": "960386e7f6bf",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 993.06,
+        "scenario_hash": "de48c0aee527",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 980.17,
+        "scenario_hash": "9991478d74ff",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 976.65,
+        "scenario_hash": "eaa740bcf802",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 976.3,
+        "scenario_hash": "8e5b29f53a0b",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 948.05,
+        "scenario_hash": "984931b659cc",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 938.11,
+        "scenario_hash": "02255c74969f",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 882.19,
+        "scenario_hash": "96b3d0fe79f6",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 869.17,
+        "scenario_hash": "fac9ba969ecc",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 856.53,
+        "scenario_hash": "ecb3b6d962f8",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 854.38,
+        "scenario_hash": "bf6fc8bdb116",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      }
+    ],
+    "total": 10000,
+    "unambiguous": {
+      "blocked_mean": 0.0,
+      "count": 8191,
+      "cross_user_scope_rate": 0.251129,
+      "equivalent_memory": {
+        "mrr_at_10": 0.419089,
+        "top1": 0.303626,
+        "top10": 0.712489,
+        "top5": 0.564766
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 1116.15,
+        "mean": 249.92,
+        "p50": 226.11,
+        "p95": 455.13,
+        "p99": 620.99
+      },
+      "lexical_channel_counts": {
+        "<empty>": 8191
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 8191
+      },
+      "strict_event": {
+        "mrr_at_10": 0.419089,
+        "top1": 0.303626,
+        "top10": 0.712489,
+        "top5": 0.564766
+      }
+    }
+  },
+  "schema": "tce-retrieval-eval-v2",
+  "throughput_requests_per_second": 32.84,
+  "wall_time_seconds": 304.5,
+  "warmup": {
+    "ambiguous": {
+      "blocked_mean": 0.0,
+      "count": 9,
+      "cross_user_scope_rate": 0.333333,
+      "equivalent_memory": {
+        "mrr_at_10": 0.355556,
+        "top1": 0.333333,
+        "top10": 0.444444,
+        "top5": 0.444444
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 880.52,
+        "mean": 381.27,
+        "p50": 284.87,
+        "p95": 880.52,
+        "p99": 880.52
+      },
+      "lexical_channel_counts": {
+        "<empty>": 9
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 9
+      },
+      "strict_event": {
+        "mrr_at_10": 0.0,
+        "top1": 0.0,
+        "top10": 0.0,
+        "top5": 0.0
+      }
+    },
+    "by_source": {
+      "tce-chat-backfill-claude": {
+        "blocked_mean": 0.0,
+        "count": 8,
+        "cross_user_scope_rate": 0.25,
+        "equivalent_memory": {
+          "mrr_at_10": 0.71875,
+          "top1": 0.625,
+          "top10": 0.875,
+          "top5": 0.875
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 771.83,
+          "mean": 345.49,
+          "p50": 220.38,
+          "p95": 771.83,
+          "p99": 771.83
+        },
+        "lexical_channel_counts": {
+          "<empty>": 8
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 8
+        },
+        "strict_event": {
+          "mrr_at_10": 0.34375,
+          "top1": 0.25,
+          "top10": 0.5,
+          "top5": 0.5
+        }
+      },
+      "tce-chat-backfill-codex": {
+        "blocked_mean": 0.0,
+        "count": 32,
+        "cross_user_scope_rate": 0.25,
+        "equivalent_memory": {
+          "mrr_at_10": 0.476042,
+          "top1": 0.40625,
+          "top10": 0.625,
+          "top5": 0.625
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 925.34,
+          "mean": 409.52,
+          "p50": 351.97,
+          "p95": 880.52,
+          "p99": 925.34
+        },
+        "lexical_channel_counts": {
+          "<empty>": 32
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 32
+        },
+        "strict_event": {
+          "mrr_at_10": 0.469792,
+          "top1": 0.40625,
+          "top10": 0.59375,
+          "top5": 0.59375
+        }
+      }
+    },
+    "by_variant": {
+      "cross_user_explicit": {
+        "blocked_mean": 0.0,
+        "count": 10,
+        "cross_user_scope_rate": 1.0,
+        "equivalent_memory": {
+          "mrr_at_10": 0.525,
+          "top1": 0.5,
+          "top10": 0.6,
+          "top5": 0.6
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 876.01,
+          "mean": 404.85,
+          "p50": 284.87,
+          "p95": 876.01,
+          "p99": 876.01
+        },
+        "lexical_channel_counts": {
+          "<empty>": 10
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 10
+        },
+        "strict_event": {
+          "mrr_at_10": 0.525,
+          "top1": 0.5,
+          "top10": 0.6,
+          "top5": 0.6
+        }
+      },
+      "exact": {
+        "blocked_mean": 0.0,
+        "count": 10,
+        "cross_user_scope_rate": 0.0,
+        "equivalent_memory": {
+          "mrr_at_10": 0.64,
+          "top1": 0.5,
+          "top10": 0.9,
+          "top5": 0.9
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 925.34,
+          "mean": 412.7,
+          "p50": 326.74,
+          "p95": 925.34,
+          "p99": 925.34
+        },
+        "lexical_channel_counts": {
+          "<empty>": 10
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 10
+        },
+        "strict_event": {
+          "mrr_at_10": 0.42,
+          "top1": 0.3,
+          "top10": 0.6,
+          "top5": 0.6
+        }
+      },
+      "noisy_partial": {
+        "blocked_mean": 0.0,
+        "count": 10,
+        "cross_user_scope_rate": 0.0,
+        "equivalent_memory": {
+          "mrr_at_10": 0.258333,
+          "top1": 0.2,
+          "top10": 0.4,
+          "top5": 0.4
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 715.87,
+          "mean": 383.85,
+          "p50": 280.72,
+          "p95": 715.87,
+          "p99": 715.87
+        },
+        "lexical_channel_counts": {
+          "<empty>": 10
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 10
+        },
+        "strict_event": {
+          "mrr_at_10": 0.258333,
+          "top1": 0.2,
+          "top10": 0.4,
+          "top5": 0.4
+        }
+      },
+      "rare_keywords": {
+        "blocked_mean": 0.0,
+        "count": 10,
+        "cross_user_scope_rate": 0.0,
+        "equivalent_memory": {
+          "mrr_at_10": 0.675,
+          "top1": 0.6,
+          "top10": 0.8,
+          "top5": 0.8
+        },
+        "http_success_rate": 1.0,
+        "latency_ms": {
+          "max": 880.52,
+          "mean": 385.47,
+          "p50": 290.55,
+          "p95": 880.52,
+          "p99": 880.52
+        },
+        "lexical_channel_counts": {
+          "<empty>": 10
+        },
+        "planner_used_rate": 0.0,
+        "retrieval_source_counts": {
+          "pgvector_ann": 10
+        },
+        "strict_event": {
+          "mrr_at_10": 0.575,
+          "top1": 0.5,
+          "top10": 0.7,
+          "top5": 0.7
+        }
+      }
+    },
+    "equivalent_miss_count": 13,
+    "equivalent_miss_sample_hashes": [
+      "26a1a934f006",
+      "0520795b54d4",
+      "4e6278977a6a",
+      "4ef4ff3f2610",
+      "137a57f6dbc2",
+      "2efbd4a84207",
+      "dcfeac82cd6a",
+      "a5aa223e233d",
+      "7caea2a1449e",
+      "4776c6062f3a",
+      "9fdaf897263e",
+      "584de895d927",
+      "1b98cf62e99e"
+    ],
+    "error_counts": {},
+    "http_status_counts": {
+      "200": 40
+    },
+    "latency_sample_count": 40,
+    "overall": {
+      "blocked_mean": 0.0,
+      "count": 40,
+      "cross_user_scope_rate": 0.25,
+      "equivalent_memory": {
+        "mrr_at_10": 0.524583,
+        "top1": 0.45,
+        "top10": 0.675,
+        "top5": 0.675
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 925.34,
+        "mean": 396.72,
+        "p50": 326.74,
+        "p95": 876.01,
+        "p99": 925.34
+      },
+      "lexical_channel_counts": {
+        "<empty>": 40
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 40
+      },
+      "strict_event": {
+        "mrr_at_10": 0.444583,
+        "top1": 0.375,
+        "top10": 0.575,
+        "top5": 0.575
+      }
+    },
+    "slowest_scenarios": [
+      {
+        "latency_ms": 925.34,
+        "scenario_hash": "a9f1b03079ef",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 880.52,
+        "scenario_hash": "26a1a934f006",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 876.01,
+        "scenario_hash": "4fd9407f294b",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 771.83,
+        "scenario_hash": "49d952ab8987",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 731.58,
+        "scenario_hash": "3b4588c05e71",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 715.87,
+        "scenario_hash": "8881ee5d64d1",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 714.52,
+        "scenario_hash": "0520795b54d4",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 684.88,
+        "scenario_hash": "2bdef1bfbc2d",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 470.65,
+        "scenario_hash": "5278cecb7e70",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 470.35,
+        "scenario_hash": "4a57eda4b67e",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 448.57,
+        "scenario_hash": "eded4b4618ad",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 437.0,
+        "scenario_hash": "9fdaf897263e",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      },
+      {
+        "latency_ms": 396.34,
+        "scenario_hash": "951a262092cd",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 394.5,
+        "scenario_hash": "2a1de8ba0086",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 393.46,
+        "scenario_hash": "c21478e83f6a",
+        "status_code": 200,
+        "variant": "rare_keywords"
+      },
+      {
+        "latency_ms": 381.1,
+        "scenario_hash": "584de895d927",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 379.11,
+        "scenario_hash": "56044d91a444",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 373.96,
+        "scenario_hash": "4e6278977a6a",
+        "status_code": 200,
+        "variant": "noisy_partial"
+      },
+      {
+        "latency_ms": 351.97,
+        "scenario_hash": "7888e52ab508",
+        "status_code": 200,
+        "variant": "exact"
+      },
+      {
+        "latency_ms": 350.01,
+        "scenario_hash": "9d4851ef974e",
+        "status_code": 200,
+        "variant": "cross_user_explicit"
+      }
+    ],
+    "total": 40,
+    "unambiguous": {
+      "blocked_mean": 0.0,
+      "count": 31,
+      "cross_user_scope_rate": 0.225806,
+      "equivalent_memory": {
+        "mrr_at_10": 0.573656,
+        "top1": 0.483871,
+        "top10": 0.741935,
+        "top5": 0.741935
+      },
+      "http_success_rate": 1.0,
+      "latency_ms": {
+        "max": 925.34,
+        "mean": 401.2,
+        "p50": 350.01,
+        "p95": 876.01,
+        "p99": 925.34
+      },
+      "lexical_channel_counts": {
+        "<empty>": 31
+      },
+      "planner_used_rate": 0.0,
+      "retrieval_source_counts": {
+        "pgvector_ann": 31
+      },
+      "strict_event": {
+        "mrr_at_10": 0.573656,
+        "top1": 0.483871,
+        "top10": 0.741935,
+        "top5": 0.741935
+      }
+    }
+  },
+  "workload": {
+    "ambiguous_event_count": 848,
+    "available_embedded_events": 4649,
+    "coverage_rate": 1.0,
+    "source_counts": {
+      "tce-chat-backfill-claude": 3483,
+      "tce-chat-backfill-codex": 6517
+    },
+    "unique_events_covered": 4649,
+    "variant_counts": {
+      "cross_user_explicit": 2500,
+      "exact": 2500,
+      "noisy_partial": 2500,
+      "rare_keywords": 2500
+    }
+  }
+}

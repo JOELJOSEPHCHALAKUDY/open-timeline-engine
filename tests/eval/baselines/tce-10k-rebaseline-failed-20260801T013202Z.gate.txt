@@ -1,0 +1,15 @@
+Gate                                       Observed                             Requirement                    Result
+--------------------------------------------------------------------------------------------------------------------------
+embedded corpus                            4649                                 == 4649                        PASS
+variant count: exact                       2500                                 == 2500                        PASS
+variant count: rare_keywords               2500                                 == 2500                        PASS
+variant count: noisy_partial               2500                                 == 2500                        PASS
+variant count: cross_user_explicit         2500                                 == 2500                        PASS
+overall equivalent top10                   0.681700                             0.6974 +/- 0.015               HALT
+exact equivalent top10                     0.856000                             0.8656 +/- 0.025               PASS
+rare_keywords equivalent top10             0.781600                             0.8048 +/- 0.025               PASS
+noisy_partial equivalent top10             0.499600                             0.5252 +/- 0.025               HALT
+cross_user_explicit equivalent top10       0.589600                             0.5940 +/- 0.025               PASS
+HTTP success                               1.000000                             == 1.0                         PASS
+planner rate                               0.000000                             == 0.0                         PASS
+retrieval source attribution               {'pgvector_ann': 10000}              at least one non-empty source  PASS
