@@ -1,0 +1,22 @@
+{
+  "schema": "tce-stress-finding-v1",
+  "date": "2026-07-30",
+  "configuration": {
+    "api_workers": 4,
+    "client_concurrency": 8,
+    "auto_capture_interactions": true,
+    "audit_write_mode": "async",
+    "isolated_postgres_max_connections": 200
+  },
+  "observed": {
+    "completed_before_stop": 2500,
+    "http_failures": 7,
+    "throughput_initial_rps": 26.05,
+    "throughput_degraded_rps": 17.71,
+    "postgres_connections_observed": 128,
+    "tuple_lock_waiters_observed": 94
+  },
+  "root_cause_query_shape": "team_memberships INSERT ... ON CONFLICT (workspace_id, user_id) DO UPDATE SET active=true",
+  "classification": "capture-on concurrency bottleneck; run invalid for retrieval-quality acceptance",
+  "production_database_mutated": false
+}
