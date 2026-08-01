@@ -467,6 +467,11 @@ _APP_START_TIME = time.monotonic()
 
 REQUEST_COUNT = PromCounter("tce_api_requests_total", "Total API requests", ["endpoint", "method"])
 REQUEST_LATENCY = Histogram("tce_api_request_latency_seconds", "API request latency", ["endpoint", "method"])
+SEARCH_RETRIEVAL_SOURCE_COUNT = PromCounter(
+    "tce_api_search_retrieval_total",
+    "Search retrieval channel",
+    ["source", "lexical_channel"],
+)
 TAKEOVER_FAST_PATH_MS = Histogram("tce_api_takeover_fast_path_seconds", "Takeover fast-path latency seconds")
 TAKEOVER_DELIBERATION_MS = Histogram("tce_api_takeover_deliberation_seconds", "Takeover deliberation latency seconds")
 TAKEOVER_TOTAL_MS = Histogram("tce_api_takeover_total_seconds", "Takeover total latency seconds")
@@ -4121,6 +4126,10 @@ def search(
         auth.consumer, auth.role, workspace_id=auth.workspace_id, owner_id=auth.user_id
     )
     hits, citations, blocked, retrieval_meta = run_search(db, body, consumer_ctx, policy_engine)
+    SEARCH_RETRIEVAL_SOURCE_COUNT.labels(
+        source=str(retrieval_meta.get("source") or "none"),
+        lexical_channel=str(retrieval_meta.get("lexical_channel") or "none"),
+    ).inc()
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="search", method="POST").observe(latency_ms / 1000)
     policy_summary = {
