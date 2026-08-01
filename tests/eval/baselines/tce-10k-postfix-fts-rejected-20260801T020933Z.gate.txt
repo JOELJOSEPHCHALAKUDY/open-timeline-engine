@@ -1,0 +1,22 @@
+Gate                                       Observed                             Requirement                    Result
+--------------------------------------------------------------------------------------------------------------------------
+embedded corpus                            4649                                 == 4649                        PASS
+variant count: exact                       2500                                 == 2500                        PASS
+variant count: rare_keywords               2500                                 == 2500                        PASS
+variant count: noisy_partial               2500                                 == 2500                        PASS
+variant count: cross_user_explicit         2500                                 == 2500                        PASS
+noisy_partial equivalent top10             0.893200 (+0.3936)                   >= 0.62 and delta >= +0.05     PASS
+cross_user_explicit equivalent top10       0.871200 (+0.2816)                   >= 0.68 and delta >= +0.04     PASS
+rare_keywords equivalent top10             0.939200 (+0.1576)                   absolute delta <= 0.08         HALT
+exact equivalent top10                     0.947600 (+0.0916)                   delta >= -0.03                 PASS
+overall equivalent top10 target            0.912800                             >= 0.75                        PASS
+overall equivalent MRR@10                  0.758741 (+0.3372)                   delta >= 0                     PASS
+cross-user scope privacy                   0.251900                             <= 0.28                        PASS
+cross-user scope non-increase              0.251900 (+0.0000)                   prefer <= baseline             PASS
+p95 latency                                686.99 ms                            <= 600 ms                      HALT
+HTTP success                               1.000000                             == 1.0                         PASS
+planner rate                               0.000000                             == 0.0                         PASS
+retrieval source attribution               {'pgvector_ann': 10000}              at least one non-empty source  PASS
+FTS lexical channel                        98.75% {'fts_union_ilike': 9875, 'ilike_only': 125} >= 95%                         PASS
+FTS error fallback                         0.00%                                <= 0.5%                        PASS
+blocked mean                               0.000000 (+0.0000)                   prefer <= baseline             PASS
