@@ -1038,6 +1038,58 @@ def _seed_lifecycle_defaults(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_events_fts_schema(conn: sqlite3.Connection) -> None:
+    """Create and synchronize the standalone FTS5 event index once."""
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+            event_id UNINDEXED,
+            title,
+            payload,
+            tags,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_insert
+        AFTER INSERT ON events BEGIN
+            INSERT INTO events_fts(event_id, title, payload, tags)
+            VALUES (new.id, new.title, new.payload, new.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_delete
+        AFTER DELETE ON events BEGIN
+            DELETE FROM events_fts WHERE event_id = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_update
+        AFTER UPDATE OF title, payload, tags ON events BEGIN
+            DELETE FROM events_fts WHERE event_id = old.id;
+            INSERT INTO events_fts(event_id, title, payload, tags)
+            VALUES (new.id, new.title, new.payload, new.tags);
+        END;
+        """
+    )
+    sentinel = conn.execute(
+        "SELECT 1 FROM runtime_settings WHERE key = 'events_fts_v1_backfilled'"
+    ).fetchone()
+    if sentinel is not None:
+        return
+    conn.execute("DELETE FROM events_fts")
+    conn.execute(
+        """
+        INSERT INTO events_fts(event_id, title, payload, tags)
+        SELECT id, title, payload, tags FROM events
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO runtime_settings(key, value, updated_at)
+        VALUES('events_fts_v1_backfilled', 'true', ?)
+        """,
+        (datetime.now(tz=UTC).isoformat(),),
+    )
+
+
 def init_db() -> None:
     conn = _connect()
     try:
@@ -1448,6 +1500,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE events ADD COLUMN summary_version TEXT NOT NULL DEFAULT 'v1'")
         if not _column_exists(conn, "events", "summary_updated_at"):
             conn.execute("ALTER TABLE events ADD COLUMN summary_updated_at TEXT NOT NULL DEFAULT ''")
+        _ensure_events_fts_schema(conn)
         _ensure_takeover_v3_schema(conn)
         _ensure_behavior_fidelity_schema(conn)
         _ensure_continuity_v04_schema(conn)

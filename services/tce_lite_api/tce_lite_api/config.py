@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     search_recency_lambda: float = 0.01
     search_weight_lexical: float = 0.55
     search_weight_vector: float = 0.20
+    search_candidate_pool_multiplier: int = 8
+    search_candidate_pool_max: int = 400
+    search_rrf_enabled: bool = False
+    search_rrf_k: int = 60
     search_graph_bonus: float = 0.10
     search_weight_recency: float = 0.15
     search_feedback_enabled: bool = True

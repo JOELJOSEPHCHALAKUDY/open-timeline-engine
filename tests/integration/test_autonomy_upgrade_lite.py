@@ -126,7 +126,7 @@ def test_flags_keep_context_tiers_and_planner_off_by_default(lite_client: TestCl
     brief_body = brief.json()
     assert brief_body["context_tier_used"] == "l2"
     assert brief_body["planner_used"] is False
-    assert brief_body["current_state"][0]["text"].startswith("Interaction: search_events")
+    assert brief_body["current_state"][0]["text"].startswith("Advisor runtime fallback step")
 
 
 def test_flags_enable_tiered_context_and_intent_planner_metadata(lite_client: TestClient) -> None:

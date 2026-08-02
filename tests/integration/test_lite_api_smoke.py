@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 from tce_lite_api.config import get_settings
+from tce_lite_api.db import init_db
 from tce_lite_api.main import app
 
 
@@ -71,6 +72,8 @@ def test_lite_ingest_search_and_bundle(lite_client: TestClient) -> None:
     assert "metadata" in search_body
     assert "handoff_hits_count" in search_body["metadata"]
     assert "top_handoff_record_ids" in search_body["metadata"]
+    assert search_body["policy"]["retrieval"]["lexical_channel"].startswith("fts5_")
+    assert search_body["policy"]["retrieval"]["scope_prefilter_applied"] is False
 
     event = lite_client.get(f"/v1/events/{event_id}", headers=_headers())
     assert event.status_code == 200
@@ -85,6 +88,47 @@ def test_lite_ingest_search_and_bundle(lite_client: TestClient) -> None:
     body = bundle.json()
     assert "citations" in body
     assert "policy" in body
+
+
+def test_lite_fts_index_is_idempotent_and_tracks_event_mutations(
+    lite_client: TestClient,
+) -> None:
+    ingest = lite_client.post(
+        "/v1/events",
+        json=_event_payload("ftsinsertmarker continuity"),
+        headers=_headers(),
+    )
+    assert ingest.status_code == 200
+    event_id = ingest.json()["event_id"]
+    db_path = get_settings().lite_db_path
+
+    init_db()
+    init_db()
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM events_fts WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()[0]
+        assert count == 1
+
+        conn.execute(
+            "UPDATE events SET title = ? WHERE id = ?",
+            ("ftsupdatedmarker continuity", event_id),
+        )
+        assert conn.execute(
+            "SELECT count(*) FROM events_fts WHERE events_fts MATCH ? AND event_id = ?",
+            ('"ftsupdatedmarker"', event_id),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM events_fts WHERE events_fts MATCH ? AND event_id = ?",
+            ('"ftsinsertmarker"', event_id),
+        ).fetchone()[0] == 0
+
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        assert conn.execute(
+            "SELECT count(*) FROM events_fts WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()[0] == 0
 
 
 def test_lite_governance_status_is_honest_about_protocol_only_enforcement(

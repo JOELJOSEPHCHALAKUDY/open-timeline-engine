@@ -149,6 +149,31 @@ def _normalize_fts_rank_lookup(rows: list[dict[str, Any]]) -> dict[Any, float]:
     return {event_id: value / maximum for event_id, value in raw.items()}
 
 
+def _normalized_rrf_scores(
+    ranked_channels: list[list[Any]],
+    *,
+    rrf_k: int = 60,
+) -> dict[Any, float]:
+    """Fuse ranked candidate IDs and normalize the result for relevance scoring."""
+    denominator_offset = max(1, int(rrf_k))
+    raw: dict[Any, float] = {}
+    for channel in ranked_channels:
+        seen: set[Any] = set()
+        for rank, event_id in enumerate(channel, start=1):
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            raw[event_id] = raw.get(event_id, 0.0) + (1.0 / (denominator_offset + rank))
+    if not raw:
+        return {}
+    minimum = min(raw.values())
+    maximum = max(raw.values())
+    if maximum <= minimum:
+        return {event_id: 1.0 for event_id in raw}
+    scale = maximum - minimum
+    return {event_id: (value - minimum) / scale for event_id, value in raw.items()}
+
+
 def _lexical_score_for_candidate(
     *,
     event_id: Any,
@@ -1079,6 +1104,7 @@ def run_search(
     vector_similarity_lookup: dict[Any, float] = {}
     fts_rank_lookup: dict[Any, float] = {}
     ilike_rank_lookup: dict[Any, int] = {}
+    rrf_score_lookup: dict[Any, float] = {}
     query_embedding: list[float] | None = None
     entity_event_ids: set[Any] = set()
     retrieval_source = ""
@@ -1086,6 +1112,7 @@ def run_search(
     lexical_channel = "none"
     lexical_candidate_count = 0
     fts_candidate_count = 0
+    trigram_candidate_count = 0
     scope_requery_applied = False
     ownerless_fts_requery: Callable[[], list[dict[str, Any]]] | None = None
     feedback_adjustment_applied = False
@@ -1194,6 +1221,23 @@ def run_search(
             result = db.execute(
                 text(fts_sql),
                 {**selected_params, "tsq": tsquery, "fts_limit": limit},
+            ).mappings().all()
+            return [dict(row) for row in result]
+
+        def _run_trigram_query() -> list[dict[str, Any]]:
+            trigram_sql = f"""
+                SELECT id, ts, actor, source, domain, task_type, event_type,
+                       title, summary_l0, summary_l1_json, sensitivity, context, authority_level,
+                       similarity(title, :trigram_query) AS trigram_similarity
+                FROM events
+                WHERE {base_where_sql}
+                  AND title % :trigram_query
+                ORDER BY trigram_similarity DESC, ts DESC
+                LIMIT :trigram_limit
+            """
+            result = db.execute(
+                text(trigram_sql),
+                {**params, "trigram_query": query_text, "trigram_limit": limit},
             ).mappings().all()
             return [dict(row) for row in result]
 
@@ -1377,9 +1421,36 @@ def run_search(
 
         embed_future: Future[list[float] | None] = _SEARCH_EXECUTOR.submit(_do_embed)
         entity_future: Future[set[Any]] = _SEARCH_EXECUTOR.submit(_do_entity_query)
-        ilike_rows = _run_lexical_query(lexical_terms, expansion_mode=False)
+        ilike_rows: list[dict[str, Any]] = []
+        tsquery = _build_or_tsquery(query_text)
+        fts_rows: list[dict[str, Any]] = []
+        if tsquery:
+            try:
+                fts_rows = _run_fts_query(tsquery, include_owner_scope=True)
+
+                def _ownerless_fts_requery() -> list[dict[str, Any]]:
+                    return _run_fts_query(tsquery, include_owner_scope=False)
+
+                ownerless_fts_requery = _ownerless_fts_requery
+                lexical_channel = "fts_primary"
+            except (ProgrammingError, DBAPIError) as exc:
+                logger.warning("event FTS query failed; continuing with ILIKE candidates: %s", exc)
+                db.rollback()
+                lexical_channel = "ilike_fallback_error"
+                retrieval_reason = "fts_query_failed"
+
+        # Preserve substring/payload coverage only when the indexed path cannot
+        # fill the requested result set. Running both paths unconditionally made
+        # every search pay for the legacy full scan.
+        if len(fts_rows) < search_request.k:
+            ilike_rows = _run_lexical_query(lexical_terms, expansion_mode=False)
+            if fts_rows:
+                lexical_channel = "fts_plus_ilike_fill"
+            elif lexical_channel != "ilike_fallback_error":
+                lexical_channel = "ilike_only"
+
         preview_dup_ratio = _citation_dup_ratio([dict(row) for row in ilike_rows])
-        initial_candidate_count = len(ilike_rows)
+        initial_candidate_count = len({row["id"] for row in [*fts_rows, *ilike_rows]})
         expansion_triggered = bool(scale_trigger_met or preview_dup_ratio > 0.35)
         expansion_skip = _should_skip_query_expansion(
             initial_candidate_count=initial_candidate_count,
@@ -1410,25 +1481,6 @@ def run_search(
                 query_expansion_terms = expanded_terms
                 query_expansion_used = True
 
-        fts_rows: list[dict[str, Any]] = []
-        tsquery = _build_or_tsquery(query_text)
-        if tsquery:
-            try:
-                fts_rows = _run_fts_query(tsquery, include_owner_scope=True)
-
-                def _ownerless_fts_requery() -> list[dict[str, Any]]:
-                    return _run_fts_query(tsquery, include_owner_scope=False)
-
-                ownerless_fts_requery = _ownerless_fts_requery
-                lexical_channel = "fts_union_ilike" if fts_rows else "ilike_only"
-            except (ProgrammingError, DBAPIError) as exc:
-                logger.warning("event FTS query failed; continuing with ILIKE candidates: %s", exc)
-                db.rollback()
-                lexical_channel = "ilike_fallback_error"
-                retrieval_reason = "fts_query_failed"
-        else:
-            lexical_channel = "ilike_only"
-
         fts_candidate_count = len(fts_rows)
         fts_rank_lookup = _normalize_fts_rank_lookup(fts_rows)
         ilike_rank_lookup = {row["id"]: rank for rank, row in enumerate(ilike_rows)}
@@ -1442,6 +1494,16 @@ def run_search(
         primary_label = planned_queries[0]["label"] if planned_queries else "objective"
         _merge_rows(fts_rows, primary_label)
         _merge_rows(ilike_rows, primary_label)
+        trigram_rows: list[dict[str, Any]] = []
+        if bool(getattr(settings, "search_rrf_enabled", False)):
+            try:
+                trigram_rows = _run_trigram_query()
+            except (ProgrammingError, DBAPIError) as exc:
+                logger.warning("event trigram query failed; continuing without trigram candidates: %s", exc)
+                db.rollback()
+                trigram_rows = []
+            trigram_candidate_count = len(trigram_rows)
+            _merge_rows(trigram_rows, primary_label)
         if planner_used and not _enhancement_budget_exhausted():
             for index, planned in enumerate(planned_queries):
                 remaining_budget_ms = enhancement_budget_ms - int((monotonic() - retrieval_started) * 1000)
@@ -1594,6 +1656,23 @@ def run_search(
                             )
                             retrieval_reason = "low_pgvector_score_qdrant_fallback"
 
+        if bool(getattr(settings, "search_rrf_enabled", False)):
+            fts_ids = [row["id"] for row in fts_rows]
+            trigram_ids = [row["id"] for row in trigram_rows]
+            vector_ids = [
+                event_id
+                for event_id, _score in sorted(
+                    vector_similarity_lookup.items(),
+                    key=lambda item: (-item[1], str(item[0])),
+                )
+            ]
+            ilike_ids = [row["id"] for row in ilike_rows]
+            rrf_score_lookup = _normalized_rrf_scores(
+                [channel for channel in (fts_ids, trigram_ids, vector_ids, ilike_ids) if channel],
+                rrf_k=int(getattr(settings, "search_rrf_k", 60)),
+            )
+            lexical_channel = "rrf_fts_trgm_vector"
+
         if not retrieval_source:
             retrieval_source = "lexical_only"
 
@@ -1624,7 +1703,7 @@ def run_search(
                 retrieval_reason = "owner_scope_auto_expand_no_hits"
                 fts_rank_lookup = _normalize_fts_rank_lookup(requery_rows)
                 fts_candidate_count = len(requery_rows)
-                lexical_channel = "fts_union_ilike"
+                lexical_channel = "fts_primary"
                 for row in requery_rows:
                     merged_rows.setdefault(row["id"], dict(row))
                     subquery_labels_by_event.setdefault(row["id"], set()).add("objective")
@@ -1724,7 +1803,9 @@ def run_search(
                 ilike_rank_lookup=ilike_rank_lookup,
             )
             vector_score = max(0.0, float(vector_similarity_lookup.get(event_id, 0.0)))
-            if query_embedding is None:
+            if rrf_score_lookup:
+                relevance_score = max(0.0, min(1.0, rrf_score_lookup.get(event_id, 0.0)))
+            elif query_embedding is None:
                 relevance_score = lexical_score
             else:
                 relevance_score = max(
@@ -1892,6 +1973,8 @@ def run_search(
         "lexical_channel": lexical_channel,
         "lexical_candidate_count": int(lexical_candidate_count),
         "fts_candidate_count": int(fts_candidate_count),
+        "trigram_candidate_count": int(trigram_candidate_count),
+        "rrf_applied": bool(rrf_score_lookup),
         "candidate_pool_limit": int(limit),
         "scope_prefilter_applied": True,
         "scope_requery_applied": bool(scope_requery_applied),

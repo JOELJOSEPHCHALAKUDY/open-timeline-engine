@@ -8,8 +8,10 @@ from tce_api.search import (
     _lexical_score_for_candidate,
     _normalize_fts_rank_lookup,
     _normalized_channel_weights,
+    _normalized_rrf_scores,
     _scope_sql_parts,
 )
+from tce_lite_api.store import _build_fts5_query
 
 
 def _terms(tsquery: str) -> list[str]:
@@ -43,6 +45,22 @@ def test_build_or_tsquery_returns_empty_for_unusable_input() -> None:
     assert _build_or_tsquery("a I * -") == ""
 
 
+def test_build_fts5_query_strips_operators_and_bounds_terms() -> None:
+    source = 'AND near * alpha alpha "beta" path:value ' + " ".join(
+        f"term{index}" for index in range(40)
+    )
+    query = _build_fts5_query(source)
+    assert query.startswith('"and" OR "near" OR "alpha" OR "beta" OR "path" OR "value"')
+    assert query.count(" OR ") == 31
+    assert "*" not in query
+    assert ":" not in query
+
+
+def test_build_fts5_query_rejects_unusable_tokens() -> None:
+    assert _build_fts5_query("a I * -") == ""
+    assert "x" * 41 not in _build_fts5_query(f"valid {'x' * 41}")
+
+
 def test_normalize_fts_rank_lookup_maps_top_hit_to_one() -> None:
     rows = [
         {"id": "top", "lexical_rank": 0.5},
@@ -58,6 +76,20 @@ def test_normalize_fts_rank_lookup_maps_top_hit_to_one() -> None:
 
 def test_normalize_fts_rank_lookup_handles_zero_maximum() -> None:
     assert _normalize_fts_rank_lookup([{"id": "a", "lexical_rank": 0.0}]) == {"a": 0.0}
+
+
+def test_rrf_uses_one_based_ranks_and_normalizes() -> None:
+    scores = _normalized_rrf_scores(
+        [["shared", "lexical"], ["shared", "vector"]],
+        rrf_k=60,
+    )
+    assert scores["shared"] == pytest.approx(1.0)
+    assert scores["lexical"] == pytest.approx(0.0)
+    assert scores["vector"] == pytest.approx(0.0)
+
+
+def test_rrf_deduplicates_ids_within_each_channel() -> None:
+    assert _normalized_rrf_scores([["a", "a"]], rrf_k=60) == {"a": 1.0}
 
 
 @pytest.mark.parametrize(

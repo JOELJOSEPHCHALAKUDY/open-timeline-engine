@@ -116,8 +116,8 @@ def postfix_gates(reference: dict[str, Any], candidate: dict[str, Any]) -> list[
             Gate(
                 "rare_keywords equivalent top10",
                 f"{after['rare_keywords']:.6f} ({delta['rare_keywords']:+.4f})",
-                "absolute delta <= 0.08",
-                abs(delta["rare_keywords"]) <= 0.08,
+                "delta >= -0.03 (no-regression floor)",
+                delta["rare_keywords"] >= -0.03,
             ),
             Gate(
                 "exact equivalent top10",
@@ -162,7 +162,13 @@ def postfix_gates(reference: dict[str, Any], candidate: dict[str, Any]) -> list[
 
     lexical_counts = nested(candidate, "results", "overall", "lexical_channel_counts")
     total = sum(int(value) for value in lexical_counts.values()) if isinstance(lexical_counts, dict) else 0
-    fts_rate = int(lexical_counts.get("fts_union_ilike", 0)) / max(1, total)
+    fts_channels = {
+        "fts_primary",
+        "fts_plus_ilike_fill",
+        "fts_union_ilike",
+        "rrf_fts_trgm_vector",
+    }
+    fts_rate = sum(int(lexical_counts.get(key, 0)) for key in fts_channels) / max(1, total)
     fallback_rate = int(lexical_counts.get("ilike_fallback_error", 0)) / max(1, total)
     gates.extend(
         [

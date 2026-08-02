@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     search_weight_vector: float = 0.35
     search_candidate_pool_multiplier: int = 8
     search_candidate_pool_max: int = 400
+    search_rrf_enabled: bool = False
+    search_rrf_k: int = 60
     search_graph_bonus: float = 0.10
     search_weight_recency: float = 0.15
     search_feedback_enabled: bool = True

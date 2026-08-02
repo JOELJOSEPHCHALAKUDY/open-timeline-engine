@@ -163,6 +163,25 @@ from .types import (
     PatternItem,
 )
 
+_FTS5_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_FTS5_MAX_TERMS = 32
+_FTS5_MAX_TOKEN_LEN = 40
+
+
+def _build_fts5_query(query_text: str) -> str:
+    """Return an operator-safe, bounded OR query for SQLite FTS5."""
+    terms: list[str] = []
+    for token in _FTS5_TOKEN_RE.findall(query_text or ""):
+        normalized = token.lower()
+        if len(normalized) < 2 or len(normalized) > _FTS5_MAX_TOKEN_LEN:
+            continue
+        if normalized in terms:
+            continue
+        terms.append(normalized)
+        if len(terms) >= _FTS5_MAX_TERMS:
+            break
+    return " OR ".join(f'"{term}"' for term in terms)
+
 _RETRIEVAL_COUNTERS_LITE: dict[str, int] = {
     "none": 0,
     "pgvector_ann": 0,
@@ -2064,7 +2083,16 @@ def search_events(
         clauses.append("ts <= ?")
         params.append(body.time_end.astimezone(UTC).isoformat())
 
-    limit = max(body.k * 4, body.k)
+    candidate_pool_multiplier = max(
+        1, int(getattr(settings, "search_candidate_pool_multiplier", 8))
+    )
+    candidate_pool_max = max(
+        body.k, int(getattr(settings, "search_candidate_pool_max", 400))
+    )
+    limit = max(min(body.k * candidate_pool_multiplier, candidate_pool_max), body.k)
+    legacy_limit = max(body.k * 4, body.k)
+    lexical_channel = "none"
+    fts_candidate_count = 0
     base_clauses = list(clauses)
     base_params = list(params)
 
@@ -2085,7 +2113,7 @@ def search_events(
             local_clauses.append("(" + " OR ".join(term_conditions) + ")")
             for pattern in search_patterns:
                 local_params.extend([pattern, pattern, pattern])
-        local_params.append(limit)
+        local_params.append(legacy_limit)
         def _query() -> list[sqlite3.Row]:
             return conn.execute(
                 f"""
@@ -2093,6 +2121,27 @@ def search_events(
                 FROM events
                 WHERE {' AND '.join(local_clauses)}
                 ORDER BY ts DESC
+                LIMIT ?
+                """,
+                local_params,
+            ).fetchall()
+
+        return _run_sql_retry(_query, settings=settings)
+
+    def _query_fts_rows(fts_query: str) -> list[sqlite3.Row]:
+        local_params = [fts_query, *base_params, limit]
+
+        def _query() -> list[sqlite3.Row]:
+            return conn.execute(
+                f"""
+                SELECT e.id, e.ts, e.title, e.summary_l0, e.summary_l1_json,
+                       e.domain, e.task_type, e.sensitivity, e.payload, e.tags,
+                       e.context, e.authority_level
+                FROM events_fts
+                JOIN events e ON e.id = events_fts.event_id
+                WHERE events_fts MATCH ?
+                  AND {' AND '.join(f'e.{clause}' for clause in base_clauses)}
+                ORDER BY events_fts.rank, e.ts DESC
                 LIMIT ?
                 """,
                 local_params,
@@ -2127,7 +2176,29 @@ def search_events(
                 owner_id=owner_id,
             )
 
-    rows = _query_rows(search_patterns if not match_all else None, expansion_mode=False)
+    if match_all:
+        rows = _query_rows(None, expansion_mode=False)
+    else:
+        fts_query = _build_fts5_query(query_text)
+        rows = []
+        if fts_query:
+            try:
+                rows = _query_fts_rows(fts_query)
+                lexical_channel = "fts5_primary"
+            except sqlite3.OperationalError:
+                rows = []
+                lexical_channel = "like_fallback_error"
+        fts_candidate_count = len(rows)
+        if len(rows) < body.k:
+            fallback_rows = _query_rows(search_patterns, expansion_mode=False)
+            merged = {str(row["id"]): row for row in rows}
+            for row in fallback_rows:
+                merged.setdefault(str(row["id"]), row)
+            rows = list(merged.values())
+            if fts_candidate_count:
+                lexical_channel = "fts5_plus_like_fill"
+            elif lexical_channel != "like_fallback_error":
+                lexical_channel = "like_only"
     preview_dup_ratio = _citation_dup_ratio_lite(rows)
     initial_candidate_count = len(rows)
     expansion_triggered = bool(trigger_met or preview_dup_ratio > 0.35)
@@ -2157,6 +2228,7 @@ def search_events(
             search_patterns = [f"%{query_text}%", *[f"%{token}%" for token in expanded_terms]]
             rerun_started = time.perf_counter()
             rows = _query_rows(search_patterns, expansion_mode=True)
+            lexical_channel = "like_expansion"
             expansion_ms += int((time.perf_counter() - rerun_started) * 1000)
             query_expansion_used = True
             query_expansion_terms = expanded_terms
@@ -2489,6 +2561,15 @@ def search_events(
         "reason": None,
         "latency_ms": int((time.perf_counter() - retrieval_started) * 1000),
         "candidate_count": len(rows),
+        "lexical_channel": lexical_channel,
+        "lexical_candidate_count": len(rows),
+        "fts_candidate_count": int(fts_candidate_count),
+        "trigram_candidate_count": 0,
+        "rrf_applied": False,
+        "candidate_pool_limit": int(limit),
+        "scope_prefilter_applied": False,
+        "scope_requery_applied": False,
+        "score_components_version": 2,
         "hit_count": len(hits),
         "vector_used": False,
         "activation_enabled": bool(getattr(settings, "memory_activation_enabled", True)),

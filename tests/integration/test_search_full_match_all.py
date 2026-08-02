@@ -162,7 +162,7 @@ def test_full_fts_prefilters_workspace_and_owner_before_ranking() -> None:
         assert citations == [same_owner_id]
         assert blocked == 0
         assert metadata["source"] == "lexical_only"
-        assert metadata["lexical_channel"] == "fts_union_ilike"
+        assert metadata["lexical_channel"] == "fts_plus_ilike_fill"
         assert metadata["fts_candidate_count"] == 1
         assert metadata["lexical_candidate_count"] == 1
         assert metadata["scope_prefilter_applied"] is True
