@@ -13155,11 +13155,23 @@ def _plan_gateway_settings(settings_obj: Any) -> Any:
 
 DREAM_PROMPT = """Below are real messages a developer sent to their coding assistant, newest first.
 
-Read them and say what this person is actually trying to achieve. Not what they asked for
-in any one message — what they keep coming back to.
+Work out what this person is actually trying to get done. Not what they asked for in any
+one message -- what they keep returning to.
 
-Rules:
-- Only name something you can point to specific messages for.
+Then write it the way THEY would write it. Look at how they type in these messages and
+match it. They are one person building alone, at a keyboard, with no team.
+
+Hard rules on wording:
+- Write it as they'd say it out loud. Short. Plain. Lower case is fine.
+- Name the actual thing. "get the witness engine in front of someone" beats
+  "validate market positioning". "stop the CI failing" beats "improve pipeline health".
+- Banned words: comprehensive, leverage, stakeholder, framework, roadmap, strategy,
+  ecosystem, robust, holistic, real-world, best practice, optimize, streamline.
+- No Title Case. No consultant voice. If it reads like a slide, rewrite it.
+- It has to be something they could have typed themselves.
+
+Hard rules on content:
+- Only name something you can point at specific messages for.
 - Ignore interruptions, pasted links, one-word replies and tool output.
 - Something said once but clearly counts for more than boilerplate repeated ten times.
 - If nothing clear comes through, return an empty list. That is a good answer.
@@ -13169,7 +13181,7 @@ Messages:
 __MESSAGES__
 
 Reply with JSON only:
-{"dreams": [{"title": "the goal in plain words", "why": "what makes you say that",
+{"dreams": [{"title": "the goal, in their words", "why": "what makes you say that",
 "message_numbers": [1, 4, 9]}]}
 """
 

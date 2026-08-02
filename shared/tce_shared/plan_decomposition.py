@@ -32,11 +32,17 @@ PLAN_DECOMPOSITION_PROMPT = """Break this objective into an ordered list of conc
 
 Objective: {objective}
 
+The person doing this is working alone at a keyboard. Every step must be something they
+can start themselves today.
+
 Rules:
 - Each step must be independently completable and verifiable.
 - Order them so each step only depends on earlier ones.
 - Between 2 and 8 steps. Fewer is better.
 - No step may restate the objective as a whole.
+- Nothing requiring other people: no interviews, no stakeholders, no workshops,
+  no committees, no sign-off.
+- Plain wording, no Title Case, no consultant language.
 
 Respond with JSON only:
 {"steps": [{"id": "short-slug", "title": "...", "description": "...", "depends_on": []}]}
