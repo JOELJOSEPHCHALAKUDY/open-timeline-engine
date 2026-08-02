@@ -235,6 +235,15 @@ class Settings(BaseSettings):
     # default; with it off the plan code paths are inert.
     takeover_plan_enabled: bool = False
     takeover_plan_max_steps: int = 8
+    # Use the model gateway to decompose an objective. Off by default; the
+    # deterministic fallback runs whenever this is off or the model fails.
+    takeover_plan_llm_enabled: bool = False
+    takeover_plan_llm_timeout_seconds: int = 25
+    # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
+    # A hosted API is the better default here: decomposition runs once per
+    # objective, quality matters more than latency, and a small local model is
+    # both slower and weaker at planning.
+    takeover_plan_llm_provider: str = ""
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45

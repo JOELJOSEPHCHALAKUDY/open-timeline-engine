@@ -89,6 +89,12 @@ from tce_shared.behavior_pilot import (
     sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.dreams import (
+    DreamSeed,
+    DreamSignals,
+    derive_dream_seeds,
+    select_dream_to_pursue,
+)
 from tce_shared.events import (
     AgentRole,
     AutonomyGoalSource,
@@ -224,7 +230,12 @@ from tce_shared.handoff import (
     normalize_objective_text,
     rank_resume_candidates,
 )
-from tce_shared.plan_decomposition import fallback_plan_steps
+from tce_shared.plan_decomposition import (
+    PLAN_DECOMPOSITION_PROMPT,
+    PlanStep,
+    fallback_plan_steps,
+    parse_plan_steps,
+)
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
@@ -10526,6 +10537,7 @@ def takeover_autonomy_tick(
         ).mappings().all()
         sessions = [str(row["session_id"]) for row in rows]
     goals_refreshed = 0
+    dreams_pursued = 0
     notices_created = 0
     dedupe_cutoff = now - timedelta(minutes=max(1, int(settings.takeover_notice_dedupe_minutes)))
     threshold = float(settings.takeover_notice_threshold)
@@ -10546,6 +10558,23 @@ def takeover_autonomy_tick(
             include_open_discovery=body.include_open_discovery,
         )
         goals_refreshed += 1
+        # Dream in the gap. With no plan in flight and nothing pinned, form aspirations
+        # from what the system can observe about itself and turn the strongest into an
+        # ordered plan. The plan machinery then walks it exactly as a user-given
+        # objective, so a dream is pursued the same way anything else is.
+        if bool(getattr(settings, "takeover_plan_enabled", False)) and not state.active_goal_id:
+            try:
+                pursued = _dream_and_pursue(db, auth=auth, state=state)
+                if pursued:
+                    dreams_pursued += 1
+                    next_step = _select_next_plan_step(db, state)
+                    if next_step is not None:
+                        state.active_goal_id = next_step.id
+                        save_takeover_state(db, state)
+                        db.commit()
+            except Exception:
+                # Dreaming is strictly optional; never let it break the tick.
+                logger.warning("dream pursuit failed", exc_info=True)
         top_goal = goals[0] if goals else None
         if (
             top_goal is not None
@@ -12770,7 +12799,60 @@ def _write_objective_plan(
         return None
     settings_obj = get_settings()
     max_steps = max(2, int(getattr(settings_obj, "takeover_plan_max_steps", 8)))
-    steps = fallback_plan_steps(cleaned)[:max_steps]
+
+    steps: list[PlanStep] = []
+    if bool(getattr(settings_obj, "takeover_plan_llm_enabled", False)):
+        try:
+            # A clamped settings clone: the configured advisor timeout is 90s, which
+            # would block the request thread for a minute and a half on a slow model.
+            # Provider is configurable, and a hosted API is the better default for this
+            # job: decomposition is a once-per-objective call where quality matters and
+            # a small local model is both slower and weaker. Falls back to the global
+            # model_provider when no plan-specific one is set.
+            provider = str(
+                getattr(settings_obj, "takeover_plan_llm_provider", "")
+                or getattr(settings_obj, "model_provider", "ollama")
+            ).strip().lower()
+            gateway = get_model_gateway(
+                SimpleNamespace(
+                    model_provider=provider,
+                    # ollama
+                    ollama_url=getattr(settings_obj, "ollama_url", "http://ollama:11434"),
+                    embed_model=getattr(settings_obj, "embed_model", "mxbai-embed-large"),
+                    extract_model=getattr(settings_obj, "extract_model", "qwen2.5:3b"),
+                    # openai
+                    openai_api_key=getattr(settings_obj, "openai_api_key", ""),
+                    openai_embed_model=getattr(
+                        settings_obj, "openai_embed_model", "text-embedding-3-small"
+                    ),
+                    openai_extract_model=getattr(
+                        settings_obj, "openai_extract_model", "gpt-4o-mini"
+                    ),
+                    openai_base_url=getattr(settings_obj, "openai_base_url", None),
+                    # anthropic
+                    anthropic_api_key=getattr(settings_obj, "anthropic_api_key", ""),
+                    anthropic_extract_model=getattr(
+                        settings_obj, "anthropic_extract_model", "claude-haiku-4-5-20251001"
+                    ),
+                    advisor_timeout_seconds=float(
+                        getattr(settings_obj, "takeover_plan_llm_timeout_seconds", 25)
+                    ),
+                    advisor_attempt_timeout_ms=0,
+                    advisor_read_timeout_ms=0,
+                    redis_url=getattr(settings_obj, "redis_url", ""),
+                )
+            )
+            payload = gateway.extract_structured(
+                PLAN_DECOMPOSITION_PROMPT.replace("{objective}", cleaned[:2000]),
+                "plan_decomposition_v1",
+            )
+            steps = parse_plan_steps(payload, max_steps=max_steps)
+        except Exception:
+            logger.warning("model plan decomposition failed; using fallback", exc_info=True)
+    if not steps:
+        # Unconditional safety net. A model may be absent, slow, or incoherent; a plan
+        # must exist regardless, so this path has no failure mode.
+        steps = fallback_plan_steps(cleaned)[:max_steps]
     if not steps:
         return None
 
@@ -12847,6 +12929,227 @@ def _write_objective_plan(
     # nowhere else. Observed exactly that before this line was added.
     db.commit()
     return str(root_id)
+
+
+PLAN_DREAM_STEP_INDEX = -1
+"""Marks a stored aspiration. Plan roots are 0 and steps are 1..N, so a dream that
+gets pursued simply becomes a root; no separate table or wire field is needed."""
+
+
+def _gather_dream_signals(db: Session, *, auth: AuthContext) -> DreamSignals:
+    """Observe the system's own situation. Every number here becomes a rationale."""
+
+    def _count(sql: str, params: dict[str, Any] | None = None) -> int:
+        try:
+            return int(db.execute(text(sql), params or {}).scalar() or 0)
+        except Exception:
+            # Dreaming is best-effort: a missing table must not break the tick.
+            logger.warning("dream signal query failed", exc_info=True)
+            return 0
+
+    total_events = _count("SELECT count(*) FROM events")
+    embedded = _count("SELECT count(*) FROM event_embeddings")
+    failed = _count(
+        """
+        SELECT count(*) FROM directive_executions
+        WHERE workspace_id = :workspace_id AND state = 'failed'
+        """,
+        {"workspace_id": auth.workspace_id},
+    )
+    stalled = _count(
+        """
+        SELECT count(*) FROM autonomy_goals
+        WHERE workspace_id = :workspace_id
+          AND status = :candidate
+          AND step_index IS NULL
+          AND updated_at < :cutoff
+        """,
+        {
+            "workspace_id": auth.workspace_id,
+            "candidate": AutonomyGoalStatus.CANDIDATE.value,
+            "cutoff": datetime.now(tz=UTC) - timedelta(days=1),
+        },
+    )
+    domains: list[tuple[str, int]] = []
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT domain, count(*) AS n
+                FROM events
+                WHERE domain IS NOT NULL AND domain <> ''
+                  AND COALESCE(task_type, '') NOT LIKE 'interaction\\_%'
+                GROUP BY domain
+                ORDER BY n DESC
+                LIMIT 3
+                """
+            )
+        ).mappings().all()
+        domains = [(str(r["domain"]), int(r["n"])) for r in rows]
+    except Exception:
+        logger.warning("dream domain query failed", exc_info=True)
+
+    return DreamSignals(
+        failed_unretried_directives=failed,
+        unembedded_events=max(0, total_events - embedded),
+        recurring_domains=domains,
+        stalled_goals=stalled,
+        total_events=total_events,
+    )
+
+
+def _store_dreams(
+    db: Session, *, auth: AuthContext, state: TakeoverState, dreams: list[DreamSeed]
+) -> int:
+    """Persist aspirations, replacing any previous set for this session."""
+    now = datetime.now(tz=UTC)
+    db.execute(
+        text(
+            """
+            DELETE FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": auth.workspace_id,
+            "user_id": auth.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+        },
+    )
+    for dream in dreams:
+        db.execute(
+            text(
+                """
+                INSERT INTO autonomy_goals(
+                    id, session_id, workspace_id, user_id, title, description,
+                    source, priority_score, risk_tier, confidence, reasoning,
+                    evidence_event_ids, goal_kind, affective_scores, selection_score,
+                    goal_signature, cache_hit, cache_source, status, created_at,
+                    updated_at, parent_goal_id, step_index
+                )
+                VALUES(
+                    :id, :session_id, :workspace_id, :user_id, :title, :description,
+                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
+                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
+                    :selection_score, :goal_signature, :cache_hit, :cache_source,
+                    :status, :created_at, :updated_at, NULL, :step_index
+                )
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "title": sanitize_untrusted_objective(dream.title, max_len=140),
+                "description": sanitize_untrusted_objective(dream.description, max_len=240),
+                "source": AutonomyGoalSource.OPEN_DISCOVERY.value,
+                "priority_score": float(dream.weight),
+                "risk_tier": AutonomyRiskTier.LOW.value,
+                "confidence": float(dream.weight),
+                "reasoning": dream.rationale[:400],
+                "evidence_event_ids": [],
+                "goal_kind": GoalKind.NORMAL.value,
+                "affective_scores": json.dumps({}),
+                "selection_score": float(dream.weight),
+                "goal_signature": hashlib.sha256(
+                    f"dream|{state.session_id}|{dream.title}".encode()
+                ).hexdigest()[:24],
+                "cache_hit": False,
+                "cache_source": "dream",
+                "status": AutonomyGoalStatus.CANDIDATE.value,
+                "created_at": now,
+                "updated_at": now,
+                "step_index": PLAN_DREAM_STEP_INDEX,
+            },
+        )
+    db.commit()
+    return len(dreams)
+
+
+def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]:
+    rows = db.execute(
+        text(
+            """
+            SELECT title, description, reasoning, selection_score
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+              AND status = :candidate
+            ORDER BY selection_score DESC
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+            "candidate": AutonomyGoalStatus.CANDIDATE.value,
+        },
+    ).mappings().all()
+    return [
+        DreamSeed(
+            title=str(r["title"]),
+            description=str(r["description"]),
+            rationale=str(r["reasoning"] or ""),
+            weight=float(r["selection_score"] or 0.0),
+        )
+        for r in rows
+    ]
+
+
+def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
+    """Form aspirations when idle, then turn the strongest into an ordered plan.
+
+    This is the whole loop in one place: observe -> want -> plan -> (the existing
+    machinery then walks the plan to completion). Returns the pursued dream's title.
+    """
+    if state.takeover_context.get("plan_root_goal_id"):
+        return None  # a plan is already in flight; dreaming waits for the gap
+    dreams = _load_stored_dreams(db, state=state)
+    if not dreams:
+        dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth))
+        if dreams:
+            _store_dreams(db, auth=auth, state=state, dreams=dreams)
+    chosen = select_dream_to_pursue(dreams, has_active_plan=False)
+    if chosen is None:
+        return None
+    root_id = _write_objective_plan(db, auth=auth, state=state, objective=chosen.title)
+    if root_id is None:
+        return None
+    state.takeover_context["pursued_dream"] = chosen.title
+    state.takeover_context["pursued_dream_rationale"] = chosen.rationale
+    # The dream has become a plan; retire it so it is not pursued twice.
+    db.execute(
+        text(
+            """
+            UPDATE autonomy_goals
+            SET status = :done, updated_at = :now
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+              AND title = :title
+            """
+        ),
+        {
+            "done": AutonomyGoalStatus.DONE.value,
+            "now": datetime.now(tz=UTC),
+            "session_id": state.session_id,
+            "workspace_id": auth.workspace_id,
+            "user_id": auth.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+            "title": sanitize_untrusted_objective(chosen.title, max_len=140),
+        },
+    )
+    db.commit()
+    return chosen.title
 
 
 def _advance_plan_after_completion(
