@@ -48,17 +48,20 @@ For generic MCP clients that do not have an installer path, generate config only
 - `TCE_MCP_WORKSPACE_ID=personal`
 - `TCE_MCP_USER_ID=<your-user-id>`
 - `TCE_MCP_BEHAVIOR_SUBJECT_ID=<human-profile-id>`
+- `TCE_MCP_TOOL_PROFILE=core|continuity|autonomy|research|admin|all`
 
 Dual-AI mode:
 
 - MCP servers use executor identity: `TCE_MCP_ROLE=executor`
 - advisor model routing remains API-side via `/v1/setup/advisor/*`
 
-## 4. Tool schemas and compatibility
+## 4. Tool profiles, schemas, and compatibility
 
 All tool responses include `tool_schema_version` from `tce_shared.version.MCP_SCHEMA_VERSION`.
 
-Supported tools:
+Generated configs explicitly carry the selected tool profile. The default is the 10-tool `core` surface. `continuity`, `autonomy`, and `research` are cumulative supersets; `admin` and `all` expose the complete compatibility surface. Clone-advisor takeover needs `autonomy` or `research`.
+
+The following is a profile-dependent catalog, not the default tool list:
 
 - `tce.search_events`
 - `tce.get_context_bundle`
@@ -76,6 +79,7 @@ Supported tools:
 - `tce.get_resume_packet`
 - `tce.report_resume_feedback`
 - `tce.get_continuity_pilot`
+- `tce.get_governance_status`
 - `tce.record_behavior_evidence`
 - `tce.predict_behavior`
 - `tce.run_behavior_fidelity_eval`
@@ -90,6 +94,8 @@ Supported tools:
 - `tce.record_behavior_counterfactual`
 - `tce.get_behavior_counterfactuals`
 - `tce.resolve_behavior_counterfactual`
+
+Run `tce.get_governance_status` to inspect the effective boundary. `protocol_only` means TCE validates its lifecycle protocol but does not intercept arbitrary host commands; external interception must be deployed and attested separately.
 
 Validation coverage:
 

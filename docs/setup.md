@@ -1,6 +1,6 @@
 # Setup
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V9`/`V9.4`/`V9.6` terms in this guide are internal milestones.
 
 > Docs index: [Open Timeline Engine Docs](README.md)
@@ -31,6 +31,12 @@ Non-interactive env-first start:
 
 ```bash
 ./scripts/install.sh install full --setup-mode env --yes
+```
+
+Reviewed runtime profiles are available through `--profile local-lite|local-full|team-secure|research`. Timeline-only installs expose the 10-tool MCP `core` profile. A wizard install with `--behavior clone_advisor` selects the `autonomy` MCP profile; `research` is the broader evaluation profile. After changing `TCE_MCP_TOOL_PROFILE`, regenerate client config and restart the executor:
+
+```bash
+./scripts/configure_mcp_clients.sh --client all
 ```
 
 If `.env` is missing in env-first mode, installer will prompt to create it from `.env.example` (or abort).

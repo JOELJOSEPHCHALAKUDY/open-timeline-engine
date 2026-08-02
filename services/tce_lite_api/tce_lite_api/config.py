@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     search_recency_lambda: float = 0.01
     search_weight_lexical: float = 0.55
     search_weight_vector: float = 0.20
+    search_candidate_pool_multiplier: int = 8
+    search_candidate_pool_max: int = 400
+    search_rrf_enabled: bool = False
+    search_rrf_k: int = 60
     search_graph_bonus: float = 0.10
     search_weight_recency: float = 0.15
     search_feedback_enabled: bool = True
@@ -186,6 +190,22 @@ class Settings(BaseSettings):
     takeover_goal_min_confidence: float = 0.62
     takeover_goal_selection_min_confidence: float = 0.62
     takeover_goal_discovery_every_n_turns: int = 24
+    # Ordered plan goals: an objective is decomposed once into ordered steps and then
+    # walked to completion, instead of re-ranking past events every turn. Off by
+    # default; with it off the plan code paths are inert.
+    takeover_plan_enabled: bool = True
+    takeover_plan_max_steps: int = 8
+    # Use the model gateway to decompose an objective. Off by default; the
+    # deterministic fallback runs whenever this is off or the model fails.
+    takeover_plan_llm_enabled: bool = True
+    takeover_plan_llm_timeout_seconds: int = 25
+    # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
+    # A hosted API is the better default here: decomposition runs once per
+    # objective, quality matters more than latency, and a small local model is
+    # both slower and weaker at planning.
+    takeover_plan_llm_provider: str = "openai"
+    # Form dreams by reading the user's own messages instead of counting rows.
+    takeover_dream_llm_enabled: bool = True
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45

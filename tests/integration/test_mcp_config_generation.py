@@ -21,6 +21,7 @@ def test_configure_mcp_clients_generates_generic_pack(tmp_path) -> None:
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
     env["CODEX_HOME"] = str(tmp_path / ".codex")
+    env["TCE_MCP_TOOL_PROFILE"] = "core"
 
     cmd = [
         "bash",
@@ -64,6 +65,7 @@ def test_configure_mcp_clients_generates_generic_pack(tmp_path) -> None:
     assert servers["tce-executor"]["env"]["TCE_MCP_CONSUMER_ID"] == "generic-executor"
     assert servers["tce-executor"]["env"]["TCE_MCP_USER_ID"] == "generic-executor"
     assert servers["tce-executor"]["env"]["TCE_MCP_SESSION_ID"] == "generic"
+    assert servers["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "core"
     assert servers["tce-executor"]["env"]["TCE_API_TOKEN"] == "test-token"
 
     claude = _load_json(generated_dir / "claude_desktop_config.json")
@@ -82,6 +84,7 @@ def test_configure_mcp_clients_honors_identity_and_session_maps(tmp_path) -> Non
     env = os.environ.copy()
     env["HOME"] = str(tmp_path)
     env["CODEX_HOME"] = str(tmp_path / ".codex")
+    env.pop("TCE_MCP_TOOL_PROFILE", None)
 
     cmd = [
         "bash",
@@ -99,6 +102,8 @@ def test_configure_mcp_clients_honors_identity_and_session_maps(tmp_path) -> Non
         "claude=claude-executor,codex=codex-executor,cursor=cursor-executor,generic=generic-executor",
         "--session-map",
         "claude=claude,codex=codex,cursor=cursor,generic=generic",
+        "--tool-profile",
+        "autonomy",
     ]
     completed = subprocess.run(
         cmd,
@@ -125,3 +130,41 @@ def test_configure_mcp_clients_honors_identity_and_session_maps(tmp_path) -> Non
     assert codex["mcpServers"]["tce-executor"]["env"]["TCE_MCP_SESSION_ID"] == "codex"
     assert cursor["mcpServers"]["tce-executor"]["env"]["TCE_MCP_SESSION_ID"] == "cursor"
     assert generic["mcpServers"]["tce-executor"]["env"]["TCE_MCP_SESSION_ID"] == "generic"
+    assert claude["mcpServers"]["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "autonomy"
+    assert codex["mcpServers"]["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "autonomy"
+    assert cursor["mcpServers"]["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "autonomy"
+    assert generic["mcpServers"]["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "autonomy"
+
+
+def test_configure_mcp_clients_infers_autonomy_for_legacy_clone_env(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    script = root / "scripts" / "configure_mcp_clients.sh"
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    env["CODEX_HOME"] = str(tmp_path / ".codex")
+    env.pop("TCE_MCP_TOOL_PROFILE", None)
+    env["TCE_DEFAULT_OPERATION_MODE"] = "clone_advisor"
+
+    subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--client",
+            "generic",
+            "--no-install",
+            "--api-url",
+            "http://localhost:8080",
+            "--token",
+            "test-token",
+            "--workspace",
+            "personal",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    generic = _load_json(root / "docs" / "mcp-config" / "generated" / "generic_mcp.json")
+    assert generic["mcpServers"]["tce-executor"]["env"]["TCE_MCP_TOOL_PROFILE"] == "autonomy"

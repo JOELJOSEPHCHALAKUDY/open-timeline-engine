@@ -12,6 +12,8 @@ USER_ID="${TCE_MCP_USER_ID:-${USER:-local-user}}"
 IDENTITY_MAP="${TCE_MCP_IDENTITY_MAP:-}"
 CONSUMER_MAP="${TCE_MCP_CONSUMER_MAP:-}"
 SESSION_MAP="${TCE_MCP_SESSION_MAP:-}"
+TOOL_PROFILE="${TCE_MCP_TOOL_PROFILE:-}"
+OPERATION_MODE="${TCE_DEFAULT_OPERATION_MODE:-}"
 USER_ID_EXPLICIT="false"
 INSTALL_TARGETS="true"
 TAKEOVER_POLICY_FILE="$ROOT/docs/mcp-config/generated/takeover_auto_call_policy.md"
@@ -31,6 +33,7 @@ Options:
   --identity-map <codex=id-a,claude=id-b,...>
   --consumer-map <codex=consumer-a,claude=consumer-b,...>
   --session-map <codex=session-a,claude=session-b,...>
+  --tool-profile <core|continuity|autonomy|research|admin|all>
   --no-install      Only generate files under docs/mcp-config/generated
   -h, --help
 
@@ -84,6 +87,10 @@ while [ $# -gt 0 ]; do
       SESSION_MAP="${2:-$SESSION_MAP}"
       shift
       ;;
+    --tool-profile)
+      TOOL_PROFILE="${2:-$TOOL_PROFILE}"
+      shift
+      ;;
     --no-install)
       INSTALL_TARGETS="false"
       ;;
@@ -120,6 +127,29 @@ fi
 if [ -z "$TOKEN" ]; then
   TOKEN="local-dev-token"
 fi
+
+if [ -z "$TOOL_PROFILE" ] && [ "$OPERATION_MODE" = "clone_advisor" ]; then
+  TOOL_PROFILE="autonomy"
+fi
+if [ -f "$ROOT/.env" ]; then
+  if [ -z "$TOOL_PROFILE" ]; then
+    TOOL_PROFILE="$(awk -F= '$1=="TCE_MCP_TOOL_PROFILE" {print $2}' "$ROOT/.env" | tail -n1)"
+  fi
+  if [ -z "$OPERATION_MODE" ]; then
+    OPERATION_MODE="$(awk -F= '$1=="TCE_DEFAULT_OPERATION_MODE" {print $2}' "$ROOT/.env" | tail -n1)"
+  fi
+fi
+if [ -z "$TOOL_PROFILE" ] && [ "$OPERATION_MODE" = "clone_advisor" ]; then
+  TOOL_PROFILE="autonomy"
+fi
+TOOL_PROFILE="${TOOL_PROFILE:-core}"
+case "$TOOL_PROFILE" in
+  core|continuity|autonomy|research|admin|all) ;;
+  *)
+    echo "Invalid MCP tool profile: ${TOOL_PROFILE}" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required for config generation." >&2
@@ -325,6 +355,7 @@ install_codex_via_cli() {
     --env "TCE_MCP_WORKSPACE_ID=${codex_workspace}" \
     --env "TCE_MCP_USER_ID=${codex_user_id}" \
     --env "TCE_MCP_SESSION_ID=${codex_session_id}" \
+    --env "TCE_MCP_TOOL_PROFILE=${TOOL_PROFILE}" \
     -- "$mcp_python" -m tce_mcp.server >/dev/null
 }
 
@@ -335,7 +366,7 @@ write_config() {
   local identity_id="$4"
   local consumer_id="$5"
   local session_id="$6"
-  python3 - "$destination" "$client" "$ROOT" "$API_URL" "$TOKEN" "$workspace" "$identity_id" "$consumer_id" "$session_id" <<'PY'
+  python3 - "$destination" "$client" "$ROOT" "$API_URL" "$TOKEN" "$workspace" "$identity_id" "$consumer_id" "$session_id" "$TOOL_PROFILE" <<'PY'
 import json
 import os
 import sys
@@ -350,6 +381,7 @@ workspace = sys.argv[6]
 user_id = sys.argv[7]
 consumer_id = sys.argv[8]
 executor_session_id = sys.argv[9]
+tool_profile = sys.argv[10]
 
 mcp_python = Path(root) / ".venv_mcp" / "bin" / "python"
 if mcp_python.exists():
@@ -372,6 +404,7 @@ def server() -> dict:
             "TCE_MCP_WORKSPACE_ID": workspace,
             "TCE_MCP_USER_ID": user_id,
             "TCE_MCP_SESSION_ID": executor_session_id,
+            "TCE_MCP_TOOL_PROFILE": tool_profile,
         },
     }
 
@@ -413,6 +446,7 @@ Use this policy in clients that support project or custom instructions.
 ## Required behavior
 1. Keep a stable `session_id` for the current chat.
 2. On every user message, call `tce.takeover_step` with that `session_id`, user message text, and `activation_mode_default="takeover"`.
+2a. On the first call in a repository, include `app_context` with the absolute `project_root` and repository `project` name. Send it again whenever the repository changes.
 3. If `final_response` exists in the tool result, return it directly.
 4. If `safety_decision` is `confirm_required`, ask for confirmation and wait.
 5. Continue auto-calling `tce.takeover_step` for each later message while takeover is active.
@@ -436,7 +470,7 @@ for client in "${clients[@]-}"; do
   client_session="$(session_for_client "$client")"
   generated_file="$(generated_path "$client")"
   write_config "$generated_file" "$client" "$client_workspace" "$client_identity" "$client_consumer" "$client_session"
-  echo "  generated: $generated_file (workspace=${client_workspace}, user=${client_identity}, session=${client_session})"
+  echo "  generated: $generated_file (workspace=${client_workspace}, user=${client_identity}, session=${client_session}, profile=${TOOL_PROFILE})"
 
   if [ "$INSTALL_TARGETS" = "true" ]; then
     if [ "$client" = "generic" ]; then

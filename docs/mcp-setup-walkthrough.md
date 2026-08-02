@@ -1,6 +1,6 @@
 # MCP Setup Walkthrough
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V7.2`/`V8`/`V9.x` terms in this walkthrough are internal milestones.
 
 This walkthrough configures Open Timeline Engine MCP for Codex Desktop, Claude Desktop, Cursor, and generic MCP clients.
@@ -88,6 +88,13 @@ Shared values:
 - `TCE_API_TOKEN=local-dev-token`
 - `TCE_MCP_WORKSPACE_ID=personal`
 
+Project identity:
+
+- On the first takeover call in a repository, send `app_context.project_root` and `app_context.project`.
+- TCE derives a redaction-safe `project_id`, binds it to that takeover session, and applies it to later events and completion handoffs.
+- Long-lived MCP processes cannot reliably infer an editor's active repository. Set `TCE_MCP_PROJECT_ROOT`/`TCE_MCP_PROJECT_NAME` for a fixed-project process, or resend explicit `app_context` whenever the repository changes.
+- Dream generation is disabled when no project is bound. Project-direction dreams require repeated project-scoped user asks and retain source event citations.
+
 Note:
 
 - MCP executors do not magically call a cloud advisor model by themselves.
@@ -124,7 +131,7 @@ Detailed operation policy: `<repo-root>/docs/clone-advisor.md`
 
 ## 6. Takeover tool-calling pattern
 
-1. First call `tce.takeover_step` with the user message and session id.
+1. First call `tce.takeover_step` with the user message, session id, and `app_context` containing the absolute repository root and repository name.
 2. If result action is `inactive` or `stopped`, do not call clone-advice tools.
 3. If result action is `advisor_takeover` or `advisor_suggest`, use `final_response` as baseline.
 4. Use `tce.get_takeover_state` for diagnostics and `tce.reset_takeover_state` to clear session state.

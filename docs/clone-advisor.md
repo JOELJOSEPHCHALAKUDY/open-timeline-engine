@@ -1,6 +1,6 @@
 # Clone Advisor Guide
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > `V4`–`V9` labels in this guide are internal milestones.
 
 Use one or more executor AIs at the same time:
@@ -32,6 +32,8 @@ Enable clone mode:
 ```bash
 ./scripts/set_mode.sh clone_advisor
 ```
+
+The executor also needs `TCE_MCP_TOOL_PROFILE=autonomy` (or `research`) so takeover and lifecycle tools are exposed. Wizard installs select this automatically. For an existing installation, update `.env`, regenerate MCP client config, and restart the executor.
 
 Fallback mode:
 
@@ -229,6 +231,12 @@ Public surfaces:
 Predictions abstain below the configured confidence floor. When `TCE_BEHAVIOR_AUTONOMY_GATE_ENABLED=true`, takeover also pauses unless the latest chronological evaluation passes its accuracy, calibration, precision, and sample-count gates. Permit/claim/report and hard safety gates remain mandatory.
 
 Detailed rollout instructions: [Behavior Fidelity v1](behavior-fidelity.md).
+
+## Project-scoped dreams
+
+When ordered planning is enabled, idle autonomy may convert a bounded aspiration into a plan. Directional dreams require a canonical project binding plus repeated, similar relayed user asks. The stored dream retains the source event IDs; global folder/domain activity alone cannot create a directional dream. Operational signals such as unfinished directives and indexing gaps are scoped to the bound session/project. No project binding means no dream generation.
+
+Executors should send `app_context.project_root` and `app_context.project` on the first takeover call in a repository and whenever the repository changes. TCE pins the redaction-safe identity to the takeover session and copies it to events and completion handoffs.
 
 ## Long-term goal definition
 

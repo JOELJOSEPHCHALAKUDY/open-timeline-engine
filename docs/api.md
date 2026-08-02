@@ -16,6 +16,7 @@
 - `GET /v1/health`
 - `GET /v1/metrics`
 - `GET /v1/auth/whoami`
+- `GET /v1/governance/status`
 - `POST /v1/completions`
 - `POST /v1/handoff/resume`
 - `POST /v1/continuity/pilot/feedback`
@@ -91,5 +92,7 @@
 - `POST /v1/completions` validates milestone v1, commits an idempotent outbox row, then materializes the linked event and handoff record.
 - Pending outbox rows are retried by the worker in Full and at Lite startup. Delivery is idempotent and dead-letters after 10 attempts.
 - `POST /v1/handoff/resume` records resume latency and selected-file telemetry without changing the packet response shape.
-- Pilot feedback measures correct-file and correction rates. `GET /v1/continuity/pilot/status` reports these with time-to-resume and handoff capture coverage.
+- Pilot progress supports `file_opened`, `productive`, `completed`, and `feedback` phases. `GET /v1/continuity/pilot/status` reports handoff age, time to first file, active resume time, completion-after-resume, correct-file/anchor rates, correction rate, archaeology cost, retrieval latency, and handoff capture coverage.
+- Legacy `median_time_to_resume_ms` / `p95_time_to_resume_ms` fields remain compatibility aliases for handoff age at request time. Use `median_active_resume_ms` / `p95_active_resume_ms` for measured productive-resume duration.
 - `GET /v1/auth/whoami` returns the server-resolved caller identity. In `enforce` mode, bound claims cannot be overridden by request headers.
+- `GET /v1/governance/status` distinguishes protocol validation from externally attested host interception; it does not claim a sandbox when none is deployed.

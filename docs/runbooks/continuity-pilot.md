@@ -27,12 +27,14 @@ Use a stable completion key. Repeating a key returns the original outbox, event,
 
 ## Pilot Procedure
 
-1. Run at least four weeks with Codex and Claude using distinct bound identities in the same workspace.
+1. Capture a pre-rollout baseline, then run at least four weeks with Codex and Claude using distinct bound identities in the same workspace.
 2. Use `tce.get_resume_packet` before manually searching the repository.
-3. After opening the first suggested file, call `tce.report_resume_feedback`.
-4. Mark `correct_file=true` only when the first file or anchor was actionable.
-5. Mark `correction_required=true` when the receiving executor had to replace material context, files, or next steps.
-6. Review `GET /v1/continuity/pilot/status?days=30` and `/dashboard/behavior-review` weekly.
+3. Open the first suggested file and call `tce.check_context` with the same session ID. This records `file_opened` automatically. If that hook is unavailable, call `tce.report_resume_feedback` with `phase=file_opened`.
+4. When enough context is recovered to make productive progress, report `phase=productive`.
+5. At task completion, report `phase=completed`, the opened file/rank, anchor result, correction result, archaeology tool calls/tokens, and outcome status.
+6. Mark `correct_file=true` only when the first file was actionable; record `correct_anchor` separately.
+7. Mark `correction_required=true` when the receiving executor had to replace material context, files, or next steps.
+8. Review `GET /v1/continuity/pilot/status?days=30` and `/dashboard/behavior-review` weekly.
 
 ## Latency gates
 
@@ -50,10 +52,18 @@ The default gate is resume p95 `<=120ms`. Keep the existing takeover p95 gate at
 
 - `handoff_capture_coverage`: delivered handoffs / eligible terminal directives, consumed mutation obligations, and standalone completion submissions. Target `>=0.80`, then `>=0.95`.
 - `correct_file_rate`: first selected file was correct. Target `>=0.80`.
+- `correct_file_at_1_rate` and `correct_file_at_3_rate`: recommended-file rank quality.
+- `correct_anchor_rate`: recommended anchor was actionable.
 - `correction_rate`: resume required material correction. Target `<=0.20`.
-- `median_time_to_resume_ms` and `p95_time_to_resume_ms`: elapsed time from handoff creation to resume request. Compare with a pre-pilot baseline.
+- `median_handoff_age_at_resume_ms` and `p95_handoff_age_at_resume_ms`: age of the handoff when resume was requested.
+- `median_time_to_first_file_ms` and `p95_time_to_first_file_ms`: resume request to first file open.
+- `median_active_resume_ms` and `p95_active_resume_ms`: resume request to productive work. Use these for time-to-resume comparisons.
+- `median_completion_after_resume_ms` and `p95_completion_after_resume_ms`: resume request to reported completion.
+- `median_archaeology_tool_calls` and `median_archaeology_tokens`: repository archaeology cost after requesting a packet.
 - `median_retrieval_latency_ms`: server retrieval latency, not human time-to-resume.
 - `outbox_dead_count`: must remain `0`.
+
+`median_time_to_resume_ms` and `p95_time_to_resume_ms` are deprecated compatibility aliases for handoff age, not active resume duration.
 
 Do not claim behavioral cloning or continuity improvement from event volume alone. Promote only after longitudinal metrics improve without increasing correction rate.
 

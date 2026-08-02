@@ -1,0 +1,22 @@
+{"phase": "warmup", "summary": {"count": 40, "cross_user_scope_rate": 0.25, "equivalent_memory": {"mrr_at_10": 0.549375, "top1": 0.45, "top10": 0.775, "top5": 0.75}, "http_success_rate": 1.0, "latency_ms": {"max": 1202.0, "mean": 558.7, "p50": 458.59, "p95": 1110.22, "p99": 1202.0}, "planner_used_rate": 0.0, "strict_event": {"mrr_at_10": 0.469375, "top1": 0.375, "top10": 0.675, "top5": 0.65}}}
+{"completed": 500, "elapsed_seconds": 20.0, "http_failures": 0, "phase": "benchmark", "requests_per_second": 25.04, "total": 10000}
+{"completed": 1000, "elapsed_seconds": 40.7, "http_failures": 0, "phase": "benchmark", "requests_per_second": 24.54, "total": 10000}
+{"completed": 1500, "elapsed_seconds": 61.3, "http_failures": 0, "phase": "benchmark", "requests_per_second": 24.46, "total": 10000}
+{"completed": 2000, "elapsed_seconds": 77.2, "http_failures": 0, "phase": "benchmark", "requests_per_second": 25.92, "total": 10000}
+{"completed": 2500, "elapsed_seconds": 92.1, "http_failures": 0, "phase": "benchmark", "requests_per_second": 27.15, "total": 10000}
+{"completed": 3000, "elapsed_seconds": 105.4, "http_failures": 0, "phase": "benchmark", "requests_per_second": 28.46, "total": 10000}
+{"completed": 3500, "elapsed_seconds": 119.2, "http_failures": 0, "phase": "benchmark", "requests_per_second": 29.36, "total": 10000}
+{"completed": 4000, "elapsed_seconds": 133.0, "http_failures": 0, "phase": "benchmark", "requests_per_second": 30.08, "total": 10000}
+{"completed": 4500, "elapsed_seconds": 147.3, "http_failures": 0, "phase": "benchmark", "requests_per_second": 30.54, "total": 10000}
+{"completed": 5000, "elapsed_seconds": 160.4, "http_failures": 0, "phase": "benchmark", "requests_per_second": 31.17, "total": 10000}
+{"completed": 5500, "elapsed_seconds": 175.2, "http_failures": 0, "phase": "benchmark", "requests_per_second": 31.4, "total": 10000}
+{"completed": 6000, "elapsed_seconds": 189.4, "http_failures": 0, "phase": "benchmark", "requests_per_second": 31.68, "total": 10000}
+{"completed": 6500, "elapsed_seconds": 203.7, "http_failures": 0, "phase": "benchmark", "requests_per_second": 31.91, "total": 10000}
+{"completed": 7000, "elapsed_seconds": 217.2, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.23, "total": 10000}
+{"completed": 7500, "elapsed_seconds": 231.5, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.4, "total": 10000}
+{"completed": 8000, "elapsed_seconds": 245.9, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.54, "total": 10000}
+{"completed": 8500, "elapsed_seconds": 260.2, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.67, "total": 10000}
+{"completed": 9000, "elapsed_seconds": 274.1, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.83, "total": 10000}
+{"completed": 9500, "elapsed_seconds": 289.0, "http_failures": 0, "phase": "benchmark", "requests_per_second": 32.87, "total": 10000}
+{"completed": 10000, "elapsed_seconds": 302.8, "http_failures": 0, "phase": "benchmark", "requests_per_second": 33.02, "total": 10000}
+{"output": "/Users/joeljoseph/.cache/open-timeline-engine/tce-10k-eval-readpath-20260730T213629Z.json", "phase": "complete", "summary": {"count": 10000, "cross_user_scope_rate": 0.2519, "equivalent_memory": {"mrr_at_10": 0.425128, "top1": 0.3188, "top10": 0.6974, "top5": 0.5655}, "http_success_rate": 1.0, "latency_ms": {"max": 1086.11, "mean": 242.11, "p50": 216.75, "p95": 450.84, "p99": 609.18}, "planner_used_rate": 0.0, "strict_event": {"mrr_at_10": 0.365222, "top1": 0.2591, "top10": 0.6384, "top5": 0.5023}}}

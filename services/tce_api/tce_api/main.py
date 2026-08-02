@@ -89,6 +89,13 @@ from tce_shared.behavior_pilot import (
     sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.dreams import (
+    DreamSeed,
+    DreamSignals,
+    cluster_recurring_asks,
+    derive_dream_seeds,
+    select_dream_to_pursue,
+)
 from tce_shared.events import (
     AgentRole,
     AutonomyGoalSource,
@@ -224,9 +231,17 @@ from tce_shared.handoff import (
     normalize_objective_text,
     rank_resume_candidates,
 )
+from tce_shared.plan_decomposition import (
+    PLAN_DECOMPOSITION_PROMPT,
+    PlanStep,
+    fallback_plan_steps,
+    parse_plan_steps,
+)
+from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
+    OBJECTIVE_PLACEHOLDER_VALUES,
     build_decisive_response,
     build_next_action,
     classify_text,
@@ -234,6 +249,7 @@ from tce_shared.takeover import (
     contains_phrase,
     ensure_takeover_response,
     evaluate_safety,
+    is_self_referential_event,
     mode_override,
     next_expiry,
     normalize_text,
@@ -314,7 +330,7 @@ from .continuity_store import (
     record_resume_attempt,
     record_resume_progress,
 )
-from .crypto import maybe_encrypt_payload
+from .crypto import maybe_decrypt_payload, maybe_encrypt_payload
 from .db import get_db, get_session_factory
 from .graph import (
     graph_for_event,
@@ -467,6 +483,11 @@ _APP_START_TIME = time.monotonic()
 
 REQUEST_COUNT = PromCounter("tce_api_requests_total", "Total API requests", ["endpoint", "method"])
 REQUEST_LATENCY = Histogram("tce_api_request_latency_seconds", "API request latency", ["endpoint", "method"])
+SEARCH_RETRIEVAL_SOURCE_COUNT = PromCounter(
+    "tce_api_search_retrieval_total",
+    "Search retrieval channel",
+    ["source", "lexical_channel"],
+)
 TAKEOVER_FAST_PATH_MS = Histogram("tce_api_takeover_fast_path_seconds", "Takeover fast-path latency seconds")
 TAKEOVER_DELIBERATION_MS = Histogram("tce_api_takeover_deliberation_seconds", "Takeover deliberation latency seconds")
 TAKEOVER_TOTAL_MS = Histogram("tce_api_takeover_total_seconds", "Takeover total latency seconds")
@@ -3646,6 +3667,7 @@ def _auto_capture_interaction_sync(
             "citations": [str(item) for item in (citations or [])],
         }
 
+    project_context = project_context_from_payload(request_payload)
     event = EventEnvelope(
         schema_version=1,
         ts=datetime.now(tz=UTC),
@@ -3661,6 +3683,8 @@ def _auto_capture_interaction_sync(
             "user": auth_user_id,
             "consumer": auth_consumer,
             "role": auth_role_value,
+            "input_origin": "executor_relay" if action == "takeover_step" else "system",
+            **project_context,
         },
         inputs={},
         steps=[],
@@ -4121,6 +4145,10 @@ def search(
         auth.consumer, auth.role, workspace_id=auth.workspace_id, owner_id=auth.user_id
     )
     hits, citations, blocked, retrieval_meta = run_search(db, body, consumer_ctx, policy_engine)
+    SEARCH_RETRIEVAL_SOURCE_COUNT.labels(
+        source=str(retrieval_meta.get("source") or "none"),
+        lexical_channel=str(retrieval_meta.get("lexical_channel") or "none"),
+    ).inc()
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="search", method="POST").observe(latency_ms / 1000)
     policy_summary = {
@@ -4357,6 +4385,19 @@ def capture_completion(
     milestone = dict(normalized["normalized"])
     milestone["change_summary_json"] = dict(body.change_summary or {})
     milestone["source"] = body.source
+    takeover_context = db.execute(
+        text(
+            """
+            SELECT takeover_context FROM takeover_sessions
+            WHERE session_id = :session_id AND workspace_id = :workspace_id AND user_id = :user_id
+            """
+        ),
+        {"session_id": body.session_id, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
+    ).scalar()
+    if isinstance(takeover_context, dict):
+        project_context = canonical_project_context(takeover_context.get("project_context"))
+        if project_context:
+            milestone["project_context"] = project_context
     now = datetime.now(tz=UTC)
     outbox = enqueue_handoff(
         db,
@@ -10514,6 +10555,7 @@ def takeover_autonomy_tick(
         ).mappings().all()
         sessions = [str(row["session_id"]) for row in rows]
     goals_refreshed = 0
+    dreams_pursued = 0
     notices_created = 0
     dedupe_cutoff = now - timedelta(minutes=max(1, int(settings.takeover_notice_dedupe_minutes)))
     threshold = float(settings.takeover_notice_threshold)
@@ -10534,6 +10576,23 @@ def takeover_autonomy_tick(
             include_open_discovery=body.include_open_discovery,
         )
         goals_refreshed += 1
+        # Dream in the gap. With no plan in flight and nothing pinned, form aspirations
+        # from what the system can observe about itself and turn the strongest into an
+        # ordered plan. The plan machinery then walks it exactly as a user-given
+        # objective, so a dream is pursued the same way anything else is.
+        if bool(getattr(settings, "takeover_plan_enabled", False)) and not state.active_goal_id:
+            try:
+                pursued = _dream_and_pursue(db, auth=auth, state=state)
+                if pursued:
+                    dreams_pursued += 1
+                    next_step = _select_next_plan_step(db, state)
+                    if next_step is not None:
+                        state.active_goal_id = next_step.id
+                        save_takeover_state(db, state)
+                        db.commit()
+            except Exception:
+                # Dreaming is strictly optional; never let it break the tick.
+                logger.warning("dream pursuit failed", exc_info=True)
         top_goal = goals[0] if goals else None
         if (
             top_goal is not None
@@ -11725,6 +11784,9 @@ def takeover_execution_report(
         state.objective_hash = ""
         state.goal_queue_size = max(0, int(state.goal_queue_size or 0) - 1)
         _invalidate_goal_queue_cache(db, auth=auth, state=state)
+        # Must run last: it overrides awaiting_next_objective / objective / objective_hash
+        # that the lines above just set, which is the whole point of a plan.
+        _advance_plan_after_completion(db, auth=auth, state=state, context=context)
     state.takeover_context = context
     _sync_enforcement_counters(db, state)
     save_takeover_state(db, state)
@@ -12184,6 +12246,11 @@ def _discover_takeover_goals(
         fingerprint = None
 
     objective = str(state.takeover_context.get("objective", "")).strip()
+    # A placeholder objective ("continue active objective") is what the state carries
+    # when takeover was activated without a task. Promoting it to a goal made the
+    # top-ranked entry in the queue a tautology that points back at the queue.
+    if normalize_text(objective) in OBJECTIVE_PLACEHOLDER_VALUES:
+        objective = ""
     if objective:
         priority = score_goal(urgency=0.9, recency=0.85, blocker_impact=0.8, success_probability=0.75)
         candidates[f"user:{objective.lower()}"] = {
@@ -12209,6 +12276,15 @@ def _discover_takeover_goals(
                 FROM events
                 WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
                   AND sensitivity <= :max_sensitivity
+                  -- Exclude TCE's own telemetry. Every takeover step, search, and
+                  -- context-bundle call writes an interaction event, so these are the
+                  -- highest-frequency rows in the table. The filter has to happen in
+                  -- SQL rather than after the fact: post-filtering a recency-ordered
+                  -- LIMIT would leave almost no real work, which is how discovery came
+                  -- to return 36/40 goals that were records of TCE running.
+                  AND COALESCE(task_type, '') NOT LIKE 'interaction\\_%'
+                  AND COALESCE(title, '') NOT LIKE 'Interaction:%'
+                  AND COALESCE(title, '') !~* '^directive\\s+[a-z_]+:'
                 ORDER BY ts DESC
                 LIMIT 120
                 """
@@ -12219,6 +12295,10 @@ def _discover_takeover_goals(
             event_type = str(row["event_type"] or "").upper()
             title = str(row["title"] or "").strip()
             if not title:
+                continue
+            # Defence in depth: the SQL above already excludes TCE's own telemetry,
+            # but this keeps the invariant true if that predicate is ever loosened.
+            if is_self_referential_event(title, str(row["task_type"] or "")):
                 continue
             ts_value = row["ts"]
             if isinstance(ts_value, datetime):
@@ -12310,6 +12390,11 @@ def _discover_takeover_goals(
               AND workspace_id = :workspace_id
               AND user_id = :user_id
               AND status = :candidate_status
+              -- Plan rows are never dropped by discovery. A plan is authored once and
+              -- walked to completion; without this clause it would survive at most one
+              -- discovery pass, and it would fail silently because interactive testing
+              -- hits the goal cache and never sees the wipe.
+              AND step_index IS NULL
             """
         ),
         {
@@ -12458,6 +12543,15 @@ def _list_takeover_goals(
     if status is not None:
         status_clause = " AND status = :status "
         params["status"] = status.value
+    else:
+        # With no explicit filter this is the working queue, so terminal goals must not
+        # appear. Discovery marks the previous batch DROPPED before inserting the new
+        # one, and returning both made every goal show up twice in the queue.
+        status_clause = (
+            " AND status NOT IN (:excluded_dropped, :excluded_done) "
+        )
+        params["excluded_dropped"] = AutonomyGoalStatus.DROPPED.value
+        params["excluded_done"] = AutonomyGoalStatus.DONE.value
     rows = db.execute(
         text(
             f"""
@@ -12697,6 +12791,771 @@ def _load_active_goal(db: Session, state: TakeoverState) -> TakeoverGoal | None:
         },
     ).mappings().first()
     return _goal_from_row(row) if row else None
+
+
+def _write_objective_plan(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    objective: str,
+) -> str | None:
+    """Decompose an objective into ordered steps and store them. Returns the root id.
+
+    The root row carries ``step_index = 0`` and the steps ``1..N`` under
+    ``parent_goal_id = root``. ``step_index IS NOT NULL`` is what marks a row as part
+    of a plan, which is also what protects the whole plan from the discovery wipe —
+    ``parent_goal_id IS NULL`` could not do that job, because the root has a null
+    parent too.
+
+    Decomposition currently uses the deterministic fallback only. That is on purpose:
+    a plan must always exist, so the path that produces one may not depend on a model
+    being present, fast, or coherent.
+    """
+    cleaned = " ".join((objective or "").split()).strip()
+    if not cleaned or normalize_text(cleaned) in OBJECTIVE_PLACEHOLDER_VALUES:
+        return None
+    settings_obj = get_settings()
+    max_steps = max(2, int(getattr(settings_obj, "takeover_plan_max_steps", 8)))
+
+    steps: list[PlanStep] = []
+    if bool(getattr(settings_obj, "takeover_plan_llm_enabled", False)) and _plan_model_available(
+        settings_obj
+    ):
+        try:
+            # A clamped settings clone: the configured advisor timeout is 90s, which
+            # would block the request thread for a minute and a half on a slow model.
+            gateway = get_model_gateway(_plan_gateway_settings(settings_obj))
+            payload = gateway.extract_structured(
+                PLAN_DECOMPOSITION_PROMPT.replace("{objective}", cleaned[:2000]),
+                "plan_decomposition_v1",
+            )
+            steps = parse_plan_steps(payload, max_steps=max_steps)
+        except Exception:
+            logger.warning("model plan decomposition failed; using fallback", exc_info=True)
+    if not steps:
+        # Unconditional safety net. A model may be absent, slow, or incoherent; a plan
+        # must exist regardless, so this path has no failure mode.
+        steps = fallback_plan_steps(cleaned)[:max_steps]
+    if not steps:
+        return None
+
+    now = datetime.now(tz=UTC)
+    root_id = uuid.uuid4()
+
+    def _insert(goal_id: uuid.UUID, parent: uuid.UUID | None, step_index: int,
+                title: str, description: str, status: str) -> None:
+        db.execute(
+            text(
+                """
+                INSERT INTO autonomy_goals(
+                    id, session_id, workspace_id, user_id, title, description,
+                    source, priority_score, risk_tier, confidence, reasoning,
+                    evidence_event_ids, goal_kind, affective_scores, selection_score,
+                    goal_signature, cache_hit, cache_source, status, created_at,
+                    updated_at, parent_goal_id, step_index
+                )
+                VALUES(
+                    :id, :session_id, :workspace_id, :user_id, :title, :description,
+                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
+                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
+                    :selection_score, :goal_signature, :cache_hit, :cache_source,
+                    :status, :created_at, :updated_at, :parent_goal_id, :step_index
+                )
+                """
+            ),
+            {
+                "id": goal_id,
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "title": sanitize_untrusted_objective(title, max_len=140),
+                "description": sanitize_untrusted_objective(description, max_len=240),
+                "source": AutonomyGoalSource.USER_OBJECTIVE.value,
+                "priority_score": 0.9,
+                "risk_tier": AutonomyRiskTier.MEDIUM.value,
+                "confidence": 0.85,
+                "reasoning": "Ordered plan step derived from the user objective.",
+                "evidence_event_ids": [],
+                "goal_kind": GoalKind.NORMAL.value,
+                "affective_scores": json.dumps({}),
+                # Plan order comes from step_index, not from this score; it is set high
+                # only so the plan reads sensibly in the dashboard queue.
+                "selection_score": 0.9,
+                "goal_signature": hashlib.sha256(
+                    f"plan|{root_id}|{step_index}|{title}".encode()
+                ).hexdigest()[:24],
+                "cache_hit": False,
+                "cache_source": "plan",
+                "status": status,
+                "created_at": now,
+                "updated_at": now,
+                "parent_goal_id": parent,
+                "step_index": step_index,
+            },
+        )
+
+    _insert(root_id, None, 0, cleaned[:140], cleaned[:240], AutonomyGoalStatus.SELECTED.value)
+    for step in steps:
+        _insert(
+            uuid.uuid4(), root_id, step.step_index, step.title, step.description,
+            AutonomyGoalStatus.CANDIDATE.value,
+        )
+
+    state.takeover_context["plan_root_goal_id"] = str(root_id)
+    state.takeover_context["plan_step_count"] = len(steps)
+    # A fresh plan behind a stale cached queue would be invisible for the cache TTL.
+    _invalidate_goal_queue_cache(db, auth=auth, state=state)
+    # Commit the plan on its own, as goal discovery already does. Later stages of the
+    # same request can roll the session back (the audit-log writer does this on
+    # failure), and because the state is re-saved afterwards the pointer would survive
+    # while the rows it points at silently did not — a plan that exists in state and
+    # nowhere else. Observed exactly that before this line was added.
+    db.commit()
+    return str(root_id)
+
+
+PLAN_DREAM_STEP_INDEX = -1
+"""Marks a stored aspiration. Plan roots are 0 and steps are 1..N, so a dream that
+gets pursued simply becomes a root; no separate table or wire field is needed."""
+
+
+def _gather_dream_signals(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> DreamSignals:
+    """Observe the system's own situation. Every number here becomes a rationale."""
+
+    project = canonical_project_context(state.takeover_context.get("project_context"))
+    project_id = project.get("project_id", "")
+    if not project_id:
+        return DreamSignals()
+
+    def _count(sql: str, params: dict[str, Any] | None = None) -> int:
+        try:
+            return int(db.execute(text(sql), params or {}).scalar() or 0)
+        except Exception:
+            # Dreaming is best-effort: a missing table must not break the tick.
+            logger.warning("dream signal query failed", exc_info=True)
+            return 0
+
+    project_params = {"project_id": project_id}
+    total_events = _count(
+        "SELECT count(*) FROM events WHERE context->>'project_id' = :project_id",
+        project_params,
+    )
+    embedded = _count(
+        """
+        SELECT count(*) FROM event_embeddings ee
+        JOIN events e ON e.id = ee.event_id
+        WHERE e.context->>'project_id' = :project_id
+        """,
+        project_params,
+    )
+    failed = _count(
+        """
+        SELECT count(*) FROM directive_executions
+        WHERE workspace_id = :workspace_id AND session_id = :session_id AND state = 'failed'
+        """,
+        {"workspace_id": auth.workspace_id, "session_id": state.session_id},
+    )
+    stalled = _count(
+        """
+        SELECT count(*) FROM autonomy_goals
+        WHERE workspace_id = :workspace_id
+          AND session_id = :session_id
+          AND status = :candidate
+          AND step_index IS NULL
+          AND updated_at < :cutoff
+        """,
+        {
+            "workspace_id": auth.workspace_id,
+            "session_id": state.session_id,
+            "candidate": AutonomyGoalStatus.CANDIDATE.value,
+            "cutoff": datetime.now(tz=UTC) - timedelta(days=1),
+        },
+    )
+    asks: list[tuple[str, str]] = []
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, payload #>> '{request,message}' AS message
+                FROM events
+                WHERE context->>'project_id' = :project_id
+                  AND source = 'api-auto-capture'
+                  AND task_type = 'interaction_takeover_step'
+                  AND context->>'input_origin' = 'executor_relay'
+                  AND COALESCE(payload #>> '{request,message}', '') <> ''
+                ORDER BY ts ASC
+                LIMIT 200
+                """
+            ),
+            project_params,
+        ).mappings().all()
+        asks = [(str(row["id"]), str(row["message"])) for row in rows]
+    except Exception:
+        logger.warning("dream project ask query failed", exc_info=True)
+
+    return DreamSignals(
+        failed_unretried_directives=failed,
+        unembedded_events=max(0, total_events - embedded),
+        recurring_domains=(),
+        stalled_goals=stalled,
+        total_events=total_events,
+        project_id=project_id,
+        project_name=project.get("project", ""),
+        recurring_asks=cluster_recurring_asks(asks),
+    )
+
+
+def _store_dreams(
+    db: Session, *, auth: AuthContext, state: TakeoverState, dreams: list[DreamSeed]
+) -> int:
+    """Persist aspirations, replacing any previous set for this session."""
+    now = datetime.now(tz=UTC)
+    db.execute(
+        text(
+            """
+            DELETE FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": auth.workspace_id,
+            "user_id": auth.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+        },
+    )
+    for dream in dreams:
+        db.execute(
+            text(
+                """
+                INSERT INTO autonomy_goals(
+                    id, session_id, workspace_id, user_id, title, description,
+                    source, priority_score, risk_tier, confidence, reasoning,
+                    evidence_event_ids, goal_kind, affective_scores, selection_score,
+                    goal_signature, cache_hit, cache_source, status, created_at,
+                    updated_at, parent_goal_id, step_index
+                )
+                VALUES(
+                    :id, :session_id, :workspace_id, :user_id, :title, :description,
+                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
+                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
+                    :selection_score, :goal_signature, :cache_hit, :cache_source,
+                    :status, :created_at, :updated_at, NULL, :step_index
+                )
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "title": sanitize_untrusted_objective(dream.title, max_len=140),
+                "description": sanitize_untrusted_objective(dream.description, max_len=240),
+                "source": AutonomyGoalSource.OPEN_DISCOVERY.value,
+                "priority_score": float(dream.weight),
+                "risk_tier": AutonomyRiskTier.LOW.value,
+                "confidence": float(dream.weight),
+                "reasoning": dream.rationale[:400],
+                "evidence_event_ids": [str(value) for value in dream.evidence_event_ids],
+                "goal_kind": GoalKind.NORMAL.value,
+                "affective_scores": json.dumps({}),
+                "selection_score": float(dream.weight),
+                "goal_signature": hashlib.sha256(
+                    f"dream|{state.session_id}|{dream.project_id}|{dream.title}".encode()
+                ).hexdigest()[:24],
+                "cache_hit": False,
+                "cache_source": f"dream:{dream.project_id or 'project'}",
+                "status": AutonomyGoalStatus.CANDIDATE.value,
+                "created_at": now,
+                "updated_at": now,
+                "step_index": PLAN_DREAM_STEP_INDEX,
+            },
+        )
+    db.commit()
+    return len(dreams)
+
+
+def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]:
+    project = canonical_project_context(state.takeover_context.get("project_context"))
+    project_id = project.get("project_id", "")
+    if not project_id:
+        return []
+    rows = db.execute(
+        text(
+            """
+            SELECT title, description, reasoning, selection_score, evidence_event_ids
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+              AND status = :candidate
+              AND cache_source = :cache_source
+            ORDER BY selection_score DESC
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+            "candidate": AutonomyGoalStatus.CANDIDATE.value,
+            "cache_source": f"dream:{project_id}",
+        },
+    ).mappings().all()
+    return [
+        DreamSeed(
+            title=str(r["title"]),
+            description=str(r["description"]),
+            rationale=str(r["reasoning"] or ""),
+            weight=float(r["selection_score"] or 0.0),
+            evidence_event_ids=tuple(str(value) for value in (r["evidence_event_ids"] or [])),
+            project_id=project_id,
+        )
+        for r in rows
+    ]
+
+
+def _plan_model_available(settings_obj: Any) -> bool:
+    """True when the configured provider can actually be called.
+
+    Without this, enabling the model paths by default makes every plan and dream call
+    block for the full timeout before falling back, on any machine that has no key.
+    """
+    provider = str(
+        getattr(settings_obj, "takeover_plan_llm_provider", "")
+        or getattr(settings_obj, "model_provider", "ollama")
+    ).strip().lower()
+    if provider == "openai":
+        return bool(str(getattr(settings_obj, "openai_api_key", "") or "").strip())
+    if provider == "anthropic":
+        return bool(str(getattr(settings_obj, "anthropic_api_key", "") or "").strip())
+    return True  # a local provider is reachable or it is not; the call finds out
+
+
+def _plan_gateway_settings(settings_obj: Any) -> Any:
+    """Clamped settings clone for plan/dream model calls.
+
+    The configured advisor timeout is 90s, which would block a request thread for a
+    minute and a half. Provider is configurable so a hosted API can be used instead of
+    a local model.
+    """
+    provider = str(
+        getattr(settings_obj, "takeover_plan_llm_provider", "")
+        or getattr(settings_obj, "model_provider", "ollama")
+    ).strip().lower()
+    return SimpleNamespace(
+        model_provider=provider,
+        ollama_url=getattr(settings_obj, "ollama_url", "http://ollama:11434"),
+        embed_model=getattr(settings_obj, "embed_model", "mxbai-embed-large"),
+        extract_model=getattr(settings_obj, "extract_model", "qwen2.5:3b"),
+        openai_api_key=getattr(settings_obj, "openai_api_key", ""),
+        openai_embed_model=getattr(settings_obj, "openai_embed_model", "text-embedding-3-small"),
+        openai_extract_model=getattr(settings_obj, "openai_extract_model", "gpt-4o-mini"),
+        openai_base_url=getattr(settings_obj, "openai_base_url", None),
+        anthropic_api_key=getattr(settings_obj, "anthropic_api_key", ""),
+        anthropic_extract_model=getattr(
+            settings_obj, "anthropic_extract_model", "claude-haiku-4-5-20251001"
+        ),
+        advisor_timeout_seconds=float(
+            getattr(settings_obj, "takeover_plan_llm_timeout_seconds", 25)
+        ),
+        advisor_attempt_timeout_ms=0,
+        advisor_read_timeout_ms=0,
+        redis_url=getattr(settings_obj, "redis_url", ""),
+    )
+
+
+DREAM_PROMPT = """Below are real messages a developer sent to their coding assistant, newest first.
+
+Work out what this person is actually trying to get done. Not what they asked for in any
+one message -- what they keep returning to.
+
+Then write it the way THEY would write it. Look at how they type in these messages and
+match it. They are one person building alone, at a keyboard, with no team.
+
+Hard rules on wording:
+- Write it as they'd say it out loud. Short. Plain. Lower case is fine.
+- Name the actual thing. "get the witness engine in front of someone" beats
+  "validate market positioning". "stop the CI failing" beats "improve pipeline health".
+- Banned words: comprehensive, leverage, stakeholder, framework, roadmap, strategy,
+  ecosystem, robust, holistic, real-world, best practice, optimize, streamline.
+- No Title Case. No consultant voice. If it reads like a slide, rewrite it.
+- It has to be something they could have typed themselves.
+
+Hard rules on content:
+- Only name something you can point at specific messages for.
+- Ignore interruptions, pasted links, one-word replies and tool output.
+- Something said once but clearly counts for more than boilerplate repeated ten times.
+- If nothing clear comes through, return an empty list. That is a good answer.
+- At most 3.
+
+Messages:
+__MESSAGES__
+
+Reply with JSON only:
+{"dreams": [{"title": "the goal, in their words", "why": "what makes you say that",
+"message_numbers": [1, 4, 9]}]}
+"""
+
+
+def _recent_messages_for_dreaming(
+    db: Session, *, limit: int = 60
+) -> list[tuple[str, str]]:
+    """Return (event_id, the real message text) for recent human messages.
+
+    Reads the encrypted payload rather than the title. `title` caps at 150 characters
+    and a quarter of rows sit at that ceiling, so every earlier attempt at this was
+    reading sentence fragments — and the longest, most considered messages, the ones
+    most likely to say what someone wants, were exactly the ones cut off.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT id, payload
+            FROM events
+            WHERE task_type = 'human_input_backfill'
+              AND sensitivity <= :max_sensitivity
+            ORDER BY ts DESC
+            LIMIT :limit
+            """
+        ),
+        {"max_sensitivity": settings.block_sensitivity - 1, "limit": limit},
+    ).mappings().all()
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            payload = maybe_decrypt_payload(row["payload"] or {})
+        except Exception:
+            continue
+        body = str(payload.get("input_excerpt") or "").strip()
+        if len(body) < 25:
+            continue  # acknowledgements, not intentions
+        out.append((str(row["id"]), body[:1200]))
+    return out
+
+
+def _dreams_from_own_words(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> list[DreamSeed]:
+    """Ask the model what this person keeps trying to achieve, and make it cite them.
+
+    Noticing a throughline across fifty messages is what a model is for, and what
+    counting cannot do: frequency in a chat log ranks boilerplate first, because
+    boilerplate is the only thing that repeats word for word.
+    """
+    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
+        return []
+    if not _plan_model_available(settings):
+        return []
+    messages = _recent_messages_for_dreaming(db)
+    if len(messages) < 10:
+        return []
+    numbered = "\n\n".join(f"{i}. {body}" for i, (_, body) in enumerate(messages, start=1))
+    try:
+        gateway = get_model_gateway(_plan_gateway_settings(settings))
+        payload = gateway.extract_structured(
+            DREAM_PROMPT.replace("__MESSAGES__", numbered[:24000]), "dream_formation_v1"
+        )
+    except Exception:
+        logger.warning("dream formation from own words failed", exc_info=True)
+        return []
+
+    raw = payload.get("dreams") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    seeds: list[DreamSeed] = []
+    for item in raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        why = str(item.get("why") or "").strip()
+        numbers = item.get("message_numbers")
+        if not title or not isinstance(numbers, list) or not numbers:
+            continue  # no citation, no dream
+        cited = [
+            messages[int(n) - 1][0]
+            for n in numbers[:10]
+            if str(n).lstrip("-").isdigit() and 0 <= int(n) - 1 < len(messages)
+        ]
+        if not cited:
+            continue  # cited nothing that exists
+        seeds.append(
+            DreamSeed(
+                title=title[:140],
+                description=(why or title)[:240],
+                rationale=f"From {len(cited)} of your own messages. {why}"[:400],
+                # Confidence follows how much of the person's own writing backs it.
+                weight=min(0.95, 0.55 + (0.08 * len(cited))),
+                evidence_event_ids=tuple(cited),
+                project_id=str(state.takeover_context.get("project") or ""),
+            )
+        )
+    return seeds
+
+
+def _nothing_left_to_do(db: Session, *, auth: AuthContext, state: TakeoverState) -> bool:
+    """True only when there is genuinely no outstanding work and no open question.
+
+    Dreaming is what you do when the desk is clear. Firing it on a timer means
+    inventing new wants while real work is still queued, and paying for a model call
+    to do it. Every condition below is something that must be finished or answered
+    first, and any one of them being true means stay quiet.
+    """
+    context = state.takeover_context or {}
+    # An unanswered question to the user outranks anything the system might want.
+    if context.get("pending_safety"):
+        return False
+    if state.active_goal_id or context.get("plan_root_goal_id"):
+        return False
+
+    pending_directives = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM directive_executions
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND state IN ('pending', 'in_progress')
+                """
+            ),
+            {"session_id": state.session_id, "workspace_id": auth.workspace_id},
+        ).scalar()
+        or 0
+    )
+    if pending_directives:
+        return False
+
+    # A notice already raised and not acknowledged is a question awaiting an answer.
+    open_notices = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM autonomy_notices
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND user_id = :user_id
+                  AND acknowledged_at IS NULL
+                  AND (expires_at IS NULL OR expires_at >= :now)
+                """
+            ),
+            {
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "now": datetime.now(tz=UTC),
+            },
+        ).scalar()
+        or 0
+    )
+    if open_notices:
+        return False
+
+    # Work the user actually asked for comes before anything invented. Auto-discovered
+    # candidates deliberately do NOT count: they are guesses derived from event rows,
+    # and treating them as outstanding work would mean the queue is never empty and the
+    # system never dreams at all — which is exactly what happened before this filter.
+    user_goals = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM autonomy_goals
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND user_id = :user_id
+                  AND status = :candidate
+                  AND step_index IS NULL
+                  AND source = :user_objective
+                """
+            ),
+            {
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "candidate": AutonomyGoalStatus.CANDIDATE.value,
+                "user_objective": AutonomyGoalSource.USER_OBJECTIVE.value,
+            },
+        ).scalar()
+        or 0
+    )
+    return user_goals == 0
+
+
+def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
+    """Form aspirations when idle, then turn the strongest into an ordered plan.
+
+    This is the whole loop in one place: observe -> want -> plan -> (the existing
+    machinery then walks the plan to completion). Returns the pursued dream's title.
+    """
+    if not _nothing_left_to_do(db, auth=auth, state=state):
+        return None  # work or an open question outranks anything it might want
+    dreams = _load_stored_dreams(db, state=state)
+    if not dreams:
+        # Read what the person actually wrote first. Counting rows only ever produced
+        # things like "advance a folder"; the throughline across many messages is the
+        # part a model can see and arithmetic cannot.
+        dreams = _dreams_from_own_words(db, auth=auth, state=state)
+        if not dreams:
+            dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth, state=state))
+        if dreams:
+            _store_dreams(db, auth=auth, state=state, dreams=dreams)
+    chosen = select_dream_to_pursue(dreams, has_active_plan=False)
+    if chosen is None:
+        return None
+    root_id = _write_objective_plan(db, auth=auth, state=state, objective=chosen.title)
+    if root_id is None:
+        return None
+    state.takeover_context["pursued_dream"] = chosen.title
+    state.takeover_context["pursued_dream_rationale"] = chosen.rationale
+    # The dream has become a plan; retire it so it is not pursued twice.
+    db.execute(
+        text(
+            """
+            UPDATE autonomy_goals
+            SET status = :done, updated_at = :now
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND step_index = :dream_index
+              AND title = :title
+            """
+        ),
+        {
+            "done": AutonomyGoalStatus.DONE.value,
+            "now": datetime.now(tz=UTC),
+            "session_id": state.session_id,
+            "workspace_id": auth.workspace_id,
+            "user_id": auth.user_id,
+            "dream_index": PLAN_DREAM_STEP_INDEX,
+            "title": sanitize_untrusted_objective(chosen.title, max_len=140),
+        },
+    )
+    db.commit()
+    return chosen.title
+
+
+def _advance_plan_after_completion(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    context: dict[str, Any],
+) -> None:
+    """After a step completes, pin the next one instead of waiting for a new objective.
+
+    The generic completion path sets ``awaiting_next_objective`` and drops the
+    objective, which is right when work is one-off and wrong when it is a plan: the
+    point of a plan is that finishing floor 1 tells you to build floor 2. This
+    overrides those three fields, so it must run last in the SUCCEEDED block.
+
+    When no steps remain the plan is finished: the root is marked done and the pointer
+    cleared, so the next objective starts a fresh plan rather than resurrecting this one.
+    """
+    root_id = str(context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return
+    # _select_next_plan_step reads the pointer off state, which is only assigned from
+    # `context` after this block, so keep them in sync before querying.
+    state.takeover_context = context
+    next_step = _select_next_plan_step(db, state)
+    if next_step is not None:
+        state.active_goal_id = next_step.id
+        context["objective"] = next_step.title
+        context["awaiting_next_objective"] = False
+        context["awaiting_next_objective_turns"] = 0
+        state.objective_hash = objective_hash(next_step.title)
+        return
+
+    db.execute(
+        text(
+            """
+            UPDATE autonomy_goals
+            SET status = :status, updated_at = :updated_at
+            WHERE id = CAST(:id AS uuid)
+              AND session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+            """
+        ),
+        {
+            "status": AutonomyGoalStatus.DONE.value,
+            "updated_at": datetime.now(tz=UTC),
+            "id": root_id,
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+        },
+    )
+    context.pop("plan_root_goal_id", None)
+    context.pop("plan_step_count", None)
+    context["plan_completed_at"] = datetime.now(tz=UTC).isoformat()
+    # Clear the objective as well. The final step's title is still sitting in context,
+    # and leaving it there makes the next turn author a brand new plan *from that step*
+    # — the plan finishes, then immediately restarts as "verify the outcome", forever.
+    # Wait for a genuinely new objective instead.
+    context.pop("objective", None)
+    context["awaiting_next_objective"] = True
+    context["awaiting_next_objective_turns"] = 0
+    state.objective_hash = ""
+    state.active_goal_id = None
+    _invalidate_goal_queue_cache(db, auth=auth, state=state)
+
+
+def _select_next_plan_step(db: Session, state: TakeoverState) -> TakeoverGoal | None:
+    """Return the next unfinished step of the active plan, or None.
+
+    Because step indexes are contiguous and ordered, the lowest non-terminal step is
+    by definition the one whose predecessors are all finished — no dependency walk is
+    needed at runtime. A completed step can never be returned, which is the whole
+    point: score-ranked selection puts the just-finished item first, a plan does not.
+
+    Deliberately reads the database directly rather than going through
+    ``_discover_takeover_goals``: that function early-returns a cached queue, so plan
+    logic placed behind it would work on cache misses and silently fall back to score
+    ordering on hits.
+    """
+    root_id = str(state.takeover_context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT id, session_id, workspace_id, user_id, title, description, source,
+                   priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
+                   goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   status, created_at, updated_at
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND parent_goal_id = CAST(:root_id AS uuid)
+              AND status NOT IN (:done_status, :dropped_status)
+            ORDER BY step_index ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "root_id": root_id,
+            "done_status": AutonomyGoalStatus.DONE.value,
+            "dropped_status": AutonomyGoalStatus.DROPPED.value,
+        },
+    ).mappings().first()
+    if row is None:
+        return None  # every step finished — the plan is complete
+    if str(row["status"]) == AutonomyGoalStatus.BLOCKED.value:
+        # Stalled, not skippable: building the next floor on an unfinished one is
+        # worse than stopping and surfacing the blocker.
+        return None
+    return _goal_from_row(row)
 
 
 def _find_valid_allow_permit(
@@ -13289,6 +14148,15 @@ def takeover_preload(
         activation_keywords=body.activation_keywords,
         stop_keywords=body.stop_keywords,
     )
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     now = datetime.now(tz=UTC)
     resolved_task = resolve_objective(
         message=body.task,
@@ -13507,6 +14375,15 @@ def takeover_step(
         stop_keywords=body.stop_keywords,
     )
     state_ms = int((time.perf_counter() - state_started) * 1000)
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     snapshot_rehydrated = False
     snapshot_age_hours: int | None = None
 
@@ -13768,10 +14645,44 @@ def takeover_step(
     objective_hash_value = objective_hash(resolved_task)
     objective_changed = objective_hash_value != (state.objective_hash or "")
     selected_goal: TakeoverGoal | None = _load_active_goal(db, state)
+    # A pin left on a finished goal would otherwise be returned forever, which is the
+    # "propose the step you just completed" failure at the pin level. Release it so a
+    # plan step (or discovery) can supply the next objective instead.
+    if selected_goal is not None and selected_goal.status in {
+        AutonomyGoalStatus.DONE,
+        AutonomyGoalStatus.DROPPED,
+    }:
+        selected_goal = None
+        state.active_goal_id = None
+    # Author a plan once per objective. Only when takeover is active, the objective is
+    # real, and no plan is already in flight — re-authoring on every turn would reset
+    # progress, which is exactly the "rebuild floor 1" behaviour this replaces.
+    if (
+        bool(getattr(settings, "takeover_plan_enabled", False))
+        and state.active
+        and not state.takeover_context.get("plan_root_goal_id")
+        # A finished plan leaves this set until the user supplies a real next
+        # objective. Without the guard, "continue" is enough to start another plan.
+        and not (awaiting_next_objective and not has_new_objective_signal)
+        and resolved_task
+        and normalize_text(resolved_task) not in OBJECTIVE_PLACEHOLDER_VALUES
+    ):
+        try:
+            _write_objective_plan(db, auth=auth, state=state, objective=resolved_task)
+        except Exception:
+            # A plan is an optimisation, never a precondition for taking a turn.
+            logger.warning("failed to author objective plan", exc_info=True)
+    plan_step = _select_next_plan_step(db, state) if selected_goal is None else None
+    if plan_step is not None:
+        selected_goal = plan_step
+        state.active_goal_id = plan_step.id
     goal_discovery_every_n_turns = max(6, int(getattr(settings, "takeover_goal_discovery_every_n_turns", 24)))
     periodic_goal_discovery_due = turn_count > 0 and (turn_count % goal_discovery_every_n_turns == 0)
     should_discover = bool(
         state.active
+        # A live plan owns the objective; letting discovery run would wipe the
+        # candidate queue and insert 20 competing event-derived goals beside it.
+        and plan_step is None
         and (not awaiting_next_objective or has_new_objective_signal)
         and (
             selected_goal is None
@@ -14605,6 +15516,25 @@ def takeover_step(
         final_response = (
             "Behavior fidelity is not validated for autonomous continuation. "
             "Confirm the preferred choice or run a behavior fidelity evaluation."
+        )
+    if (
+        needs_human
+        and bool(takeover_enforcement.get("pending_execution_lock"))
+        and safety_decision == SafetyDecision.ALLOW
+        and not actionable_lifecycle_pause
+    ):
+        # The execution lock is applied earlier in this handler, before needs_human has
+        # been computed, so its text unconditionally says "continue execution now". When
+        # the turn then escalates, that stale instruction is what reaches the executor as
+        # next_step — and next_step takes precedence by policy, so the escalation is
+        # silently overridden and a low-confidence turn executes anyway. Keep the lock,
+        # because takeover must never degrade to natural chat, but point the executor at
+        # the human instead of at more execution.
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        final_response = (
+            "Execution lock active for takeover objective, but confidence is below the "
+            "autonomy threshold for this turn. Ask the user how to proceed on this "
+            "objective. Do not execute further and do not switch to natural-response mode."
         )
     if needs_human:
         TAKEOVER_NEEDS_HUMAN_COUNT.inc()

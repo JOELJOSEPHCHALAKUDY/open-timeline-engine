@@ -9,6 +9,7 @@ from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.version import MCP_SCHEMA_VERSION
 
 from .client import TCEApiClient
+from .project_context import with_project_context
 
 client = TCEApiClient()
 _WORKFLOW_HINTS_CACHE_TTL_SECONDS = 30.0
@@ -439,7 +440,7 @@ def search_events(query: str, filters: dict[str, Any] | None = None, k: int = 10
 
 
 def get_context_bundle(task: str, app_context: dict[str, Any] | None = None, constraints: dict[str, Any] | None = None) -> dict[str, Any]:
-    result = client.context_bundle({"task": task, "app_context": app_context or {}, "constraints": constraints or {}})
+    result = client.context_bundle({"task": task, "app_context": with_project_context(app_context), "constraints": constraints or {}})
     return with_schema({"kind": "context_bundle", "bundle": result, "citations": result.get("citations", [])})
 
 
@@ -563,7 +564,7 @@ def get_context_brief(
         {
             "task": task,
             "session_id": session_id,
-            "app_context": app_context or {},
+            "app_context": with_project_context(app_context),
             "constraints": constraints or {},
             "max_items": max_items,
         }
@@ -719,7 +720,7 @@ def get_clone_advice(
     result = client.clone_advice(
         {
             "task": task,
-            "app_context": app_context or {},
+            "app_context": with_project_context(app_context),
             "constraints": constraints or {},
             "takeover_context": takeover_context or {},
             "message_delta": message_delta or {},
@@ -1218,7 +1219,7 @@ def takeover_step(
             "session_id": session_id,
             "persona_mode": persona_mode,
             "task": task,
-            "app_context": app_context or {},
+            "app_context": with_project_context(app_context),
             "constraints": constraints or {},
             "takeover_context": takeover_context or {},
             "message_delta": message_delta or {},
@@ -1283,7 +1284,7 @@ def takeover_preload(
             "session_id": session_id,
             "persona_mode": persona_mode,
             "task": task,
-            "app_context": app_context or {},
+            "app_context": with_project_context(app_context),
             "constraints": constraints or {},
             "activation_keywords": activation_keywords,
             "stop_keywords": stop_keywords,
@@ -1561,6 +1562,7 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
     state = result.get("state", {})
     objective = state.get("takeover_context", {}).get("objective", "")
     turn_count = state.get("takeover_context", {}).get("turn_count", 0)
+    project_context = state.get("takeover_context", {}).get("project_context", {})
 
     slim_state = {
         "session_id": state.get("session_id"),
@@ -1570,6 +1572,7 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "takeover_context": {
             "objective": objective,
             "turn_count": turn_count,
+            "project_context": project_context if isinstance(project_context, dict) else {},
         },
     }
 

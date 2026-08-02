@@ -423,6 +423,17 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE autonomy_goals ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0")
     if not _column_exists(conn, "autonomy_goals", "cache_source"):
         conn.execute("ALTER TABLE autonomy_goals ADD COLUMN cache_source TEXT")
+    # Ordered plan position. Nullable because SQLite cannot add a NOT NULL column
+    # without a constant default, and because NULL is the meaningful value here:
+    # it marks a goal that is not part of a plan.
+    if not _column_exists(conn, "autonomy_goals", "step_index"):
+        conn.execute("ALTER TABLE autonomy_goals ADD COLUMN step_index INTEGER")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_autonomy_goals_plan_step
+            ON autonomy_goals (session_id, workspace_id, user_id, parent_goal_id, step_index)
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS autonomy_goals (
@@ -1038,6 +1049,58 @@ def _seed_lifecycle_defaults(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_events_fts_schema(conn: sqlite3.Connection) -> None:
+    """Create and synchronize the standalone FTS5 event index once."""
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+            event_id UNINDEXED,
+            title,
+            payload,
+            tags,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_insert
+        AFTER INSERT ON events BEGIN
+            INSERT INTO events_fts(event_id, title, payload, tags)
+            VALUES (new.id, new.title, new.payload, new.tags);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_delete
+        AFTER DELETE ON events BEGIN
+            DELETE FROM events_fts WHERE event_id = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS events_fts_update
+        AFTER UPDATE OF title, payload, tags ON events BEGIN
+            DELETE FROM events_fts WHERE event_id = old.id;
+            INSERT INTO events_fts(event_id, title, payload, tags)
+            VALUES (new.id, new.title, new.payload, new.tags);
+        END;
+        """
+    )
+    sentinel = conn.execute(
+        "SELECT 1 FROM runtime_settings WHERE key = 'events_fts_v1_backfilled'"
+    ).fetchone()
+    if sentinel is not None:
+        return
+    conn.execute("DELETE FROM events_fts")
+    conn.execute(
+        """
+        INSERT INTO events_fts(event_id, title, payload, tags)
+        SELECT id, title, payload, tags FROM events
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO runtime_settings(key, value, updated_at)
+        VALUES('events_fts_v1_backfilled', 'true', ?)
+        """,
+        (datetime.now(tz=UTC).isoformat(),),
+    )
+
+
 def init_db() -> None:
     conn = _connect()
     try:
@@ -1448,6 +1511,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE events ADD COLUMN summary_version TEXT NOT NULL DEFAULT 'v1'")
         if not _column_exists(conn, "events", "summary_updated_at"):
             conn.execute("ALTER TABLE events ADD COLUMN summary_updated_at TEXT NOT NULL DEFAULT ''")
+        _ensure_events_fts_schema(conn)
         _ensure_takeover_v3_schema(conn)
         _ensure_behavior_fidelity_schema(conn)
         _ensure_continuity_v04_schema(conn)

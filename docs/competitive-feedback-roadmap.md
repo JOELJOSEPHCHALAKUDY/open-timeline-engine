@@ -2,7 +2,7 @@
 
 This document tracks external product feedback and how Open Timeline Engine responds.
 
-## Latest update (v0.3.0)
+## v0.3.0 update (historical)
 
 - Completed hardening pass for reliability and setup safety:
 - Lazy DB engine initialization in full API, retry/backoff in MCP client, and corrected CI load-test gating.

@@ -9,12 +9,12 @@
 <p align="center">
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white" alt="CI"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License"/></a>
-  <a href="docs/releases.md"><img src="https://img.shields.io/badge/release-v0.3.0_beta-orange" alt="Beta"/></a>
+  <a href="docs/releases.md"><img src="https://img.shields.io/badge/release-v0.4.0_beta-orange" alt="Beta"/></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python"/></a>
   <a href="infra/docker-compose.yml"><img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker"/></a>
 </p>
 
-> Public release track: `v0.3.0` (pre-1.0).
+> Public release track: `v0.4.0` (pre-1.0).
 > Internal labels such as `V4`–`V9.6` are architecture milestones, not public release numbers.
 
 > ⚠️ **Experimental Project** — This is a personal research experiment and is **not production-ready**. APIs, storage formats, and behavior may change without notice. Use at your own risk.
@@ -24,6 +24,8 @@
 Open Timeline Engine (TCE) is a local-first context platform that captures your real workflow over time, mines repeatable patterns, and serves them back to AI agents with citations, policy enforcement, and auditability.
 
 > Naming note: `TCE` is the original internal shorthand for **Timeline Context Engine**. Public project name is **Open Timeline Engine**.
+>
+> Scope note: TCE models observed, task-specific behavior. It does not literally clone a person, and behavioral or continuity improvement must be demonstrated with longitudinal evidence rather than event volume.
 
 ### What problem this solves
 
@@ -266,7 +268,7 @@ Small example: in this repo, takeover can return `has_directive=true` but block 
 | Mode | Best for | What you get |
 | --- | --- | --- |
 | `timeline_only` | Personal logging, search, and memory without advisor takeover | Timeline capture, hybrid search, context bundles, graph features, summaries |
-| `clone_advisor` | Human-level paired execution with advisor constraints | Everything in `timeline_only` plus advisor suggestions/takeover flows |
+| `clone_advisor` | Behavior-informed paired execution with advisor constraints | Everything in `timeline_only` plus advisor suggestions/takeover flows |
 
 Details: [docs/clone-advisor.md](docs/clone-advisor.md)
 
@@ -521,11 +523,13 @@ User message → Executor
 └─────────────────────────────────────────────────┘
 ```
 
-### What each AI calls
+### What each AI can call
 
 MCP tool calls are made by executor clients. The advisor lane runs API-side and is not an MCP caller.
 
-**Core flow (every takeover turn)**
+The tables below are the capability catalog, not the default exposed surface. Fresh timeline-only installs use `TCE_MCP_TOOL_PROFILE=core` (10 tools). Takeover requires `autonomy`; the `research` profile includes autonomy plus evaluation and review tools. Changing the profile requires regenerating MCP config and restarting the executor.
+
+**Takeover flow (`autonomy` or `research` profile)**
 
 | MCP tool | Called by | Purpose |
 | --- | --- | --- |
@@ -563,9 +567,21 @@ MCP tool calls are made by executor clients. The advisor lane runs API-side and 
 | `tce.complete_task` | Executor | Mandatory durable completion/handoff capture outside a directive |
 | `tce.get_resume_packet` | Executor | Retrieve the exact file, anchor, git refs, and next step from another executor |
 | `tce.report_resume_feedback` | Executor | Record correct-file and correction feedback for the longitudinal pilot |
-| `tce.get_continuity_pilot` | Executor | Read capture coverage, time-to-resume, correct-file, and correction metrics |
+| `tce.get_continuity_pilot` | Executor | Read capture coverage, active-resume, correct-file/anchor, correction, and archaeology metrics |
 
 Completion writes are staged in `handoff_outbox`. The lifecycle event and canonical `handoff_records` row are delivered atomically and retried by the Full worker or Lite startup drain. The Review & Drift dashboard combines these continuity metrics with memory review and shadow-clone drift.
+
+Runtime profiles and MCP surfaces:
+
+| MCP profile | Intended use | Relationship |
+| --- | --- | --- |
+| `core` | Timeline search, context, completion, resume, governance | 10-tool least-privilege default |
+| `continuity` | Memory maintenance and timeline inspection | Superset of `core` |
+| `autonomy` | Clone advisor and permit/claim/report takeover | Superset of `continuity` |
+| `research` | Behavioral evaluation, drift review, retrieval experiments | Superset of `autonomy` |
+| `admin` / `all` | Complete compatibility surface | Explicit opt-in |
+
+Inspect the effective server boundary with `tce.get_governance_status`. A reported `protocol_only` execution level means permit/claim/report is cooperative; it is not host-level command interception unless an external interceptor is separately deployed and attested.
 
 **Clone advisor**
 

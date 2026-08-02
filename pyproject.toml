@@ -16,6 +16,9 @@ target-version = "py312"
 select = ["E", "F", "I", "B", "UP"]
 ignore = ["B008"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/eval/harness/*.py" = ["E", "F", "I", "B", "UP"]
+
 [tool.pytest.ini_options]
 pythonpath = ["services/tce_api", "services/tce_worker", "services/tce_mcp", "services/tce_lite_api", "shared"]
 testpaths = ["tests"]
@@ -30,7 +33,11 @@ strict = false
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_return_any = true
-exclude = "(^|/)(build|dist|node_modules|\\.venv)/"
+exclude = "(^|/)(build|dist|node_modules|\\.venv)/|^tests/eval/harness/"
+
+[[tool.mypy.overrides]]
+module = ["tce_10k_retrieval_eval", "tests.eval.harness.*"]
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 # locust is an optional load-test dependency, installed only in the load-tests CI

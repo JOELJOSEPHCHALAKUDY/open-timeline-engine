@@ -10,6 +10,7 @@ from typing import Any, cast
 from tce_shared.autonomy_context import SUMMARY_VERSION, summarize_event_record
 from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
+from tce_shared.project_context import canonical_project_context
 from tce_shared.redaction import redact_payload, redact_text
 
 
@@ -138,6 +139,7 @@ def deliver_handoff(conn: sqlite3.Connection, *, outbox_id: str, retention_days:
         "_tce_workspace": row["workspace_id"],
         "_tce_owner": row["owner_id"],
         "_tce_behavior_subject": row["behavior_subject_id"],
+        **canonical_project_context(milestone.get("project_context")),
     }
     event_outcome = {
         "success": row["terminal_state"] == "succeeded",
