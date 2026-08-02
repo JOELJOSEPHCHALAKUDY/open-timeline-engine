@@ -12819,7 +12819,9 @@ def _write_objective_plan(
     max_steps = max(2, int(getattr(settings_obj, "takeover_plan_max_steps", 8)))
 
     steps: list[PlanStep] = []
-    if bool(getattr(settings_obj, "takeover_plan_llm_enabled", False)):
+    if bool(getattr(settings_obj, "takeover_plan_llm_enabled", False)) and _plan_model_available(
+        settings_obj
+    ):
         try:
             # A clamped settings clone: the configured advisor timeout is 90s, which
             # would block the request thread for a minute and a half on a slow model.
@@ -13120,6 +13122,23 @@ def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]
     ]
 
 
+def _plan_model_available(settings_obj: Any) -> bool:
+    """True when the configured provider can actually be called.
+
+    Without this, enabling the model paths by default makes every plan and dream call
+    block for the full timeout before falling back, on any machine that has no key.
+    """
+    provider = str(
+        getattr(settings_obj, "takeover_plan_llm_provider", "")
+        or getattr(settings_obj, "model_provider", "ollama")
+    ).strip().lower()
+    if provider == "openai":
+        return bool(str(getattr(settings_obj, "openai_api_key", "") or "").strip())
+    if provider == "anthropic":
+        return bool(str(getattr(settings_obj, "anthropic_api_key", "") or "").strip())
+    return True  # a local provider is reachable or it is not; the call finds out
+
+
 def _plan_gateway_settings(settings_obj: Any) -> Any:
     """Clamped settings clone for plan/dream model calls.
 
@@ -13232,6 +13251,8 @@ def _dreams_from_own_words(
     boilerplate is the only thing that repeats word for word.
     """
     if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
+        return []
+    if not _plan_model_available(settings):
         return []
     messages = _recent_messages_for_dreaming(db)
     if len(messages) < 10:
