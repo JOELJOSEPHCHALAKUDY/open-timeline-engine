@@ -642,6 +642,35 @@ OBJECTIVE_PLACEHOLDER_VALUES = {
     "follow latest concrete objective",
 }
 
+# Titles and task types TCE writes about its own operation. Every takeover step,
+# search, and context-bundle call emits one, which makes them by far the most
+# frequent rows in the events table.
+SELF_REFERENTIAL_TITLE_PREFIXES = ("interaction:",)
+# Directive lifecycle rows are emitted for every terminal state, so match the shape
+# rather than listing states — naming only "succeeded" let "Directive failed:"
+# through and it came back as a top-ranked goal.
+_DIRECTIVE_LIFECYCLE_TITLE = re.compile(r"^directive\s+[a-z_]+:", re.IGNORECASE)
+SELF_REFERENTIAL_TASK_TYPE_PREFIX = "interaction_"
+
+
+def is_self_referential_event(title: str | None, task_type: str | None) -> bool:
+    """True when an event describes TCE's own activity rather than the user's work.
+
+    Goal discovery reads the most recent events, so without this filter the window
+    fills with records of TCE running and it proposes working on its own exhaust —
+    the queue observed live was 36/40 "Interaction: takeover_step - ..." entries.
+    Matching is anchored to the start of the title so ordinary prose containing
+    "interaction" is not caught.
+    """
+    normalized_title = (title or "").strip().lower()
+    if not normalized_title:
+        return True
+    if normalized_title.startswith(SELF_REFERENTIAL_TITLE_PREFIXES):
+        return True
+    if _DIRECTIVE_LIFECYCLE_TITLE.match(normalized_title):
+        return True
+    return (task_type or "").strip().lower().startswith(SELF_REFERENTIAL_TASK_TYPE_PREFIX)
+
 
 def _is_vague_objective(value: str) -> bool:
     """Detect objectives that are too vague, meta, or self-referential to be actionable.

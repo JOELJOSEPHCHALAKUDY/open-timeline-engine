@@ -115,6 +115,43 @@ def test_strip_activation_prefix_empty_on_pure_activation() -> None:
     assert result == ""
 
 
+def test_is_self_referential_event_rejects_tce_own_telemetry() -> None:
+    """Goal discovery must not propose working on records of TCE working.
+
+    Observed live: 36 of 40 discovered goals were "Interaction: takeover_step - ..."
+    and 2 were "Directive succeeded: takeover_step". TCE writes an interaction event
+    on every call, so its own telemetry is the highest-frequency row in the events
+    table and crowds real work out of the discovery window entirely.
+    """
+    from tce_shared.takeover import is_self_referential_event
+
+    assert is_self_referential_event(
+        "Interaction: takeover_step - beru take over", "interaction_takeover_step"
+    )
+    assert is_self_referential_event("Directive succeeded: takeover_step", "coding")
+    # Any directive lifecycle state, not just the happy one — "Directive failed:"
+    # slipped through a prefix-list that only named "succeeded" and came back as a
+    # top-ranked goal.
+    assert is_self_referential_event("Directive failed: takeover_step", "coding")
+    assert is_self_referential_event("Directive retried: takeover_step", "coding")
+    assert is_self_referential_event("Interaction: search_events", "interaction_search_events")
+    assert is_self_referential_event("anything", "interaction_context_bundle_cache_hit")
+    assert is_self_referential_event("", "human_input_backfill")
+
+
+def test_is_self_referential_event_keeps_real_work() -> None:
+    """Genuine user work must survive the filter."""
+    from tce_shared.takeover import is_self_referential_event
+
+    assert not is_self_referential_event(
+        "Historical claude user input: i still lot of ci fails", "human_input_backfill"
+    )
+    assert not is_self_referential_event("Fix the retrieval regression", "implement_feature")
+    assert not is_self_referential_event("Add a logo for open-witness-engine", "human_input_backfill")
+    # "interaction" as a substring of ordinary prose must not trip the filter
+    assert not is_self_referential_event("Improve user interaction in the dashboard", "coding")
+
+
 def test_strip_activation_prefix_removes_sentence_ending_punctuation() -> None:
     """A sentence break after the activation phrase must not leak into the objective.
 

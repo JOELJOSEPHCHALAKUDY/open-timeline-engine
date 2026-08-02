@@ -227,6 +227,7 @@ from tce_shared.handoff import (
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
+    OBJECTIVE_PLACEHOLDER_VALUES,
     build_decisive_response,
     build_next_action,
     classify_text,
@@ -234,6 +235,7 @@ from tce_shared.takeover import (
     contains_phrase,
     ensure_takeover_response,
     evaluate_safety,
+    is_self_referential_event,
     mode_override,
     next_expiry,
     normalize_text,
@@ -12193,6 +12195,11 @@ def _discover_takeover_goals(
         fingerprint = None
 
     objective = str(state.takeover_context.get("objective", "")).strip()
+    # A placeholder objective ("continue active objective") is what the state carries
+    # when takeover was activated without a task. Promoting it to a goal made the
+    # top-ranked entry in the queue a tautology that points back at the queue.
+    if normalize_text(objective) in OBJECTIVE_PLACEHOLDER_VALUES:
+        objective = ""
     if objective:
         priority = score_goal(urgency=0.9, recency=0.85, blocker_impact=0.8, success_probability=0.75)
         candidates[f"user:{objective.lower()}"] = {
@@ -12218,6 +12225,15 @@ def _discover_takeover_goals(
                 FROM events
                 WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
                   AND sensitivity <= :max_sensitivity
+                  -- Exclude TCE's own telemetry. Every takeover step, search, and
+                  -- context-bundle call writes an interaction event, so these are the
+                  -- highest-frequency rows in the table. The filter has to happen in
+                  -- SQL rather than after the fact: post-filtering a recency-ordered
+                  -- LIMIT would leave almost no real work, which is how discovery came
+                  -- to return 36/40 goals that were records of TCE running.
+                  AND COALESCE(task_type, '') NOT LIKE 'interaction\\_%'
+                  AND COALESCE(title, '') NOT LIKE 'Interaction:%'
+                  AND COALESCE(title, '') !~* '^directive\\s+[a-z_]+:'
                 ORDER BY ts DESC
                 LIMIT 120
                 """
@@ -12228,6 +12244,10 @@ def _discover_takeover_goals(
             event_type = str(row["event_type"] or "").upper()
             title = str(row["title"] or "").strip()
             if not title:
+                continue
+            # Defence in depth: the SQL above already excludes TCE's own telemetry,
+            # but this keeps the invariant true if that predicate is ever loosened.
+            if is_self_referential_event(title, str(row["task_type"] or "")):
                 continue
             ts_value = row["ts"]
             if isinstance(ts_value, datetime):
@@ -12467,6 +12487,15 @@ def _list_takeover_goals(
     if status is not None:
         status_clause = " AND status = :status "
         params["status"] = status.value
+    else:
+        # With no explicit filter this is the working queue, so terminal goals must not
+        # appear. Discovery marks the previous batch DROPPED before inserting the new
+        # one, and returning both made every goal show up twice in the queue.
+        status_clause = (
+            " AND status NOT IN (:excluded_dropped, :excluded_done) "
+        )
+        params["excluded_dropped"] = AutonomyGoalStatus.DROPPED.value
+        params["excluded_done"] = AutonomyGoalStatus.DONE.value
     rows = db.execute(
         text(
             f"""
