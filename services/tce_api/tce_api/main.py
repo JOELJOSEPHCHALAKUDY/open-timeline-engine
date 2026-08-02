@@ -13300,14 +13300,101 @@ def _dreams_from_own_words(
     return seeds
 
 
+def _nothing_left_to_do(db: Session, *, auth: AuthContext, state: TakeoverState) -> bool:
+    """True only when there is genuinely no outstanding work and no open question.
+
+    Dreaming is what you do when the desk is clear. Firing it on a timer means
+    inventing new wants while real work is still queued, and paying for a model call
+    to do it. Every condition below is something that must be finished or answered
+    first, and any one of them being true means stay quiet.
+    """
+    context = state.takeover_context or {}
+    # An unanswered question to the user outranks anything the system might want.
+    if context.get("pending_safety"):
+        return False
+    if state.active_goal_id or context.get("plan_root_goal_id"):
+        return False
+
+    pending_directives = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM directive_executions
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND state IN ('pending', 'in_progress')
+                """
+            ),
+            {"session_id": state.session_id, "workspace_id": auth.workspace_id},
+        ).scalar()
+        or 0
+    )
+    if pending_directives:
+        return False
+
+    # A notice already raised and not acknowledged is a question awaiting an answer.
+    open_notices = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM autonomy_notices
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND user_id = :user_id
+                  AND acknowledged_at IS NULL
+                  AND (expires_at IS NULL OR expires_at >= :now)
+                """
+            ),
+            {
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "now": datetime.now(tz=UTC),
+            },
+        ).scalar()
+        or 0
+    )
+    if open_notices:
+        return False
+
+    # Work the user actually asked for comes before anything invented. Auto-discovered
+    # candidates deliberately do NOT count: they are guesses derived from event rows,
+    # and treating them as outstanding work would mean the queue is never empty and the
+    # system never dreams at all — which is exactly what happened before this filter.
+    user_goals = int(
+        db.execute(
+            text(
+                """
+                SELECT count(*) FROM autonomy_goals
+                WHERE session_id = :session_id
+                  AND workspace_id = :workspace_id
+                  AND user_id = :user_id
+                  AND status = :candidate
+                  AND step_index IS NULL
+                  AND source = :user_objective
+                """
+            ),
+            {
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "candidate": AutonomyGoalStatus.CANDIDATE.value,
+                "user_objective": AutonomyGoalSource.USER_OBJECTIVE.value,
+            },
+        ).scalar()
+        or 0
+    )
+    return user_goals == 0
+
+
 def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
     """Form aspirations when idle, then turn the strongest into an ordered plan.
 
     This is the whole loop in one place: observe -> want -> plan -> (the existing
     machinery then walks the plan to completion). Returns the pursued dream's title.
     """
-    if state.takeover_context.get("plan_root_goal_id"):
-        return None  # a plan is already in flight; dreaming waits for the gap
+    if not _nothing_left_to_do(db, auth=auth, state=state):
+        return None  # work or an open question outranks anything it might want
     dreams = _load_stored_dreams(db, state=state)
     if not dreams:
         # Read what the person actually wrote first. Counting rows only ever produced
