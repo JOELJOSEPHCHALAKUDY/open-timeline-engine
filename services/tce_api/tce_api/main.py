@@ -330,7 +330,7 @@ from .continuity_store import (
     record_resume_attempt,
     record_resume_progress,
 )
-from .crypto import maybe_encrypt_payload
+from .crypto import maybe_decrypt_payload, maybe_encrypt_payload
 from .db import get_db, get_session_factory
 from .graph import (
     graph_for_event,
@@ -12823,43 +12823,7 @@ def _write_objective_plan(
         try:
             # A clamped settings clone: the configured advisor timeout is 90s, which
             # would block the request thread for a minute and a half on a slow model.
-            # Provider is configurable, and a hosted API is the better default for this
-            # job: decomposition is a once-per-objective call where quality matters and
-            # a small local model is both slower and weaker. Falls back to the global
-            # model_provider when no plan-specific one is set.
-            provider = str(
-                getattr(settings_obj, "takeover_plan_llm_provider", "")
-                or getattr(settings_obj, "model_provider", "ollama")
-            ).strip().lower()
-            gateway = get_model_gateway(
-                SimpleNamespace(
-                    model_provider=provider,
-                    # ollama
-                    ollama_url=getattr(settings_obj, "ollama_url", "http://ollama:11434"),
-                    embed_model=getattr(settings_obj, "embed_model", "mxbai-embed-large"),
-                    extract_model=getattr(settings_obj, "extract_model", "qwen2.5:3b"),
-                    # openai
-                    openai_api_key=getattr(settings_obj, "openai_api_key", ""),
-                    openai_embed_model=getattr(
-                        settings_obj, "openai_embed_model", "text-embedding-3-small"
-                    ),
-                    openai_extract_model=getattr(
-                        settings_obj, "openai_extract_model", "gpt-4o-mini"
-                    ),
-                    openai_base_url=getattr(settings_obj, "openai_base_url", None),
-                    # anthropic
-                    anthropic_api_key=getattr(settings_obj, "anthropic_api_key", ""),
-                    anthropic_extract_model=getattr(
-                        settings_obj, "anthropic_extract_model", "claude-haiku-4-5-20251001"
-                    ),
-                    advisor_timeout_seconds=float(
-                        getattr(settings_obj, "takeover_plan_llm_timeout_seconds", 25)
-                    ),
-                    advisor_attempt_timeout_ms=0,
-                    advisor_read_timeout_ms=0,
-                    redis_url=getattr(settings_obj, "redis_url", ""),
-                )
-            )
+            gateway = get_model_gateway(_plan_gateway_settings(settings_obj))
             payload = gateway.extract_structured(
                 PLAN_DECOMPOSITION_PROMPT.replace("{objective}", cleaned[:2000]),
                 "plan_decomposition_v1",
@@ -13156,6 +13120,153 @@ def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]
     ]
 
 
+def _plan_gateway_settings(settings_obj: Any) -> Any:
+    """Clamped settings clone for plan/dream model calls.
+
+    The configured advisor timeout is 90s, which would block a request thread for a
+    minute and a half. Provider is configurable so a hosted API can be used instead of
+    a local model.
+    """
+    provider = str(
+        getattr(settings_obj, "takeover_plan_llm_provider", "")
+        or getattr(settings_obj, "model_provider", "ollama")
+    ).strip().lower()
+    return SimpleNamespace(
+        model_provider=provider,
+        ollama_url=getattr(settings_obj, "ollama_url", "http://ollama:11434"),
+        embed_model=getattr(settings_obj, "embed_model", "mxbai-embed-large"),
+        extract_model=getattr(settings_obj, "extract_model", "qwen2.5:3b"),
+        openai_api_key=getattr(settings_obj, "openai_api_key", ""),
+        openai_embed_model=getattr(settings_obj, "openai_embed_model", "text-embedding-3-small"),
+        openai_extract_model=getattr(settings_obj, "openai_extract_model", "gpt-4o-mini"),
+        openai_base_url=getattr(settings_obj, "openai_base_url", None),
+        anthropic_api_key=getattr(settings_obj, "anthropic_api_key", ""),
+        anthropic_extract_model=getattr(
+            settings_obj, "anthropic_extract_model", "claude-haiku-4-5-20251001"
+        ),
+        advisor_timeout_seconds=float(
+            getattr(settings_obj, "takeover_plan_llm_timeout_seconds", 25)
+        ),
+        advisor_attempt_timeout_ms=0,
+        advisor_read_timeout_ms=0,
+        redis_url=getattr(settings_obj, "redis_url", ""),
+    )
+
+
+DREAM_PROMPT = """Below are real messages a developer sent to their coding assistant, newest first.
+
+Read them and say what this person is actually trying to achieve. Not what they asked for
+in any one message — what they keep coming back to.
+
+Rules:
+- Only name something you can point to specific messages for.
+- Ignore interruptions, pasted links, one-word replies and tool output.
+- Something said once but clearly counts for more than boilerplate repeated ten times.
+- If nothing clear comes through, return an empty list. That is a good answer.
+- At most 3.
+
+Messages:
+__MESSAGES__
+
+Reply with JSON only:
+{"dreams": [{"title": "the goal in plain words", "why": "what makes you say that",
+"message_numbers": [1, 4, 9]}]}
+"""
+
+
+def _recent_messages_for_dreaming(
+    db: Session, *, limit: int = 60
+) -> list[tuple[str, str]]:
+    """Return (event_id, the real message text) for recent human messages.
+
+    Reads the encrypted payload rather than the title. `title` caps at 150 characters
+    and a quarter of rows sit at that ceiling, so every earlier attempt at this was
+    reading sentence fragments — and the longest, most considered messages, the ones
+    most likely to say what someone wants, were exactly the ones cut off.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT id, payload
+            FROM events
+            WHERE task_type = 'human_input_backfill'
+              AND sensitivity <= :max_sensitivity
+            ORDER BY ts DESC
+            LIMIT :limit
+            """
+        ),
+        {"max_sensitivity": settings.block_sensitivity - 1, "limit": limit},
+    ).mappings().all()
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            payload = maybe_decrypt_payload(row["payload"] or {})
+        except Exception:
+            continue
+        body = str(payload.get("input_excerpt") or "").strip()
+        if len(body) < 25:
+            continue  # acknowledgements, not intentions
+        out.append((str(row["id"]), body[:1200]))
+    return out
+
+
+def _dreams_from_own_words(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> list[DreamSeed]:
+    """Ask the model what this person keeps trying to achieve, and make it cite them.
+
+    Noticing a throughline across fifty messages is what a model is for, and what
+    counting cannot do: frequency in a chat log ranks boilerplate first, because
+    boilerplate is the only thing that repeats word for word.
+    """
+    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
+        return []
+    messages = _recent_messages_for_dreaming(db)
+    if len(messages) < 10:
+        return []
+    numbered = "\n\n".join(f"{i}. {body}" for i, (_, body) in enumerate(messages, start=1))
+    try:
+        gateway = get_model_gateway(_plan_gateway_settings(settings))
+        payload = gateway.extract_structured(
+            DREAM_PROMPT.replace("__MESSAGES__", numbered[:24000]), "dream_formation_v1"
+        )
+    except Exception:
+        logger.warning("dream formation from own words failed", exc_info=True)
+        return []
+
+    raw = payload.get("dreams") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    seeds: list[DreamSeed] = []
+    for item in raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        why = str(item.get("why") or "").strip()
+        numbers = item.get("message_numbers")
+        if not title or not isinstance(numbers, list) or not numbers:
+            continue  # no citation, no dream
+        cited = [
+            messages[int(n) - 1][0]
+            for n in numbers[:10]
+            if str(n).lstrip("-").isdigit() and 0 <= int(n) - 1 < len(messages)
+        ]
+        if not cited:
+            continue  # cited nothing that exists
+        seeds.append(
+            DreamSeed(
+                title=title[:140],
+                description=(why or title)[:240],
+                rationale=f"From {len(cited)} of your own messages. {why}"[:400],
+                # Confidence follows how much of the person's own writing backs it.
+                weight=min(0.95, 0.55 + (0.08 * len(cited))),
+                evidence_event_ids=tuple(cited),
+                project_id=str(state.takeover_context.get("project") or ""),
+            )
+        )
+    return seeds
+
+
 def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
     """Form aspirations when idle, then turn the strongest into an ordered plan.
 
@@ -13166,7 +13277,12 @@ def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -
         return None  # a plan is already in flight; dreaming waits for the gap
     dreams = _load_stored_dreams(db, state=state)
     if not dreams:
-        dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth, state=state))
+        # Read what the person actually wrote first. Counting rows only ever produced
+        # things like "advance a folder"; the throughline across many messages is the
+        # part a model can see and arithmetic cannot.
+        dreams = _dreams_from_own_words(db, auth=auth, state=state)
+        if not dreams:
+            dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth, state=state))
         if dreams:
             _store_dreams(db, auth=auth, state=state, dreams=dreams)
     chosen = select_dream_to_pursue(dreams, has_active_plan=False)

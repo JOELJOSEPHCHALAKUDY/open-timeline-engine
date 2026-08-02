@@ -204,6 +204,8 @@ class Settings(BaseSettings):
     # objective, quality matters more than latency, and a small local model is
     # both slower and weaker at planning.
     takeover_plan_llm_provider: str = ""
+    # Form dreams by reading the user's own messages instead of counting rows.
+    takeover_dream_llm_enabled: bool = False
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
