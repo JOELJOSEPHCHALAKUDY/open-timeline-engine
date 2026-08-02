@@ -92,6 +92,7 @@ from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_beh
 from tce_shared.dreams import (
     DreamSeed,
     DreamSignals,
+    cluster_recurring_asks,
     derive_dream_seeds,
     select_dream_to_pursue,
 )
@@ -236,6 +237,7 @@ from tce_shared.plan_decomposition import (
     fallback_plan_steps,
     parse_plan_steps,
 )
+from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
@@ -3665,6 +3667,7 @@ def _auto_capture_interaction_sync(
             "citations": [str(item) for item in (citations or [])],
         }
 
+    project_context = project_context_from_payload(request_payload)
     event = EventEnvelope(
         schema_version=1,
         ts=datetime.now(tz=UTC),
@@ -3680,6 +3683,8 @@ def _auto_capture_interaction_sync(
             "user": auth_user_id,
             "consumer": auth_consumer,
             "role": auth_role_value,
+            "input_origin": "executor_relay" if action == "takeover_step" else "system",
+            **project_context,
         },
         inputs={},
         steps=[],
@@ -4380,6 +4385,19 @@ def capture_completion(
     milestone = dict(normalized["normalized"])
     milestone["change_summary_json"] = dict(body.change_summary or {})
     milestone["source"] = body.source
+    takeover_context = db.execute(
+        text(
+            """
+            SELECT takeover_context FROM takeover_sessions
+            WHERE session_id = :session_id AND workspace_id = :workspace_id AND user_id = :user_id
+            """
+        ),
+        {"session_id": body.session_id, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
+    ).scalar()
+    if isinstance(takeover_context, dict):
+        project_context = canonical_project_context(takeover_context.get("project_context"))
+        if project_context:
+            milestone["project_context"] = project_context
     now = datetime.now(tz=UTC)
     outbox = enqueue_handoff(
         db,
@@ -12936,8 +12954,15 @@ PLAN_DREAM_STEP_INDEX = -1
 gets pursued simply becomes a root; no separate table or wire field is needed."""
 
 
-def _gather_dream_signals(db: Session, *, auth: AuthContext) -> DreamSignals:
+def _gather_dream_signals(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> DreamSignals:
     """Observe the system's own situation. Every number here becomes a rationale."""
+
+    project = canonical_project_context(state.takeover_context.get("project_context"))
+    project_id = project.get("project_id", "")
+    if not project_id:
+        return DreamSignals()
 
     def _count(sql: str, params: dict[str, Any] | None = None) -> int:
         try:
@@ -12947,54 +12972,73 @@ def _gather_dream_signals(db: Session, *, auth: AuthContext) -> DreamSignals:
             logger.warning("dream signal query failed", exc_info=True)
             return 0
 
-    total_events = _count("SELECT count(*) FROM events")
-    embedded = _count("SELECT count(*) FROM event_embeddings")
+    project_params = {"project_id": project_id}
+    total_events = _count(
+        "SELECT count(*) FROM events WHERE context->>'project_id' = :project_id",
+        project_params,
+    )
+    embedded = _count(
+        """
+        SELECT count(*) FROM event_embeddings ee
+        JOIN events e ON e.id = ee.event_id
+        WHERE e.context->>'project_id' = :project_id
+        """,
+        project_params,
+    )
     failed = _count(
         """
         SELECT count(*) FROM directive_executions
-        WHERE workspace_id = :workspace_id AND state = 'failed'
+        WHERE workspace_id = :workspace_id AND session_id = :session_id AND state = 'failed'
         """,
-        {"workspace_id": auth.workspace_id},
+        {"workspace_id": auth.workspace_id, "session_id": state.session_id},
     )
     stalled = _count(
         """
         SELECT count(*) FROM autonomy_goals
         WHERE workspace_id = :workspace_id
+          AND session_id = :session_id
           AND status = :candidate
           AND step_index IS NULL
           AND updated_at < :cutoff
         """,
         {
             "workspace_id": auth.workspace_id,
+            "session_id": state.session_id,
             "candidate": AutonomyGoalStatus.CANDIDATE.value,
             "cutoff": datetime.now(tz=UTC) - timedelta(days=1),
         },
     )
-    domains: list[tuple[str, int]] = []
+    asks: list[tuple[str, str]] = []
     try:
         rows = db.execute(
             text(
                 """
-                SELECT domain, count(*) AS n
+                SELECT id, payload #>> '{request,message}' AS message
                 FROM events
-                WHERE domain IS NOT NULL AND domain <> ''
-                  AND COALESCE(task_type, '') NOT LIKE 'interaction\\_%'
-                GROUP BY domain
-                ORDER BY n DESC
-                LIMIT 3
+                WHERE context->>'project_id' = :project_id
+                  AND source = 'api-auto-capture'
+                  AND task_type = 'interaction_takeover_step'
+                  AND context->>'input_origin' = 'executor_relay'
+                  AND COALESCE(payload #>> '{request,message}', '') <> ''
+                ORDER BY ts ASC
+                LIMIT 200
                 """
-            )
+            ),
+            project_params,
         ).mappings().all()
-        domains = [(str(r["domain"]), int(r["n"])) for r in rows]
+        asks = [(str(row["id"]), str(row["message"])) for row in rows]
     except Exception:
-        logger.warning("dream domain query failed", exc_info=True)
+        logger.warning("dream project ask query failed", exc_info=True)
 
     return DreamSignals(
         failed_unretried_directives=failed,
         unembedded_events=max(0, total_events - embedded),
-        recurring_domains=domains,
+        recurring_domains=(),
         stalled_goals=stalled,
         total_events=total_events,
+        project_id=project_id,
+        project_name=project.get("project", ""),
+        recurring_asks=cluster_recurring_asks(asks),
     )
 
 
@@ -13052,15 +13096,15 @@ def _store_dreams(
                 "risk_tier": AutonomyRiskTier.LOW.value,
                 "confidence": float(dream.weight),
                 "reasoning": dream.rationale[:400],
-                "evidence_event_ids": [],
+                "evidence_event_ids": [str(value) for value in dream.evidence_event_ids],
                 "goal_kind": GoalKind.NORMAL.value,
                 "affective_scores": json.dumps({}),
                 "selection_score": float(dream.weight),
                 "goal_signature": hashlib.sha256(
-                    f"dream|{state.session_id}|{dream.title}".encode()
+                    f"dream|{state.session_id}|{dream.project_id}|{dream.title}".encode()
                 ).hexdigest()[:24],
                 "cache_hit": False,
-                "cache_source": "dream",
+                "cache_source": f"dream:{dream.project_id or 'project'}",
                 "status": AutonomyGoalStatus.CANDIDATE.value,
                 "created_at": now,
                 "updated_at": now,
@@ -13072,16 +13116,21 @@ def _store_dreams(
 
 
 def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]:
+    project = canonical_project_context(state.takeover_context.get("project_context"))
+    project_id = project.get("project_id", "")
+    if not project_id:
+        return []
     rows = db.execute(
         text(
             """
-            SELECT title, description, reasoning, selection_score
+            SELECT title, description, reasoning, selection_score, evidence_event_ids
             FROM autonomy_goals
             WHERE session_id = :session_id
               AND workspace_id = :workspace_id
               AND user_id = :user_id
               AND step_index = :dream_index
               AND status = :candidate
+              AND cache_source = :cache_source
             ORDER BY selection_score DESC
             """
         ),
@@ -13091,6 +13140,7 @@ def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]
             "user_id": state.user_id,
             "dream_index": PLAN_DREAM_STEP_INDEX,
             "candidate": AutonomyGoalStatus.CANDIDATE.value,
+            "cache_source": f"dream:{project_id}",
         },
     ).mappings().all()
     return [
@@ -13099,6 +13149,8 @@ def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]
             description=str(r["description"]),
             rationale=str(r["reasoning"] or ""),
             weight=float(r["selection_score"] or 0.0),
+            evidence_event_ids=tuple(str(value) for value in (r["evidence_event_ids"] or [])),
+            project_id=project_id,
         )
         for r in rows
     ]
@@ -13114,7 +13166,7 @@ def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -
         return None  # a plan is already in flight; dreaming waits for the gap
     dreams = _load_stored_dreams(db, state=state)
     if not dreams:
-        dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth))
+        dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth, state=state))
         if dreams:
             _store_dreams(db, auth=auth, state=state, dreams=dreams)
     chosen = select_dream_to_pursue(dreams, has_active_plan=False)
@@ -13860,6 +13912,15 @@ def takeover_preload(
         activation_keywords=body.activation_keywords,
         stop_keywords=body.stop_keywords,
     )
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     now = datetime.now(tz=UTC)
     resolved_task = resolve_objective(
         message=body.task,
@@ -14078,6 +14139,15 @@ def takeover_step(
         stop_keywords=body.stop_keywords,
     )
     state_ms = int((time.perf_counter() - state_started) * 1000)
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     snapshot_rehydrated = False
     snapshot_age_hours: int | None = None
 

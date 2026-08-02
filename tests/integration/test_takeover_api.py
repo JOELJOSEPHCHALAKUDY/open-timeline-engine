@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -71,7 +73,11 @@ def test_takeover_state_step_and_reset(lite_client: TestClient) -> None:
             "session_id": session_id,
             "persona_mode": "shadow",
             "task": "validate takeover",
-            "app_context": {"domain": "coding"},
+            "app_context": {
+                "domain": "coding",
+                "project": "open-timeline-engine",
+                "project_root": "/work/open-timeline-engine",
+            },
             "constraints": {"k": 8},
         },
         headers=_headers(),
@@ -109,6 +115,23 @@ def test_takeover_state_step_and_reset(lite_client: TestClient) -> None:
     assert "needs_human" in body
     assert "execution_permit_required" in body
     assert "continuity_ok" in body
+    bound_project = body["state"]["takeover_context"]["project_context"]
+    assert bound_project["project"] == "open-timeline-engine"
+    assert bound_project["project_id"].startswith("proj_")
+
+    db_path = get_settings().lite_db_path
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT context FROM events
+            WHERE task_type = 'interaction_takeover_step'
+            ORDER BY ts DESC LIMIT 1
+            """
+        ).fetchone()
+    assert row is not None
+    captured_context = json.loads(str(row[0]))
+    assert captured_context["project_id"] == bound_project["project_id"]
+    assert captured_context["input_origin"] == "executor_relay"
 
     execution_status_before = lite_client.get(
         "/v1/takeover/execution/status",

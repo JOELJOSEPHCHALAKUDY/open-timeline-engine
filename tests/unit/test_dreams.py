@@ -12,6 +12,8 @@ from __future__ import annotations
 from tce_shared.dreams import (
     DreamSeed,
     DreamSignals,
+    RecurringAsk,
+    cluster_recurring_asks,
     derive_dream_seeds,
     select_dream_to_pursue,
 )
@@ -74,6 +76,52 @@ def test_recurring_ground_becomes_a_dream() -> None:
 
 def test_a_quiet_domain_is_not_worth_dreaming_about() -> None:
     assert derive_dream_seeds(_signals(recurring_domains=[("scratch", 2)])) == []
+
+
+def test_repeated_project_asks_create_a_cited_dream() -> None:
+    recurring = RecurringAsk(
+        summary="fix project-scoped dream generation",
+        count=3,
+        evidence_event_ids=("event-1", "event-2", "event-3"),
+    )
+    dreams = derive_dream_seeds(
+        _signals(
+            project_id="proj_123",
+            project_name="open-timeline-engine",
+            recurring_asks=[recurring],
+        )
+    )
+
+    assert dreams[0].project_id == "proj_123"
+    assert dreams[0].evidence_event_ids == recurring.evidence_event_ids
+    assert "fix project-scoped" in dreams[0].title
+
+
+def test_uncited_or_single_ask_cannot_create_a_dream() -> None:
+    assert derive_dream_seeds(
+        _signals(recurring_asks=[RecurringAsk(summary="fix dream generation", count=2)])
+    ) == []
+    assert derive_dream_seeds(
+        _signals(
+            recurring_asks=[
+                RecurringAsk(summary="fix dream generation", count=1, evidence_event_ids=("event-1",))
+            ]
+        )
+    ) == []
+
+
+def test_recurring_ask_clustering_is_conservative_and_deterministic() -> None:
+    asks = [
+        ("event-1", "Please fix project scoped dream generation now"),
+        ("event-2", "fix project scoped dream generation please"),
+        ("event-3", "update the dashboard colors"),
+    ]
+
+    clustered = cluster_recurring_asks(asks)
+
+    assert len(clustered) == 1
+    assert clustered[0].count == 2
+    assert clustered[0].evidence_event_ids == ("event-1", "event-2")
 
 
 # --- ordering, determinism, bounds ---

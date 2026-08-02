@@ -118,6 +118,7 @@ from tce_shared.handoff import (
     rank_resume_candidates,
     task_overlap_score,
 )
+from tce_shared.project_context import canonical_project_context
 from tce_shared.redaction import apply_redaction_zones, redact_payload, redact_text
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
@@ -7957,6 +7958,15 @@ def takeover_preload(
         activation_keywords=body.activation_keywords,
         stop_keywords=body.stop_keywords,
     )
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     now = now_utc()
     resolved_task = resolve_objective(message=body.task, task=body.task, takeover_context=state.takeover_context)
     working_set = _build_takeover_working_set(
@@ -8153,6 +8163,15 @@ def takeover_step(
         stop_keywords=body.stop_keywords,
     )
     state_ms = int((time.perf_counter() - state_started) * 1000)
+    previous_project = (
+        state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None
+    )
+    project_context = canonical_project_context(body.app_context, previous_project)
+    if project_context:
+        body.app_context = {**body.app_context, **project_context}
+        state.takeover_context["project_context"] = project_context
     snapshot_rehydrated = False
     snapshot_age_hours: int | None = None
     now = now_utc()

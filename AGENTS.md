@@ -16,6 +16,7 @@ If you find a bug in these paths, report it to the user instead of changing it, 
 ### Session management
 1. Use one stable `session_id` per conversation and reuse it on every call.
 2. Always pass `activation_mode_default="takeover"` on every `tce.takeover_step` call.
+2a. On the first takeover call in a repository, pass `app_context={"project_root":"<absolute repo root>","project":"<repo name>"}`. Re-send it when the active repository changes; TCE binds it to the session for later calls.
 
 ### State resolution (history-driven)
 3. Determine takeover state from conversation history ordering, not local flags:

@@ -446,6 +446,7 @@ Use this policy in clients that support project or custom instructions.
 ## Required behavior
 1. Keep a stable `session_id` for the current chat.
 2. On every user message, call `tce.takeover_step` with that `session_id`, user message text, and `activation_mode_default="takeover"`.
+2a. On the first call in a repository, include `app_context` with the absolute `project_root` and repository `project` name. Send it again whenever the repository changes.
 3. If `final_response` exists in the tool result, return it directly.
 4. If `safety_decision` is `confirm_required`, ask for confirmation and wait.
 5. Continue auto-calling `tce.takeover_step` for each later message while takeover is active.

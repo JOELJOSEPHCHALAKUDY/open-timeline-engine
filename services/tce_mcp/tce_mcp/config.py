@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     mcp_user_id: str = "local-user"
     mcp_behavior_subject_id: str = ""
     mcp_session_id: str = ""
+    mcp_project_id: str = ""
+    mcp_project_name: str = ""
+    mcp_project_root: str = ""
+    mcp_project_remote: str = ""
+    mcp_project_branch: str = ""
     mcp_http_retry_total: int = 3
     mcp_http_retry_backoff_seconds: float = 0.4
     mcp_http_retry_statuses: str = "429,500,502,503,504"

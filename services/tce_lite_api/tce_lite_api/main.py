@@ -146,6 +146,7 @@ from tce_shared.events import (
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
 from tce_shared.governance import build_governance_status
 from tce_shared.handoff import normalize_milestone_v1
+from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_text
 
@@ -2578,6 +2579,7 @@ def _auto_capture_interaction(
             "citations": [str(item) for item in (citations or [])],
         }
 
+    project_context = project_context_from_payload(request_payload)
     event = EventEnvelope(
         schema_version=1,
         ts=datetime.now(tz=UTC),
@@ -2593,6 +2595,8 @@ def _auto_capture_interaction(
             "user": auth.user_id,
             "consumer": auth.consumer,
             "role": auth.role.value,
+            "input_origin": "executor_relay" if action == "takeover_step" else "system",
+            **project_context,
         },
         inputs={},
         steps=[],
@@ -2863,6 +2867,21 @@ def capture_completion(
     milestone = dict(normalized["normalized"])
     milestone["change_summary_json"] = dict(body.change_summary or {})
     milestone["source"] = body.source
+    state_row = conn.execute(
+        """
+        SELECT takeover_context FROM takeover_sessions
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+        """,
+        (body.session_id, auth.workspace_id, auth.user_id),
+    ).fetchone()
+    if state_row is not None:
+        try:
+            takeover_context = json.loads(str(state_row["takeover_context"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            takeover_context = {}
+        project_context = canonical_project_context(takeover_context.get("project_context"))
+        if project_context:
+            milestone["project_context"] = project_context
     now = datetime.now(tz=UTC)
     outbox = enqueue_handoff(
         conn,

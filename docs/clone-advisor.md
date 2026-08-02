@@ -232,6 +232,12 @@ Predictions abstain below the configured confidence floor. When `TCE_BEHAVIOR_AU
 
 Detailed rollout instructions: [Behavior Fidelity v1](behavior-fidelity.md).
 
+## Project-scoped dreams
+
+When ordered planning is enabled, idle autonomy may convert a bounded aspiration into a plan. Directional dreams require a canonical project binding plus repeated, similar relayed user asks. The stored dream retains the source event IDs; global folder/domain activity alone cannot create a directional dream. Operational signals such as unfinished directives and indexing gaps are scoped to the bound session/project. No project binding means no dream generation.
+
+Executors should send `app_context.project_root` and `app_context.project` on the first takeover call in a repository and whenever the repository changes. TCE pins the redaction-safe identity to the takeover session and copies it to events and completion handoffs.
+
 ## Long-term goal definition
 
 A goal is flagged `long_term=true` when any rule matches (first-match reason is emitted):

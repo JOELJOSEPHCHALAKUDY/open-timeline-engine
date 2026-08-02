@@ -17,6 +17,7 @@ Pure: no I/O. The caller gathers the signals; this decides what they mean.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -27,6 +28,7 @@ MIN_STALLED_GOALS = 5
 MIN_UNEMBEDDED_EVENTS = 100
 MIN_UNEMBEDDED_RATIO = 0.02
 MIN_DOMAIN_ACTIVITY = 25
+MIN_RECURRING_ASKS = 2
 
 # A dream fainter than this is not worth acting on; staying idle is the better move.
 MIN_PURSUIT_WEIGHT = 0.25
@@ -43,6 +45,18 @@ class DreamSignals:
     recurring_domains: Sequence[tuple[str, int]] = ()
     stalled_goals: int = 0
     total_events: int = 0
+    project_id: str = ""
+    project_name: str = ""
+    recurring_asks: Sequence[RecurringAsk] = ()
+
+
+@dataclass(frozen=True)
+class RecurringAsk:
+    """A repeated, project-bound human request with provenance."""
+
+    summary: str
+    count: int
+    evidence_event_ids: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +67,77 @@ class DreamSeed:
     description: str
     rationale: str
     weight: float
+    evidence_event_ids: Sequence[str] = ()
+    project_id: str = ""
+
+
+_ASK_STOPWORDS = {
+    "a", "an", "and", "are", "can", "could", "do", "for", "from", "how",
+    "i", "in", "is", "it", "of", "on", "please", "the", "this", "to", "we",
+    "what", "with", "you",
+}
+_ACTIVATION_PREFIX = re.compile(
+    r"^(?:hey\s+)?(?:beru|igris|kurama|shadow)\s+"
+    r"(?:take\s+over|takeover|suggest)\b(?:\s+and\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _ask_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9_-]+", value.lower())
+        if token not in _ASK_STOPWORDS and len(token) > 2
+    }
+
+
+def cluster_recurring_asks(
+    asks: Sequence[tuple[str, str]], *, minimum_count: int = MIN_RECURRING_ASKS
+) -> list[RecurringAsk]:
+    """Cluster repeated asks conservatively; weakly related prompts stay separate."""
+    clusters: list[dict[str, object]] = []
+    for event_id, raw in asks:
+        summary = re.sub(r"\s+", " ", str(raw or "")).strip()[:240]
+        summary = _ACTIVATION_PREFIX.sub("", summary).strip()
+        tokens = _ask_tokens(summary)
+        if len(tokens) < 2:
+            continue
+        match: dict[str, object] | None = None
+        best = 0.0
+        for cluster in clusters:
+            existing = cluster["tokens"]
+            if not isinstance(existing, set):
+                continue
+            union = tokens | existing
+            score = len(tokens & existing) / len(union) if union else 0.0
+            if score >= 0.55 and score > best:
+                best = score
+                match = cluster
+        if match is None:
+            clusters.append({"summary": summary, "tokens": set(tokens), "ids": [str(event_id)]})
+            continue
+        match["summary"] = summary  # latest ask is the least lossy grounded summary
+        existing_tokens = match["tokens"]
+        if isinstance(existing_tokens, set):
+            existing_tokens.update(tokens)
+        ids = match["ids"]
+        if isinstance(ids, list) and str(event_id) not in ids:
+            ids.append(str(event_id))
+
+    result: list[RecurringAsk] = []
+    for cluster in clusters:
+        ids = cluster["ids"]
+        if not isinstance(ids, list) or len(ids) < max(2, minimum_count):
+            continue
+        result.append(
+            RecurringAsk(
+                summary=str(cluster["summary"]),
+                count=len(ids),
+                evidence_event_ids=tuple(ids[:20]),
+            )
+        )
+    result.sort(key=lambda item: (-item.count, item.summary))
+    return result[:5]
 
 
 def _scaled(value: int, full: int) -> float:
@@ -68,6 +153,24 @@ def derive_dream_seeds(
     """Turn observations into ranked aspirations. Returns [] when nothing warrants one."""
     seeds: list[DreamSeed] = []
 
+    for ask in signals.recurring_asks:
+        if ask.count < MIN_RECURRING_ASKS or not ask.evidence_event_ids:
+            continue
+        project = signals.project_name or "the active project"
+        seeds.append(
+            DreamSeed(
+                title=f"Resolve the recurring ask: {ask.summary}"[:140],
+                description=(
+                    f"Move {project} forward by resolving this repeatedly requested outcome: "
+                    f"{ask.summary}"
+                )[:240],
+                rationale=f"The user asked for this {ask.count} times in {project}.",
+                weight=0.55 + (0.35 * _scaled(ask.count, 8)),
+                evidence_event_ids=tuple(ask.evidence_event_ids),
+                project_id=signals.project_id,
+            )
+        )
+
     if signals.failed_unretried_directives >= MIN_FAILED_DIRECTIVES:
         n = signals.failed_unretried_directives
         seeds.append(
@@ -79,6 +182,7 @@ def derive_dream_seeds(
                 ),
                 rationale=f"{n} directives failed and were never retried.",
                 weight=0.45 + (0.45 * _scaled(n, 25)),
+                project_id=signals.project_id,
             )
         )
 
@@ -97,6 +201,7 @@ def derive_dream_seeds(
                 ),
                 rationale=f"{n} of {signals.total_events} events have no embedding.",
                 weight=0.35 + (0.45 * _scaled(n, 2000)),
+                project_id=signals.project_id,
             )
         )
 
@@ -111,6 +216,7 @@ def derive_dream_seeds(
                 ),
                 rationale=f"{n} goals are stalled with no progress.",
                 weight=0.30 + (0.40 * _scaled(n, 40)),
+                project_id=signals.project_id,
             )
         )
 
@@ -127,6 +233,7 @@ def derive_dream_seeds(
                 ),
                 rationale=f"{activity} recorded events concentrate on {name}.",
                 weight=0.30 + (0.50 * _scaled(activity, 400)),
+                project_id=signals.project_id,
             )
         )
 

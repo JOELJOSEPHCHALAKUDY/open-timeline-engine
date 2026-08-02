@@ -60,6 +60,20 @@ def test_transactional_completion_resume_feedback_and_identity_binding(client: T
     )
     assert forged.status_code == 403
 
+    preload = client.post(
+        "/v1/takeover/preload",
+        headers=_auth("codex-token"),
+        json={
+            "session_id": "shared-session",
+            "task": "implement durable completion outbox",
+            "app_context": {
+                "project": "open-timeline-engine",
+                "project_root": "/work/open-timeline-engine",
+            },
+        },
+    )
+    assert preload.status_code == 200, preload.text
+
     completion = client.post(
         "/v1/completions",
         headers=_auth("codex-token"),
@@ -79,6 +93,15 @@ def test_transactional_completion_resume_feedback_and_identity_binding(client: T
     )
     assert completion.status_code == 200, completion.text
     assert completion.json()["delivery_status"] == "delivered"
+    with sqlite3.connect(get_settings().lite_db_path) as conn:
+        event_row = conn.execute(
+            "SELECT context FROM events WHERE id = ?",
+            (completion.json()["event_id"],),
+        ).fetchone()
+    assert event_row is not None
+    completion_context = json.loads(str(event_row[0]))
+    assert completion_context["project"] == "open-timeline-engine"
+    assert completion_context["project_id"].startswith("proj_")
 
     duplicate = client.post(
         "/v1/completions",

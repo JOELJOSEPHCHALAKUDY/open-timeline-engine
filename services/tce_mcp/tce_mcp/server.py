@@ -715,7 +715,9 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "Run one takeover engine step with enforcement and safety checks. IMPORTANT: When the result contains "
         "has_directive=true, immediately use tools (read files, edit files, run commands) to work on "
         "state.takeover_context.objective. Do not narrate the result; take action. Before editing any file, call "
-        "tce.check_context first. If result contains persona_ack, show only that text before taking action."
+        "tce.check_context first. On the first call in a repository, include app_context.project_root and "
+        "app_context.project; resend them when the repository changes. If result contains persona_ack, show only "
+        "that text before taking action."
     ),
 )
 def takeover_step(
