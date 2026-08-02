@@ -224,6 +224,7 @@ from tce_shared.handoff import (
     normalize_objective_text,
     rank_resume_candidates,
 )
+from tce_shared.plan_decomposition import fallback_plan_steps
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
@@ -11736,6 +11737,9 @@ def takeover_execution_report(
         state.objective_hash = ""
         state.goal_queue_size = max(0, int(state.goal_queue_size or 0) - 1)
         _invalidate_goal_queue_cache(db, auth=auth, state=state)
+        # Must run last: it overrides awaiting_next_objective / objective / objective_hash
+        # that the lines above just set, which is the whole point of a plan.
+        _advance_plan_after_completion(db, auth=auth, state=state, context=context)
     state.takeover_context = context
     _sync_enforcement_counters(db, state)
     save_takeover_state(db, state)
@@ -12339,6 +12343,11 @@ def _discover_takeover_goals(
               AND workspace_id = :workspace_id
               AND user_id = :user_id
               AND status = :candidate_status
+              -- Plan rows are never dropped by discovery. A plan is authored once and
+              -- walked to completion; without this clause it would survive at most one
+              -- discovery pass, and it would fail silently because interactive testing
+              -- hits the goal cache and never sees the wipe.
+              AND step_index IS NULL
             """
         ),
         {
@@ -12735,6 +12744,227 @@ def _load_active_goal(db: Session, state: TakeoverState) -> TakeoverGoal | None:
         },
     ).mappings().first()
     return _goal_from_row(row) if row else None
+
+
+def _write_objective_plan(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    objective: str,
+) -> str | None:
+    """Decompose an objective into ordered steps and store them. Returns the root id.
+
+    The root row carries ``step_index = 0`` and the steps ``1..N`` under
+    ``parent_goal_id = root``. ``step_index IS NOT NULL`` is what marks a row as part
+    of a plan, which is also what protects the whole plan from the discovery wipe —
+    ``parent_goal_id IS NULL`` could not do that job, because the root has a null
+    parent too.
+
+    Decomposition currently uses the deterministic fallback only. That is on purpose:
+    a plan must always exist, so the path that produces one may not depend on a model
+    being present, fast, or coherent.
+    """
+    cleaned = " ".join((objective or "").split()).strip()
+    if not cleaned or normalize_text(cleaned) in OBJECTIVE_PLACEHOLDER_VALUES:
+        return None
+    settings_obj = get_settings()
+    max_steps = max(2, int(getattr(settings_obj, "takeover_plan_max_steps", 8)))
+    steps = fallback_plan_steps(cleaned)[:max_steps]
+    if not steps:
+        return None
+
+    now = datetime.now(tz=UTC)
+    root_id = uuid.uuid4()
+
+    def _insert(goal_id: uuid.UUID, parent: uuid.UUID | None, step_index: int,
+                title: str, description: str, status: str) -> None:
+        db.execute(
+            text(
+                """
+                INSERT INTO autonomy_goals(
+                    id, session_id, workspace_id, user_id, title, description,
+                    source, priority_score, risk_tier, confidence, reasoning,
+                    evidence_event_ids, goal_kind, affective_scores, selection_score,
+                    goal_signature, cache_hit, cache_source, status, created_at,
+                    updated_at, parent_goal_id, step_index
+                )
+                VALUES(
+                    :id, :session_id, :workspace_id, :user_id, :title, :description,
+                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
+                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
+                    :selection_score, :goal_signature, :cache_hit, :cache_source,
+                    :status, :created_at, :updated_at, :parent_goal_id, :step_index
+                )
+                """
+            ),
+            {
+                "id": goal_id,
+                "session_id": state.session_id,
+                "workspace_id": auth.workspace_id,
+                "user_id": auth.user_id,
+                "title": sanitize_untrusted_objective(title, max_len=140),
+                "description": sanitize_untrusted_objective(description, max_len=240),
+                "source": AutonomyGoalSource.USER_OBJECTIVE.value,
+                "priority_score": 0.9,
+                "risk_tier": AutonomyRiskTier.MEDIUM.value,
+                "confidence": 0.85,
+                "reasoning": "Ordered plan step derived from the user objective.",
+                "evidence_event_ids": [],
+                "goal_kind": GoalKind.NORMAL.value,
+                "affective_scores": json.dumps({}),
+                # Plan order comes from step_index, not from this score; it is set high
+                # only so the plan reads sensibly in the dashboard queue.
+                "selection_score": 0.9,
+                "goal_signature": hashlib.sha256(
+                    f"plan|{root_id}|{step_index}|{title}".encode()
+                ).hexdigest()[:24],
+                "cache_hit": False,
+                "cache_source": "plan",
+                "status": status,
+                "created_at": now,
+                "updated_at": now,
+                "parent_goal_id": parent,
+                "step_index": step_index,
+            },
+        )
+
+    _insert(root_id, None, 0, cleaned[:140], cleaned[:240], AutonomyGoalStatus.SELECTED.value)
+    for step in steps:
+        _insert(
+            uuid.uuid4(), root_id, step.step_index, step.title, step.description,
+            AutonomyGoalStatus.CANDIDATE.value,
+        )
+
+    state.takeover_context["plan_root_goal_id"] = str(root_id)
+    state.takeover_context["plan_step_count"] = len(steps)
+    # A fresh plan behind a stale cached queue would be invisible for the cache TTL.
+    _invalidate_goal_queue_cache(db, auth=auth, state=state)
+    # Commit the plan on its own, as goal discovery already does. Later stages of the
+    # same request can roll the session back (the audit-log writer does this on
+    # failure), and because the state is re-saved afterwards the pointer would survive
+    # while the rows it points at silently did not — a plan that exists in state and
+    # nowhere else. Observed exactly that before this line was added.
+    db.commit()
+    return str(root_id)
+
+
+def _advance_plan_after_completion(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    context: dict[str, Any],
+) -> None:
+    """After a step completes, pin the next one instead of waiting for a new objective.
+
+    The generic completion path sets ``awaiting_next_objective`` and drops the
+    objective, which is right when work is one-off and wrong when it is a plan: the
+    point of a plan is that finishing floor 1 tells you to build floor 2. This
+    overrides those three fields, so it must run last in the SUCCEEDED block.
+
+    When no steps remain the plan is finished: the root is marked done and the pointer
+    cleared, so the next objective starts a fresh plan rather than resurrecting this one.
+    """
+    root_id = str(context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return
+    # _select_next_plan_step reads the pointer off state, which is only assigned from
+    # `context` after this block, so keep them in sync before querying.
+    state.takeover_context = context
+    next_step = _select_next_plan_step(db, state)
+    if next_step is not None:
+        state.active_goal_id = next_step.id
+        context["objective"] = next_step.title
+        context["awaiting_next_objective"] = False
+        context["awaiting_next_objective_turns"] = 0
+        state.objective_hash = objective_hash(next_step.title)
+        return
+
+    db.execute(
+        text(
+            """
+            UPDATE autonomy_goals
+            SET status = :status, updated_at = :updated_at
+            WHERE id = CAST(:id AS uuid)
+              AND session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+            """
+        ),
+        {
+            "status": AutonomyGoalStatus.DONE.value,
+            "updated_at": datetime.now(tz=UTC),
+            "id": root_id,
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+        },
+    )
+    context.pop("plan_root_goal_id", None)
+    context.pop("plan_step_count", None)
+    context["plan_completed_at"] = datetime.now(tz=UTC).isoformat()
+    # Clear the objective as well. The final step's title is still sitting in context,
+    # and leaving it there makes the next turn author a brand new plan *from that step*
+    # — the plan finishes, then immediately restarts as "verify the outcome", forever.
+    # Wait for a genuinely new objective instead.
+    context.pop("objective", None)
+    context["awaiting_next_objective"] = True
+    context["awaiting_next_objective_turns"] = 0
+    state.objective_hash = ""
+    state.active_goal_id = None
+    _invalidate_goal_queue_cache(db, auth=auth, state=state)
+
+
+def _select_next_plan_step(db: Session, state: TakeoverState) -> TakeoverGoal | None:
+    """Return the next unfinished step of the active plan, or None.
+
+    Because step indexes are contiguous and ordered, the lowest non-terminal step is
+    by definition the one whose predecessors are all finished — no dependency walk is
+    needed at runtime. A completed step can never be returned, which is the whole
+    point: score-ranked selection puts the just-finished item first, a plan does not.
+
+    Deliberately reads the database directly rather than going through
+    ``_discover_takeover_goals``: that function early-returns a cached queue, so plan
+    logic placed behind it would work on cache misses and silently fall back to score
+    ordering on hits.
+    """
+    root_id = str(state.takeover_context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT id, session_id, workspace_id, user_id, title, description, source,
+                   priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
+                   goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   status, created_at, updated_at
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND parent_goal_id = CAST(:root_id AS uuid)
+              AND status NOT IN (:done_status, :dropped_status)
+            ORDER BY step_index ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "root_id": root_id,
+            "done_status": AutonomyGoalStatus.DONE.value,
+            "dropped_status": AutonomyGoalStatus.DROPPED.value,
+        },
+    ).mappings().first()
+    if row is None:
+        return None  # every step finished — the plan is complete
+    if str(row["status"]) == AutonomyGoalStatus.BLOCKED.value:
+        # Stalled, not skippable: building the next floor on an unfinished one is
+        # worse than stopping and surfacing the blocker.
+        return None
+    return _goal_from_row(row)
 
 
 def _find_valid_allow_permit(
@@ -13806,10 +14036,44 @@ def takeover_step(
     objective_hash_value = objective_hash(resolved_task)
     objective_changed = objective_hash_value != (state.objective_hash or "")
     selected_goal: TakeoverGoal | None = _load_active_goal(db, state)
+    # A pin left on a finished goal would otherwise be returned forever, which is the
+    # "propose the step you just completed" failure at the pin level. Release it so a
+    # plan step (or discovery) can supply the next objective instead.
+    if selected_goal is not None and selected_goal.status in {
+        AutonomyGoalStatus.DONE,
+        AutonomyGoalStatus.DROPPED,
+    }:
+        selected_goal = None
+        state.active_goal_id = None
+    # Author a plan once per objective. Only when takeover is active, the objective is
+    # real, and no plan is already in flight — re-authoring on every turn would reset
+    # progress, which is exactly the "rebuild floor 1" behaviour this replaces.
+    if (
+        bool(getattr(settings, "takeover_plan_enabled", False))
+        and state.active
+        and not state.takeover_context.get("plan_root_goal_id")
+        # A finished plan leaves this set until the user supplies a real next
+        # objective. Without the guard, "continue" is enough to start another plan.
+        and not (awaiting_next_objective and not has_new_objective_signal)
+        and resolved_task
+        and normalize_text(resolved_task) not in OBJECTIVE_PLACEHOLDER_VALUES
+    ):
+        try:
+            _write_objective_plan(db, auth=auth, state=state, objective=resolved_task)
+        except Exception:
+            # A plan is an optimisation, never a precondition for taking a turn.
+            logger.warning("failed to author objective plan", exc_info=True)
+    plan_step = _select_next_plan_step(db, state) if selected_goal is None else None
+    if plan_step is not None:
+        selected_goal = plan_step
+        state.active_goal_id = plan_step.id
     goal_discovery_every_n_turns = max(6, int(getattr(settings, "takeover_goal_discovery_every_n_turns", 24)))
     periodic_goal_discovery_due = turn_count > 0 and (turn_count % goal_discovery_every_n_turns == 0)
     should_discover = bool(
         state.active
+        # A live plan owns the objective; letting discovery run would wipe the
+        # candidate queue and insert 20 competing event-derived goals beside it.
+        and plan_step is None
         and (not awaiting_next_objective or has_new_objective_signal)
         and (
             selected_goal is None

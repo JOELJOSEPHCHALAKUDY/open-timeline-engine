@@ -423,6 +423,17 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE autonomy_goals ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0")
     if not _column_exists(conn, "autonomy_goals", "cache_source"):
         conn.execute("ALTER TABLE autonomy_goals ADD COLUMN cache_source TEXT")
+    # Ordered plan position. Nullable because SQLite cannot add a NOT NULL column
+    # without a constant default, and because NULL is the meaningful value here:
+    # it marks a goal that is not part of a plan.
+    if not _column_exists(conn, "autonomy_goals", "step_index"):
+        conn.execute("ALTER TABLE autonomy_goals ADD COLUMN step_index INTEGER")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_autonomy_goals_plan_step
+            ON autonomy_goals (session_id, workspace_id, user_id, parent_goal_id, step_index)
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS autonomy_goals (

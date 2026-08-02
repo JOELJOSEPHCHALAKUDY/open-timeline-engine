@@ -6363,6 +6363,9 @@ def discover_takeover_goals(
         UPDATE autonomy_goals
         SET status = ?, updated_at = ?
         WHERE session_id = ? AND workspace_id = ? AND user_id = ? AND status = ?
+          -- Plan rows are authored once and walked to completion, so discovery must
+          -- never drop them. Mirrors the Full backend.
+          AND step_index IS NULL
         """,
         (
             AutonomyGoalStatus.DROPPED.value,

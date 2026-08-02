@@ -230,6 +230,11 @@ class Settings(BaseSettings):
     takeover_goal_min_confidence: float = 0.62
     takeover_goal_selection_min_confidence: float = 0.62
     takeover_goal_discovery_every_n_turns: int = 24
+    # Ordered plan goals: an objective is decomposed once into ordered steps and then
+    # walked to completion, instead of re-ranking past events every turn. Off by
+    # default; with it off the plan code paths are inert.
+    takeover_plan_enabled: bool = False
+    takeover_plan_max_steps: int = 8
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
