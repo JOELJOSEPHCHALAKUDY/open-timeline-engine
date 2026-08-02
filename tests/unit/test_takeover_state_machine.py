@@ -115,6 +115,21 @@ def test_strip_activation_prefix_empty_on_pure_activation() -> None:
     assert result == ""
 
 
+def test_strip_activation_prefix_removes_sentence_ending_punctuation() -> None:
+    """A sentence break after the activation phrase must not leak into the objective.
+
+    Observed live: "beru take over. Objective: ..." produced an objective of
+    ". Objective: ...", because only ",;:- " was stripped. The leading period then
+    shows up in every directive and in the executor's marching orders.
+    """
+    assert (
+        _strip_activation_prefix("beru take over. Objective: count the markdown files")
+        == "Objective: count the markdown files"
+    )
+    assert _strip_activation_prefix("beru take over! fix the auth flow") == "fix the auth flow"
+    assert _strip_activation_prefix("beru take over? review the diff") == "review the diff"
+
+
 # --- Fix 2: Vague/meta objectives detected and replaced ---
 
 def test_is_vague_objective_detects_meta() -> None:

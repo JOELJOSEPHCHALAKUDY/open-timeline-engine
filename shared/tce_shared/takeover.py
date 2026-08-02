@@ -805,8 +805,11 @@ def _strip_activation_prefix(text: str) -> str:
         idx = normalized.find(marker)
         if idx >= 0:
             after = text[idx + len(marker):].strip()
-            # Remove leading punctuation/conjunctions
-            after = after.lstrip(",;:- ")
+            # Remove leading punctuation/conjunctions. Sentence-ending marks matter
+            # here too: "beru take over. Objective: ..." is a natural way to phrase
+            # an activation, and without "." the period leaks into the objective and
+            # then into every directive built from it.
+            after = after.lstrip(".!?,;:- ")
             for prefix in ("and ", "then ", "now ", "please "):
                 if after.lower().startswith(prefix):
                     after = after[len(prefix):].strip()

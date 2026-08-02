@@ -14615,6 +14615,25 @@ def takeover_step(
             "Behavior fidelity is not validated for autonomous continuation. "
             "Confirm the preferred choice or run a behavior fidelity evaluation."
         )
+    if (
+        needs_human
+        and bool(takeover_enforcement.get("pending_execution_lock"))
+        and safety_decision == SafetyDecision.ALLOW
+        and not actionable_lifecycle_pause
+    ):
+        # The execution lock is applied earlier in this handler, before needs_human has
+        # been computed, so its text unconditionally says "continue execution now". When
+        # the turn then escalates, that stale instruction is what reaches the executor as
+        # next_step — and next_step takes precedence by policy, so the escalation is
+        # silently overridden and a low-confidence turn executes anyway. Keep the lock,
+        # because takeover must never degrade to natural chat, but point the executor at
+        # the human instead of at more execution.
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        final_response = (
+            "Execution lock active for takeover objective, but confidence is below the "
+            "autonomy threshold for this turn. Ask the user how to proceed on this "
+            "objective. Do not execute further and do not switch to natural-response mode."
+        )
     if needs_human:
         TAKEOVER_NEEDS_HUMAN_COUNT.inc()
     quality_history = state.takeover_context.get("quality_history")
