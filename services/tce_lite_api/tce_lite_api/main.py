@@ -143,12 +143,14 @@ from tce_shared.events import (
     TakeoverStepRequest,
     TakeoverStepResponse,
 )
+from tce_shared.execution_transitions import completion_payload_fingerprint
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
 from tce_shared.governance import build_governance_status
 from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_text
+from tce_shared.scope import PROJECT_BOUND
 
 from .auth import AuthContext, get_auth_context
 from .behavior_control_store import (
@@ -185,6 +187,7 @@ from .behavior_pilot_store import (
 )
 from .config import get_settings
 from .continuity_store import (
+    CompletionConflictError,
     deliver_handoff_safely,
     drain_pending_handoffs,
     enqueue_handoff,
@@ -2780,8 +2783,13 @@ def search(
     REQUEST_COUNT.labels(endpoint="search", method="POST").inc()
     _enforce_workspace_access(auth, conn)
     start = time.perf_counter()
+    scope = auth.resolved_scope(
+        project_hint=getattr(body, "app_context", None) if isinstance(getattr(body, "app_context", None), dict) else None,
+        target_owner=getattr(body, "target_owner", None),
+        continuity_intent=bool(getattr(body, "continuity_intent", False)),
+    )
     result, blocked, retrieval_meta = search_events(
-        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id
+        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=scope
     )
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="search", method="POST").observe(latency_ms / 1000.0)
@@ -2874,29 +2882,69 @@ def capture_completion(
         """,
         (body.session_id, auth.workspace_id, auth.user_id),
     ).fetchone()
+    session_project: dict[str, Any] | None = None
     if state_row is not None:
         try:
             takeover_context = json.loads(str(state_row["takeover_context"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             takeover_context = {}
-        project_context = canonical_project_context(takeover_context.get("project_context"))
+        session_project_raw = takeover_context.get("project_context") if isinstance(takeover_context, dict) else None
+        session_project = dict(session_project_raw) if isinstance(session_project_raw, dict) and session_project_raw else None
+    # Project binding for an ordinary completion (no takeover activation required): explicit
+    # app_context => bound, session-bound project => inherited, otherwise visibly unbound.
+    explicit_app_context = getattr(body, "app_context", None)
+    scope = auth.resolved_scope(
+        project_hint=explicit_app_context if isinstance(explicit_app_context, dict) and explicit_app_context else None,
+        session_project=session_project,
+        task_id=body.session_id,
+    )
+    if scope.is_bound():
+        project_context = canonical_project_context(
+            explicit_app_context if scope.project_binding == PROJECT_BOUND and isinstance(explicit_app_context, dict) else None,
+            session_project,
+        )
         if project_context:
             milestone["project_context"] = project_context
+    milestone["project_binding"] = scope.project_binding
     now = datetime.now(tz=UTC)
-    outbox = enqueue_handoff(
-        conn,
-        workspace_id=auth.workspace_id,
-        owner_id=auth.user_id,
-        behavior_subject_id=auth.behavior_subject_id,
-        session_id=body.session_id,
-        directive_id=None,
-        completion_key=body.completion_key,
-        terminal_state=body.state,
-        milestone=milestone,
-        source=body.source,
-        redaction_applied=bool(normalized["redaction_applied"]),
-        now=now,
-    )
+    try:
+        outbox = enqueue_handoff(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            behavior_subject_id=auth.behavior_subject_id,
+            session_id=body.session_id,
+            directive_id=None,
+            completion_key=body.completion_key,
+            terminal_state=body.state,
+            milestone=milestone,
+            source=body.source,
+            redaction_applied=bool(normalized["redaction_applied"]),
+            now=now,
+            executor_id=auth.consumer,
+            payload_hash=completion_payload_fingerprint(milestone),
+        )
+    except CompletionConflictError as exc:
+        conn.rollback()
+        write_audit(
+            conn,
+            consumer=auth.consumer,
+            action="completion_conflict",
+            query={"completion_key": body.completion_key, "session_id": body.session_id, "outbox_id": str(exc.outbox_id)},
+            result_event_ids=[],
+            policy_decisions={"reason": "idempotency_conflict"},
+            latency_ms=0,
+        )
+        conn.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "idempotency_conflict",
+                "completion_key": body.completion_key,
+                "outbox_id": str(exc.outbox_id),
+                "message": "same completion_key with a different payload",
+            },
+        ) from exc
     conn.commit()
     delivered = deliver_handoff_safely(
         conn,
@@ -2919,6 +2967,7 @@ def capture_completion(
         handoff_record_id=UUID(str(delivered["handoff_record_id"])),
         contract_valid=True,
         captured_at=datetime.fromisoformat(str(delivered["created_at"])),
+        project_binding=scope.project_binding,
     )
 
 
@@ -3859,8 +3908,13 @@ def get_context_bundle(
     REQUEST_COUNT.labels(endpoint="context_bundle", method="POST").inc()
     _enforce_workspace_access(auth, conn)
     start = time.perf_counter()
+    scope = auth.resolved_scope(
+        project_hint=body.app_context if isinstance(body.app_context, dict) else None,
+        target_owner=getattr(body, "target_owner", None),
+        continuity_intent=bool(getattr(body, "continuity_intent", False)),
+    )
     bundle, blocked = context_bundle(
-        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id
+        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=scope
     )
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="context_bundle", method="POST").observe(latency_ms / 1000.0)
@@ -3968,6 +4022,10 @@ def context_brief(
 ) -> ContextBriefResponse:
     REQUEST_COUNT.labels(endpoint="context_brief", method="POST").inc()
     _enforce_workspace_access(auth, conn)
+    scope = auth.resolved_scope(
+        project_hint=body.app_context if isinstance(body.app_context, dict) else None,
+        task_id=body.session_id,
+    )
     result = store_context_brief(
         conn,
         settings=settings,
@@ -3978,6 +4036,7 @@ def context_brief(
         app_context=body.app_context,
         constraints=body.constraints,
         max_items=body.max_items,
+        scope=scope,
     )
     return ContextBriefResponse.model_validate(result)
 
@@ -4127,6 +4186,7 @@ def get_activity_summary(
         period=period,
         domain=domain,
         max_events=max_events,
+        scope=auth.resolved_scope(),
     )
     write_audit(
         conn,
@@ -4190,6 +4250,7 @@ def get_patterns(
         workspace_id=auth.workspace_id,
         owner_id=auth.user_id,
         limit=100,
+        scope=auth.resolved_scope(),
     )
 
 
@@ -4904,8 +4965,15 @@ def _store_behavior_evidence_lite_api(
     if not bool(getattr(settings, "behavior_evidence_enabled", True)):
         raise HTTPException(status_code=404, detail="behavior evidence capture is disabled")
     raw = body.model_dump(mode="python")
-    if body.evidence_source.value in {"explicit", "correction", "calibration"} and not raw.get("confirmed_at"):
-        raw["confirmed_at"] = datetime.now(tz=UTC)
+    # P0: confirmation is never caller-asserted; a verified source-event path (P1) is the only writer.
+    raw["confirmed_at"] = None
+    # P0: only a human operator can author human-origin evidence. A non-human caller (executor/advisor)
+    # is downgraded to inferred, may not supersede prior observations, and is held out of learning as
+    # pending_review below regardless of score.
+    is_human = auth.role == AgentRole.USER
+    if not is_human:
+        raw["evidence_source"] = BehaviorEvidenceSource.INFERRED.value
+        raw["supersedes_observation_id"] = None
     normalized = normalize_behavior_evidence(raw)
     storage_gate = behavior_storage_gate(
         normalized,
@@ -4954,16 +5022,24 @@ def _store_behavior_evidence_lite_api(
         if mode == "warn":
             warnings.append(message)
     review_pending = bool(
-        getattr(settings, "behavior_memory_review_enabled", True)
-        and storage_gate["learning_eligible"]
-        and normalized.get("evidence_source") in {"inferred", "backfill"}
+        storage_gate["learning_eligible"]
+        and (
+            not is_human
+            or (
+                getattr(settings, "behavior_memory_review_enabled", True)
+                and normalized.get("evidence_source") in {"inferred", "backfill"}
+            )
+        )
     )
     if review_pending:
+        review_reasons = [*list(storage_gate.get("reasons") or []), "human_review_required"]
+        if not is_human:
+            review_reasons.append("non_human_caller")
         storage_gate = {
             **storage_gate,
             "learning_eligible": False,
             "decision": "pending_review",
-            "reasons": [*list(storage_gate.get("reasons") or []), "human_review_required"],
+            "reasons": review_reasons,
         }
         warnings.append("evidence is pending memory review and cannot influence behavior yet")
     supersedes = normalized.get("supersedes_observation_id")

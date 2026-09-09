@@ -4,6 +4,11 @@ The MCP client auto-retries POSTs on 5xx/read-timeout, so a duplicate
 report of an already-terminal directive must replay the recorded result —
 not mint a second retry directive, re-run side effects, or flip the
 terminal state.
+
+Reports carry the lease generation handed out at claim time; a legacy
+report without a lease is still accepted while ``takeover_lease_strict``
+is off (see tests/integration/test_trust_boundary_lite.py for the fenced
+paths).
 """
 
 from __future__ import annotations
@@ -35,7 +40,8 @@ def lite_client(tmp_path) -> Iterator[TestClient]:
         yield client
 
 
-def _mint_claimed_directive(client: TestClient, session_id: str) -> str:
+def _mint_claimed_directive(client: TestClient, session_id: str) -> tuple[str, int]:
+    """Permit + activation + claim. Returns (directive_id, lease_generation)."""
     permit = client.post(
         "/v1/takeover/permit",
         json={
@@ -56,7 +62,8 @@ def _mint_claimed_directive(client: TestClient, session_id: str) -> str:
             "session_id": session_id,
             "persona_mode": "shadow",
             "task": "update the changelog notes",
-            "app_context": {"domain": "coding"},
+            # A mutating directive needs a bound project; an unbound context is refused (case 8).
+            "app_context": {"domain": "coding", "project": "open-timeline-engine", "project_root": "/work/open-timeline-engine"},
             "constraints": {"k": 4},
             "allow_fallback": True,
         },
@@ -72,24 +79,25 @@ def _mint_claimed_directive(client: TestClient, session_id: str) -> str:
         headers=_headers(),
     )
     assert claim.status_code == 200
-    return str(directive_id)
+    lease_generation = int(claim.json()["lease_generation"])
+    assert lease_generation >= 1
+    return str(directive_id), lease_generation
 
 
-def _report(client: TestClient, session_id: str, directive_id: str, state: str) -> dict:
-    resp = client.post(
-        "/v1/takeover/execution/report",
-        json={
-            "session_id": session_id,
-            "directive_id": directive_id,
-            "state": state,
-            "result": "failure" if state == "failed" else "success",
-            "failure_reason": "tool crashed" if state == "failed" else None,
-        },
-        headers=_headers(),
-    )
-    assert resp.status_code == 200
-    payload: dict = resp.json()
-    return payload
+def _report(client: TestClient, session_id: str, directive_id: str, state: str, *, lease: int | None = None) -> dict:
+    payload: dict = {
+        "session_id": session_id,
+        "directive_id": directive_id,
+        "state": state,
+        "result": "failure" if state == "failed" else "success",
+        "failure_reason": "tool crashed" if state == "failed" else None,
+    }
+    if lease is not None:
+        payload["lease_generation"] = lease
+    resp = client.post("/v1/takeover/execution/report", json=payload, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    body: dict = resp.json()
+    return body
 
 
 def _pending_count(client: TestClient, session_id: str) -> int:
@@ -106,13 +114,13 @@ def test_duplicate_failed_report_replays_without_second_retry(
     lite_client: TestClient,
 ) -> None:
     session_id = f"lifecycle-{uuid.uuid4().hex[:8]}"
-    directive_id = _mint_claimed_directive(lite_client, session_id)
+    directive_id, lease = _mint_claimed_directive(lite_client, session_id)
 
-    first = _report(lite_client, session_id, directive_id, "failed")
+    first = _report(lite_client, session_id, directive_id, "failed", lease=lease)
     assert first["state"] == "failed"
     pending_after_first = _pending_count(lite_client, session_id)
 
-    duplicate = _report(lite_client, session_id, directive_id, "failed")
+    duplicate = _report(lite_client, session_id, directive_id, "failed", lease=lease)
     assert duplicate["state"] == "failed"
     assert duplicate.get("idempotent_replay") is True
     assert duplicate.get("retry_directive_id") == first.get("retry_directive_id")
@@ -121,11 +129,12 @@ def test_duplicate_failed_report_replays_without_second_retry(
 
 def test_late_report_cannot_flip_terminal_state(lite_client: TestClient) -> None:
     session_id = f"lifecycle-{uuid.uuid4().hex[:8]}"
-    directive_id = _mint_claimed_directive(lite_client, session_id)
+    directive_id, lease = _mint_claimed_directive(lite_client, session_id)
 
-    first = _report(lite_client, session_id, directive_id, "failed")
+    first = _report(lite_client, session_id, directive_id, "failed", lease=lease)
     assert first["state"] == "failed"
 
+    # Legacy no-key, no-lease late report: replays the recorded terminal result.
     late = _report(lite_client, session_id, directive_id, "succeeded")
     assert late["state"] == "failed"
     assert late.get("idempotent_replay") is True

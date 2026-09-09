@@ -80,8 +80,8 @@ def behavior_evidence_json(workspace_id: str, subject_id: str, observation_id: s
 
 
 @mcp.tool(name="tce.search_events", description="Search timeline events with filters and citations")
-def search_events(query: str, filters: dict | None = None, k: int = 10, time_range: dict | None = None) -> dict:
-    return tools.search_events(query=query, filters=filters, k=k, time_range=time_range)
+def search_events(query: str, filters: dict | None = None, k: int = 10, time_range: dict | None = None, app_context: dict | None = None) -> dict:
+    return tools.search_events(query=query, filters=filters, k=k, time_range=time_range, app_context=app_context)
 
 
 @mcp.tool(name="tce.get_context_bundle", description="Get redaction-safe context bundle for a task")
@@ -89,13 +89,25 @@ def get_context_bundle(task: str, app_context: dict | None = None, constraints: 
     return tools.get_context_bundle(task=task, app_context=app_context, constraints=constraints)
 
 
-@mcp.tool(name="tce.get_resume_packet", description="Get deterministic handoff resume packet for cross-executor continuation")
+@mcp.tool(
+    name="tce.get_resume_packet",
+    description=(
+        "Get deterministic handoff resume packet for cross-executor continuation. session_id is YOUR (reader) session. "
+        "To resume a peer's work, pass source_session_id (the session that completed the work, e.g. 'codex-a'), or "
+        "target_owner plus include_cross_user=true to resume that executor's latest completion. Pass current_git "
+        "({commit, repo}) so the result reports anchor_freshness (current|stale|unknown); treat stale anchors as "
+        "untrusted. legacy_session_scope=true restricts results to records written by session_id itself (old behaviour)."
+    ),
+)
 def get_resume_packet(
     query: str,
     target_owner: str | None = None,
     session_id: str = "default",
     k: int = 5,
     include_cross_user: bool = True,
+    source_session_id: str | None = None,
+    legacy_session_scope: bool = False,
+    current_git: dict | None = None,
 ) -> dict:
     return tools.get_resume_packet(
         query=query,
@@ -103,6 +115,9 @@ def get_resume_packet(
         session_id=session_id,
         k=k,
         include_cross_user=include_cross_user,
+        source_session_id=source_session_id,
+        legacy_session_scope=legacy_session_scope,
+        current_git=current_git,
     )
 
 
@@ -119,6 +134,7 @@ def complete_task(
     git: dict | None = None,
     anchors: list[dict] | None = None,
     change_summary: dict | None = None,
+    app_context: dict | None = None,
 ) -> dict:
     return tools.complete_task(
         completion_key=completion_key,
@@ -132,6 +148,7 @@ def complete_task(
         git=git,
         anchors=anchors,
         change_summary=change_summary,
+        app_context=app_context,
     )
 
 
@@ -282,8 +299,8 @@ def run_retrieval_eval(session_id: str = "default", tasks: list[str] | None = No
 
 
 @mcp.tool(name="tce.get_patterns", description="Get extracted patterns by domain")
-def get_patterns(domain: str | None = None, min_confidence: float = 0.5) -> dict:
-    return tools.get_patterns(domain=domain, min_confidence=min_confidence)
+def get_patterns(domain: str | None = None, min_confidence: float = 0.5, app_context: dict | None = None) -> dict:
+    return tools.get_patterns(domain=domain, min_confidence=min_confidence, app_context=app_context)
 
 
 @mcp.tool(name="tce.record_event", description="Record an event in the timeline engine")
@@ -717,7 +734,9 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "state.takeover_context.objective. Do not narrate the result; take action. Before editing any file, call "
         "tce.check_context first. On the first call in a repository, include app_context.project_root and "
         "app_context.project; resend them when the repository changes. If result contains persona_ack, show only "
-        "that text before taking action."
+        "that text before taking action. The result's project_binding (bound|unbound) says whether autonomous writes "
+        "are allowed: unbound means provide app_context.project_root first. state.lease_generation, when present, is "
+        "the directive lease you must echo on tce.report_execution."
     ),
 )
 def takeover_step(
@@ -915,7 +934,14 @@ def ack_takeover_notice(notice_id: str, session_id: str = "default", select_goal
     return tools.ack_takeover_notice(notice_id=notice_id, session_id=session_id, select_goal=select_goal)
 
 
-@mcp.tool(name="tce.claim_execution", description="Claim a pending directive execution before mutating work")
+@mcp.tool(
+    name="tce.claim_execution",
+    description=(
+        "Claim a pending directive execution before mutating work. The response's lease_generation is the fencing "
+        "token: remember it and echo it on tce.report_execution. A directive already claimed by another executor "
+        "returns 409 claimed_by_other; do not retry, report it to the user."
+    ),
+)
 def claim_execution(
     session_id: str = "default",
     directive_id: str | None = None,
@@ -928,7 +954,16 @@ def claim_execution(
     )
 
 
-@mcp.tool(name="tce.report_execution", description="Report directive execution outcome for retry/self-correction")
+@mcp.tool(
+    name="tce.report_execution",
+    description=(
+        "Report directive execution outcome for retry/self-correction. REQUIRED: echo lease_generation from your "
+        "tce.claim_execution response (or state.lease_generation in the takeover_step result); it is the fencing token "
+        "and a stale or missing lease is rejected with 409 (stale_lease / lease_required) and the report is discarded. "
+        "Pass a stable idempotency_key per attempt so a retried report replays instead of duplicating; the same key with "
+        "a different payload is rejected with 409 idempotency_conflict. verification_state is never caller-asserted."
+    ),
+)
 def report_execution(
     session_id: str = "default",
     directive_id: str = "",
@@ -937,6 +972,8 @@ def report_execution(
     failure_reason: str | None = None,
     details: dict | None = None,
     rollback_performed: bool = False,
+    lease_generation: int | None = None,
+    idempotency_key: str | None = None,
 ) -> dict:
     return tools.report_execution(
         session_id=session_id,
@@ -946,6 +983,8 @@ def report_execution(
         failure_reason=failure_reason,
         details=details,
         rollback_performed=rollback_performed,
+        lease_generation=lease_generation,
+        idempotency_key=idempotency_key,
     )
 
 

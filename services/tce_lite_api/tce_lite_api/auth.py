@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import Header, HTTPException
 from tce_shared.events import AgentRole
 from tce_shared.identity import claim_conflicts, parse_identity_claims, resolve_bound_identity
+from tce_shared.scope import ResolvedScope, resolve_scope
 
 from .config import get_settings
 
@@ -16,6 +19,31 @@ class AuthContext:
     workspace_id: str
     user_id: str
     behavior_subject_id: str
+
+    def resolved_scope(
+        self,
+        *,
+        project_hint: Mapping[str, Any] | None = None,
+        session_project: Mapping[str, Any] | None = None,
+        task_id: str | None = None,
+        target_owner: str | None = None,
+        continuity_intent: bool = False,
+        source_session_id: str | None = None,
+        legacy_session_scope: bool = False,
+        retention_days: int = 90,
+    ) -> ResolvedScope:
+        """Server-bound request scope: identity comes from this context, never from the body."""
+        return resolve_scope(
+            self,
+            project_hint=project_hint,
+            session_project=session_project,
+            task_id=task_id,
+            target_owner=target_owner,
+            continuity_intent=continuity_intent,
+            source_session_id=source_session_id,
+            legacy_session_scope=legacy_session_scope,
+            retention_days=retention_days,
+        )
 
 
 def _parse_bearer_token(authorization: str | None) -> str | None:

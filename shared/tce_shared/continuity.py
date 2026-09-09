@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -222,3 +222,38 @@ def progress_patch(
         patch["feedback_at"] = now
     patch["phase"] = normalized_phase
     return patch
+
+
+def assess_anchor_freshness(
+    *,
+    record_git: Mapping[str, Any] | None,
+    record_ts: datetime | None,
+    current_git: Mapping[str, Any] | None,
+    now: datetime,
+    max_age_hours: float = 72.0,
+) -> tuple[str, list[str]]:
+    """Label a handoff record's anchors ``current`` / ``stale`` / ``unknown`` against the reader's checkout.
+
+    Never returns ``current`` without a matching commit; a repo mismatch is stale regardless of commit.
+    """
+    current = dict(current_git or {})
+    current_commit = str(current.get("commit") or "").strip().lower()
+    if not current_commit:
+        return "unknown", ["no_current_commit"]
+    record = dict(record_git or {})
+    record_repo = str(record.get("repo") or record.get("remote") or "").strip().lower()
+    current_repo = str(current.get("repo") or current.get("remote") or "").strip().lower()
+    if record_repo and current_repo and record_repo != current_repo:
+        return "stale", ["repo_mismatch"]
+    record_commit = str(record.get("commit") or "").strip().lower()
+    if not record_commit:
+        return "unknown", ["record_commit_missing"]
+    if record_commit[:12] != current_commit[:12]:
+        return "stale", ["commit_mismatch"]
+    reasons = ["commit_match"]
+    record_dt = _datetime(record_ts)
+    if record_dt is not None:
+        now_dt = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        if record_dt < now_dt - timedelta(hours=max_age_hours):
+            reasons.append("older_than_max_age")
+    return "current", reasons

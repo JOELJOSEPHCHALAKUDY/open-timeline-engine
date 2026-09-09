@@ -10,24 +10,97 @@ from sqlalchemy.orm import Session
 from tce_shared.autonomy_context import summarize_hit_text
 from tce_shared.events import EventFilter, EventSearchRequest, EventSearchResponse
 from tce_shared.policy import ConsumerContext
+from tce_shared.scope import PROJECT_BOUND, ResolvedScope
 
 from .config import get_settings
 from .db import get_session_factory
 from .graph import graph_snapshot_for_events
 from .policy import PolicyEngine
 from .schemas import ContextBundleRequest, ContextBundleResponse, EvidenceEvent, PatternItem
-from .search import run_search
+from .search import run_search, scope_from_consumer
 
 _BUNDLE_EXECUTOR = ThreadPoolExecutor(max_workers=3)
 
 
+def visible_requested_domain(scope: ResolvedScope, domain: str | None) -> str | None:
+    """Drop a body-supplied ``<other-workspace>:takeover`` domain.
+
+    Learned patterns and workflow templates have no workspace column; per-workspace rows are
+    keyed only by ``f"{workspace_id}:takeover"``, so honouring a foreign takeover domain from the
+    request would read another workspace's learned rows. Only the caller's own takeover domain or
+    a non-takeover domain survives.
+    """
+    if not domain:
+        return None
+    if domain.endswith(":takeover") and domain != f"{scope.workspace_id}:takeover":
+        return None
+    return domain
+
+
+def _pattern_rows_in_scope(
+    db: Session,
+    pattern_rows: list[Any],
+    scope: ResolvedScope,
+    *,
+    domain: str | None,
+) -> list[Any]:
+    """Keep only patterns whose evidence sits inside ``scope``.
+
+    A pattern with no evidence events is visible only when its domain is the caller's own
+    takeover domain or the domain explicitly requested; otherwise at least one evidence event
+    must carry this workspace and one of the scope's owners.
+    """
+    if not pattern_rows:
+        return []
+    domain = visible_requested_domain(scope, domain)
+    takeover_domain = f"{scope.workspace_id}:takeover"
+    visible_unevidenced_domains = {takeover_domain}
+    if domain:
+        visible_unevidenced_domains.add(domain)
+    all_evidence_ids: list[Any] = []
+    for row in pattern_rows:
+        if row["evidence_event_ids"]:
+            all_evidence_ids.extend(row["evidence_event_ids"][:10])
+    evidence_contexts: dict[Any, dict[str, Any]] = {}
+    if all_evidence_ids:
+        ev_rows = db.execute(
+            text("SELECT id, context FROM events WHERE id = ANY(:ids)"),
+            {"ids": list(set(all_evidence_ids))},
+        ).fetchall()
+        for ev in ev_rows:
+            evidence_contexts[ev[0]] = ev[1] if isinstance(ev[1], dict) else {}
+    owners = {str(owner).strip().lower() for owner in scope.owner_ids}
+    kept: list[Any] = []
+    for row in pattern_rows:
+        evidence_ids = list(row["evidence_event_ids"] or [])
+        if not evidence_ids:
+            if str(row["domain"] or "") in visible_unevidenced_domains:
+                kept.append(row)
+            continue
+        scoped = False
+        for eid in evidence_ids[:10]:
+            ctx = evidence_contexts.get(eid)
+            if ctx is None:
+                continue
+            workspace = str(ctx.get("_tce_workspace") or "").strip()
+            owner = str(ctx.get("_tce_owner") or "").strip().lower()
+            if workspace == scope.workspace_id and owner in owners:
+                scoped = True
+                break
+        if scoped:
+            kept.append(row)
+    return kept
+
+
 def _fetch_patterns_scoped(
     db: Session,
-    min_confidence: float,
+    scope: ResolvedScope,
+    *,
     domain: str | None,
-    consumer_ctx: ConsumerContext,
+    min_confidence: float,
 ) -> list[PatternItem]:
     """Fetch patterns with batch evidence scoping (eliminates N+1)."""
+    domain = visible_requested_domain(scope, domain)
     # Raw SQL pattern query
     where_parts = [
         "confidence >= :min_conf",
@@ -49,43 +122,8 @@ def _fetch_patterns_scoped(
         params,
     ).mappings().all()
 
-    if not pattern_rows:
-        return []
-
-    # Collect ALL evidence IDs across all patterns for a single batch query
-    all_evidence_ids: list[Any] = []
-    for row in pattern_rows:
-        if row["evidence_event_ids"]:
-            all_evidence_ids.extend(row["evidence_event_ids"][:10])
-
-    # Batch-fetch evidence contexts in ONE query instead of N+1
-    evidence_contexts: dict[Any, dict[str, Any]] = {}
-    if all_evidence_ids:
-        ev_rows = db.execute(
-            text("SELECT id, context FROM events WHERE id = ANY(:ids)"),
-            {"ids": list(set(all_evidence_ids))},
-        ).fetchall()
-        for ev in ev_rows:
-            evidence_contexts[ev[0]] = ev[1] if isinstance(ev[1], dict) else {}
-
-    # Scope-check using batch results
     top_patterns: list[PatternItem] = []
-    for row in pattern_rows:
-        if row["evidence_event_ids"]:
-            scoped = False
-            for eid in row["evidence_event_ids"][:10]:
-                ctx = evidence_contexts.get(eid)
-                if ctx is None:
-                    continue
-                workspace = ctx.get("_tce_workspace")
-                owner = ctx.get("_tce_owner")
-                if (not workspace or workspace == consumer_ctx.workspace_id) and (
-                    not owner or owner == consumer_ctx.owner_id
-                ):
-                    scoped = True
-                    break
-            if not scoped:
-                continue
+    for row in _pattern_rows_in_scope(db, list(pattern_rows), scope, domain=domain):
         top_patterns.append(
             PatternItem(
                 id=row["id"],
@@ -100,28 +138,20 @@ def _fetch_patterns_scoped(
     return top_patterns
 
 
-def _fetch_workflows(db: Session, domain: str | None) -> list[dict[str, Any]]:
-    """Fetch workflow templates via raw SQL."""
-    if domain:
-        rows = db.execute(
-            text("""
-                SELECT id, name, domain, graph, triggers, version
-                FROM workflow_templates
-                WHERE domain = :domain
-                ORDER BY updated_at DESC
-                LIMIT 5
-            """),
-            {"domain": domain},
-        ).mappings().all()
-    else:
-        rows = db.execute(
-            text("""
-                SELECT id, name, domain, graph, triggers, version
-                FROM workflow_templates
-                ORDER BY updated_at DESC
-                LIMIT 5
-            """),
-        ).mappings().all()
+def _fetch_workflows(db: Session, scope: ResolvedScope, domain: str | None) -> list[dict[str, Any]]:
+    """Fetch workflow templates scoped to the caller's workspace takeover domain (plus a non-takeover requested domain)."""
+    scope_domain = f"{scope.workspace_id}:takeover"
+    domain = visible_requested_domain(scope, domain)
+    rows = db.execute(
+        text("""
+            SELECT id, name, domain, graph, triggers, version
+            FROM workflow_templates
+            WHERE domain IN (:domain, :scope_domain)
+            ORDER BY updated_at DESC
+            LIMIT 5
+        """),
+        {"domain": domain or scope_domain, "scope_domain": scope_domain},
+    ).mappings().all()
     return [
         {
             "id": str(row["id"]),
@@ -142,7 +172,9 @@ def build_context_bundle(
     policy_engine: PolicyEngine,
 ) -> tuple[ContextBundleResponse, int, list[str]]:
     settings = get_settings()
+    scope = consumer_ctx.scope or scope_from_consumer(consumer_ctx)
     domain = request.app_context.get("domain") if isinstance(request.app_context, dict) else None
+    domain = visible_requested_domain(scope, domain)
     min_confidence = float(request.constraints.get("min_confidence", 0.5)) if isinstance(request.constraints, dict) else 0.5
 
     search_request = EventSearchRequest(
@@ -152,13 +184,15 @@ def build_context_bundle(
             task_type=request.app_context.get("task_type") if isinstance(request.app_context, dict) else None,
         ),
         k=int(request.constraints.get("k", 12)) if isinstance(request.constraints, dict) else 12,
+        # Only an explicitly bound project narrows the bundle; an inherited one never auto-filters.
+        project_id=scope.project_id if scope.project_binding == PROJECT_BOUND else None,
     )
 
     # Run patterns + workflows + graph in parallel (each uses own DB session or is independent)
     def _patterns_task() -> list[PatternItem]:
         s = get_session_factory()()
         try:
-            return _fetch_patterns_scoped(s, min_confidence, domain, consumer_ctx)
+            return _fetch_patterns_scoped(s, scope, domain=domain, min_confidence=min_confidence)
         finally:
             s.rollback()
             s.close()
@@ -166,7 +200,7 @@ def build_context_bundle(
     def _workflows_task() -> list[dict[str, Any]]:
         s = get_session_factory()()
         try:
-            return _fetch_workflows(s, domain)
+            return _fetch_workflows(s, scope, domain)
         finally:
             s.rollback()
             s.close()
@@ -293,6 +327,7 @@ def build_context_bundle(
             "resume_packet_available": bool(retrieval_meta.get("resume_packet_available", False)),
             "cross_user_scope_applied": bool(retrieval_meta.get("cross_user_scope_applied", False)),
             "cross_user_scope_owners": list(retrieval_meta.get("cross_user_scope_owners") or []),
+            "project_binding": scope.project_binding,
             "context_tier_used": str(retrieval_meta.get("context_tier_used") or "l2"),
             "summary_coverage": float(retrieval_meta.get("summary_coverage", 0.0) or 0.0),
             "planner_used": bool(retrieval_meta.get("planner_used", False)),

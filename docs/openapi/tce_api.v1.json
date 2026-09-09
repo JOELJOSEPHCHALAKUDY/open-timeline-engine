@@ -3713,6 +3713,11 @@
             "title": "Anchors",
             "type": "array"
           },
+          "app_context": {
+            "additionalProperties": true,
+            "title": "App Context",
+            "type": "object"
+          },
           "change_summary": {
             "additionalProperties": true,
             "title": "Change Summary",
@@ -3815,6 +3820,11 @@
           "outbox_id": {
             "format": "uuid",
             "title": "Outbox Id",
+            "type": "string"
+          },
+          "project_binding": {
+            "default": "unbound",
+            "title": "Project Binding",
             "type": "string"
           },
           "validation_errors": {
@@ -5341,6 +5351,29 @@
             "title": "Attempt",
             "type": "integer"
           },
+          "cancel_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Reason"
+          },
+          "cancelled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancelled At"
+          },
           "claimed_by": {
             "anyOf": [
               {
@@ -5351,6 +5384,17 @@
               }
             ],
             "title": "Claimed By"
+          },
+          "claimed_executor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed Executor"
           },
           "created_at": {
             "format": "date-time",
@@ -5419,6 +5463,23 @@
             ],
             "title": "Goal Id"
           },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "lease_generation": {
+            "default": 0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
           "meta": {
             "additionalProperties": true,
             "title": "Meta",
@@ -5446,6 +5507,17 @@
               }
             ],
             "title": "Permit Id"
+          },
+          "report_idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Report Idempotency Key"
           },
           "requires_permit": {
             "default": false,
@@ -5491,6 +5563,11 @@
             "title": "User Id",
             "type": "string"
           },
+          "verification_state": {
+            "default": "unverified",
+            "title": "Verification State",
+            "type": "string"
+          },
           "workspace_id": {
             "title": "Workspace Id",
             "type": "string"
@@ -5514,7 +5591,9 @@
           "succeeded",
           "failed",
           "blocked",
-          "abandoned"
+          "abandoned",
+          "cancelled",
+          "rejected"
         ],
         "title": "DirectiveExecutionState",
         "type": "string"
@@ -6162,6 +6241,11 @@
       },
       "EventSearchRequest": {
         "properties": {
+          "continuity_intent": {
+            "default": false,
+            "title": "Continuity Intent",
+            "type": "boolean"
+          },
           "filters": {
             "$ref": "#/components/schemas/EventFilter"
           },
@@ -6177,10 +6261,32 @@
             "title": "Match All",
             "type": "boolean"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
           "query": {
             "minLength": 1,
             "title": "Query",
             "type": "string"
+          },
+          "target_owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Owner"
           },
           "time_end": {
             "anyOf": [
@@ -6409,6 +6515,18 @@
             "title": "Action Kind",
             "type": "string"
           },
+          "attempt": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt"
+          },
           "command_preview": {
             "anyOf": [
               {
@@ -6420,11 +6538,34 @@
             ],
             "title": "Command Preview"
           },
+          "directive_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directive Id"
+          },
           "estimated_change_size": {
             "default": 0,
             "minimum": 0.0,
             "title": "Estimated Change Size",
             "type": "integer"
+          },
+          "objective_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Objective Hash"
           },
           "session_id": {
             "default": "default",
@@ -6520,6 +6661,18 @@
       },
       "ExecutionReportRequest": {
         "properties": {
+          "cancel_reason": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Reason"
+          },
           "contract_type": {
             "anyOf": [
               {
@@ -6551,6 +6704,30 @@
               }
             ],
             "title": "Failure Reason"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "lease_generation": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Generation"
           },
           "result": {
             "default": "success",
@@ -7953,6 +8130,17 @@
             ],
             "title": "Line"
           },
+          "stale": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stale"
+          },
           "symbol": {
             "anyOf": [
               {
@@ -8024,6 +8212,11 @@
       },
       "ResumePacketRequest": {
         "properties": {
+          "current_git": {
+            "additionalProperties": true,
+            "title": "Current Git",
+            "type": "object"
+          },
           "include_cross_user": {
             "default": true,
             "title": "Include Cross User",
@@ -8036,6 +8229,11 @@
             "title": "K",
             "type": "integer"
           },
+          "legacy_session_scope": {
+            "default": false,
+            "title": "Legacy Session Scope",
+            "type": "boolean"
+          },
           "query": {
             "minLength": 1,
             "title": "Query",
@@ -8045,6 +8243,17 @@
             "default": "default",
             "title": "Session Id",
             "type": "string"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
           },
           "target_owner": {
             "anyOf": [
@@ -8066,6 +8275,11 @@
       },
       "ResumePacketResponse": {
         "properties": {
+          "anchor_freshness": {
+            "default": "unknown",
+            "title": "Anchor Freshness",
+            "type": "string"
+          },
           "continuation_steps": {
             "items": {
               "type": "string"
@@ -8101,6 +8315,13 @@
             "title": "Files",
             "type": "array"
           },
+          "freshness_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Freshness Reasons",
+            "type": "array"
+          },
           "git": {
             "additionalProperties": true,
             "title": "Git",
@@ -8115,6 +8336,23 @@
             "title": "Packet Id",
             "type": "string"
           },
+          "project_binding": {
+            "default": "unbound",
+            "title": "Project Binding",
+            "type": "string"
+          },
+          "record_ts": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Ts"
+          },
           "retrieval_meta": {
             "$ref": "#/components/schemas/ResumePacketRetrievalMeta"
           },
@@ -8127,6 +8365,28 @@
             "default": "task_overlap_then_recency",
             "title": "Selection Reason",
             "type": "string"
+          },
+          "source_owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Owner Id"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Session Id"
           },
           "status": {
             "title": "Status",
@@ -9130,6 +9390,11 @@
             "title": "Objective Hash",
             "type": "string"
           },
+          "project_binding": {
+            "default": "unbound",
+            "title": "Project Binding",
+            "type": "string"
+          },
           "refreshed_at": {
             "format": "date-time",
             "title": "Refreshed At",
@@ -9705,6 +9970,11 @@
             "default": false,
             "title": "Planner Used",
             "type": "boolean"
+          },
+          "project_binding": {
+            "default": "unbound",
+            "title": "Project Binding",
+            "type": "string"
           },
           "query_expansion_terms": {
             "items": {

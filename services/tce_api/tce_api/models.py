@@ -213,6 +213,7 @@ class HandoffRecord(Base):
         Index("idx_handoff_records_workspace_ts", "workspace_id", "ts"),
         Index("idx_handoff_records_workspace_session_ts", "workspace_id", "session_id", "ts"),
         Index("idx_handoff_records_workspace_owner_objective", "workspace_id", "owner_id", "objective_text"),
+        Index("idx_handoff_records_workspace_project_ts", "workspace_id", "project_id", "ts"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -235,6 +236,9 @@ class HandoffRecord(Base):
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
     redaction_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    git_remote: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    executor_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class HandoffOutbox(Base):
@@ -264,6 +268,8 @@ class HandoffOutbox(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executor_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    payload_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class ContinuityResumeAttempt(Base):
@@ -300,6 +306,7 @@ class ContinuityResumeAttempt(Base):
     outcome_status: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     progress_source: Mapped[str] = mapped_column(TEXT, nullable=False, default="resume_packet")
     feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_session_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class TakeoverActionLog(Base):
@@ -403,6 +410,14 @@ class DirectiveExecution(Base):
     meta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    claimed_executor: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_state: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="unverified")
+    report_idempotency_key: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    report_payload_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class ExecutionPermit(Base):
@@ -421,6 +436,14 @@ class ExecutionPermit(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    requested_by: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    objective_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    policy_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    scope_digest: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class EventIdentity(Base):

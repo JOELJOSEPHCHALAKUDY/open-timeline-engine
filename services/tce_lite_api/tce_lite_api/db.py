@@ -338,6 +338,54 @@ def _ensure_continuity_v04_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_directive_lease_schema(conn: sqlite3.Connection) -> None:
+    """P0 trust boundary: lease fencing / verification / report idempotency on directives, permit binding."""
+    directive_columns = {
+        "lease_generation": "INTEGER NOT NULL DEFAULT 0",
+        "claimed_executor": "TEXT",
+        "lease_expires_at": "TEXT",
+        "verification_state": "TEXT NOT NULL DEFAULT 'unverified'",
+        "report_idempotency_key": "TEXT",
+        "report_payload_hash": "TEXT",
+        "cancelled_at": "TEXT",
+        "cancel_reason": "TEXT",
+    }
+    for name, ddl in directive_columns.items():
+        if not _column_exists(conn, "directive_executions", name):
+            conn.execute(f"ALTER TABLE directive_executions ADD COLUMN {name} {ddl}")
+    permit_columns = {
+        "user_id": "TEXT",
+        "requested_by": "TEXT",
+        "directive_id": "TEXT",
+        "attempt": "INTEGER",
+        "objective_hash": "TEXT",
+        "policy_revision": "TEXT",
+        "scope_digest": "TEXT",
+        "resolved_by": "TEXT",
+    }
+    for name, ddl in permit_columns.items():
+        if not _column_exists(conn, "execution_permits", name):
+            conn.execute(f"ALTER TABLE execution_permits ADD COLUMN {name} {ddl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_directive_executions_report_idem ON directive_executions (workspace_id, report_idempotency_key)"
+    )
+
+
+def _ensure_continuity_v05_schema(conn: sqlite3.Connection) -> None:
+    """P0 trust boundary: project/executor binding on handoffs and the reader-vs-source session split."""
+    for name in ("project_id", "git_remote", "executor_id"):
+        if not _column_exists(conn, "handoff_records", name):
+            conn.execute(f"ALTER TABLE handoff_records ADD COLUMN {name} TEXT")
+    for name in ("executor_id", "payload_hash"):
+        if not _column_exists(conn, "handoff_outbox", name):
+            conn.execute(f"ALTER TABLE handoff_outbox ADD COLUMN {name} TEXT")
+    if not _column_exists(conn, "continuity_resume_attempts", "source_session_id"):
+        conn.execute("ALTER TABLE continuity_resume_attempts ADD COLUMN source_session_id TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_handoff_records_workspace_project_ts ON handoff_records (workspace_id, project_id, ts DESC)"
+    )
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -578,6 +626,7 @@ def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
             ON directive_executions (session_id, state, started_at DESC);
         """
     )
+    _ensure_directive_lease_schema(conn)
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_dashboard_human_score_scope_created
@@ -1515,6 +1564,7 @@ def init_db() -> None:
         _ensure_takeover_v3_schema(conn)
         _ensure_behavior_fidelity_schema(conn)
         _ensure_continuity_v04_schema(conn)
+        _ensure_continuity_v05_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

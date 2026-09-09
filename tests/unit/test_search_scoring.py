@@ -149,3 +149,20 @@ def test_scope_sql_omits_owner_predicate_for_empty_scope() -> None:
     assert "_tce_owner" not in sql
     assert ":scope_owners" not in sql
     assert params == {"scope_workspace": "personal"}
+
+
+def test_scope_sql_parts_strict_mode_drops_null_branch() -> None:
+    predicates, params = _scope_sql_parts(
+        workspace_id="personal",
+        owner_ids=["codex-executor", "claude-executor"],
+        strict=True,
+    )
+    sql = " AND ".join(predicates)
+    assert "IS NULL" not in sql
+    assert "= ''" not in sql
+    assert "context->>'_tce_workspace'" in sql
+    assert "CAST(:scope_owners AS text[])" in sql
+    assert params == {
+        "scope_workspace": "personal",
+        "scope_owners": ["claude-executor", "codex-executor"],
+    }

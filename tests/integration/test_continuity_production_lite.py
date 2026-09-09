@@ -103,37 +103,56 @@ def test_transactional_completion_resume_feedback_and_identity_binding(client: T
     assert completion_context["project"] == "open-timeline-engine"
     assert completion_context["project_id"].startswith("proj_")
 
-    duplicate = client.post(
-        "/v1/completions",
-        headers=_auth("codex-token"),
-        json={
-            "session_id": "shared-session",
-            "completion_key": "test:continuity:1",
-            "source": "integration",
-            "state": "succeeded",
-            "title": "Implemented durable completion outbox",
-            "payload": {"files": ["services/tce_api/tce_api/continuity_store.py"]},
-            "decision": "Idempotent retry",
-            "outcome": {"status": "succeeded", "next_step": "Resume"},
-            "milestone_schema": "v1",
-        },
-    )
+    completion_payload = {
+        "session_id": "shared-session",
+        "completion_key": "test:continuity:1",
+        "source": "integration",
+        "state": "succeeded",
+        "title": "Implemented durable completion outbox",
+        "payload": {"files": ["services/tce_api/tce_api/continuity_store.py"]},
+        "decision": "Commit state and outbox before asynchronous delivery",
+        "outcome": {"status": "succeeded", "next_step": "Open deliver_handoff and run integration tests"},
+        "git": {"branch": "test", "commit": "abc123"},
+        "anchors": [{"file": "services/tce_api/tce_api/continuity_store.py", "line": 70, "symbol": "deliver_handoff"}],
+        "milestone_schema": "v1",
+    }
+    # Identical retry under the same completion_key replays the original receipt.
+    duplicate = client.post("/v1/completions", headers=_auth("codex-token"), json=completion_payload)
     assert duplicate.status_code == 200
     assert duplicate.json()["outbox_id"] == completion.json()["outbox_id"]
 
+    # Same completion_key with a different payload is a conflict, never a silent replay.
+    changed = client.post(
+        "/v1/completions",
+        headers=_auth("codex-token"),
+        json={**completion_payload, "decision": "Idempotent retry", "outcome": {"status": "succeeded", "next_step": "Resume"}},
+    )
+    assert changed.status_code == 409, changed.text
+    assert changed.json()["detail"]["reason"] == "idempotency_conflict"
+    with sqlite3.connect(get_settings().lite_db_path) as conn:
+        outbox_count = conn.execute(
+            "SELECT COUNT(*) FROM handoff_outbox WHERE completion_key = ?",
+            ("test:continuity:1",),
+        ).fetchone()[0]
+    assert outbox_count == 1
+
+    # Claude resumes from a *different* session: the candidate scope is the authorised
+    # project/owner window, not equality with the reader's own conversation id.
     resume = client.post(
         "/v1/handoff/resume",
         headers=_auth("claude-token"),
         json={
             "query": "read codex timeline durable completion outbox",
             "target_owner": "codex-executor",
-            "session_id": "shared-session",
+            "session_id": "claude-b",
             "k": 5,
             "include_cross_user": True,
         },
     )
     assert resume.status_code == 200, resume.text
     packet = resume.json()
+    assert packet["source_session_id"] == "shared-session"
+    assert packet["source_owner_id"] == "codex-executor"
     assert packet["files"][0]["path"] == "services/tce_api/tce_api/continuity_store.py"
     assert packet["files"][0]["anchors"][0]["symbol"] == "deliver_handoff"
 

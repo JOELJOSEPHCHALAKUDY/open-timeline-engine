@@ -4,7 +4,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -256,6 +256,8 @@ def test_lite_resume_packet_cross_user(lite_client: TestClient) -> None:
         "X-TCE-Workspace": "personal",
     }
     now = datetime.now(tz=UTC).isoformat()
+    # Candidate scope is the retention window: the seeded record must not already be expired.
+    expires_at = (datetime.now(tz=UTC) + timedelta(days=30)).isoformat()
     codex_headers = {**base_headers, "X-TCE-User": "codex-executor"}
     claude_headers = {**base_headers, "X-TCE-User": "claude-executor"}
     assert lite_client.post("/v1/events", json=_event_payload("codex seed event"), headers=codex_headers).status_code == 200
@@ -307,27 +309,63 @@ def test_lite_resume_packet_cross_user(lite_client: TestClient) -> None:
                 None,
                 "v1",
                 0,
-                now,
+                expires_at,
             ),
         )
         conn.commit()
     finally:
         conn.close()
 
+    # The reader's own session id is not a candidate filter: explicit target_owner +
+    # include_cross_user is the continuity intent that widens the owner scope.
     response = lite_client.post(
         "/v1/handoff/resume",
         json={
             "query": "continue codex work on advisor runtime fallback",
             "target_owner": "codex-executor",
-            "session_id": "default",
+            "session_id": "reader-session",
             "k": 5,
             "include_cross_user": True,
         },
         headers=claude_headers,
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["task_summary"] == "Refactor advisor fallback path"
     assert body["cross_user_scope_applied"] is True
+    assert body["source_session_id"] == "default"
+    assert body["source_owner_id"] == "codex-executor"
     assert body["files"]
     assert body["files"][0]["anchors"]
+
+    # Legacy clients can opt back into reader-session equality explicitly.
+    legacy = lite_client.post(
+        "/v1/handoff/resume",
+        json={
+            "query": "continue codex work on advisor runtime fallback",
+            "target_owner": "codex-executor",
+            "session_id": "reader-session",
+            "include_cross_user": True,
+            "legacy_session_scope": True,
+        },
+        headers=claude_headers,
+    )
+    assert legacy.status_code == 404
+
+
+def test_search_misses_owner_scope_stays_empty(lite_client: TestClient) -> None:
+    alice_headers = {**_headers(consumer="lite-alice"), "X-TCE-User": "alice"}
+    bob_headers = {**_headers(consumer="lite-bob"), "X-TCE-User": "bob"}
+    title = f"owner scoped needle {uuid.uuid4().hex[:6]}"
+    ingest = lite_client.post("/v1/events", json=_event_payload(title), headers=alice_headers)
+    assert ingest.status_code == 200
+    # Bob is a member of the same workspace; membership is not owner scope.
+    add_member = lite_client.post("/v1/team/memberships", json={"user_id": "bob", "role": "member", "active": True}, headers=alice_headers)
+    assert add_member.status_code == 200
+
+    search = lite_client.post("/v1/search", json={"query": title, "k": 5}, headers=bob_headers)
+    assert search.status_code == 200
+    body = search.json()
+    assert body["result"]["hits"] == []
+    assert body["policy"]["retrieval"]["cross_user_scope_applied"] is False
+    assert body["policy"]["policy_profile"] == "user-only"

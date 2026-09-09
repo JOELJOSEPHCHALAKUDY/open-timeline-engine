@@ -71,7 +71,8 @@ def _claim_directive(client: TestClient, session_id: str) -> str:
             "session_id": session_id,
             "persona_mode": "shadow",
             "task": "update the changelog notes",
-            "app_context": {"domain": "coding"},
+            # A mutating directive needs a bound project; an unbound context is refused.
+            "app_context": {"domain": "coding", "project": "open-timeline-engine", "project_root": "/work/open-timeline-engine"},
             "constraints": {"k": 4},
             "allow_fallback": True,
         },

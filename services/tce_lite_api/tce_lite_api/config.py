@@ -238,6 +238,10 @@ class Settings(BaseSettings):
     typed_contract_enabled: bool = False
     workflow_template_reuse_min_reliability: float = 0.70
     takeover_execution_claim_ttl_seconds: int = 300
+    # P0 trust boundary: require reporters to echo the lease they hold (fencing token) and
+    # require exact workspace/owner tags on events (drop the legacy untagged-row branch).
+    takeover_lease_strict: bool = False
+    scope_strict_tags: bool = False
     takeover_enforcement_mode: str = "strict_takeover"
     advisor_primary_provider: str = "openai"
     advisor_primary_model: str = "gpt-4o-mini"

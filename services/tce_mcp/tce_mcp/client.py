@@ -204,10 +204,12 @@ class TCEApiClient:
         response.raise_for_status()
         return self._json_dict(response)
 
-    def get_patterns(self, domain: str | None, min_confidence: float) -> list[dict[str, Any]]:
+    def get_patterns(self, domain: str | None, min_confidence: float, project_id: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"min_confidence": min_confidence}
         if domain:
             params["domain"] = domain
+        if project_id:
+            params["project_id"] = project_id
         response = self._get("/v1/patterns", params=params)
         response.raise_for_status()
         return self._json_list_dict(response)

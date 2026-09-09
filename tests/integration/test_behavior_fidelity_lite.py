@@ -117,6 +117,42 @@ def test_evidence_is_redacted_and_correction_supersedes_prior_record(client: Tes
     assert "plain-secret-value-12345" not in old_row["response_reasoning"]
 
 
+def test_explicit_evidence_is_not_auto_confirmed(client: TestClient) -> None:
+    """P0: 'the human approved this' is never minted from a caller-declared evidence_source."""
+    explicit = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    assert explicit.status_code == 200, explicit.text
+
+    asserted = _payload(2)
+    asserted["confirmed_at"] = "2026-09-09T00:00:00+00:00"
+    self_confirmed = client.post("/v1/behavior/evidence", json=asserted, headers=_headers())
+    assert self_confirmed.status_code == 200, self_confirmed.text
+
+    correction_payload = _payload(3, choice="broad refactor")
+    correction_payload.update(
+        {
+            "evidence_source": "correction",
+            "correction_text": "The minimal patch did not address the shared invariant",
+            "supersedes_observation_id": explicit.json()["observation_id"],
+        }
+    )
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    assert correction.status_code == 200, correction.text
+
+    settings = get_settings()
+    conn = sqlite3.connect(settings.lite_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT id, evidence_source, confirmed_at FROM decision_observations WHERE id IN (?, ?, ?)",
+            (explicit.json()["observation_id"], self_confirmed.json()["observation_id"], correction.json()["observation_id"]),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 3
+    assert {str(row["evidence_source"]) for row in rows} == {"explicit", "correction"}
+    assert all(row["confirmed_at"] is None for row in rows), [dict(row) for row in rows]
+
+
 def test_prediction_evaluation_and_calibration_flow(client: TestClient) -> None:
     for index in range(30):
         response = client.post("/v1/behavior/evidence", json=_payload(index), headers=_headers())

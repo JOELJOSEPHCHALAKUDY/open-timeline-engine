@@ -18,6 +18,14 @@ from tce_shared.redaction import redact_payload, redact_text
 from .models import ContinuityResumeAttempt, Event, HandoffOutbox, HandoffRecord
 
 
+class CompletionConflictError(ValueError):
+    """Same completion_key re-submitted with a different payload (idempotency conflict)."""
+
+    def __init__(self, outbox_id: uuid.UUID) -> None:
+        super().__init__(f"completion payload conflict for outbox {outbox_id}")
+        self.outbox_id = outbox_id
+
+
 def _safe_change_summary(raw: Any) -> tuple[dict[str, dict[str, Any]], bool]:
     if not isinstance(raw, dict):
         return {}, False
@@ -56,6 +64,8 @@ def enqueue_handoff(
     source: str,
     redaction_applied: bool,
     now: datetime | None = None,
+    executor_id: str | None = None,
+    payload_hash: str | None = None,
 ) -> HandoffOutbox:
     created_at = now or datetime.now(tz=UTC)
     event_id = uuid.uuid4()
@@ -80,6 +90,8 @@ def enqueue_handoff(
         redaction_applied=redaction_applied,
         created_at=created_at,
         updated_at=created_at,
+        executor_id=executor_id,
+        payload_hash=payload_hash,
     ).on_conflict_do_nothing(index_elements=["workspace_id", "owner_id", "completion_key"])
     db.execute(statement)
     row = db.execute(
@@ -89,6 +101,9 @@ def enqueue_handoff(
             HandoffOutbox.completion_key == str(completion_key)[:240],
         )
     ).scalar_one()
+    # Same key + different payload is a conflict, never a silent replay of the first receipt.
+    if row.payload_hash is not None and payload_hash is not None and row.payload_hash != payload_hash:
+        raise CompletionConflictError(row.id)
     return row
 
 
@@ -190,6 +205,7 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
     change_summary, summary_redacted = _safe_change_summary(
         milestone.get("change_summary_json") or milestone.get("change_summary")
     )
+    record_project = canonical_project_context(milestone.get("project_context"))
     if db.get(HandoffRecord, row.handoff_record_id) is None:
         db.add(
             HandoffRecord(
@@ -215,6 +231,9 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
                     row.redaction_applied or payload_redacted or title_redacted or objective_redacted or summary_redacted
                 ),
                 expires_at=row.created_at + timedelta(days=max(1, retention_days)),
+                project_id=str(record_project.get("project_id") or "").strip() or None,
+                git_remote=str(record_project.get("project_remote") or "").strip() or None,
+                executor_id=row.executor_id,
             )
         )
     db.execute(
@@ -281,10 +300,12 @@ def record_resume_attempt(
     requested_at: datetime,
     returned_at: datetime,
     handoff_ts: datetime,
+    source_session_id: str | None = None,
 ) -> None:
     db.add(
         ContinuityResumeAttempt(
             packet_id=packet_id,
+            source_session_id=(str(source_session_id)[:160] if source_session_id else None),
             workspace_id=workspace_id,
             requesting_owner_id=requesting_owner_id,
             target_owner_id=target_owner_id,

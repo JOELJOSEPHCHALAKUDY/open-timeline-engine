@@ -118,6 +118,9 @@ class EventSearchRequest(BaseModel):
     k: int = Field(default=10, ge=1, le=100)
     time_start: datetime | None = None
     time_end: datetime | None = None
+    continuity_intent: bool = False
+    target_owner: str | None = None
+    project_id: str | None = None
 
 
 class EventSearchHit(BaseModel):
@@ -434,6 +437,8 @@ class DirectiveExecutionState(StrEnum):
     FAILED = "failed"
     BLOCKED = "blocked"
     ABANDONED = "abandoned"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
 
 
 class FailureClass(StrEnum):
@@ -534,6 +539,13 @@ class DirectiveExecution(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+    lease_generation: int = 0
+    claimed_executor: str | None = None
+    lease_expires_at: datetime | None = None
+    verification_state: str = "unverified"
+    report_idempotency_key: str | None = None
+    cancelled_at: datetime | None = None
+    cancel_reason: str | None = None
 
 
 class AffectiveScores(BaseModel):
@@ -636,6 +648,7 @@ class TakeoverStepResponse(BaseModel):
     retrieval_triggered: bool = False
     retrieval_source: str = "none"
     retrieval_reason: str | None = None
+    project_binding: str = "unbound"
     retrieval_latency_ms: int = 0
     retrieval_hit_count: int = 0
     feedback_adjustment_applied: bool = False
@@ -694,6 +707,9 @@ class ExecutionPermitRequest(BaseModel):
     target_paths: list[str] = Field(default_factory=list)
     command_preview: str | None = None
     estimated_change_size: int = Field(default=0, ge=0)
+    directive_id: UUID | None = None
+    attempt: int | None = Field(default=None, ge=1)
+    objective_hash: str | None = None
 
 
 class ExecutionPermitResolveRequest(BaseModel):
@@ -766,6 +782,9 @@ class ExecutionReportRequest(BaseModel):
     step_output: dict[str, Any] | None = None
     contract_type: str | None = None
     rollback_performed: bool = False
+    lease_generation: int | None = Field(default=None, ge=0)
+    idempotency_key: str | None = Field(default=None, max_length=160)
+    cancel_reason: str | None = Field(default=None, max_length=500)
 
 
 class ResumePacketRequest(BaseModel):
@@ -774,12 +793,16 @@ class ResumePacketRequest(BaseModel):
     session_id: str = "default"
     k: int = Field(default=5, ge=1, le=20)
     include_cross_user: bool = True
+    source_session_id: str | None = None
+    legacy_session_scope: bool = False
+    current_git: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResumePacketAnchor(BaseModel):
     file: str
     line: int | None = Field(default=None, ge=1)
     symbol: str | None = None
+    stale: bool | None = None
 
 
 class ResumePacketChangeSummary(BaseModel):
@@ -816,6 +839,12 @@ class ResumePacketResponse(BaseModel):
     files: list[ResumePacketFileItem] = Field(default_factory=list)
     continuation_steps: list[str] = Field(default_factory=list)
     retrieval_meta: ResumePacketRetrievalMeta = Field(default_factory=ResumePacketRetrievalMeta)
+    source_session_id: str | None = None
+    source_owner_id: str | None = None
+    record_ts: datetime | None = None
+    anchor_freshness: str = "unknown"
+    freshness_reasons: list[str] = Field(default_factory=list)
+    project_binding: str = "unbound"
 
 
 class CompletionCaptureRequest(BaseModel):
@@ -831,6 +860,7 @@ class CompletionCaptureRequest(BaseModel):
     anchors: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     change_summary: dict[str, Any] = Field(default_factory=dict)
     milestone_schema: str = Field(default="v1", pattern="^v1$")
+    app_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompletionCaptureResponse(BaseModel):
@@ -841,6 +871,7 @@ class CompletionCaptureResponse(BaseModel):
     contract_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
     captured_at: datetime
+    project_binding: str = "unbound"
 
 
 class ResumeFeedbackRequest(BaseModel):
@@ -942,6 +973,7 @@ class TakeoverPreloadResponse(BaseModel):
     working_set_json: dict[str, Any] = Field(default_factory=dict)
     refreshed_at: datetime
     decision_source: TakeoverDecisionSource = TakeoverDecisionSource.DELIBERATION
+    project_binding: str = "unbound"
 
 
 class TakeoverFeedbackRequest(BaseModel):
@@ -985,6 +1017,7 @@ class BehaviorEvidenceRequest(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+    # Ignored server-side: confirmation is never caller-asserted (P0 trust boundary).
     confirmed_at: datetime | None = None
     supersedes_observation_id: UUID | None = None
     contradicts_observation_ids: list[UUID] = Field(default_factory=list, max_length=40)

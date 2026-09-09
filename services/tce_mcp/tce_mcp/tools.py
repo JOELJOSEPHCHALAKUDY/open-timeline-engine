@@ -426,8 +426,15 @@ def with_schema(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def search_events(query: str, filters: dict[str, Any] | None = None, k: int = 10, time_range: dict[str, str] | None = None) -> dict[str, Any]:
-    body: dict[str, Any] = {"query": query, "filters": filters or {}, "k": k}
+def search_events(
+    query: str,
+    filters: dict[str, Any] | None = None,
+    k: int = 10,
+    time_range: dict[str, str] | None = None,
+    app_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Core MCP calls carry project binding: the request always names the project it runs in.
+    body: dict[str, Any] = {"query": query, "filters": filters or {}, "k": k, "app_context": with_project_context(app_context)}
     if time_range:
         if time_range.get("start"):
             body["time_start"] = time_range["start"]
@@ -450,6 +457,9 @@ def get_resume_packet(
     session_id: str = "default",
     k: int = 5,
     include_cross_user: bool = True,
+    source_session_id: str | None = None,
+    legacy_session_scope: bool = False,
+    current_git: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = client.get_resume_packet(
         {
@@ -458,6 +468,9 @@ def get_resume_packet(
             "session_id": session_id,
             "k": k,
             "include_cross_user": include_cross_user,
+            "source_session_id": source_session_id,
+            "legacy_session_scope": legacy_session_scope,
+            "current_git": current_git or {},
         }
     )
     citations: list[str] = []
@@ -483,6 +496,7 @@ def complete_task(
     git: dict[str, Any] | None = None,
     anchors: list[dict[str, Any]] | None = None,
     change_summary: dict[str, Any] | None = None,
+    app_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = client.capture_completion(
         {
@@ -497,6 +511,7 @@ def complete_task(
             "git": git or {},
             "anchors": anchors or [],
             "change_summary": change_summary or {},
+            "app_context": with_project_context(app_context),
             "milestone_schema": "v1",
         }
     )
@@ -684,8 +699,9 @@ def retrieval_eval_run(
     return with_schema({"kind": "retrieval_eval_run", "result": result, "citations": []})
 
 
-def get_patterns(domain: str | None = None, min_confidence: float = 0.5) -> dict[str, Any]:
-    patterns = client.get_patterns(domain=domain, min_confidence=min_confidence)
+def get_patterns(domain: str | None = None, min_confidence: float = 0.5, app_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    project = with_project_context(app_context)
+    patterns = client.get_patterns(domain=domain, min_confidence=min_confidence, project_id=str(project.get("project_id") or "") or None)
     citations: list[str] = []
     for pattern in patterns:
         citations.extend(pattern.get("evidence_event_ids", []))
@@ -1521,6 +1537,8 @@ def report_execution(
     failure_reason: str | None = None,
     details: dict[str, Any] | None = None,
     rollback_performed: bool = False,
+    lease_generation: int | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     normalized_details = _normalize_execution_milestone_details(
         state=state,
@@ -1536,6 +1554,8 @@ def report_execution(
         "failure_reason": failure_reason,
         "details": normalized_details,
         "rollback_performed": rollback_performed,
+        "lease_generation": lease_generation,
+        "idempotency_key": idempotency_key,
     }
     result_payload = client.report_execution(payload)
     return with_schema({"kind": "execution_report", "result": result_payload, "citations": []})
@@ -1544,6 +1564,25 @@ def report_execution(
 def get_execution_status(session_id: str = "default") -> dict[str, Any]:
     result = client.get_execution_status(session_id=session_id)
     return with_schema({"kind": "execution_status", "result": result, "citations": []})
+
+
+def _lease_generation_from_result(state: dict[str, Any], result: dict[str, Any]) -> int | None:
+    """Surface the directive lease the executor must echo on tce.report_execution.
+
+    The API carries the lease on ``pending_execution`` (a DirectiveExecution);
+    an explicit ``state.lease_generation`` wins when present.
+    """
+    raw = state.get("lease_generation")
+    if raw is None:
+        pending = result.get("pending_execution")
+        if isinstance(pending, dict):
+            raw = pending.get("lease_generation")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1575,6 +1614,9 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             "project_context": project_context if isinstance(project_context, dict) else {},
         },
     }
+    lease_generation = _lease_generation_from_result(state, result)
+    if lease_generation is not None:
+        slim_state["lease_generation"] = lease_generation
 
     note = result.get("note")
     final_response = result.get("final_response")
@@ -1659,6 +1701,11 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             "call tce.check_context(file_path) first. If it returns "
             "signal='block', do NOT edit that file. Take action now."
         )
+        if lease_generation is not None:
+            next_step += (
+                f" When the objective is complete, call tce.report_execution with lease_generation={lease_generation} "
+                "(the fencing token from your claim) and a stable idempotency_key."
+            )
         # Strip the directive from final_response so the LLM can't echo it
         visible_response = None
     else:
@@ -1690,6 +1737,7 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "execution_permit_required": execution_permit_required,
         "execution_permit_id": execution_permit_id,
         "continuity_ok": bool(result.get("continuity_ok", True)),
+        "project_binding": str(result.get("project_binding") or "unbound"),
         "directive_id": result.get("directive_id"),
         "directive_state": result.get("directive_state"),
         "pending_execution": result.get("pending_execution"),

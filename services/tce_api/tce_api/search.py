@@ -28,6 +28,7 @@ from tce_shared.autonomy_context import (
 from tce_shared.events import EventSearchHit, EventSearchRequest
 from tce_shared.handoff import handoff_intent, task_overlap_score
 from tce_shared.policy import ConsumerContext
+from tce_shared.scope import ResolvedScope, resolve_scope
 
 from .cache_clients import get_redis_client
 from .config import get_settings
@@ -70,15 +71,6 @@ _RETRYABLE_ERROR_TOKENS = (
     "502",
     "504",
 )
-_CROSS_USER_HINT_RE = re.compile(r"(?:@|user[:=]|owner[:=]|from\s+)([a-z0-9][a-z0-9._-]{1,63})")
-_CROSS_USER_TRIGGER_RE = re.compile(r"\b(cross[-\s]?user|across users?|same workspace|shared workspace|other user)\b")
-_CROSS_USER_HISTORY_RE = re.compile(
-    r"\b(history|chat|conversation|session|discuss|discussion|recent work|recent changes|what did)\b"
-)
-_CROSS_USER_HANDOFF_RE = re.compile(
-    r"\b(continue|resume|pick up|handoff|hand off|follow up)\b.*\b(codex|claude)\b"
-)
-_CROSS_USER_DIRECT_NAMES = ("codex", "claude")
 _TSQUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#@+\-]*")
 _TSQUERY_SUBTOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _TSQUERY_MAX_TERMS = 32
@@ -92,6 +84,14 @@ _OWNER_SCOPE_PREDICATE = r"""
     (context->>'_tce_owner' IS NULL
      OR btrim(context->>'_tce_owner', E' \t\n\r\f\v') = ''
      OR lower(btrim(context->>'_tce_owner', E' \t\n\r\f\v'))
+        = ANY(CAST(:scope_owners AS text[])))
+"""
+# Strict variants (settings.scope_strict_tags): untagged legacy rows are no longer admitted.
+_WORKSPACE_SCOPE_PREDICATE_STRICT = """
+    (context->>'_tce_workspace' = :scope_workspace)
+"""
+_OWNER_SCOPE_PREDICATE_STRICT = r"""
+    (lower(btrim(context->>'_tce_owner', E' \t\n\r\f\v'))
         = ANY(CAST(:scope_owners AS text[])))
 """
 
@@ -200,48 +200,43 @@ def _normalized_channel_weights(lexical_weight: float, vector_weight: float) -> 
     return lexical / total, vector / total
 
 
-def _scope_sql_parts(*, workspace_id: str, owner_ids: list[str]) -> tuple[list[str], dict[str, Any]]:
+def _scope_sql_parts(*, workspace_id: str, owner_ids: list[str], strict: bool = False) -> tuple[list[str], dict[str, Any]]:
     normalized_owners = sorted({_normalize_owner_id_token(owner) for owner in owner_ids if owner})
-    predicates = [_WORKSPACE_SCOPE_PREDICATE]
+    predicates = [_WORKSPACE_SCOPE_PREDICATE_STRICT if strict else _WORKSPACE_SCOPE_PREDICATE]
     params: dict[str, Any] = {"scope_workspace": workspace_id}
     if normalized_owners:
-        predicates.append(_OWNER_SCOPE_PREDICATE)
+        predicates.append(_OWNER_SCOPE_PREDICATE_STRICT if strict else _OWNER_SCOPE_PREDICATE)
         params["scope_owners"] = normalized_owners
     return predicates, params
 
 
-def _query_requests_cross_user_memory(query_text: str) -> bool:
-    lowered = _collapse_whitespace(query_text.lower())
-    if not lowered:
-        return False
-    if _CROSS_USER_TRIGGER_RE.search(lowered):
-        return True
-    if _CROSS_USER_HANDOFF_RE.search(lowered):
-        return True
-    if "memory" in lowered and "from " in lowered:
-        return True
-    if "timeline" in lowered and "from " in lowered:
-        return True
-    if "vice versa" in lowered:
-        return True
-    if any(name in lowered for name in _CROSS_USER_DIRECT_NAMES):
-        if "memory" in lowered:
-            return True
-        if "timeline" in lowered:
-            return True
-        if _CROSS_USER_HISTORY_RE.search(lowered):
-            return True
-    return False
+def scope_from_consumer(consumer_ctx: ConsumerContext) -> ResolvedScope:
+    """Fallback scope for callers that did not attach one to the consumer context (never body-derived)."""
+    if consumer_ctx.scope is not None:
+        return consumer_ctx.scope
+    shim = _ConsumerAuthShim(consumer_ctx)
+    return resolve_scope(shim)
 
 
-def _extract_owner_hints(query_text: str) -> set[str]:
-    lowered = _collapse_whitespace(query_text.lower())
-    hints = {_normalize_owner_id_token(match.group(1)) for match in _CROSS_USER_HINT_RE.finditer(lowered)}
-    for token in re.split(r"[^a-z0-9._-]+", lowered):
-        normalized = _normalize_owner_id_token(token)
-        if normalized in _CROSS_USER_DIRECT_NAMES:
-            hints.add(normalized)
-    return {hint for hint in hints if hint}
+class _ConsumerAuthShim:
+    def __init__(self, consumer_ctx: ConsumerContext) -> None:
+        self._ctx = consumer_ctx
+
+    @property
+    def consumer(self) -> str:
+        return self._ctx.consumer
+
+    @property
+    def workspace_id(self) -> str:
+        return self._ctx.workspace_id
+
+    @property
+    def user_id(self) -> str:
+        return self._ctx.owner_id
+
+    @property
+    def behavior_subject_id(self) -> str:
+        return self._ctx.owner_id
 
 
 def _owner_matches_hint(owner_id: str, hint: str) -> bool:
@@ -306,88 +301,18 @@ def _load_handoff_records_map(
     return by_event
 
 
-def _resolve_owner_scope(
-    db: Session,
-    *,
-    workspace_id: str,
-    owner_id: str,
-    query_text: str,
-) -> tuple[set[str], bool, list[str]]:
-    normalized_owner = _normalize_owner_id_token(owner_id)
-    default_scope = {normalized_owner} if normalized_owner else set()
-    if not _query_requests_cross_user_memory(query_text):
-        return default_scope, False, sorted(default_scope)
+def _resolve_owner_scope(*, scope: ResolvedScope) -> tuple[set[str], bool, list[str]]:
+    """Owner scope comes only from the server-bound ResolvedScope.
 
-    owner_candidates = set(default_scope)
-    try:
-        rows = db.execute(
-            text(
-                """
-                SELECT DISTINCT context->>'_tce_owner' AS owner_id
-                FROM events
-                WHERE context->>'_tce_workspace' = :workspace_id
-                  AND context->>'_tce_owner' IS NOT NULL
-                LIMIT 400
-                """
-            ),
-            {"workspace_id": workspace_id},
-        ).mappings().all()
-        for row in rows:
-            normalized = _normalize_owner_id_token(row.get("owner_id"))
-            if normalized:
-                owner_candidates.add(normalized)
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        return default_scope, False, sorted(default_scope)
-
-    if not owner_candidates:
-        return default_scope, False, sorted(default_scope)
-
-    hints = _extract_owner_hints(query_text)
-    if hints:
-        matched = {
-            owner_candidate
-            for owner_candidate in owner_candidates
-            if any(_owner_matches_hint(owner_candidate, hint) for hint in hints)
-        }
-    else:
-        matched = set(owner_candidates)
-
-    if normalized_owner:
-        matched.add(normalized_owner)
-    if not matched:
-        return default_scope, False, sorted(default_scope)
-    applied = matched != default_scope
-    return matched, applied, sorted(matched)[:6]
-
-
-def _expand_owner_scope_from_rows(
-    rows: list[dict[str, Any]],
-    *,
-    workspace_id: str,
-    current_scope: set[str],
-) -> set[str]:
-    normalized_workspace = _normalize_owner_id_token(workspace_id)
-    expanded_scope = set(current_scope)
-    for row in rows:
-        context = row.get("context") if isinstance(row, dict) else None
-        if not isinstance(context, dict):
-            continue
-        event_workspace = _normalize_owner_id_token(context.get("_tce_workspace"))
-        if event_workspace and event_workspace != normalized_workspace:
-            continue
-        event_owner = _normalize_owner_id_token(context.get("_tce_owner"))
-        if event_owner:
-            expanded_scope.add(event_owner)
-    return expanded_scope
-
-
-def _consumer_is_executor_consumer(consumer: str) -> bool:
-    normalized = _normalize_owner_id_token(consumer)
-    return normalized.endswith("-executor") or normalized.endswith("-executer") or "-executor" in normalized or "-executer" in normalized
+    The set widens beyond the caller's own owner id solely through explicit
+    continuity intent (target_owner + continuity_intent); no query heuristics,
+    no executor-name sniffing, no post-hoc expansion from unscoped rows.
+    """
+    owners = {_normalize_owner_id_token(owner) for owner in scope.owner_ids if _normalize_owner_id_token(owner)}
+    if not owners:
+        owners = {_normalize_owner_id_token(scope.owner_id)} if _normalize_owner_id_token(scope.owner_id) else set()
+    applied = len(owners) > 1 and bool(scope.continuity_intent)
+    return owners, applied, sorted(owners)[:6]
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -1040,12 +965,8 @@ def run_search(
     )
     planner_used = bool(len(planned_queries) > 1)
     subquery_labels = [str(item.get("label") or "") for item in planned_queries if str(item.get("label") or "").strip()]
-    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope(
-        db,
-        workspace_id=consumer_ctx.workspace_id,
-        owner_id=consumer_ctx.owner_id,
-        query_text=query_text,
-    )
+    scope = consumer_ctx.scope or scope_from_consumer(consumer_ctx)
+    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope(scope=scope)
     owner_scope_ids = sorted(owner_scope)
 
     # Base filters for both lexical and ANN candidate queries.
@@ -1078,18 +999,19 @@ def run_search(
         where_parts.append("ts <= :time_end")
         params["time_end"] = search_request.time_end
 
-    workspace_scope_parts, workspace_scope_params = _scope_sql_parts(
-        workspace_id=consumer_ctx.workspace_id,
-        owner_ids=[],
-    )
-    workspace_where_sql = " AND ".join([*where_parts, *workspace_scope_parts])
-    workspace_params = {**params, **workspace_scope_params}
     active_scope_parts, active_scope_params = _scope_sql_parts(
         workspace_id=consumer_ctx.workspace_id,
         owner_ids=owner_scope_ids,
+        strict=bool(getattr(settings, "scope_strict_tags", False)),
     )
     where_parts.extend(active_scope_parts)
     params.update(active_scope_params)
+    # Project narrowing only on explicit request (the bundle passes a bound project explicitly);
+    # an inherited session project never auto-filters an ordinary search.
+    explicit_project_id = str(search_request.project_id or "").strip()
+    if explicit_project_id:
+        where_parts.append("context->>'project_id' = :scope_project")
+        params["scope_project"] = explicit_project_id
 
     candidate_pool_multiplier = max(1, int(getattr(settings, "search_candidate_pool_multiplier", 8)))
     candidate_pool_max = max(search_request.k, int(getattr(settings, "search_candidate_pool_max", 400)))
@@ -1114,7 +1036,6 @@ def run_search(
     fts_candidate_count = 0
     trigram_candidate_count = 0
     scope_requery_applied = False
-    ownerless_fts_requery: Callable[[], list[dict[str, Any]]] | None = None
     feedback_adjustment_applied = False
     query_expansion_used = False
     query_expansion_terms: list[str] = []
@@ -1200,9 +1121,7 @@ def run_search(
             ).mappings().all()
             return [dict(row) for row in result]
 
-        def _run_fts_query(tsquery: str, *, include_owner_scope: bool) -> list[dict[str, Any]]:
-            selected_where = base_where_sql if include_owner_scope else workspace_where_sql
-            selected_params = params if include_owner_scope else workspace_params
+        def _run_fts_query(tsquery: str) -> list[dict[str, Any]]:
             fts_sql = f"""
                 SELECT id, ts, actor, source, domain, task_type, event_type,
                        title, summary_l0, summary_l1_json, sensitivity, context, authority_level,
@@ -1213,14 +1132,14 @@ def run_search(
                            2|32
                        ) AS lexical_rank
                 FROM events
-                WHERE {selected_where}
+                WHERE {base_where_sql}
                   AND search_tsv @@ to_tsquery('english', :tsq)
                 ORDER BY lexical_rank DESC, ts DESC
                 LIMIT :fts_limit
             """
             result = db.execute(
                 text(fts_sql),
-                {**selected_params, "tsq": tsquery, "fts_limit": limit},
+                {**params, "tsq": tsquery, "fts_limit": limit},
             ).mappings().all()
             return [dict(row) for row in result]
 
@@ -1426,12 +1345,7 @@ def run_search(
         fts_rows: list[dict[str, Any]] = []
         if tsquery:
             try:
-                fts_rows = _run_fts_query(tsquery, include_owner_scope=True)
-
-                def _ownerless_fts_requery() -> list[dict[str, Any]]:
-                    return _run_fts_query(tsquery, include_owner_scope=False)
-
-                ownerless_fts_requery = _ownerless_fts_requery
+                fts_rows = _run_fts_query(tsquery)
                 lexical_channel = "fts_primary"
             except (ProgrammingError, DBAPIError) as exc:
                 logger.warning("event FTS query failed; continuing with ILIKE candidates: %s", exc)
@@ -1676,38 +1590,7 @@ def run_search(
         if not retrieval_source:
             retrieval_source = "lexical_only"
 
-        if (
-            not merged_rows
-            and not cross_user_scope_applied
-            and ownerless_fts_requery is not None
-        ):
-            try:
-                requery_rows = ownerless_fts_requery()
-            except (ProgrammingError, DBAPIError) as exc:
-                logger.warning("owner-scope FTS requery failed; keeping user-only scope: %s", exc)
-                db.rollback()
-                requery_rows = []
-                lexical_channel = "ilike_fallback_error"
-                retrieval_reason = "fts_scope_requery_failed"
-            expanded_scope = _expand_owner_scope_from_rows(
-                requery_rows,
-                workspace_id=consumer_ctx.workspace_id,
-                current_scope=owner_scope,
-            )
-            if requery_rows and expanded_scope != owner_scope:
-                scope_requery_applied = True
-                owner_scope = expanded_scope
-                owner_scope_ids = sorted(owner_scope)
-                cross_user_scope_applied = True
-                cross_user_scope_owners = owner_scope_ids[:6]
-                retrieval_reason = "owner_scope_auto_expand_no_hits"
-                fts_rank_lookup = _normalize_fts_rank_lookup(requery_rows)
-                fts_candidate_count = len(requery_rows)
-                lexical_channel = "fts_primary"
-                for row in requery_rows:
-                    merged_rows.setdefault(row["id"], dict(row))
-                    subquery_labels_by_event.setdefault(row["id"], set()).add("objective")
-                lexical_candidate_count = len(merged_rows)
+        # An empty result inside scope stays empty: no implicit peer/owner expansion (P0 trust boundary).
         rows = list(merged_rows.values())
         citation_dup_ratio = _citation_dup_ratio(rows)
 
@@ -1860,38 +1743,7 @@ def run_search(
         return local_scored, local_blocked, local_owner_scope_blocked, local_feedback_applied
 
     scored_events, blocked, owner_scope_blocked, feedback_adjustment_applied = _score_rows(owner_scope)
-    owner_scope_blocked_ratio = float(owner_scope_blocked) / float(max(1, len(rows)))
-    auto_expand_on_blocked_ratio = bool(
-        _consumer_is_executor_consumer(consumer_ctx.consumer) and owner_scope_blocked_ratio >= 0.95
-    )
-    if (
-        not cross_user_scope_applied
-        and owner_scope_blocked > 0
-        and (not scored_events or auto_expand_on_blocked_ratio)
-    ):
-        expanded_scope = _expand_owner_scope_from_rows(
-            rows,
-            workspace_id=consumer_ctx.workspace_id,
-            current_scope=owner_scope,
-        )
-        if expanded_scope != owner_scope:
-            owner_scope = expanded_scope
-            owner_scope_ids = sorted(owner_scope)
-            cross_user_scope_applied = True
-            cross_user_scope_owners = owner_scope_ids[:6]
-            handoff_map = _load_handoff_records_map(
-                db,
-                workspace_id=consumer_ctx.workspace_id,
-                owner_ids=owner_scope_ids,
-                max_records=max(search_request.k * 6, 30),
-            )
-            if not retrieval_reason:
-                retrieval_reason = (
-                    "owner_scope_auto_expand_no_hits"
-                    if not scored_events
-                    else "owner_scope_auto_expand_high_block_ratio"
-                )
-            scored_events, blocked, _, feedback_adjustment_applied = _score_rows(owner_scope)
+    # owner_scope_blocked is telemetry only: rows outside the owner scope never widen it.
     if not match_all:
         rerank_strategy = "score_sort"
     mmr_candidate_pool = max(
@@ -1990,6 +1842,9 @@ def run_search(
         "feedback_adjustment_applied": bool(feedback_adjustment_applied),
         "cross_user_scope_applied": bool(cross_user_scope_applied),
         "cross_user_scope_owners": cross_user_scope_owners,
+        "owner_scope_blocked": int(owner_scope_blocked),
+        "project_binding": scope.project_binding,
+        "policy_revision": scope.policy_revision,
         "handoff_hits_count": len(top_handoff_record_ids),
         "top_handoff_record_ids": top_handoff_record_ids,
         "resume_packet_available": bool(top_handoff_record_ids),
