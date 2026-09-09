@@ -4,6 +4,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -484,6 +485,9 @@ def test_inferred_memory_requires_promotion_and_shadow_eval_is_prospective(clien
 def test_process_models_are_review_gated(client: TestClient) -> None:
     settings = get_settings()
     conn = sqlite3.connect(settings.lite_db_path)
+    # Seeded relative to now: the mine call below uses lookback_days=30, so a hardcoded date silently
+    # ages out of the window and the test starts failing on a calendar boundary rather than on a change.
+    seeded_day = datetime.now(tz=UTC) - timedelta(days=2)
     try:
         for session_id in ("process-a", "process-b"):
             for turn, action in enumerate(("diagnose", "patch", "verify"), start=1):
@@ -501,7 +505,7 @@ def test_process_models_are_review_gated(client: TestClient) -> None:
                         "behavior-test-user",
                         turn,
                         action,
-                        f"2026-07-20T10:0{turn}:00+00:00",
+                        (seeded_day + timedelta(minutes=turn)).isoformat(),
                     ),
                 )
         conn.commit()
@@ -520,12 +524,21 @@ def test_process_models_are_review_gated(client: TestClient) -> None:
     assert models[0]["status"] == "candidate"
     assert models[0]["review_id"]
 
-    promoted = client.post(
+    # Promotion mints learning-eligible evidence, so P1 requires a server-verified human identity here.
+    # A compat X-TCE-Role: user header is caller-asserted and is refused.
+    unverified = client.post(
         f"/v1/behavior/reviews/{models[0]['review_id']}/resolve",
         json={"decision": "promote", "note": "Validated workflow"},
         headers=_headers(),
     )
-    assert promoted.status_code == 200
+    assert unverified.status_code == 403, unverified.text
+
+    promoted = client.post(
+        f"/v1/behavior/reviews/{models[0]['review_id']}/resolve",
+        json={"decision": "promote", "note": "Validated workflow"},
+        headers=_verified_headers(),
+    )
+    assert promoted.status_code == 200, promoted.text
     active = client.get("/v1/behavior/processes?status=active", headers=_headers())
     assert active.status_code == 200
     assert active.json()["models"][0]["process_id"] == models[0]["process_id"]

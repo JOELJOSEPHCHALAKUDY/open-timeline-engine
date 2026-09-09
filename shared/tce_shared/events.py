@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .task_state import NextPermittedAction, TaskStatus
 from .version import SCHEMA_VERSION
 
 
@@ -497,6 +498,148 @@ class TakeoverLatencyBreakdown(BaseModel):
     total: int = 0
 
 
+# --------------------------------------------------------------------------- task state (P2)
+#
+# The pydantic layer may depend on the pure layer; the reverse is forbidden. Mirroring the
+# two task-state enums here rather than re-declaring their values by hand is what keeps the
+# wire vocabulary and the fold's vocabulary from drifting apart.
+
+
+class TaskLifecycleStatus(StrEnum):
+    AWAITING_OBJECTIVE = "awaiting_objective"
+    PLANNING = "planning"
+    ACTIVE = "active"
+    BLOCKED = "blocked"
+    AWAITING_DECISION = "awaiting_decision"
+    AWAITING_VERIFICATION = "awaiting_verification"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class TaskNextPermittedAction(StrEnum):
+    AWAIT_OWNER_OBJECTIVE = "await_owner_objective"
+    AWAIT_PLANNING = "await_planning"
+    EXECUTE_STEP = "execute_step"
+    AWAIT_DECISION = "await_decision"
+    AWAIT_VERIFICATION = "await_verification"
+    RESOLVE_EFFECTS = "resolve_effects"
+    BLOCKED = "blocked"
+    NONE = "none"
+
+
+def to_lifecycle_status(value: TaskStatus | str) -> TaskLifecycleStatus:
+    """The ONE conversion at every wire boundary.
+
+    Unknown values fail closed to AWAITING_VERIFICATION: never DONE, and never a terminal
+    that silently stops autonomy. Assigning a TaskStatus straight into a
+    TaskLifecycleStatus field is a type error, which is what stops two backends inventing
+    two conversions and diverging on the unknown case.
+    """
+    try:
+        return TaskLifecycleStatus(str(value))
+    except ValueError:
+        return TaskLifecycleStatus.AWAITING_VERIFICATION
+
+
+def to_next_permitted_action(value: NextPermittedAction | str) -> TaskNextPermittedAction:
+    """The ONE conversion at every wire boundary. Unknown fails closed to NONE, never EXECUTE_STEP."""
+    try:
+        return TaskNextPermittedAction(str(value))
+    except ValueError:
+        return TaskNextPermittedAction.NONE
+
+
+class TaskStateVerificationRef(BaseModel):
+    verification_id: str
+    directive_id: UUID | None = None
+    state: str = "unverified"
+    method: str = "none"
+    recorded_at: datetime | None = None
+    contract_revision: int = 0
+    plan_id: str | None = None
+    evidence_event_ids: list[UUID] = Field(default_factory=list)
+    summary: str = ""
+
+
+class TaskStateUnresolvedEffect(BaseModel):
+    effect_id: str
+    kind: str = "directive"
+    description: str = ""
+    opened_at: datetime | None = None
+    directive_id: UUID | None = None
+    paths: list[str] = Field(default_factory=list)
+
+
+class TaskStateSummary(BaseModel):
+    task_id: str = ""
+    revision: int = 0
+    contract_revision: int = 0
+    status: TaskLifecycleStatus = TaskLifecycleStatus.AWAITING_OBJECTIVE
+    next_permitted_action: TaskNextPermittedAction = TaskNextPermittedAction.AWAIT_OWNER_OBJECTIVE
+    plan_state: str = "absent"
+    plan_producer: str | None = None
+    open_step_index: int | None = None
+    open_decision_count: int = 0
+    unresolved_effect_count: int = 0
+    source_revision: str = ""
+
+
+class TaskStateProjectionResponse(BaseModel):
+    projection_id: UUID
+    uri: str
+    task_id: str = ""
+    view: str = "state"
+    format: str = "markdown"
+    mime_type: str = "text/markdown; charset=utf-8"
+    schema_version: str = "v1"
+    source_revision: str = ""
+    content_sha256: str = ""
+    generated_at: datetime
+    revision: int = 0
+    contract_revision: int = 0
+    source_evidence_ids: list[UUID] = Field(default_factory=list)
+    trust_level: str = "projection"
+    sensitivity: int = Field(default=1, ge=0, le=3)
+    read_only: bool = True
+    projection_learning_eligible: bool = False
+    expires_at: datetime | None = None
+    evidence_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    redaction_applied: bool = False
+    content: str = ""
+
+
+class TaskCancelRequest(BaseModel):
+    reason: str = Field(default="owner_cancelled", max_length=400)
+
+
+class TaskCancelResponse(BaseModel):
+    task_id: str = ""
+    revision: int = 0
+    cancelled_planning_jobs: int = 0
+    cancelled_directives: int = 0
+    revoked_constraints: int = 0
+    expired_permits: int = 0
+    cancelled_rq_jobs: int = 0
+
+
+class PlanningJobStatusResponse(BaseModel):
+    job_id: UUID
+    task_id: str = ""
+    job_kind: str = ""
+    state: str = "pending"
+    attempts: int = 0
+    max_attempts: int = 3
+    producer: str | None = None
+    contract_revision: int = 0
+    input_revision: str = ""
+    queue_state: str = "inline"
+    cancel_requested: bool = False
+    last_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class TakeoverGoal(BaseModel):
     id: UUID
     session_id: str
@@ -518,6 +661,11 @@ class TakeoverGoal(BaseModel):
     status: AutonomyGoalStatus = AutonomyGoalStatus.CANDIDATE
     created_at: datetime
     updated_at: datetime
+    step_index: int | None = None
+    parent_goal_id: UUID | None = None
+    depends_on: list[int] = Field(default_factory=list)
+    attempts: int = 0
+    mutating: bool = False
 
 
 class AutonomyNotice(BaseModel):
@@ -684,6 +832,11 @@ class TakeoverStepResponse(BaseModel):
     behavior_fidelity_gate: dict[str, Any] = Field(default_factory=dict)
     capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
     open_decision_opportunity_id: UUID | None = None
+    planning_pending: bool = False
+    planning_job_id: UUID | None = None
+    planning_pending_hint_ms: int = 0
+    task_state: TaskStateSummary = Field(default_factory=TaskStateSummary)
+    task_state_revision: int = 0
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -864,6 +1017,12 @@ class ResumePacketResponse(BaseModel):
     anchor_freshness: str = "unknown"
     freshness_reasons: list[str] = Field(default_factory=list)
     project_binding: str = "unbound"
+    task_id: str | None = None
+    task_state_revision: int = 0
+    contract_revision: int = 0
+    verification_refs: list[TaskStateVerificationRef] = Field(default_factory=list)
+    unresolved_effects: list[TaskStateUnresolvedEffect] = Field(default_factory=list)
+    source_event_id: UUID | None = None
 
 
 class CompletionCaptureRequest(BaseModel):
@@ -975,6 +1134,8 @@ class ExecutionStatusResponse(BaseModel):
     recent: list[DirectiveExecution] = Field(default_factory=list)
     generated_at: datetime
     capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    task_state_revision: int = 0
+    next_permitted_action: TaskNextPermittedAction = TaskNextPermittedAction.NONE
 
 
 class TakeoverPreloadRequest(BaseModel):

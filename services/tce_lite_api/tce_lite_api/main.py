@@ -119,6 +119,7 @@ from tce_shared.events import (
     MemoryReviewListResponse,
     MemoryReviewResolveRequest,
     PatternFeedbackRequest,
+    PlanningJobStatusResponse,
     ProcessMiningRequest,
     ProcessMiningResponse,
     ProcessModelItem,
@@ -145,9 +146,15 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TaskCancelRequest,
+    TaskCancelResponse,
+    TaskStateProjectionResponse,
+    TaskStateSummary,
     TrustedInputCapture,
     TrustedInputOriginKind,
     TrustedInputReceipt,
+    to_lifecycle_status,
+    to_next_permitted_action,
 )
 from tce_shared.execution_transitions import completion_payload_fingerprint
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
@@ -157,6 +164,13 @@ from tce_shared.project_context import canonical_project_context, project_contex
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_project_hint, redact_text
 from tce_shared.scope import PROJECT_BOUND
+from tce_shared.task_state import (
+    TaskStatePreconditionFailed,
+    TaskStateProjection,
+    TaskStateRevisionConflict,
+    render_task_state_markdown,
+    task_state_summary_fields,
+)
 
 from .auth import AuthContext, get_auth_context
 from .behavior_control_store import (
@@ -210,6 +224,7 @@ from .continuity_store import (
     record_resume_progress,
 )
 from .db import get_db, init_db
+from .planning_store import get_planning_job, sweep_stale_planning_jobs
 from .store import (
     acknowledge_takeover_notice as store_acknowledge_takeover_notice,
 )
@@ -232,6 +247,7 @@ from .store import (
     load_behavior_evidence_by_id_lite,
     load_behavior_evidence_lite,
     load_fingerprint_lite,
+    now_utc,
     request_execution_permit_lite,
     resolve_execution_permit_lite,
     run_lifecycle_maintenance,
@@ -335,6 +351,11 @@ from .store_graph import (
     upsert_team_membership,
     workspace_access_allowed,
 )
+from .task_state_store import (
+    cancel_task,
+    load_task_state,
+    rebuild_task_state,
+)
 from .types import (
     ActivitySummaryResponse,
     AdvisorConfigResponse,
@@ -434,6 +455,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 extract_pending_inputs(conn, settings=settings, limit=int(getattr(settings, "decision_extraction_batch_size", 100)))
             except Exception:
                 _LOGGER.warning("startup decision extraction sweep failed", exc_info=True)
+        try:
+            sweep_stale_planning_jobs(conn, settings=settings, now=now_utc())
+            conn.commit()
+        except Exception:
+            _LOGGER.warning("startup planning job sweep failed", exc_info=True)
     finally:
         connection_scope.close()
     yield
@@ -7099,6 +7125,173 @@ def dashboard_human_score_recompute(
         )
     DASHBOARD_HUMAN_SCORE_RECOMPUTE_COUNT.inc()
     return computed
+
+
+# ---------------------------------------------------------------------------
+# P2 durable task state (§4.6 / §0.7 S11.12) — the same four routes, the same
+# response models and the same two exception handlers as Full.
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(TaskStateRevisionConflict)
+def _task_state_conflict(request: Request, exc: TaskStateRevisionConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_revision_conflict",
+            "task_id": exc.task_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(TaskStatePreconditionFailed)
+def _task_state_precondition(request: Request, exc: TaskStatePreconditionFailed) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_precondition_failed",
+            "task_id": exc.task_id,
+            "detail": exc.reason,
+        },
+    )
+
+
+def _parse_optional_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _task_state_summary(projection: TaskStateProjection, *, source_revision: str) -> TaskStateSummary:
+    fields = dict(task_state_summary_fields(projection, source_revision=source_revision))
+    fields["status"] = to_lifecycle_status(fields["status"])
+    fields["next_permitted_action"] = to_next_permitted_action(fields["next_permitted_action"])
+    return TaskStateSummary(**fields)
+
+
+@app.get("/v1/tasks/{task_id}/state", response_model=TaskStateSummary)
+def get_task_state(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskStateSummary:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="task_state", method="GET").inc()
+    loaded = load_task_state(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="task state was not found")
+    projection, _highest_seq, source_revision = loaded
+    return _task_state_summary(projection, source_revision=source_revision)
+
+
+@app.get("/v1/tasks/{task_id}/state.md", response_model=TaskStateProjectionResponse)
+def get_task_state_markdown(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskStateProjectionResponse:
+    if not bool(getattr(settings, "task_state_markdown_enabled", True)):
+        raise HTTPException(status_code=404, detail="task state projections are disabled")
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="task_state_markdown", method="GET").inc()
+    started = time.perf_counter()
+    folded = rebuild_task_state(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if folded is None:
+        raise HTTPException(status_code=404, detail="task state was not found")
+    rendered = render_task_state_markdown(
+        folded.projection,
+        source_revision=folded.source_revision,
+        generated_at=now_utc(),
+        max_steps=int(getattr(settings, "task_state_markdown_max_steps", 24)),
+    )
+    response = TaskStateProjectionResponse(**rendered)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="task_state_projection_read",
+        query={
+            "workspace_id": auth.workspace_id,
+            "task_id": task_id,
+            "projection_id": str(response.projection_id),
+            "uri": response.uri,
+            "source_revision": response.source_revision,
+            "content_sha256": response.content_sha256,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "role": auth.role.value,
+            "trust_level": response.trust_level,
+            "read_only": response.read_only,
+            "projection_learning_eligible": response.projection_learning_eligible,
+        },
+        latency_ms=latency_ms,
+    )
+    return response
+
+
+@app.post("/v1/tasks/{task_id}/cancel", response_model=TaskCancelResponse)
+def cancel_task_endpoint(
+    task_id: str,
+    body: TaskCancelRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskCancelResponse:
+    _enforce_workspace_access(auth, conn)
+    if auth.role == AgentRole.ADVISOR:
+        raise HTTPException(status_code=403, detail="advisor role is read-only")
+    REQUEST_COUNT.labels(endpoint="task_cancel", method="POST").inc()
+    # D4: the task identity for a takeover turn IS the session, so the path parameter is
+    # authoritative and doubles as the session the cancel fences.
+    return cancel_task(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=task_id,
+        task_id=task_id,
+        reason=body.reason,
+        actor=auth.consumer,
+        now=now_utc(),
+    )
+
+
+@app.get("/v1/planning/jobs/{job_id}", response_model=PlanningJobStatusResponse)
+def get_planning_job_status(
+    job_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PlanningJobStatusResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="planning_job_status", method="GET").inc()
+    row = get_planning_job(conn, workspace_id=auth.workspace_id, job_id=job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="planning job was not found")
+    return PlanningJobStatusResponse(
+        job_id=UUID(str(row["id"])),
+        task_id=str(row["task_id"] or ""),
+        job_kind=str(row["job_kind"] or ""),
+        state=str(row["state"] or "pending"),
+        producer=(str(row["producer"]) if row["producer"] else None),
+        attempts=int(row["attempts"] or 0),
+        max_attempts=int(row["max_attempts"] or 0),
+        last_error=(str(row["last_error"]) if row["last_error"] else None),
+        contract_revision=int(row["contract_revision"] or 0),
+        input_revision=str(row["input_revision"] or ""),
+        queue_state=str(row["queue_state"] or "inline"),
+        cancel_requested=bool(row["cancel_requested"]),
+        created_at=_parse_optional_dt(row["created_at"]),
+        updated_at=_parse_optional_dt(row["updated_at"]),
+    )
 
 
 # ---------------------------------------------------------------------------

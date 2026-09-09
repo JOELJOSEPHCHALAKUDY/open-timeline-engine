@@ -4,6 +4,7 @@ import hashlib
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.version import MCP_SCHEMA_VERSION
@@ -436,6 +437,22 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
         ),
     },
 ]
+
+# Conditional constraint: composed onto a COPY of HARD_CONSTRAINTS for the turns where
+# planning_pending is true, and never appended to HARD_CONSTRAINTS itself.  HARD_CONSTRAINTS
+# is a module-level list assigned by reference on every active turn, so appending to it would
+# forbid all mutation for every session in this process, forever.
+PLANNING_PENDING_CONSTRAINT: dict[str, Any] = {
+    "directive_type": "hard_constraint",
+    "rule_id": "no-execute-while-planning-pending",
+    "scope": {"actions": ["edit", "write", "delete", "execute"]},
+    "enforcement": "block_and_escalate",
+    "reason": (
+        "planning_pending=true means no approved plan exists for the current objective "
+        "revision. Any mutation now would execute against an invalidated or absent plan. "
+        "Wait for the next tce.takeover_step to return a directive."
+    ),
+}
 
 
 def with_schema(payload: dict[str, Any]) -> dict[str, Any]:
@@ -915,6 +932,25 @@ def get_behavior_evidence_projection(observation_id: str, format_name: str = "js
 
 def get_behavior_review_projection() -> dict[str, Any]:
     return client.get_behavior_review_projection()
+
+
+def get_task_state_projection(task_id: str) -> dict[str, Any]:
+    """Fetch the read-only Markdown projection of one task's state.
+
+    Backs the ``tce://workspace/{workspace_id}/task/{task_id}/state.md`` MCP *resource*.
+    It is deliberately not exposed as a tool: keeping it off the tool surface keeps it out
+    of ``_slim_takeover_result`` and out of the executor's mutating vocabulary.
+
+    ``TCEApiClient`` is not owned by this change, so the request goes through its generic
+    GET helper rather than through a new named client method.
+    """
+    response = client._get(f"/v1/tasks/{quote(str(task_id), safe='')}/state.md")
+    response.raise_for_status()
+    payload: Any = response.json()
+    if not isinstance(payload, dict):
+        return {}
+    projection: dict[str, Any] = payload
+    return projection
 
 
 def assign_behavior_projection_pilot(
@@ -1669,6 +1705,11 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
     if execution_claim_required:
         has_directive = False
 
+    # Planning-lifecycle derivations, computed BEFORE the branch chain so both the
+    # branch and the constraint composition below read the same values.
+    planning_pending: bool = bool(result.get("planning_pending", False))
+    hint_ms: int = int(result.get("planning_pending_hint_ms", 0) or 0) or 1500
+
     # Build the action instruction.
     # This is the ONLY mechanism to steer non-Claude executors (e.g. OpenAI).
     needs_human = bool(result.get("needs_human", False))
@@ -1731,6 +1772,25 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             )
         # Strip the directive from final_response so the LLM can't echo it
         visible_response = None
+    elif (
+        planning_pending
+        and not execution_permit_required
+        and not execution_claim_required
+        and not result.get("pending_execution")
+        and str(result.get("directive_state") or "") not in {"pending", "in_progress"}
+    ):
+        # A plan is being produced asynchronously and no executable directive exists yet.
+        # This branch sits BELOW the directive branch and additionally asserts that no
+        # execution lock is held (CLAUDE.md rule 18a defines the lock as pending_execution
+        # present OR directive_state in {pending, in_progress}), so a live directive is
+        # never hidden behind a "poll again" message.
+        has_directive = False
+        next_step = (
+            "PLANNING IN PROGRESS. No executable directive exists yet for this objective. "
+            "Do NOT start work and do NOT fall back to normal chat. Tell the user planning is "
+            f"running, then call tce.takeover_step again in about {hint_ms} ms to collect the plan."
+        )
+        visible_response = final_response or "Planning the objective; no directive yet."
     else:
         next_step = None
         visible_response = final_response
@@ -1768,15 +1828,31 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "pending_execution": result.get("pending_execution"),
         "retry_scheduled": bool(result.get("retry_scheduled", False)),
         "autonomy_notice": result.get("autonomy_notice"),
+        # Task-state / planning passthrough.  This dict is an explicit whitelist: a key that
+        # is not listed here is dropped silently, and a stale MCP process keeps dropping it
+        # after the API upgrades.  Every name the next_step string above interpolates must
+        # therefore appear here too.
+        "planning_pending": planning_pending,
+        "planning_job_id": result.get("planning_job_id"),
+        "planning_pending_hint_ms": int(result.get("planning_pending_hint_ms", 0) or 0),
+        "task_state_revision": int(result.get("task_state_revision", 0) or 0),
+        "task_state": result.get("task_state", {}),
+        "citations": [str(item) for item in (result.get("citations") or [])][:12],
     }
     if clone_hints:
         slim["clone_hints"] = clone_hints
 
     # Attach hard constraints when takeover is active so the executor
     # sees them every turn — machine-readable, not prose.
+    # HARD_CONSTRAINTS is process-global and must never be mutated: it is assigned by
+    # reference on every active turn, so a single append would forbid all mutation for
+    # every session in this process for the life of the process.  Compose a fresh list.
     is_active = slim_state.get("active", False)
     if is_active:
-        slim["constraints"] = HARD_CONSTRAINTS
+        constraints: list[dict[str, Any]] = list(HARD_CONSTRAINTS)
+        if planning_pending:
+            constraints.append(PLANNING_PENDING_CONSTRAINT)
+        slim["constraints"] = constraints
 
     # Include persona acknowledgement on activation so the executor
     # greets the user in-character. Bake it into final_response AND
@@ -1835,6 +1911,9 @@ def _extract_clone_hints(clone_advice: dict[str, Any] | None) -> dict[str, Any] 
                 {
                     "situation": summary,
                     "decision": response,
+                    # Keep the observation id so a hint the executor acts on is traceable
+                    # back to the decision_observations row it came from.
+                    "observation_id": obs.get("observation_id"),
                     "recall_source": obs.get("recall_source", "exact"),
                     "similarity": obs.get("similarity"),
                 }

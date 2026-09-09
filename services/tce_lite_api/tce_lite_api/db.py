@@ -563,6 +563,174 @@ def _ensure_trusted_capture_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_obs_opportunity ON decision_observations (opportunity_id)")
 
 
+def _ensure_task_state_schema(conn: sqlite3.Connection) -> None:
+    """P2 durable task state: versioned projection, immutable task state events, planning jobs, verifications.
+
+    Mirrors alembic revision 20260909_0037 (Full). Additive and idempotent only.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_states (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            task_id TEXT NOT NULL,
+            project_id TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            contract_revision INTEGER NOT NULL DEFAULT 0,
+            highest_seq INTEGER NOT NULL DEFAULT 0,
+            objective_text TEXT NOT NULL DEFAULT '',
+            objective_hash TEXT,
+            objective_set_at TEXT,
+            objective_set_seq INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'awaiting_objective',
+            next_permitted_action TEXT NOT NULL DEFAULT 'await_owner_objective',
+            plan_state TEXT NOT NULL DEFAULT 'absent',
+            plan_producer TEXT,
+            plan_root_goal_id TEXT,
+            planning_job_id TEXT,
+            constraints_json TEXT NOT NULL DEFAULT '[]',
+            open_decisions_json TEXT NOT NULL DEFAULT '[]',
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            unresolved_effects_json TEXT NOT NULL DEFAULT '[]',
+            latest_verification_json TEXT NOT NULL DEFAULT '{}',
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            source_revision TEXT NOT NULL DEFAULT '',
+            cancelled_at TEXT,
+            cancelled_seq INTEGER NOT NULL DEFAULT 0,
+            last_cancel_seq INTEGER NOT NULL DEFAULT 0,
+            cancel_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_task_states_identity ON task_states (workspace_id, owner_id, task_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_states_session ON task_states (workspace_id, session_id, updated_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_state_events (
+            id TEXT PRIMARY KEY,
+            task_state_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            contract_revision INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            source_event_id TEXT,
+            directive_id TEXT,
+            goal_id TEXT,
+            actor TEXT NOT NULL DEFAULT '',
+            occurred_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_task_state_events_seq ON task_state_events (task_state_id, seq)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_state_events_task ON task_state_events (workspace_id, task_id, seq)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_state_events_kind ON task_state_events (task_state_id, kind, seq DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS planning_jobs (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            task_id TEXT NOT NULL,
+            task_state_id TEXT,
+            job_kind TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            input_revision TEXT NOT NULL DEFAULT '',
+            contract_revision INTEGER NOT NULL DEFAULT 0,
+            objective_hash TEXT,
+            objective_text TEXT NOT NULL DEFAULT '',
+            charter_json TEXT NOT NULL DEFAULT '{}',
+            scope_json TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL DEFAULT 'pending',
+            lease_owner TEXT,
+            lease_until TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            producer TEXT,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            queue_state TEXT NOT NULL DEFAULT 'inline',
+            rq_job_id TEXT,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_planning_jobs_idem ON planning_jobs (workspace_id, idempotency_key)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_planning_jobs_dispatch ON planning_jobs (state, next_attempt_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_planning_jobs_task ON planning_jobs (workspace_id, task_id, created_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_verifications (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            directive_id TEXT,
+            state TEXT NOT NULL DEFAULT 'unverified',
+            method TEXT NOT NULL DEFAULT 'none',
+            summary TEXT NOT NULL DEFAULT '',
+            evidence_event_ids_json TEXT NOT NULL DEFAULT '[]',
+            recorded_by TEXT NOT NULL DEFAULT '',
+            recorded_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1',
+            contract_revision INTEGER NOT NULL DEFAULT 0,
+            plan_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_verifications_task ON task_verifications (workspace_id, task_id, recorded_at DESC)"
+    )
+    goal_columns = {
+        "plan_contract_revision": "INTEGER",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "blocked_reason": "TEXT",
+        "depends_on_json": "TEXT NOT NULL DEFAULT '[]'",
+        "mutating": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, ddl in goal_columns.items():
+        if not _column_exists(conn, "autonomy_goals", name):
+            conn.execute(f"ALTER TABLE autonomy_goals ADD COLUMN {name} {ddl}")
+    handoff_columns = {
+        "task_id": "TEXT",
+        "task_state_revision": "INTEGER",
+        "contract_revision": "INTEGER",
+        "verification_refs_json": "TEXT NOT NULL DEFAULT '[]'",
+        "unresolved_effects_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for name, ddl in handoff_columns.items():
+        if not _column_exists(conn, "handoff_records", name):
+            conn.execute(f"ALTER TABLE handoff_records ADD COLUMN {name} {ddl}")
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -1743,6 +1911,7 @@ def init_db() -> None:
         _ensure_continuity_v04_schema(conn)
         _ensure_continuity_v05_schema(conn)
         _ensure_trusted_capture_schema(conn)
+        _ensure_task_state_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

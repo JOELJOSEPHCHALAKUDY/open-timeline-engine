@@ -13,8 +13,11 @@ import threading
 import time
 import uuid
 from collections import Counter as CollectionCounter
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,7 +57,7 @@ from prometheus_client import Counter as PromCounter
 from prometheus_client import Histogram
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import or_, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import HTMLResponse, JSONResponse
 from tce_model_gateway.factory import get_gateway as get_model_gateway
@@ -90,6 +93,15 @@ from tce_shared.behavior_pilot import (
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.continuity import assess_anchor_freshness
+from tce_shared.deadline import (
+    ADVISOR_TURN_DEADLINE,
+    RETRIEVAL_REASON_DEADLINE_SKIP,
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
+    Deadline,
+    RetrievalLedger,
+    advisor_timeout_bucket_ms,
+    retrieval_child,
+)
 from tce_shared.decision_capture import (
     HOST_CAPTURE_CAPABILITY,
     HOST_CAPTURE_SOURCE,
@@ -168,6 +180,7 @@ from tce_shared.events import (
     MemoryReviewResolveRequest,
     OperationMode,
     PatternFeedbackRequest,
+    PlanningJobStatusResponse,
     ProcessMiningRequest,
     ProcessMiningResponse,
     ProcessModelItem,
@@ -206,9 +219,16 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TaskCancelRequest,
+    TaskCancelResponse,
+    TaskNextPermittedAction,
+    TaskStateProjectionResponse,
+    TaskStateSummary,
     TrustedInputCapture,
     TrustedInputOriginKind,
     TrustedInputReceipt,
+    to_lifecycle_status,
+    to_next_permitted_action,
 )
 from tce_shared.execution_transitions import (
     SYSTEM_ACTOR,
@@ -255,12 +275,6 @@ from tce_shared.handoff import (
     normalize_objective_text,
     rank_resume_candidates,
 )
-from tce_shared.plan_decomposition import (
-    PLAN_DECOMPOSITION_PROMPT,
-    PlanStep,
-    fallback_plan_steps,
-    parse_plan_steps,
-)
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.scope import PROJECT_BOUND, PROJECT_UNBOUND, SCOPE_POLICY_REVISION, ResolvedScope
@@ -285,6 +299,37 @@ from tce_shared.takeover import (
     sanitize_untrusted_objective,
     should_trigger_deliberation,
     update_recent_outcomes,
+)
+from tce_shared.task_state import (
+    CANCEL_REASON_STAND_DOWN,
+    PLANNING_JOB_KIND_DECOMPOSE,
+    PLANNING_JOB_KIND_DREAM,
+    PLANNING_PRODUCER_DETERMINISTIC,
+    TASK_STATE_POLICY_REVISION,
+    ApprovedPlan,
+    InvalidationPlan,
+    PlanState,
+    PlanStepState,
+    TaskStateEvent,
+    TaskStateEventKind,
+    TaskStatePreconditionFailed,
+    TaskStateProjection,
+    TaskStateRevisionConflict,
+    TaskStatus,
+    approved_plan_id,
+    charter_for_task,
+    charter_to_json,
+    deterministic_plan,
+    invalidation_for_objective_change,
+    objective_contract_revision,
+    objective_set_required,
+    plan_input_revision,
+    plan_steps_to_json,
+    reconcile_constraint_events,
+    render_task_state_markdown,
+    root_status,
+    task_scope_digest,
+    task_state_summary_fields,
 )
 
 from .audit import write_audit_log
@@ -374,7 +419,7 @@ from .continuity_store import (
     record_resume_attempt,
     record_resume_progress,
 )
-from .crypto import maybe_decrypt_payload, maybe_encrypt_payload
+from .crypto import maybe_encrypt_payload
 from .db import get_db, get_session_factory
 from .graph import (
     graph_for_event,
@@ -403,6 +448,16 @@ from .models import (
     WorkflowTemplate,
 )
 from .otel import setup_otel
+from .plan_rows import PLAN_DREAM_STEP_INDEX, write_dream_rows, write_plan_rows
+from .planning_store import (
+    enqueue_planning_job,
+    mark_queue_state,
+    pending_directive_ids,
+    pending_planning_job_ids,
+)
+from .planning_store import (
+    get_planning_job as load_planning_job,
+)
 from .policy import PolicyEngine
 from .queue import enqueue_job, get_queue_depth, queue_name_for_job
 from .redaction import apply_redaction_zones, redact_payload, redact_project_hint, redact_text
@@ -500,6 +555,13 @@ from .takeover_store import (
 from .takeover_store import (
     reset_takeover_state as store_reset_takeover_state,
 )
+from .task_state_store import (
+    apply_task_state_events,
+    cancel_task,
+    ensure_task_state,
+    load_task_state,
+    rebuild_task_state,
+)
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -513,6 +575,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+@app.exception_handler(TaskStateRevisionConflict)
+def _task_state_conflict(request: Request, exc: TaskStateRevisionConflict) -> JSONResponse:
+    """A lost CAS race is a 409, never a 500: the caller re-reads and retries."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_revision_conflict",
+            "task_id": exc.task_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(TaskStatePreconditionFailed)
+def _task_state_precondition(
+    request: Request, exc: TaskStatePreconditionFailed
+) -> JSONResponse:
+    """The retry re-read the row and the caller said the write is no longer valid.
+    Nothing was applied."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_precondition_failed",
+            "task_id": exc.task_id,
+            "detail": exc.reason,
+        },
+    )
+
+
 policy_engine = PolicyEngine()
 rate_limiter = InMemoryRateLimiter(limit=settings.rate_limit_requests_per_minute, window_seconds=60)
 takeover_step_rate_limiter = InMemoryRateLimiter(
@@ -1008,6 +1103,89 @@ def _store_advisor_api_key(db: Session, secret_ref: str, api_key: str) -> tuple[
     return "env_file", True
 
 
+_ADVISOR_GATEWAY_FIELDS: tuple[str, ...] = (
+    "model_provider",
+    "ollama_url",
+    "embed_model",
+    "extract_model",
+    "openai_api_key",
+    "openai_base_url",
+    "openai_embed_model",
+    "openai_extract_model",
+    "anthropic_api_key",
+    "anthropic_extract_model",
+    "redis_url",
+    "advisor_timeout_seconds",
+    "advisor_attempt_timeout_ms",
+    "advisor_read_timeout_ms",
+)
+
+_ADVISOR_GATEWAY_DEFAULTS: dict[str, Any] = {
+    "model_provider": "ollama",
+    "ollama_url": "http://localhost:11434",
+    "embed_model": "mxbai-embed-large",
+    "extract_model": "qwen2.5:7b",
+    "openai_api_key": "",
+    "openai_base_url": None,
+    "openai_embed_model": "text-embedding-3-small",
+    "openai_extract_model": "gpt-4o-mini",
+    "anthropic_api_key": "",
+    "anthropic_extract_model": "claude-haiku-4-5-20251001",
+    "redis_url": "",
+    "advisor_timeout_seconds": None,
+    "advisor_attempt_timeout_ms": 900,
+    "advisor_read_timeout_ms": 900,
+}
+
+
+def _advisor_gateway_settings(settings_obj: Any) -> tuple[Any, bool]:
+    """Clamp the advisor's socket timeouts to what the TURN deadline actually has left.
+
+    Returns ``(settings-like object, was_clamped)``. The Settings singleton is NEVER mutated.
+
+    With no turn deadline in scope the object is passed through untouched, which keeps the
+    gateway cache warm for every non-takeover advisor call.
+
+    The clamp is bucketed. ``factory._settings_signature`` interpolates all three timeout
+    fields, so an unbucketed per-turn clamp would mint a new gateway, a new HTTP session and a
+    new cache entry every turn. ``advisor_timeout_seconds`` must be clamped too: the factory
+    takes a ``max()`` over all three candidates, so clamping only the two millisecond fields
+    is a no-op on the route that sets the seconds field.
+    """
+    deadline_now: Deadline | None = ADVISOR_TURN_DEADLINE.get()
+    if deadline_now is None:
+        return settings_obj, False
+
+    bucket = advisor_timeout_bucket_ms(deadline_now.remaining_ms())
+    configured_attempt = int(getattr(settings_obj, "advisor_attempt_timeout_ms", 900) or 900)
+    configured_read = int(getattr(settings_obj, "advisor_read_timeout_ms", 900) or 900)
+    attempt = min(configured_attempt, bucket)
+    read = min(configured_read, bucket)
+    secs = getattr(settings_obj, "advisor_timeout_seconds", None)
+    secs_clamped = min(float(secs), bucket / 1000.0) if secs is not None else None
+
+    clamped = SimpleNamespace(
+        **{
+            key: getattr(settings_obj, key, _ADVISOR_GATEWAY_DEFAULTS[key])
+            for key in _ADVISOR_GATEWAY_FIELDS
+        }
+    )
+    clamped.advisor_attempt_timeout_ms = attempt
+    clamped.advisor_read_timeout_ms = read
+    if secs_clamped is not None:
+        clamped.advisor_timeout_seconds = secs_clamped
+    route_provider_id = getattr(settings_obj, "_route_provider_id", None)
+    if route_provider_id is not None:
+        clamped._route_provider_id = route_provider_id
+
+    was_clamped = bool(
+        attempt < configured_attempt
+        or read < configured_read
+        or (secs_clamped is not None and secs is not None and secs_clamped < float(secs))
+    )
+    return clamped, was_clamped
+
+
 def _provider_request_for(
     provider_id: str,
     *,
@@ -1224,7 +1402,8 @@ def _advisor_runtime_reason_from_routes(
                         model_provider=gateway_provider,
                         request=request,
                     )
-                    gateway = get_model_gateway(gateway_settings)
+                    clamped_settings, _was_clamped = _advisor_gateway_settings(gateway_settings)
+                    gateway = get_model_gateway(clamped_settings)
                     result = advisor_reason(
                         gateway=gateway,
                         user_name=settings.clone_user_name,
@@ -4211,7 +4390,23 @@ def _build_takeover_working_set(
     task: str,
     app_context: dict[str, Any],
     constraints: dict[str, Any],
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[dict[str, Any], int]:
+    # The retrieval child is built HERE, immediately above the bundle call, and not at the top
+    # of the turn: a child's clock starts at construction, and hundreds of lines plus several
+    # round trips sit between the turn's start and the first retrieval query. Building it there
+    # burned the whole retrieval budget before retrieval began. When the knob is off this
+    # returns the (unbounded) turn deadline unchanged, so no guard is installed at all.
+    retrieval_deadline = (
+        retrieval_child(
+            deadline,
+            enabled=bool(settings.retrieval_deadline_enabled),
+            budget_ms=int(settings.context_retrieval_budget_ms),
+        )
+        if deadline is not None
+        else None
+    )
     started = time.perf_counter()
     consumer_ctx = policy_engine.resolve_consumer(
         auth.consumer,
@@ -4225,6 +4420,8 @@ def _build_takeover_working_set(
         ContextBundleRequest(task=task, app_context=app_context, constraints=constraints),
         consumer_ctx,
         policy_engine,
+        deadline=retrieval_deadline,
+        ledger=ledger,
     )
     top_patterns = [
         {
@@ -8345,7 +8542,12 @@ def clone_advice(
                 }
             if not advisor_decision and body.allow_fallback:
                 try:
-                    legacy_gateway = get_model_gateway(settings)
+                    legacy_settings, legacy_clamped = _advisor_gateway_settings(settings)
+                    if legacy_clamped and isinstance(body.takeover_context, dict):
+                        # Surfaced to the caller's turn so a clamp-induced timeout is accounted
+                        # as latency rather than as advisor ill-health.
+                        body.takeover_context["_advisor_clamped_by_deadline"] = True
+                    legacy_gateway = get_model_gateway(legacy_settings)
                     legacy_decision = advisor_reason(
                         gateway=legacy_gateway,
                         user_name=settings.clone_user_name,
@@ -10593,6 +10795,47 @@ def get_takeover_state(
     )
 
 
+def _record_stand_down(
+    db: Session, *, auth: AuthContext, session_id: str, now: datetime
+) -> None:
+    """Append CANCELLATION_REQUESTED on a stand-down. Best effort, never fatal.
+
+    ``task_states`` and ``task_state_events`` are deliberately NOT deleted here, even though
+    the ``takeover_sessions`` row is: the projection is the durable record, and the next
+    activation's OBJECTIVE_SET revives the task by timestamp order. That is what makes the
+    documented stand-down -> reactivate cycle work on one stable session id.
+    """
+    if not bool(getattr(settings, "task_state_enabled", True)):
+        return
+    try:
+        loaded = load_task_state(
+            db, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=session_id
+        )
+        if loaded is None:
+            return
+        apply_task_state_events(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=session_id,
+            task_id=session_id,
+            new_events=[
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.CANCELLATION_REQUESTED,
+                    contract_revision=loaded[0].contract_revision,
+                    payload={"reason": CANCEL_REASON_STAND_DOWN, "actor": SYSTEM_ACTOR},
+                    occurred_at=now,
+                    actor=SYSTEM_ACTOR,
+                )
+            ],
+            now=now,
+            expected_revision=None,
+        )
+    except Exception:
+        logger.warning("stand-down task-state event failed", exc_info=True)
+
+
 @app.post("/v1/takeover/reset", response_model=TakeoverState)
 def reset_takeover_state(
     session_id: str,
@@ -10625,6 +10868,7 @@ def reset_takeover_state(
         ),
         {"session_id": session_id, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
     )
+    _record_stand_down(db, auth=auth, session_id=session_id, now=datetime.now(tz=UTC))
     db.execute(
         text(
             """
@@ -10740,7 +10984,13 @@ def takeover_goal_cache_status(
         activation_keywords=None,
         stop_keywords=None,
     )
-    cache_key = _goal_cache_key_for_state(state, auth)
+    cache_contract_revision, cache_scope_digest = _goal_cache_identity(db, auth=auth, state=state)
+    cache_key = _goal_cache_key_for_state(
+        state,
+        auth,
+        contract_revision=cache_contract_revision,
+        scope_digest=cache_scope_digest,
+    )
     l1_item, l1_state = goal_cache_get_l1(cache_key)
     l1: dict[str, Any]
     if l1_item:
@@ -11304,7 +11554,24 @@ def takeover_autonomy_tick(
                 pursued = _dream_and_pursue(db, auth=auth, state=state)
                 if pursued:
                     dreams_pursued += 1
-                    next_step = _select_next_plan_step(db, state)
+                    # The tick dispatches with no user turn, so it loads the projection
+                    # itself rather than reading the takeover_context mirror (which is a
+                    # wire mirror and never an input to a decision).
+                    tick_projection = load_task_state(
+                        db,
+                        workspace_id=auth.workspace_id,
+                        owner_id=auth.user_id,
+                        task_id=session_id,
+                    )
+                    next_step = _select_next_plan_step(
+                        db,
+                        state,
+                        contract_revision=(
+                            tick_projection[0].contract_revision
+                            if tick_projection is not None
+                            else 0
+                        ),
+                    )
                     if next_step is not None:
                         state.active_goal_id = next_step.id
                         save_takeover_state(db, state)
@@ -12194,6 +12461,266 @@ def _reject_directive_transition(
     )
 
 
+# The report states that stall a plan step. Must stay identical to the Lite twin
+# (`store.py::_record_execution_task_state_lite`): Full used to narrow this to FAILED and
+# CANCELLED, so an executor reporting `state="blocked"` — the most literally named block there
+# is — emitted no STEP_BLOCKED and moved no goal row. The step stayed `candidate` forever, the
+# projection reported ACTIVE where Lite reported BLOCKED, and the block was re-dispatched
+# instead of surfaced. The auto-reaper writes `directive_executions` directly and never reaches
+# this path, so ABANDONED here only ever means an executor explicitly reported it.
+_BLOCKING_REPORT_STATES: frozenset[DirectiveExecutionState] = frozenset(
+    {
+        DirectiveExecutionState.FAILED,
+        DirectiveExecutionState.BLOCKED,
+        DirectiveExecutionState.ABANDONED,
+        DirectiveExecutionState.CANCELLED,
+    }
+)
+
+
+def _goal_step_index(db: Session, *, state: TakeoverState, goal_id: str | None) -> int | None:
+    """The plan step index of ``goal_id``, or ``None`` when the row names no plan step.
+
+    The fold keys ``STEP_COMPLETED`` / ``STEP_BLOCKED`` on ``payload["step_index"]`` and, when
+    that index names no step of the approved plan, discards the event as
+    ``"<kind>:unknown_step"``. Emitting no index at all (``STEP_COMPLETED`` before this) or a
+    placeholder ``-1`` (``STEP_BLOCKED``) therefore left EVERY step of EVERY projection sitting
+    at ``candidate`` forever, which is what let ``root_status`` never see a block.
+
+    A missing index is **omitted**, never faked. ``0`` is not a free placeholder — it is the
+    plan ROOT's row (``write_plan_rows``: root 0, steps 1..N) — and ``-1`` is a stored dream
+    (``PLAN_DREAM_STEP_INDEX``). Omitting keeps the fold's ``unknown_step`` counter honest;
+    faking would silently rewrite the status of a step nobody reported on.
+    """
+    if not goal_id:
+        return None
+    try:
+        UUID(str(goal_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    row = db.execute(
+        text(
+            """
+            SELECT step_index
+            FROM autonomy_goals
+            WHERE id = CAST(:goal_id AS uuid)
+              AND session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+            """
+        ),
+        {
+            "goal_id": str(goal_id),
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+        },
+    ).first()
+    if row is None or row[0] is None:
+        return None
+    index = int(row[0])
+    # <= 0 is the root row or a dream seed, never a step the fold can address.
+    return index if index > 0 else None
+
+
+def _record_execution_task_state(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: ExecutionReportRequest,
+    directive_id: str,
+    goal_id: str | None,
+    effective_state: DirectiveExecutionState,
+    now: datetime,
+) -> int:
+    """Append this report's task-state events and return the contract revision they used.
+
+    Returns ``0`` when the projection is disabled or unreadable, which is also the value the
+    goal predicate then matches: a plan written under contract 0 stays addressable.
+    """
+    if not bool(getattr(settings, "task_state_enabled", True)):
+        return 0
+    try:
+        scope = auth.resolved_scope(
+            session_project=state.takeover_context.get("project_context")
+            if isinstance(state.takeover_context, dict)
+            else None,
+            task_id=state.session_id,
+        )
+        task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=state.session_id,
+            task_id=state.session_id,
+            project_id=scope.project_id,
+            now=now,
+        )
+        _ = task_state_id
+        events: list[TaskStateEvent] = []
+        # Resolved ONCE, from the goal row the directive actually carried: both emission
+        # sites need it, and both used to ship an index the fold could not address.
+        step_index = _goal_step_index(db, state=state, goal_id=goal_id)
+        if effective_state == DirectiveExecutionState.SUCCEEDED:
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.STEP_COMPLETED,
+                    contract_revision=projection.contract_revision,
+                    payload={
+                        **({"step_index": step_index} if step_index is not None else {}),
+                        "goal_id": goal_id,
+                        "directive_id": directive_id,
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    directive_id=directive_id,
+                    goal_id=goal_id,
+                )
+            )
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.EFFECT_RESOLVED,
+                    contract_revision=projection.contract_revision,
+                    payload={
+                        "effect_id": directive_id,
+                        "kind": "directive",
+                        "description": "",
+                        "opened_at": now,
+                        "directive_id": directive_id,
+                        "paths": [],
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    directive_id=directive_id,
+                )
+            )
+        elif effective_state in _BLOCKING_REPORT_STATES:
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.STEP_BLOCKED,
+                    contract_revision=projection.contract_revision,
+                    payload={
+                        **({"step_index": step_index} if step_index is not None else {}),
+                        "goal_id": goal_id,
+                        "blocked_reason": str(body.failure_reason or "")[:400],
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    directive_id=directive_id,
+                    goal_id=goal_id,
+                )
+            )
+        verification = _verification_from_report(body)
+        if verification is not None:
+            # S5 provenance: a verification is evidence only for the contract AND the plan it
+            # was recorded against. Stamping both here is what stops a passing verification
+            # from a finished objective driving a later one to DONE.
+            verification["contract_revision"] = projection.contract_revision
+            verification["plan_id"] = (
+                projection.plan.plan_id if projection.plan is not None else None
+            )
+            verification["directive_id"] = directive_id
+            _insert_task_verification(
+                db, auth=auth, task_id=state.session_id, ref=verification, now=now
+            )
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.VERIFICATION_RECORDED,
+                    contract_revision=projection.contract_revision,
+                    payload=verification,
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    directive_id=directive_id,
+                )
+            )
+        if events:
+            write = apply_task_state_events(
+                db,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                task_id=state.session_id,
+                new_events=events,
+                now=now,
+                expected_revision=None,
+            )
+            state.takeover_context["task_state_revision"] = int(write.next_revision)
+            return int(write.projection.contract_revision)
+        return int(projection.contract_revision)
+    except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+        raise
+    except Exception:
+        logger.warning("task-state execution report failed", exc_info=True)
+        return 0
+
+
+def _verification_from_report(body: ExecutionReportRequest) -> dict[str, Any] | None:
+    """Lift a verification out of the report's details map, or ``None``."""
+    details = body.details if isinstance(body.details, dict) else {}
+    raw = details.get("verification")
+    if not isinstance(raw, dict):
+        return None
+    state_value = str(raw.get("state") or "unverified")
+    return {
+        "verification_id": str(raw.get("verification_id") or uuid.uuid4()),
+        "directive_id": str(body.directive_id),
+        "state": state_value,
+        "method": str(raw.get("method") or "none"),
+        "recorded_at": datetime.now(tz=UTC),
+        "contract_revision": 0,
+        "plan_id": None,
+        "evidence_event_ids": [str(item) for item in (raw.get("evidence_event_ids") or [])][:40],
+        "summary": str(raw.get("summary") or "")[:500],
+    }
+
+
+def _insert_task_verification(
+    db: Session,
+    *,
+    auth: AuthContext,
+    task_id: str,
+    ref: dict[str, Any],
+    now: datetime,
+) -> None:
+    db.execute(
+        text(
+            """
+            INSERT INTO task_verifications(
+                id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
+                evidence_event_ids_json, recorded_by, recorded_at, schema_version,
+                contract_revision, plan_id
+            )
+            VALUES(
+                gen_random_uuid(), :workspace_id, :owner_id, :task_id,
+                CAST(:directive_id AS UUID), :state, :method, :summary,
+                CAST(:evidence_event_ids_json AS JSONB), :recorded_by, :recorded_at, 'v1',
+                :contract_revision, :plan_id
+            )
+            """
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "owner_id": auth.user_id,
+            "task_id": task_id,
+            "directive_id": ref.get("directive_id"),
+            "state": ref.get("state"),
+            "method": ref.get("method"),
+            "summary": ref.get("summary"),
+            "evidence_event_ids_json": json.dumps(list(ref.get("evidence_event_ids") or [])),
+            "recorded_by": auth.consumer,
+            "recorded_at": now,
+            "contract_revision": int(ref.get("contract_revision") or 0),
+            "plan_id": ref.get("plan_id"),
+        },
+    )
+
+
 @app.post("/v1/takeover/execution/report", response_model=dict)
 def takeover_execution_report(
     body: ExecutionReportRequest,
@@ -12895,6 +13422,26 @@ def takeover_execution_report(
     )
     state.recent_outcomes_json = updated_outcomes
     state.autonomy_score = updated_autonomy
+    # Lock order: task_states (1) is taken before the goal UPDATE (5) below. Because
+    # apply_task_state_events is the thing that takes lock 1 with SELECT ... FOR UPDATE,
+    # "first" means this call precedes the directive and goal updates in statement order.
+    report_contract_revision = _record_execution_task_state(
+        db,
+        auth=auth,
+        state=state,
+        body=body,
+        directive_id=str(current.directive_id),
+        # The SAME goal the two branches below mark done/blocked. A directive minted before
+        # the plan existed carries a NULL goal_id while the session is pointed at a plan step,
+        # so keying only on `current.goal_id` resolved no step_index on exactly the turn that
+        # advances a step — and the fold then discarded the event as "*:unknown_step" (1c).
+        # Lite's twin (`store.py::_record_execution_task_state_lite`) asks the same question.
+        goal_id=str(current.goal_id or state.active_goal_id)
+        if (current.goal_id or state.active_goal_id)
+        else None,
+        effective_state=effective_state,
+        now=now,
+    )
     if effective_state == DirectiveExecutionState.SUCCEEDED:
         goal_to_complete = current.goal_id or state.active_goal_id
         if goal_to_complete:
@@ -12942,7 +13489,43 @@ def takeover_execution_report(
         _invalidate_goal_queue_cache(db, auth=auth, state=state)
         # Must run last: it overrides awaiting_next_objective / objective / objective_hash
         # that the lines above just set, which is the whole point of a plan.
-        _advance_plan_after_completion(db, auth=auth, state=state, context=context)
+        _advance_plan_after_completion(
+            db,
+            auth=auth,
+            state=state,
+            context=context,
+            contract_revision=report_contract_revision,
+        )
+    elif effective_state in _BLOCKING_REPORT_STATES:
+        blocked_goal_id = current.goal_id or state.active_goal_id
+        if blocked_goal_id:
+            # The first write of AutonomyGoalStatus.BLOCKED anywhere in the tree, which is
+            # what makes plan_decomposition.next_open_step's blocked guard live rather than
+            # dead code.
+            db.execute(
+                text(
+                    """
+                    UPDATE autonomy_goals
+                    SET status = :status, blocked_reason = :reason,
+                        attempt_count = attempt_count + 1, updated_at = :updated_at
+                    WHERE id = :id
+                      AND session_id = :session_id
+                      AND workspace_id = :workspace_id
+                      AND user_id = :user_id
+                      AND plan_contract_revision = :contract_revision
+                    """
+                ),
+                {
+                    "status": AutonomyGoalStatus.BLOCKED.value,
+                    "reason": str(body.failure_reason or "")[:400],
+                    "updated_at": now,
+                    "id": blocked_goal_id,
+                    "session_id": state.session_id,
+                    "workspace_id": state.workspace_id,
+                    "user_id": state.user_id,
+                    "contract_revision": report_contract_revision,
+                },
+            )
     state.takeover_context = context
     _sync_enforcement_counters(db, state)
     save_takeover_state(db, state)
@@ -13054,12 +13637,138 @@ def takeover_execution_status(
         {"session_id": session_id, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
     ).mappings().all()
     status_now = datetime.now(tz=UTC)
+    # Read from the task_states row, not from directive_executions: under the S1 audit that
+    # table gains no columns, so a directive-sourced revision would always be null.
+    status_projection = (
+        load_task_state(
+            db, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=session_id
+        )
+        if bool(getattr(settings, "task_state_enabled", True))
+        else None
+    )
     return ExecutionStatusResponse(
         session_id=session_id,
         pending=[_directive_from_row(row) for row in pending_rows],
         recent=[_directive_from_row(row) for row in recent_rows],
         generated_at=status_now,
         capture_delivery_state=CaptureDeliveryState(_capture_delivery_state_for(db, auth, status_now)),
+        task_state_revision=int(status_projection[0].revision) if status_projection else 0,
+        next_permitted_action=(
+            to_next_permitted_action(status_projection[0].next_permitted_action)
+            if status_projection
+            else TaskNextPermittedAction.NONE
+        ),
+    )
+
+
+@app.get("/v1/tasks/{task_id}/state", response_model=TaskStateSummary)
+def get_task_state(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> TaskStateSummary:
+    REQUEST_COUNT.labels(endpoint="get_task_state", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    loaded = load_task_state(
+        db, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="task state not found")
+    projection, _highest_seq, source_revision = loaded
+    return _task_state_summary(projection, source_revision)
+
+
+@app.get("/v1/tasks/{task_id}/state.md", response_model=TaskStateProjectionResponse)
+def get_task_state_markdown(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> TaskStateProjectionResponse:
+    """The Markdown view, as a JSON body carrying the content — not a raw text/markdown
+    response, so the two OpenAPI documents stay identical."""
+    REQUEST_COUNT.labels(endpoint="get_task_state_markdown", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    if not bool(getattr(settings, "task_state_markdown_enabled", True)):
+        raise HTTPException(status_code=404, detail="task state markdown disabled")
+    result = rebuild_task_state(
+        db, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="task state not found")
+    rendered = render_task_state_markdown(
+        result.projection,
+        source_revision=result.source_revision,
+        generated_at=datetime.now(tz=UTC),
+        max_steps=int(getattr(settings, "task_state_markdown_max_steps", 24)),
+    )
+    response = TaskStateProjectionResponse(**rendered)
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="task_state_markdown",
+        query={"task_id": task_id},
+        result_event_ids=[],
+        policy_decisions={
+            "projection_id": str(response.projection_id),
+            "source_revision": response.source_revision,
+            "content_sha256": response.content_sha256,
+        },
+        latency_ms=0,
+    )
+    return response
+
+
+@app.post("/v1/tasks/{task_id}/cancel", response_model=TaskCancelResponse)
+def cancel_task_endpoint(
+    task_id: str,
+    body: TaskCancelRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> TaskCancelResponse:
+    """The PATH parameter is authoritative; the body carries only a reason."""
+    REQUEST_COUNT.labels(endpoint="cancel_task", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, db)
+    response = cancel_task(
+        db,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=task_id,  # D4: the task identity for a takeover turn IS the session
+        task_id=task_id,
+        reason=body.reason,
+        actor=auth.consumer,
+        now=datetime.now(tz=UTC),
+    )
+    db.commit()
+    return response
+
+
+@app.get("/v1/planning/jobs/{job_id}", response_model=PlanningJobStatusResponse)
+def get_planning_job_status(
+    job_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PlanningJobStatusResponse:
+    REQUEST_COUNT.labels(endpoint="get_planning_job_status", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    row = load_planning_job(db, workspace_id=auth.workspace_id, job_id=job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="planning job not found")
+    return PlanningJobStatusResponse(
+        job_id=UUID(str(row["id"])),
+        task_id=str(row["task_id"] or ""),
+        job_kind=str(row["job_kind"] or ""),
+        state=str(row["state"] or "pending"),
+        attempts=int(row["attempts"] or 0),
+        max_attempts=int(row["max_attempts"] or 3),
+        producer=str(row["producer"]) if row["producer"] else None,
+        contract_revision=int(row["contract_revision"] or 0),
+        input_revision=str(row["input_revision"] or ""),
+        queue_state=str(row["queue_state"] or "inline"),
+        cancel_requested=bool(row["cancel_requested"]),
+        last_error=str(row["last_error"]) if row["last_error"] else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
@@ -13211,10 +13920,101 @@ def _goal_from_row(row: Any) -> TakeoverGoal:
         status=_coerce_goal_status(_row_value(row, "status")),
         created_at=_coerce_datetime_value(_row_value(row, "created_at")),
         updated_at=_coerce_datetime_value(_row_value(row, "updated_at")),
+        # Plan identity finally reaches the wire. _row_value defaults a missing key, so a
+        # SELECT that omits these columns still constructs -- which is exactly the hazard:
+        # it would silently report step_index=None for a real plan step. Every SELECT that
+        # feeds this function therefore lists them.
+        step_index=_row_value(row, "step_index", None),
+        parent_goal_id=(
+            UUID(str(parent_raw))
+            if (parent_raw := _row_value(row, "parent_goal_id", None))
+            else None
+        ),
+        depends_on=[
+            int(item)
+            for item in (_coerce_depends_on(_row_value(row, "depends_on_json", None)))
+        ],
+        attempts=int(_row_value(row, "attempt_count", 0) or 0),
+        mutating=bool(_row_value(row, "mutating", False)),
     )
 
 
-def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
+def _coerce_depends_on(raw: Any) -> list[int]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        candidates = raw
+    else:
+        try:
+            decoded = json.loads(str(raw) or "[]")
+        except (ValueError, TypeError):
+            return []
+        candidates = decoded if isinstance(decoded, list) else []
+    out: list[int] = []
+    for item in candidates:
+        try:
+            out.append(int(item))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _goal_cache_identity(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> tuple[int, str]:
+    """``(contract_revision, scope_digest)`` for the goal-queue cache key.
+
+    One indexed read on ``uq_task_states_identity``. It is deliberately NOT taken from the
+    ``takeover_context`` mirror: that mirror exists for the wire and is never an input to a
+    decision, and serving a cached goal queue across an objective change is a decision.
+    ``(0, "")`` when the projection is off or absent, which is a stable key, not a wrong one.
+    """
+    scope = auth.resolved_scope(
+        session_project=state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None,
+        task_id=state.session_id,
+    )
+    digest = _task_scope_digest_for(scope)
+    if not bool(getattr(settings, "task_state_enabled", True)):
+        return 0, digest
+    try:
+        loaded = load_task_state(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            task_id=state.session_id,
+        )
+    except SQLAlchemyError:
+        # Same rule as _takeover_turn_task_state: a failed statement aborts the whole Postgres
+        # transaction, so swallowing the error without rolling back leaves every later
+        # statement in the turn raising InFailedSqlTransaction. Falling back to contract
+        # revision 0 is only a real fallback if the session survives it.
+        logger.warning("goal cache identity read failed", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning("goal cache identity rollback failed", exc_info=True)
+        return 0, digest
+    except Exception:
+        logger.warning("goal cache identity read failed", exc_info=True)
+        return 0, digest
+    return (loaded[0].contract_revision if loaded is not None else 0), digest
+
+
+def _goal_cache_key_for_state(
+    state: TakeoverState,
+    auth: AuthContext,
+    *,
+    contract_revision: int,
+    scope_digest: str,
+) -> str:
+    """The cache key now carries the contract and the planning scope.
+
+    Without them a cached goal queue could be served across an objective change or across a
+    scope narrowing. Both parameters are required and have no default, so mypy flags a missed
+    call site rather than letting one silently serve stale rows.
+    """
     objective_hash_value = state.objective_hash or objective_hash(str(state.takeover_context.get("objective", "")))
     state_version = f"{state.mode.value}:{state.autonomy_policy_profile.value}"
     return goal_cache_key(
@@ -13223,13 +14023,22 @@ def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
         session_id=state.session_id,
         objective_hash=objective_hash_value or "no-objective",
         state_version=state_version,
+        contract_revision=contract_revision,
+        scope_digest=scope_digest,
+        policy_revision=TASK_STATE_POLICY_REVISION,
     )
 
 
 def _load_goal_queue_cache(db: Session, *, auth: AuthContext, state: TakeoverState) -> tuple[list[TakeoverGoal], str | None]:
     if not settings.takeover_goal_cache_enabled:
         return [], None
-    key = _goal_cache_key_for_state(state, auth)
+    key_contract_revision, key_scope_digest = _goal_cache_identity(db, auth=auth, state=state)
+    key = _goal_cache_key_for_state(
+        state,
+        auth,
+        contract_revision=key_contract_revision,
+        scope_digest=key_scope_digest,
+    )
     l1_item, l1_state = goal_cache_get_l1(key)
     if l1_item:
         payload = l1_item.get("payload", {})
@@ -13274,7 +14083,13 @@ def _save_goal_queue_cache(
 ) -> None:
     if not settings.takeover_goal_cache_enabled:
         return
-    key = _goal_cache_key_for_state(state, auth)
+    key_contract_revision, key_scope_digest = _goal_cache_identity(db, auth=auth, state=state)
+    key = _goal_cache_key_for_state(
+        state,
+        auth,
+        contract_revision=key_contract_revision,
+        scope_digest=key_scope_digest,
+    )
     created_at = datetime.now(tz=UTC)
     l2_ttl = max(1, int(settings.takeover_goal_cache_l2_ttl_seconds))
     expires_at = created_at + timedelta(seconds=l2_ttl)
@@ -13726,7 +14541,8 @@ def _list_takeover_goals(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
-                   status, created_at, updated_at
+                   status, created_at, updated_at,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating
             FROM autonomy_goals
             WHERE session_id = :session_id
               AND workspace_id = :workspace_id
@@ -14012,7 +14828,8 @@ def _load_active_goal(db: Session, state: TakeoverState) -> TakeoverGoal | None:
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
-                   status, created_at, updated_at
+                   status, created_at, updated_at,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating
             FROM autonomy_goals
             WHERE id = :id
               AND session_id = :session_id
@@ -14034,128 +14851,35 @@ def _load_active_goal(db: Session, state: TakeoverState) -> TakeoverGoal | None:
 def _write_objective_plan(
     db: Session,
     *,
-    auth: AuthContext,
-    state: TakeoverState,
-    objective: str,
-) -> str | None:
-    """Decompose an objective into ordered steps and store them. Returns the root id.
+    scope: ResolvedScope,
+    session_id: str,
+    task_id: str,
+    steps: Sequence[PlanStepState],
+    producer: str,
+    contract_revision: int,
+    now: datetime,
+    root_goal_id: str | None = None,
+    objective_text: str = "",
+) -> str:
+    """Author the plan's goal rows. No model call, no fallback branch, no commit.
 
-    The root row carries ``step_index = 0`` and the steps ``1..N`` under
-    ``parent_goal_id = root``. ``step_index IS NOT NULL`` is what marks a row as part
-    of a plan, which is also what protects the whole plan from the discovery wipe —
-    ``parent_goal_id IS NULL`` could not do that job, because the root has a null
-    parent too.
-
-    Decomposition currently uses the deterministic fallback only. That is on purpose:
-    a plan must always exist, so the path that produces one may not depend on a model
-    being present, fast, or coherent.
+    The decomposition itself now happens either inline and deterministically (the default) or
+    asynchronously in the worker; this function only writes rows, and it writes them inside the
+    caller's transaction so a later failure cannot leave a plan pointer whose rows were rolled
+    back. The old ``db.commit()`` here was exactly that hazard.
     """
-    cleaned = " ".join((objective or "").split()).strip()
-    if not cleaned or normalize_text(cleaned) in OBJECTIVE_PLACEHOLDER_VALUES:
-        return None
-    settings_obj = get_settings()
-    max_steps = max(2, int(getattr(settings_obj, "takeover_plan_max_steps", 8)))
-
-    steps: list[PlanStep] = []
-    if bool(getattr(settings_obj, "takeover_plan_llm_enabled", False)) and _plan_model_available(
-        settings_obj
-    ):
-        try:
-            # A clamped settings clone: the configured advisor timeout is 90s, which
-            # would block the request thread for a minute and a half on a slow model.
-            gateway = get_model_gateway(_plan_gateway_settings(settings_obj))
-            payload = gateway.extract_structured(
-                PLAN_DECOMPOSITION_PROMPT.replace("{objective}", cleaned[:2000]),
-                "plan_decomposition_v1",
-            )
-            steps = parse_plan_steps(payload, max_steps=max_steps)
-        except Exception:
-            logger.warning("model plan decomposition failed; using fallback", exc_info=True)
-    if not steps:
-        # Unconditional safety net. A model may be absent, slow, or incoherent; a plan
-        # must exist regardless, so this path has no failure mode.
-        steps = fallback_plan_steps(cleaned)[:max_steps]
-    if not steps:
-        return None
-
-    now = datetime.now(tz=UTC)
-    root_id = uuid.uuid4()
-
-    def _insert(goal_id: uuid.UUID, parent: uuid.UUID | None, step_index: int,
-                title: str, description: str, status: str) -> None:
-        db.execute(
-            text(
-                """
-                INSERT INTO autonomy_goals(
-                    id, session_id, workspace_id, user_id, title, description,
-                    source, priority_score, risk_tier, confidence, reasoning,
-                    evidence_event_ids, goal_kind, affective_scores, selection_score,
-                    goal_signature, cache_hit, cache_source, status, created_at,
-                    updated_at, parent_goal_id, step_index
-                )
-                VALUES(
-                    :id, :session_id, :workspace_id, :user_id, :title, :description,
-                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
-                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
-                    :selection_score, :goal_signature, :cache_hit, :cache_source,
-                    :status, :created_at, :updated_at, :parent_goal_id, :step_index
-                )
-                """
-            ),
-            {
-                "id": goal_id,
-                "session_id": state.session_id,
-                "workspace_id": auth.workspace_id,
-                "user_id": auth.user_id,
-                "title": sanitize_untrusted_objective(title, max_len=140),
-                "description": sanitize_untrusted_objective(description, max_len=240),
-                "source": AutonomyGoalSource.USER_OBJECTIVE.value,
-                "priority_score": 0.9,
-                "risk_tier": AutonomyRiskTier.MEDIUM.value,
-                "confidence": 0.85,
-                "reasoning": "Ordered plan step derived from the user objective.",
-                "evidence_event_ids": [],
-                "goal_kind": GoalKind.NORMAL.value,
-                "affective_scores": json.dumps({}),
-                # Plan order comes from step_index, not from this score; it is set high
-                # only so the plan reads sensibly in the dashboard queue.
-                "selection_score": 0.9,
-                "goal_signature": hashlib.sha256(
-                    f"plan|{root_id}|{step_index}|{title}".encode()
-                ).hexdigest()[:24],
-                "cache_hit": False,
-                "cache_source": "plan",
-                "status": status,
-                "created_at": now,
-                "updated_at": now,
-                "parent_goal_id": parent,
-                "step_index": step_index,
-            },
-        )
-
-    _insert(root_id, None, 0, cleaned[:140], cleaned[:240], AutonomyGoalStatus.SELECTED.value)
-    for step in steps:
-        _insert(
-            uuid.uuid4(), root_id, step.step_index, step.title, step.description,
-            AutonomyGoalStatus.CANDIDATE.value,
-        )
-
-    state.takeover_context["plan_root_goal_id"] = str(root_id)
-    state.takeover_context["plan_step_count"] = len(steps)
-    # A fresh plan behind a stale cached queue would be invisible for the cache TTL.
-    _invalidate_goal_queue_cache(db, auth=auth, state=state)
-    # Commit the plan on its own, as goal discovery already does. Later stages of the
-    # same request can roll the session back (the audit-log writer does this on
-    # failure), and because the state is re-saved afterwards the pointer would survive
-    # while the rows it points at silently did not — a plan that exists in state and
-    # nowhere else. Observed exactly that before this line was added.
-    db.commit()
-    return str(root_id)
-
-
-PLAN_DREAM_STEP_INDEX = -1
-"""Marks a stored aspiration. Plan roots are 0 and steps are 1..N, so a dream that
-gets pursued simply becomes a root; no separate table or wire field is needed."""
+    return write_plan_rows(
+        db,
+        scope=scope,
+        session_id=session_id,
+        task_id=task_id,
+        steps=steps,
+        producer=producer,
+        contract_revision=contract_revision,
+        now=now,
+        root_goal_id=root_goal_id,
+        objective_text=objective_text,
+    )
 
 
 def _gather_dream_signals(
@@ -14258,9 +14982,19 @@ def _gather_dream_signals(
 
 
 def _store_dreams(
-    db: Session, *, auth: AuthContext, state: TakeoverState, dreams: list[DreamSeed]
+    db: Session,
+    *,
+    auth: AuthContext,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    dreams: list[DreamSeed],
+    contract_revision: int = 0,
 ) -> int:
-    """Persist aspirations, replacing any previous set for this session."""
+    """Persist aspirations, replacing any previous set for this session.
+
+    Row authoring is delegated to ``plan_rows.write_dream_rows`` so the request thread and the
+    worker's dream job write field-for-field identical rows.
+    """
     now = datetime.now(tz=UTC)
     db.execute(
         text(
@@ -14279,55 +15013,16 @@ def _store_dreams(
             "dream_index": PLAN_DREAM_STEP_INDEX,
         },
     )
-    for dream in dreams:
-        db.execute(
-            text(
-                """
-                INSERT INTO autonomy_goals(
-                    id, session_id, workspace_id, user_id, title, description,
-                    source, priority_score, risk_tier, confidence, reasoning,
-                    evidence_event_ids, goal_kind, affective_scores, selection_score,
-                    goal_signature, cache_hit, cache_source, status, created_at,
-                    updated_at, parent_goal_id, step_index
-                )
-                VALUES(
-                    :id, :session_id, :workspace_id, :user_id, :title, :description,
-                    :source, :priority_score, :risk_tier, :confidence, :reasoning,
-                    :evidence_event_ids, :goal_kind, CAST(:affective_scores AS JSONB),
-                    :selection_score, :goal_signature, :cache_hit, :cache_source,
-                    :status, :created_at, :updated_at, NULL, :step_index
-                )
-                """
-            ),
-            {
-                "id": uuid.uuid4(),
-                "session_id": state.session_id,
-                "workspace_id": auth.workspace_id,
-                "user_id": auth.user_id,
-                "title": sanitize_untrusted_objective(dream.title, max_len=140),
-                "description": sanitize_untrusted_objective(dream.description, max_len=240),
-                "source": AutonomyGoalSource.OPEN_DISCOVERY.value,
-                "priority_score": float(dream.weight),
-                "risk_tier": AutonomyRiskTier.LOW.value,
-                "confidence": float(dream.weight),
-                "reasoning": dream.rationale[:400],
-                "evidence_event_ids": [str(value) for value in dream.evidence_event_ids],
-                "goal_kind": GoalKind.NORMAL.value,
-                "affective_scores": json.dumps({}),
-                "selection_score": float(dream.weight),
-                "goal_signature": hashlib.sha256(
-                    f"dream|{state.session_id}|{dream.project_id}|{dream.title}".encode()
-                ).hexdigest()[:24],
-                "cache_hit": False,
-                "cache_source": f"dream:{dream.project_id or 'project'}",
-                "status": AutonomyGoalStatus.CANDIDATE.value,
-                "created_at": now,
-                "updated_at": now,
-                "step_index": PLAN_DREAM_STEP_INDEX,
-            },
-        )
+    written = write_dream_rows(
+        db,
+        scope=scope,
+        session_id=state.session_id,
+        seeds=dreams,
+        contract_revision=contract_revision,
+        now=now,
+    )
     db.commit()
-    return len(dreams)
+    return len(written)
 
 
 def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]:
@@ -14371,6 +15066,596 @@ def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]
     ]
 
 
+def _as_uuid_or_none(value: str | None) -> UUID | None:
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _task_state_summary(
+    projection: TaskStateProjection | None, source_revision: str
+) -> TaskStateSummary:
+    """One shared producer for every TaskStateSummary field, so Full and Lite cannot diverge.
+
+    The two enums cross the wire only through ``to_lifecycle_status`` /
+    ``to_next_permitted_action``, which both fail closed on an unknown value.
+    """
+    if projection is None:
+        return TaskStateSummary()
+    fields = task_state_summary_fields(projection, source_revision=source_revision)
+    fields["status"] = to_lifecycle_status(fields["status"])
+    fields["next_permitted_action"] = to_next_permitted_action(fields["next_permitted_action"])
+    return TaskStateSummary(**fields)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnTaskState:
+    """Everything one turn's task-state work produced, for the response and the plan query."""
+
+    projection: TaskStateProjection | None
+    source_revision: str
+    planning_pending: bool
+    planning_job_id: str | None
+    planning_pending_hint_ms: int
+    dispatch_blocked: bool
+
+
+def _apply_invalidation_side_effects(db: Session, plan: InvalidationPlan) -> None:
+    """The objective-change side effects, in global lock order, inside the CAS savepoint.
+
+    planning_jobs (2) -> directive_executions (3) -> execution_permits (4). ``task_states``
+    (1) is already held by the caller's ``SELECT ... FOR UPDATE``.
+    """
+    now = datetime.now(tz=UTC)
+    if plan.discard_planning_job_ids:
+        db.execute(
+            text(
+                """
+                UPDATE planning_jobs
+                   SET cancel_requested = true, state = 'cancelled', updated_at = :now
+                 WHERE id = ANY(CAST(:job_ids AS UUID[]))
+                """
+            ),
+            {"job_ids": list(plan.discard_planning_job_ids), "now": now},
+        )
+    for directive_id in plan.cancel_directive_ids:
+        row = db.execute(
+            text(
+                """
+                SELECT directive_id, state, claimed_by, lease_generation
+                  FROM directive_executions
+                 WHERE directive_id = CAST(:directive_id AS UUID)
+                """
+            ),
+            {"directive_id": directive_id},
+        ).mappings().first()
+        if row is None:
+            continue
+        current_lease = int(row["lease_generation"] or 0)
+        decision = validate_transition(
+            current_state=str(row["state"]),
+            claimed_by=row["claimed_by"],
+            lease_generation=current_lease,
+            requested="cancelled",
+            actor=SYSTEM_ACTOR,
+            actor_lease=None,
+        )
+        if not decision.allowed:
+            continue
+        db.execute(
+            text(
+                """
+                UPDATE directive_executions
+                   SET state = 'cancelled', cancel_reason = :reason, cancelled_at = :now,
+                       finished_at = :now, updated_at = :now, lease_generation = :next_lease
+                 WHERE directive_id = CAST(:directive_id AS UUID)
+                   AND state IN ('pending', 'in_progress')
+                   AND lease_generation = :lease_generation
+                """
+            ),
+            {
+                "reason": plan.reason,
+                "now": now,
+                "next_lease": int(decision.next_lease),
+                "directive_id": directive_id,
+                "lease_generation": current_lease,
+            },
+        )
+    if plan.expire_permits_for_session:
+        # The `objective_hash IS NULL` disjunct is deliberate: a NULL-hash permit matches ANY
+        # objective in _find_valid_allow_permit, so it is exactly the one that must expire on
+        # an objective change. A permit for the NEW objective cannot exist yet, so this can
+        # never expire a fresh grant.
+        db.execute(
+            text(
+                """
+                UPDATE execution_permits SET expires_at = :now
+                 WHERE workspace_id = :workspace_id
+                   AND session_id = :session_id
+                   AND (expires_at IS NULL OR expires_at > :now)
+                   AND (objective_hash IS NULL
+                        OR objective_hash IS DISTINCT FROM :new_objective_hash)
+                """
+            ),
+            {
+                "now": now,
+                "workspace_id": _invalidation_workspace_id.get(""),
+                "session_id": plan.expire_permits_for_session,
+                "new_objective_hash": plan.new_objective_hash,
+            },
+        )
+
+
+_invalidation_workspace_id: ContextVar[str] = ContextVar(
+    "tce_invalidation_workspace_id", default=""
+)
+
+
+def _takeover_turn_task_state(
+    db: Session,
+    *,
+    auth: AuthContext,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    body: TakeoverStepRequest,
+    resolved_task: str,
+    awaiting_next_objective: bool,
+    has_new_objective_signal: bool,
+    pending_objective: str | None,
+    now: datetime,
+) -> TurnTaskState:
+    """Ensure the projection, apply an objective change, reconcile constraints, plan the turn.
+
+    Every write goes through ONE CAS per concern, and each one re-reads the revision under its
+    own lock (``expected_revision=None``), so a turn's second write cannot conflict with its
+    first. A failure here degrades to "no task state this turn": the projection is a record of
+    progress, never a precondition for taking a turn.
+    """
+    empty = TurnTaskState(
+        projection=None,
+        source_revision="",
+        planning_pending=False,
+        planning_job_id=None,
+        planning_pending_hint_ms=0,
+        dispatch_blocked=False,
+    )
+    if not bool(getattr(settings, "task_state_enabled", True)):
+        return empty
+    task_id = body.session_id  # D4: the task identity for a takeover turn IS the session
+    try:
+        task_state_id, projection, _highest_seq, source_revision = ensure_task_state(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=body.session_id,
+            task_id=task_id,
+            project_id=scope.project_id,
+            now=now,
+        )
+
+        new_hash = _owner_objective_hash(body, state, pending_objective=pending_objective)
+        pre_write_projection = projection
+        next_contract_revision = objective_contract_revision(
+            projection.contract_revision, projection.objective_hash, new_hash
+        )
+        objective_changed = next_contract_revision != projection.contract_revision
+        # V1 RULING (R4 revival). An activation on the SAME objective computes an unchanged
+        # hash, so "did the objective change?" says no and nothing is appended — leaving the
+        # last retained CANCELLATION_REQUESTED newer than the last OBJECTIVE_SET forever,
+        # status rule R1 returning CANCELLED forever, and dispatch blocked for the life of the
+        # session. CLAUDE.md mandates exactly that cycle (one stable session_id,
+        # reset_takeover_state on stand-down, re-activate later), so a CANCELLED projection
+        # accepts a same-hash OBJECTIVE_SET and the fold's time-ordered clearing revives it.
+        # `objective_set_required` is the shared predicate; Lite's call site asks the same one.
+        emit_objective_set = objective_set_required(projection, new_objective_hash=new_hash)
+        # Revival is NOT a contract change: the revision does not move, no invalidation runs,
+        # and the plan pointer stays put — plan_for_turn reuses the approved plan at the
+        # unchanged contract revision, so popping the pointer would strand its step rows.
+        revival_only = emit_objective_set and not objective_changed
+        inval: InvalidationPlan | None = None
+        # The FIRST objective set is not an objective CHANGE. invalidation_for_objective_change
+        # keys purely on the contract revision moving, so on a task whose stored hash is still
+        # empty it returns a full plan that cancels the session's already-pending directives and
+        # expires its permits — the opposite of what "the owner stated an objective" means. Only
+        # a task that already carried an objective hash has a previous contract to close out.
+        # Lite's call site (`store.py::_run_task_state_cas_section`) carries the same guard.
+        if objective_changed and projection.objective_hash:
+            inval = invalidation_for_objective_change(
+                projection,
+                new_objective_hash=new_hash,
+                pending_directive_ids=pending_directive_ids(
+                    db,
+                    workspace_id=scope.workspace_id,
+                    owner_id=scope.owner_id,
+                    session_id=body.session_id,
+                ),
+                pending_planning_job_ids=pending_planning_job_ids(
+                    db, workspace_id=scope.workspace_id, task_id=task_id
+                ),
+            )
+        if emit_objective_set:
+            if objective_changed:
+                state.takeover_context.pop("plan_root_goal_id", None)
+                state.takeover_context.pop("plan_step_count", None)
+
+            def _objective_revalidate(fresh: TaskStateProjection) -> tuple[bool, str]:
+                """Three branches, and each reason names the branch it actually describes.
+
+                A lambda that attached "objective_changed_again" to the branch where the
+                objective had NOT changed again would re-apply OBJECTIVE_SET on top of a
+                concurrent third objective and silently clobber it.
+
+                Revival has its OWN precondition, because it re-states an unchanged hash:
+                "already applied" is true of a revival by construction, so keying on the hash
+                would abort every retry of it. What must still hold under the lock is that the
+                projection is still CANCELLED — if a concurrent turn already revived it, this
+                write has nothing left to do.
+                """
+                if revival_only:
+                    if fresh.status is not TaskStatus.CANCELLED:
+                        return (False, "already_revived")
+                    return (True, "ok")
+                if fresh.objective_hash == new_hash:
+                    return (False, "objective_already_applied")
+                if fresh.objective_hash != pre_write_projection.objective_hash:
+                    return (False, "objective_changed_again")
+                return (True, "ok")
+
+            token = _invalidation_workspace_id.set(scope.workspace_id)
+            try:
+                write = apply_task_state_events(
+                    db,
+                    workspace_id=auth.workspace_id,
+                    owner_id=auth.user_id,
+                    session_id=body.session_id,
+                    task_id=task_id,
+                    new_events=[
+                        TaskStateEvent(
+                            seq=0,
+                            kind=TaskStateEventKind.OBJECTIVE_SET,
+                            contract_revision=next_contract_revision,
+                            payload={
+                                "objective_text": resolved_task,
+                                "objective_hash": new_hash,
+                            },
+                            occurred_at=now,
+                            actor=auth.consumer,
+                        ),
+                        *(
+                            [
+                                TaskStateEvent(
+                                    seq=0,
+                                    kind=TaskStateEventKind.PLAN_INVALIDATED,
+                                    contract_revision=next_contract_revision,
+                                    payload={"reason": inval.reason},
+                                    occurred_at=now,
+                                    actor=auth.consumer,
+                                )
+                            ]
+                            if inval is not None
+                            else []
+                        ),
+                    ],
+                    now=now,
+                    expected_revision=None,
+                    invalidation=inval,
+                    apply_side_effects=(
+                        _apply_invalidation_side_effects if inval is not None else None
+                    ),
+                    retry_once=True,
+                    revalidate=_objective_revalidate,
+                )
+            finally:
+                _invalidation_workspace_id.reset(token)
+            # MANDATORY. Discarding this and re-using the stale object would make the plan
+            # branch below match the plan that was just invalidated, and hand the old contract
+            # revision to the very SQL filter added to stop it.
+            projection = write.projection
+            source_revision = write.source_revision
+
+        # Constraint reconciliation rides the turn's own CAS, which already holds lock 1 and
+        # already has a revision. request_execution_permit is not touched: emitting the event
+        # inside the permit INSERT would let a lost CAS race DENY a permit that should have
+        # been granted.
+        constraint_events = reconcile_constraint_events(
+            projection=projection,
+            permit_rows=_session_permit_rows(db, scope=scope, session_id=body.session_id),
+            now=now,
+        )
+
+        outcome = plan_for_turn(
+            db,
+            scope=scope,
+            projection=projection,
+            task_state_id=task_state_id,
+            session_id=body.session_id,
+            task_id=task_id,
+            objective_text=resolved_task,
+            now=now,
+        )
+        pending_events = [*constraint_events, *outcome.events]
+        if pending_events:
+            write = apply_task_state_events(
+                db,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=body.session_id,
+                task_id=task_id,
+                new_events=pending_events,
+                now=now,
+                expected_revision=None,
+            )
+            projection = write.projection
+            source_revision = write.source_revision
+        if outcome.plan is not None and outcome.plan.root_goal_id:
+            state.takeover_context["plan_root_goal_id"] = outcome.plan.root_goal_id
+            state.takeover_context["plan_step_count"] = len(outcome.plan.steps)
+        # (e) The only two new takeover_context keys, and they are wire mirrors: neither is
+        # ever read for a decision.
+        state.takeover_context["task_state_revision"] = int(projection.revision)
+        state.takeover_context["contract_revision"] = int(projection.contract_revision)
+        _ = (awaiting_next_objective, has_new_objective_signal)
+        return TurnTaskState(
+            projection=projection,
+            source_revision=source_revision,
+            planning_pending=outcome.planning_pending,
+            planning_job_id=outcome.planning_job_id,
+            planning_pending_hint_ms=outcome.planning_pending_hint_ms,
+            dispatch_blocked=outcome.cancelled or outcome.planning_pending,
+        )
+    except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+        raise
+    except SQLAlchemyError:
+        # Postgres aborts the WHOLE transaction on any statement error, so without this
+        # rollback every later statement in the turn raises InFailedSqlTransaction and the
+        # request 500s — the exact opposite of the degradation this function's docstring
+        # promises. ``task_state_store`` deliberately never rolls back ("the caller owns the
+        # transaction"), so the recovery belongs here, at the caller. Proven live against a
+        # database at 20260909_0036: ensure_task_state's INSERT fails, and the turn used to
+        # die downstream in _discover_takeover_goals rather than degrading to "no task state".
+        # Only SQLAlchemy errors roll back: a non-database failure leaves the transaction
+        # healthy, and discarding this turn's earlier writes for it would be a regression.
+        logger.warning("task-state turn work failed", exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning("task-state rollback failed", exc_info=True)
+        return empty
+    except Exception:
+        logger.warning("task-state turn work failed", exc_info=True)
+        return empty
+
+
+def _session_permit_rows(
+    db: Session, *, scope: ResolvedScope, session_id: str
+) -> list[dict[str, Any]]:
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, action_kind, scope_digest, objective_hash, decision,
+                       created_at AS granted_at, expires_at, resolved_at
+                  FROM execution_permits
+                 WHERE workspace_id = :workspace_id AND session_id = :session_id
+                 ORDER BY created_at DESC
+                 LIMIT 50
+                """
+            ),
+            {"workspace_id": scope.workspace_id, "session_id": session_id},
+        ).mappings().all()
+    except Exception:
+        logger.warning("permit reconciliation read failed", exc_info=True)
+        return []
+    return [dict(row) for row in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class PlanTurnOutcome:
+    """What one turn decided about the plan. ``cancelled`` means: dispatch NOTHING."""
+
+    plan: ApprovedPlan | None
+    planning_pending: bool
+    planning_job_id: str | None
+    planning_pending_hint_ms: int
+    events: tuple[TaskStateEvent, ...]
+    cancelled: bool
+
+
+def _owner_objective_hash(
+    body: TakeoverStepRequest, state: TakeoverState, *, pending_objective: str | None
+) -> str | None:
+    """The OWNER's objective hash — the one an objective change actually means.
+
+    Deliberately NOT ``objective_hash(resolved_task)``: ``resolved_task`` is rewritten by
+    ``_advance_plan_after_completion`` (to the next step's title) and overridden by a pending
+    directive, so hashing it would bump the contract on every plan-step advance, invalidate the
+    plan whose next step was just pinned, and stop the task at step 1. ``body.task`` is the only
+    binding that means "the owner restated the objective"; a machine-advanced objective pointer
+    is not a contract change.
+    """
+    _ = (state, pending_objective)
+    task = str(body.task or "").strip()
+    if not task:
+        return None
+    return objective_hash(task)
+
+
+def plan_for_turn(
+    db: Session,
+    *,
+    scope: ResolvedScope,
+    projection: TaskStateProjection,
+    task_state_id: str,
+    session_id: str,
+    task_id: str,
+    objective_text: str,
+    now: datetime,
+) -> PlanTurnOutcome:
+    """Decide this turn's plan: reuse, enqueue, or author inline and deterministically."""
+    # Step 0: a cancelled task dispatches nothing. This is the FIRST thing the function does,
+    # before any branch on plan.state. Without it a turn re-issuing the identical objective
+    # after a cancel revives the killed job and dispatches fresh work while the projection
+    # still reads "cancelled".
+    if projection.status is TaskStatus.CANCELLED:
+        return PlanTurnOutcome(
+            plan=None,
+            planning_pending=False,
+            planning_job_id=None,
+            planning_pending_hint_ms=0,
+            events=(),
+            cancelled=True,
+        )
+
+    plan = projection.plan
+    if (
+        plan is not None
+        and plan.state is PlanState.APPROVED
+        and plan.contract_revision == projection.contract_revision
+    ):
+        return PlanTurnOutcome(
+            plan=plan,
+            planning_pending=False,
+            planning_job_id=None,
+            planning_pending_hint_ms=0,
+            events=(),
+            cancelled=False,
+        )
+
+    charter = charter_for_task(max_steps=int(getattr(settings, "takeover_plan_max_steps", 8)))
+    input_revision = plan_input_revision(
+        objective_hash=projection.objective_hash,
+        contract_revision=projection.contract_revision,
+        policy_revision=TASK_STATE_POLICY_REVISION,
+        scope_digest=_task_scope_digest_for(scope),
+        cancel_epoch=projection.last_cancel_seq,
+    )
+
+    if settings.effective_planning_async_enabled and _plan_model_available(settings):
+        job_id, created = enqueue_planning_job(
+            db,
+            workspace_id=scope.workspace_id,
+            owner_id=scope.owner_id,
+            session_id=session_id,
+            task_id=task_id,
+            task_state_id=task_state_id,
+            job_kind=PLANNING_JOB_KIND_DECOMPOSE,
+            input_revision=input_revision,
+            contract_revision=projection.contract_revision,
+            objective_hash=projection.objective_hash,
+            objective_text=objective_text,
+            charter=charter,
+            scope=scope,
+            now=now,
+            max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+        )
+        if created and job_id:
+            try:
+                rq_job_id = enqueue_job("tce_worker.jobs.planning.run", job_id)
+                mark_queue_state(db, job_id=job_id, queue_state="queued", rq_job_id=rq_job_id)
+            except Exception:
+                logger.warning("planning job enqueue failed", exc_info=True)
+        return PlanTurnOutcome(
+            plan=None,
+            planning_pending=True,
+            planning_job_id=job_id or None,
+            planning_pending_hint_ms=int(getattr(settings, "planning_pending_hint_ms", 1500)),
+            events=(),
+            cancelled=False,
+        )
+
+    # The default path: plan inline and deterministically, in this turn, in this transaction.
+    # No extra round trip, no protocol change, no new wire state.
+    steps = deterministic_plan(objective_text, charter=charter)
+    if not steps:
+        return PlanTurnOutcome(
+            plan=None,
+            planning_pending=False,
+            planning_job_id=None,
+            planning_pending_hint_ms=0,
+            events=(),
+            cancelled=False,
+        )
+    root_goal_id = str(uuid.uuid4())
+    job_id, _created = enqueue_planning_job(
+        db,
+        workspace_id=scope.workspace_id,
+        owner_id=scope.owner_id,
+        session_id=session_id,
+        task_id=task_id,
+        task_state_id=task_state_id,
+        job_kind=PLANNING_JOB_KIND_DECOMPOSE,
+        input_revision=input_revision,
+        contract_revision=projection.contract_revision,
+        objective_hash=projection.objective_hash,
+        objective_text=objective_text,
+        charter=charter,
+        scope=scope,
+        now=now,
+        max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+        state="succeeded",
+        queue_state="inline",
+        producer=PLANNING_PRODUCER_DETERMINISTIC,
+    )
+    _write_objective_plan(
+        db,
+        scope=scope,
+        session_id=session_id,
+        task_id=task_id,
+        steps=steps,
+        producer=PLANNING_PRODUCER_DETERMINISTIC,
+        contract_revision=projection.contract_revision,
+        now=now,
+        root_goal_id=root_goal_id,
+        objective_text=objective_text,
+    )
+    approved = ApprovedPlan(
+        task_id=task_id,
+        plan_id=_plan_id_for(task_id, projection.contract_revision),
+        contract_revision=projection.contract_revision,
+        state=PlanState.APPROVED,
+        producer=PLANNING_PRODUCER_DETERMINISTIC,
+        root_goal_id=root_goal_id,
+        steps=tuple(steps),
+        approved_at=now,
+    )
+    event = TaskStateEvent(
+        seq=0,
+        kind=TaskStateEventKind.PLAN_APPROVED,
+        contract_revision=projection.contract_revision,
+        payload={
+            "producer": PLANNING_PRODUCER_DETERMINISTIC,
+            "plan_id": approved.plan_id,
+            "root_goal_id": root_goal_id,
+            "steps": plan_steps_to_json(steps),
+            "charter": charter_to_json(charter),
+            "descriptive_sources": {},
+        },
+        occurred_at=now,
+        actor="system:planner",
+    )
+    return PlanTurnOutcome(
+        plan=approved,
+        planning_pending=False,
+        planning_job_id=job_id or None,
+        planning_pending_hint_ms=0,
+        events=(event,),
+        cancelled=False,
+    )
+
+
+def _plan_id_for(task_id: str, contract_revision: int) -> str:
+    """Deterministic, so both backends and the worker mint the same id for one contract.
+
+    Delegates to ``tce_shared.task_state.approved_plan_id`` so the uuid5 namespace has
+    exactly one home.
+    """
+    return approved_plan_id(task_id, contract_revision)
+
+
 def _plan_model_available(settings_obj: Any) -> bool:
     """True when the configured provider can actually be called.
 
@@ -14388,279 +15673,102 @@ def _plan_model_available(settings_obj: Any) -> bool:
     return True  # a local provider is reachable or it is not; the call finds out
 
 
-def _plan_gateway_settings(settings_obj: Any) -> Any:
-    """Clamped settings clone for plan/dream model calls.
+def _load_task_projection_status(
+    db: Session, *, auth: AuthContext, state: TakeoverState
+) -> TaskStatus:
+    """One indexed SELECT on ``uq_task_states_identity``, folded to a status.
 
-    The configured advisor timeout is 90s, which would block a request thread for a
-    minute and a half. Provider is configurable so a hosted API can be used instead of
-    a local model.
+    ``TaskStatus.PLANNING`` when there is no row: fail open toward doing work, never toward
+    ``DONE``. A missing projection must not read as "the desk is clear".
     """
-    provider = str(
-        getattr(settings_obj, "takeover_plan_llm_provider", "")
-        or getattr(settings_obj, "model_provider", "ollama")
-    ).strip().lower()
-    return SimpleNamespace(
-        model_provider=provider,
-        ollama_url=getattr(settings_obj, "ollama_url", "http://ollama:11434"),
-        embed_model=getattr(settings_obj, "embed_model", "mxbai-embed-large"),
-        extract_model=getattr(settings_obj, "extract_model", "qwen2.5:3b"),
-        openai_api_key=getattr(settings_obj, "openai_api_key", ""),
-        openai_embed_model=getattr(settings_obj, "openai_embed_model", "text-embedding-3-small"),
-        openai_extract_model=getattr(settings_obj, "openai_extract_model", "gpt-4o-mini"),
-        openai_base_url=getattr(settings_obj, "openai_base_url", None),
-        anthropic_api_key=getattr(settings_obj, "anthropic_api_key", ""),
-        anthropic_extract_model=getattr(
-            settings_obj, "anthropic_extract_model", "claude-haiku-4-5-20251001"
-        ),
-        advisor_timeout_seconds=float(
-            getattr(settings_obj, "takeover_plan_llm_timeout_seconds", 25)
-        ),
-        advisor_attempt_timeout_ms=0,
-        advisor_read_timeout_ms=0,
-        redis_url=getattr(settings_obj, "redis_url", ""),
-    )
-
-
-DREAM_PROMPT = """Below are real messages a developer sent to their coding assistant, newest first.
-
-Work out what this person is actually trying to get done. Not what they asked for in any
-one message -- what they keep returning to.
-
-Then write it the way THEY would write it. Look at how they type in these messages and
-match it. They are one person building alone, at a keyboard, with no team.
-
-Hard rules on wording:
-- Write it as they'd say it out loud. Short. Plain. Lower case is fine.
-- Name the actual thing. "get the witness engine in front of someone" beats
-  "validate market positioning". "stop the CI failing" beats "improve pipeline health".
-- Banned words: comprehensive, leverage, stakeholder, framework, roadmap, strategy,
-  ecosystem, robust, holistic, real-world, best practice, optimize, streamline.
-- No Title Case. No consultant voice. If it reads like a slide, rewrite it.
-- It has to be something they could have typed themselves.
-
-Hard rules on content:
-- Only name something you can point at specific messages for.
-- Ignore interruptions, pasted links, one-word replies and tool output.
-- Something said once but clearly counts for more than boilerplate repeated ten times.
-- If nothing clear comes through, return an empty list. That is a good answer.
-- At most 3.
-
-Messages:
-__MESSAGES__
-
-Reply with JSON only:
-{"dreams": [{"title": "the goal, in their words", "why": "what makes you say that",
-"message_numbers": [1, 4, 9]}]}
-"""
-
-
-def _recent_messages_for_dreaming(
-    db: Session, *, scope: ResolvedScope, limit: int = 60, subject_user_id: str | None = None
-) -> list[tuple[str, str]]:
-    """Return (event_id, the real message text) for recent human messages.
-
-    Reads the encrypted payload rather than the title. `title` caps at 150 characters
-    and a quarter of rows sit at that ceiling, so every earlier attempt at this was
-    reading sentence fragments — and the longest, most considered messages, the ones
-    most likely to say what someone wants, were exactly the ones cut off.
-    """
-    # Scoped to the caller's workspace/owner (and bound project): never read another workspace's words.
-    message_params: dict[str, Any] = {
-        "max_sensitivity": settings.block_sensitivity - 1,
-        "limit": limit,
-        "workspace_id": scope.workspace_id,
-        "owner_id": scope.owner_id,
-        "subject_user_id": subject_user_id or scope.owner_id,
-    }
-    project_clause = ""
-    if scope.is_bound() and scope.project_id:
-        project_clause = "AND context->>'project_id' = :project_id"
-        message_params["project_id"] = scope.project_id
-    # Live receipts (task_type='human_input') are accepted only when a trusted receipt row binds the
-    # event to this behavior subject; historical backfills keep the owner-scoped rule.
-    rows = db.execute(
-        text(
-            f"""
-            SELECT id, payload
-            FROM events
-            WHERE task_type IN ('human_input_backfill', '{HUMAN_INPUT_TASK_TYPE}')
-              AND sensitivity <= :max_sensitivity
-              AND context->>'_tce_workspace' = :workspace_id
-              AND (
-                    (task_type = 'human_input_backfill' AND context->>'_tce_owner' = :owner_id)
-                 OR (task_type = '{HUMAN_INPUT_TASK_TYPE}' AND EXISTS (
-                        SELECT 1 FROM trusted_input_receipts r
-                        WHERE r.event_id = events.id AND r.subject_user_id = :subject_user_id
-                    ))
-              )
-              {project_clause}
-            ORDER BY ts DESC
-            LIMIT :limit
-            """
-        ),
-        message_params,
-    ).mappings().all()
-    out: list[tuple[str, str]] = []
-    for row in rows:
-        try:
-            payload = maybe_decrypt_payload(row["payload"] or {})
-        except Exception:
-            continue
-        body = str(payload.get("input_excerpt") or "").strip()
-        if len(body) < 25:
-            continue  # acknowledgements, not intentions
-        out.append((str(row["id"]), body[:1200]))
-    return out
-
-
-def _dreams_from_own_words(
-    db: Session, *, auth: AuthContext, scope: ResolvedScope, state: TakeoverState
-) -> list[DreamSeed]:
-    """Ask the model what this person keeps trying to achieve, and make it cite them.
-
-    Noticing a throughline across fifty messages is what a model is for, and what
-    counting cannot do: frequency in a chat log ranks boilerplate first, because
-    boilerplate is the only thing that repeats word for word.
-    """
-    if not scope.is_bound():
-        return []
-    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
-        return []
-    if not _plan_model_available(settings):
-        return []
-    messages = _recent_messages_for_dreaming(db, scope=scope, subject_user_id=auth.behavior_subject_id)
-    if len(messages) < 10:
-        return []
-    numbered = "\n\n".join(f"{i}. {body}" for i, (_, body) in enumerate(messages, start=1))
+    if not bool(getattr(settings, "task_state_enabled", True)):
+        return TaskStatus.PLANNING
     try:
-        gateway = get_model_gateway(_plan_gateway_settings(settings))
-        payload = gateway.extract_structured(
-            DREAM_PROMPT.replace("__MESSAGES__", numbered[:24000]), "dream_formation_v1"
+        loaded = load_task_state(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            task_id=state.session_id,
         )
     except Exception:
-        logger.warning("dream formation from own words failed", exc_info=True)
-        return []
-
-    raw = payload.get("dreams") if isinstance(payload, dict) else None
-    if not isinstance(raw, list):
-        return []
-    seeds: list[DreamSeed] = []
-    for item in raw[:3]:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or "").strip()
-        why = str(item.get("why") or "").strip()
-        numbers = item.get("message_numbers")
-        if not title or not isinstance(numbers, list) or not numbers:
-            continue  # no citation, no dream
-        cited = [
-            messages[int(n) - 1][0]
-            for n in numbers[:10]
-            if str(n).lstrip("-").isdigit() and 0 <= int(n) - 1 < len(messages)
-        ]
-        if not cited:
-            continue  # cited nothing that exists
-        seeds.append(
-            DreamSeed(
-                title=title[:140],
-                description=(why or title)[:240],
-                rationale=f"From {len(cited)} of your own messages. {why}"[:400],
-                # Confidence follows how much of the person's own writing backs it.
-                weight=min(0.95, 0.55 + (0.08 * len(cited))),
-                evidence_event_ids=tuple(cited),
-                project_id=str(state.takeover_context.get("project") or ""),
-            )
-        )
-    return seeds
+        logger.warning("task-state read failed; assuming work remains", exc_info=True)
+        return TaskStatus.PLANNING
+    if loaded is None:
+        return TaskStatus.PLANNING
+    return loaded[0].status
 
 
 def _nothing_left_to_do(db: Session, *, auth: AuthContext, state: TakeoverState) -> bool:
-    """True only when there is genuinely no outstanding work and no open question.
+    """True only when the projection says the task is done.
 
-    Dreaming is what you do when the desk is clear. Firing it on a timer means
-    inventing new wants while real work is still queued, and paying for a model call
-    to do it. Every condition below is something that must be finished or answered
-    first, and any one of them being true means stay quiet.
+    The same six conditions the hand-rolled version re-queried are now folded into the
+    projection's status, so this is one indexed read instead of five.
     """
-    context = state.takeover_context or {}
-    # An unanswered question to the user outranks anything the system might want.
-    if context.get("pending_safety"):
-        return False
-    if context.get("open_decision"):
-        return False
-    if state.active_goal_id or context.get("plan_root_goal_id"):
-        return False
+    return _load_task_projection_status(db, auth=auth, state=state) is TaskStatus.DONE
 
-    pending_directives = int(
-        db.execute(
-            text(
-                """
-                SELECT count(*) FROM directive_executions
-                WHERE session_id = :session_id
-                  AND workspace_id = :workspace_id
-                  AND state IN ('pending', 'in_progress')
-                """
-            ),
-            {"session_id": state.session_id, "workspace_id": auth.workspace_id},
-        ).scalar()
-        or 0
-    )
-    if pending_directives:
-        return False
 
-    # A notice already raised and not acknowledged is a question awaiting an answer.
-    open_notices = int(
-        db.execute(
-            text(
-                """
-                SELECT count(*) FROM autonomy_notices
-                WHERE session_id = :session_id
-                  AND workspace_id = :workspace_id
-                  AND user_id = :user_id
-                  AND acknowledged_at IS NULL
-                  AND (expires_at IS NULL OR expires_at >= :now)
-                """
-            ),
-            {
-                "session_id": state.session_id,
-                "workspace_id": auth.workspace_id,
-                "user_id": auth.user_id,
-                "now": datetime.now(tz=UTC),
-            },
-        ).scalar()
-        or 0
-    )
-    if open_notices:
-        return False
+def _enqueue_dream_synthesis(
+    db: Session, *, auth: AuthContext, scope: ResolvedScope, state: TakeoverState
+) -> None:
+    """Hand the model-authored dream reading to the worker. Best effort, never fatal.
 
-    # Work the user actually asked for comes before anything invented. Auto-discovered
-    # candidates deliberately do NOT count: they are guesses derived from event rows,
-    # and treating them as outstanding work would mean the queue is never empty and the
-    # system never dreams at all — which is exactly what happened before this filter.
-    user_goals = int(
-        db.execute(
-            text(
-                """
-                SELECT count(*) FROM autonomy_goals
-                WHERE session_id = :session_id
-                  AND workspace_id = :workspace_id
-                  AND user_id = :user_id
-                  AND status = :candidate
-                  AND step_index IS NULL
-                  AND source = :user_objective
-                """
+    A queue that is down must not stop the tick: the arithmetic dreams above already ran.
+    """
+    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
+        return
+    try:
+        task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=state.session_id,
+            task_id=state.session_id,
+            project_id=scope.project_id,
+            now=datetime.now(tz=UTC),
+        )
+        job_id, created = enqueue_planning_job(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=state.session_id,
+            task_id=state.session_id,
+            task_state_id=task_state_id,
+            job_kind=PLANNING_JOB_KIND_DREAM,
+            input_revision=plan_input_revision(
+                objective_hash=projection.objective_hash,
+                contract_revision=projection.contract_revision,
+                policy_revision=TASK_STATE_POLICY_REVISION,
+                scope_digest=_task_scope_digest_for(scope),
+                cancel_epoch=projection.last_cancel_seq,
             ),
-            {
-                "session_id": state.session_id,
-                "workspace_id": auth.workspace_id,
-                "user_id": auth.user_id,
-                "candidate": AutonomyGoalStatus.CANDIDATE.value,
-                "user_objective": AutonomyGoalSource.USER_OBJECTIVE.value,
-            },
-        ).scalar()
-        or 0
+            contract_revision=projection.contract_revision,
+            objective_hash=projection.objective_hash,
+            objective_text=projection.objective_text,
+            charter=charter_for_task(
+                max_steps=int(getattr(settings, "takeover_plan_max_steps", 8))
+            ),
+            scope=scope,
+            now=datetime.now(tz=UTC),
+            max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+        )
+        if created and job_id:
+            rq_job_id = enqueue_job("tce_worker.jobs.dream_synthesis.run", job_id)
+            mark_queue_state(db, job_id=job_id, queue_state="queued", rq_job_id=rq_job_id)
+    except Exception:
+        logger.warning("dream synthesis enqueue failed", exc_info=True)
+
+
+def _task_scope_digest_for(scope: ResolvedScope) -> str:
+    """The PLANNING scope digest — distinct from the permit scope digest."""
+    return task_scope_digest(
+        workspace_id=scope.workspace_id,
+        executor_id=scope.executor_id,
+        owner_ids=sorted(scope.owner_ids),
+        subject_user_id=scope.subject_user_id,
+        project_id=scope.project_id,
+        project_binding=scope.project_binding,
     )
-    return user_goals == 0
 
 
 def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
@@ -14677,20 +15785,43 @@ def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -
             session_project=state.takeover_context.get("project_context") if isinstance(state.takeover_context, dict) else None,
             task_id=state.session_id,
         )
-        # Read what the person actually wrote first. Counting rows only ever produced
-        # things like "advance a folder"; the throughline across many messages is the
-        # part a model can see and arithmetic cannot.
-        dreams = _dreams_from_own_words(db, auth=auth, scope=dream_scope, state=state)
-        if not dreams:
-            dreams = derive_dream_seeds(_gather_dream_signals(db, auth=auth, scope=dream_scope, state=state))
+        # The model-authored reading of the person's own messages moved to the worker
+        # (tce_worker.jobs.dream_synthesis): it is a model call, and a model call has no
+        # business on a bounded request path. What stays here is the arithmetic producer.
+        dreams = derive_dream_seeds(
+            _gather_dream_signals(db, auth=auth, scope=dream_scope, state=state)
+        )
         if dreams:
-            _store_dreams(db, auth=auth, state=state, dreams=dreams)
+            _store_dreams(db, auth=auth, scope=dream_scope, state=state, dreams=dreams)
+        _enqueue_dream_synthesis(db, auth=auth, scope=dream_scope, state=state)
     chosen = select_dream_to_pursue(dreams, has_active_plan=False)
     if chosen is None:
         return None
-    root_id = _write_objective_plan(db, auth=auth, state=state, objective=chosen.title)
-    if root_id is None:
+    dream_scope = auth.resolved_scope(
+        session_project=state.takeover_context.get("project_context")
+        if isinstance(state.takeover_context, dict)
+        else None,
+        task_id=state.session_id,
+    )
+    steps = deterministic_plan(
+        chosen.title,
+        charter=charter_for_task(max_steps=int(getattr(settings, "takeover_plan_max_steps", 8))),
+    )
+    if not steps:
         return None
+    root_id = _write_objective_plan(
+        db,
+        scope=dream_scope,
+        session_id=state.session_id,
+        task_id=state.session_id,
+        steps=steps,
+        producer=PLANNING_PRODUCER_DETERMINISTIC,
+        contract_revision=0,
+        now=datetime.now(tz=UTC),
+        objective_text=chosen.title,
+    )
+    state.takeover_context["plan_root_goal_id"] = root_id
+    state.takeover_context["plan_step_count"] = len(steps)
     state.takeover_context["pursued_dream"] = chosen.title
     state.takeover_context["pursued_dream_rationale"] = chosen.rationale
     # The dream has become a plan; retire it so it is not pursued twice.
@@ -14726,6 +15857,7 @@ def _advance_plan_after_completion(
     auth: AuthContext,
     state: TakeoverState,
     context: dict[str, Any],
+    contract_revision: int,
 ) -> None:
     """After a step completes, pin the next one instead of waiting for a new objective.
 
@@ -14734,8 +15866,13 @@ def _advance_plan_after_completion(
     point of a plan is that finishing floor 1 tells you to build floor 2. This
     overrides those three fields, so it must run last in the SUCCEEDED block.
 
-    When no steps remain the plan is finished: the root is marked done and the pointer
-    cleared, so the next objective starts a fresh plan rather than resurrecting this one.
+    When the plan is genuinely finished the root is marked done and the pointer cleared, so
+    the next objective starts a fresh plan rather than resurrecting this one. "Finished" is
+    decided by ``root_status``, NOT by ``_select_next_plan_step`` returning ``None``: that
+    ``None`` also means "the next step is blocked" and "every step was dropped", and marking
+    the root done on either of those is exactly how a blocked dependency used to reach DONE.
+    A blocked plan leaves the root ``selected`` and the pointer in place, and R5 drives the
+    projection to ``BLOCKED``.
     """
     root_id = str(context.get("plan_root_goal_id") or "").strip()
     if not root_id:
@@ -14743,13 +15880,20 @@ def _advance_plan_after_completion(
     # _select_next_plan_step reads the pointer off state, which is only assigned from
     # `context` after this block, so keep them in sync before querying.
     state.takeover_context = context
-    next_step = _select_next_plan_step(db, state)
+    next_step = _select_next_plan_step(db, state, contract_revision=contract_revision)
     if next_step is not None:
         state.active_goal_id = next_step.id
         context["objective"] = next_step.title
         context["awaiting_next_objective"] = False
         context["awaiting_next_objective_turns"] = 0
         state.objective_hash = objective_hash(next_step.title)
+        return
+
+    if _plan_root_status(db, state, contract_revision=contract_revision) != "done":
+        # Blocked, all-dropped, or unreadable. Leave the root selected and the pointer
+        # pinned: the blocker is the thing to surface, and a plan that finished nothing has
+        # not finished. `awaiting_next_objective`, already set by the SUCCEEDED block, stands.
+        state.active_goal_id = None
         return
 
     db.execute(
@@ -14787,7 +15931,145 @@ def _advance_plan_after_completion(
     _invalidate_goal_queue_cache(db, auth=auth, state=state)
 
 
-def _select_next_plan_step(db: Session, state: TakeoverState) -> TakeoverGoal | None:
+def _plan_root_status(
+    db: Session, state: TakeoverState, *, contract_revision: int
+) -> str:
+    """``absent`` | ``blocked`` | ``active`` | ``done`` for the session's pinned plan.
+
+    ``_select_next_plan_step`` returns ``None`` for THREE different worlds — every step
+    finished, the next step blocked, and every step dropped — and treating that one ``None``
+    as "the plan is complete" is how a blocked sibling used to flip the root goal to ``done``.
+    ``root_status`` is the total function that separates them, so both callers ask it instead
+    of inferring from the absence of a next step.
+
+    The steps are read from ``autonomy_goals`` rather than from the folded projection because
+    this is the decision that authorises a write to those very rows: at both call sites the row
+    for the step just reported on has already been updated inside this transaction, while the
+    projection's copy of it is one event-fold away. The two agree — the fold is fed the same
+    step index (``_goal_step_index``) — but only the rows are guaranteed current here, and only
+    the rows still exist when ``task_state_enabled`` is False.
+
+    Fails closed: an unreadable or unpinned plan returns ``"absent"``, which is neither
+    ``"done"`` (so nothing is marked complete) nor ``"blocked"`` (so nothing is falsely stalled).
+    """
+    root_id = str(state.takeover_context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return "absent"
+    try:
+        UUID(root_id)
+    except (ValueError, AttributeError, TypeError):
+        return "absent"
+    rows = db.execute(
+        text(
+            """
+            SELECT step_index, status, depends_on_json
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND parent_goal_id = CAST(:root_id AS uuid)
+              AND plan_contract_revision = :contract_revision
+            ORDER BY step_index ASC
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "root_id": root_id,
+            "contract_revision": int(contract_revision),
+        },
+    ).mappings().all()
+    steps = tuple(
+        PlanStepState(
+            step_index=int(row["step_index"] or 0),
+            goal_id=None,
+            title="",
+            description="",
+            status=str(row["status"] or ""),
+            depends_on=_depends_on_tuple(row["depends_on_json"]),
+        )
+        for row in rows
+    )
+    return root_status(steps)
+
+
+def _blocked_plan_message(
+    db: Session, state: TakeoverState, *, contract_revision: int
+) -> str:
+    """The turn's response when the plan is stalled: name the step and the reason.
+
+    Only ever called on the blocked path, so the extra read costs nothing on a healthy turn.
+    Falls back to the generic sentence when the row cannot be read — a blocked plan must still
+    say it is blocked even if it cannot say why.
+    """
+    generic = (
+        "Plan is blocked: a step of the current plan failed and its successors cannot start. "
+        "Clear the blocker and report it resolved, or state a new objective."
+    )
+    root_id = str(state.takeover_context.get("plan_root_goal_id") or "").strip()
+    if not root_id:
+        return generic
+    try:
+        UUID(root_id)
+    except (ValueError, AttributeError, TypeError):
+        return generic
+    row = db.execute(
+        text(
+            """
+            SELECT step_index, title, blocked_reason
+            FROM autonomy_goals
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+              AND parent_goal_id = CAST(:root_id AS uuid)
+              AND plan_contract_revision = :contract_revision
+              AND status = :blocked
+            ORDER BY step_index ASC
+            LIMIT 1
+            """
+        ),
+        {
+            "session_id": state.session_id,
+            "workspace_id": state.workspace_id,
+            "user_id": state.user_id,
+            "root_id": root_id,
+            "contract_revision": int(contract_revision),
+            "blocked": AutonomyGoalStatus.BLOCKED.value,
+        },
+    ).mappings().first()
+    if row is None:
+        return generic
+    reason = str(row["blocked_reason"] or "").strip()[:400] or "no reason recorded"
+    title = sanitize_untrusted_objective(str(row["title"] or ""), max_len=140)
+    return (
+        f"Plan is blocked at step {int(row['step_index'] or 0)} ({title}): {reason}. "
+        "Clear the blocker and report it resolved, or state a new objective."
+    )
+
+
+def _depends_on_tuple(raw: Any) -> tuple[int, ...]:
+    """``depends_on_json`` as ints. JSONB comes back decoded; a text column does not."""
+    value = raw
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            return ()
+    if not isinstance(value, list):
+        return ()
+    out: list[int] = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return tuple(out)
+
+
+def _select_next_plan_step(
+    db: Session, state: TakeoverState, *, contract_revision: int
+) -> TakeoverGoal | None:
     """Return the next unfinished step of the active plan, or None.
 
     Because step indexes are contiguous and ordered, the lowest non-terminal step is
@@ -14809,12 +16091,14 @@ def _select_next_plan_step(db: Session, state: TakeoverState) -> TakeoverGoal | 
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
-                   status, created_at, updated_at
+                   status, created_at, updated_at,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating
             FROM autonomy_goals
             WHERE session_id = :session_id
               AND workspace_id = :workspace_id
               AND user_id = :user_id
               AND parent_goal_id = CAST(:root_id AS uuid)
+              AND plan_contract_revision = :contract_revision
               AND status NOT IN (:done_status, :dropped_status)
             ORDER BY step_index ASC
             LIMIT 1
@@ -14825,6 +16109,7 @@ def _select_next_plan_step(db: Session, state: TakeoverState) -> TakeoverGoal | 
             "workspace_id": state.workspace_id,
             "user_id": state.user_id,
             "root_id": root_id,
+            "contract_revision": int(contract_revision),
             "done_status": AutonomyGoalStatus.DONE.value,
             "dropped_status": AutonomyGoalStatus.DROPPED.value,
         },
@@ -15784,6 +17069,23 @@ def takeover_step(
     auth: AuthContext = Depends(get_auth_context),
     db: Session = Depends(get_db),
 ) -> TakeoverStepResponse:
+    # (a) The TURN deadline and the turn ledger, first two statements of the body.
+    # There is deliberately NO retrieval child here: a child's clock starts at construction,
+    # and hundreds of lines and several round trips sit between here and the first retrieval
+    # query. The child is built inside _build_takeover_working_set, immediately above the
+    # bundle call. With retrieval_deadline_enabled off the turn is genuinely unbounded, so
+    # no guard is installed anywhere.
+    deadline = (
+        Deadline.start(
+            budget_ms=int(settings.takeover_turn_budget_ms),
+            backend_budget_ms=int(settings.context_backend_timeout_ms),
+            floor_ms=int(settings.retrieval_deadline_floor_ms),
+            label="takeover_step",
+        )
+        if settings.retrieval_deadline_enabled
+        else Deadline.unbounded("takeover_step")
+    )
+    ledger = RetrievalLedger()
     started_total = time.perf_counter()
     REQUEST_COUNT.labels(endpoint="takeover_step", method="POST").inc()
     _enforce_workspace_access(auth, db)
@@ -15860,6 +17162,7 @@ def takeover_step(
             ),
             {"session_id": state.session_id, "workspace_id": state.workspace_id, "user_id": state.user_id},
         )
+        _record_stand_down(db, auth=auth, session_id=state.session_id, now=now)
         db.execute(
             text(
                 """
@@ -16108,25 +17411,45 @@ def takeover_step(
     }:
         selected_goal = None
         state.active_goal_id = None
-    # Author a plan once per objective. Only when takeover is active, the objective is
-    # real, and no plan is already in flight — re-authoring on every turn would reset
-    # progress, which is exactly the "rebuild floor 1" behaviour this replaces.
-    if (
-        bool(getattr(settings, "takeover_plan_enabled", False))
-        and state.active
-        and not state.takeover_context.get("plan_root_goal_id")
-        # A finished plan leaves this set until the user supplies a real next
-        # objective. Without the guard, "continue" is enough to start another plan.
-        and not (awaiting_next_objective and not has_new_objective_signal)
-        and resolved_task
-        and normalize_text(resolved_task) not in OBJECTIVE_PLACEHOLDER_VALUES
-    ):
-        try:
-            _write_objective_plan(db, auth=auth, state=state, objective=resolved_task)
-        except Exception:
-            # A plan is an optimisation, never a precondition for taking a turn.
-            logger.warning("failed to author objective plan", exc_info=True)
-    plan_step = _select_next_plan_step(db, state) if selected_goal is None else None
+    # (b) Durable task state, the objective-change invalidation and the turn's plan.
+    task_state_result = _takeover_turn_task_state(
+        db,
+        auth=auth,
+        scope=scope,
+        state=state,
+        body=body,
+        resolved_task=resolved_task,
+        awaiting_next_objective=awaiting_next_objective,
+        has_new_objective_signal=has_new_objective_signal,
+        pending_objective=(
+            str((pending_execution.meta or {}).get("objective") or "").strip()
+            if pending_execution is not None
+            else None
+        ),
+        now=now,
+    )
+    task_projection = task_state_result.projection
+    task_contract_revision = task_projection.contract_revision if task_projection else 0
+    planning_pending = task_state_result.planning_pending
+    planning_job_id = task_state_result.planning_job_id
+    planning_pending_hint_ms = task_state_result.planning_pending_hint_ms
+    plan_step = (
+        _select_next_plan_step(db, state, contract_revision=task_contract_revision)
+        if selected_goal is None and not task_state_result.dispatch_blocked
+        else None
+    )
+    # C1-G13d. `_select_next_plan_step` returning None is NOT "the plan is finished" — it is
+    # also "the next step is blocked" and "every step was dropped". Falling straight through to
+    # `should_discover` on a stalled plan wipes the plan's queue and authors twenty
+    # event-derived goals AROUND a blocker nobody cleared, which is the opposite of surfacing
+    # it. Ask `root_status` which of the three worlds this is.
+    plan_blocked = bool(
+        plan_step is None
+        and selected_goal is None
+        and not task_state_result.dispatch_blocked
+        and str(state.takeover_context.get("plan_root_goal_id") or "").strip()
+        and _plan_root_status(db, state, contract_revision=task_contract_revision) == "blocked"
+    )
     if plan_step is not None:
         selected_goal = plan_step
         state.active_goal_id = plan_step.id
@@ -16135,8 +17458,10 @@ def takeover_step(
     should_discover = bool(
         state.active
         # A live plan owns the objective; letting discovery run would wipe the
-        # candidate queue and insert 20 competing event-derived goals beside it.
+        # candidate queue and insert 20 competing event-derived goals beside it. A BLOCKED
+        # plan owns it just as much: the block is the thing to report, not to route around.
         and plan_step is None
+        and not plan_blocked
         and (not awaiting_next_objective or has_new_objective_signal)
         and (
             selected_goal is None
@@ -16239,6 +17564,8 @@ def takeover_step(
             task=resolved_task,
             app_context=body.app_context,
             constraints=body.constraints,
+            deadline=deadline,
+            ledger=ledger,
         )
         state.working_set_json = working_set
     retrieval_ms = int((time.perf_counter() - retrieval_started) * 1000)
@@ -16444,18 +17771,29 @@ def takeover_step(
     if advisor_backoff_active:
         should_call_clone_advice = False
         fast_path_reason = "advisor_runtime_cooloff" if advisor_runtime_cooloff_active else "advisor_backoff"
-    remaining_budget_ms = max(0, int(getattr(settings, "context_retrieval_budget_ms", 120)) - retrieval_ms)
-    backend_budget_ms = max(1, int(getattr(settings, "context_backend_timeout_ms", 60)))
-    budget_guard_enabled = bool(getattr(settings, "takeover_retrieval_budget_guard_enabled", True))
-    budget_exceeded = bool(
-        budget_guard_enabled and retrieval_triggered and should_call_clone_advice and (remaining_budget_ms < backend_budget_ms)
-    )
     retrieval_source_override: str | None = None
-    if budget_exceeded:
+    # (d) The advisor gate, on the TURN deadline. The old `budget_exceeded` block gated the
+    # advisor on the 120 ms RETRIEVAL budget, which by construction could never leave 250 ms
+    # for a 2200 ms advisor call — the gate could not open at all. It is retired here, and
+    # `budget_exceeded_skip_deliberation` retires with it: alerts move to
+    # `deadline_expired_skip`.
+    advisor_min_ms = int(settings.retrieval_advisor_min_ms)
+    advisor_skipped_for_deadline = False
+    advisor_clamped_by_deadline = False
+    if should_call_clone_advice and not deadline.allows(advisor_min_ms):
         should_call_clone_advice = False
-        retrieval_source_override = "hybrid_fallback"
-        retrieval_reason = "budget_exceeded_skip_deliberation"
-        fast_path_reason = "budget_exceeded_skip_deliberation"
+        # The safety term must survive the skip: advisor_unhealthy is conjunctive on
+        # should_call_clone_advice, so without this a latency knob would silently drop the
+        # SAFETY_GATE branch that pauses autonomy.
+        advisor_skipped_for_deadline = True
+        ledger.record_skip(
+            "advisor",
+            remaining_ms=deadline.remaining_ms(),
+            reason=RETRIEVAL_REASON_DEADLINE_SKIP,
+        )
+        retrieval_source_override = RETRIEVAL_SOURCE_DEADLINE_PARTIAL
+        retrieval_reason = RETRIEVAL_REASON_DEADLINE_SKIP
+        fast_path_reason = RETRIEVAL_REASON_DEADLINE_SKIP
         TAKEOVER_RETRIEVAL_BUDGET_EXCEEDED_COUNT.inc()
     elif not should_call_clone_advice:
         if advisor_required_in_takeover and not advisor_cadence_due and not run_deliberation and not retrieval_triggered:
@@ -16468,6 +17806,9 @@ def takeover_step(
         advisor_call_succeeded = False
         TAKEOVER_DELIBERATION_COUNT.labels(trigger="confidence_or_refresh").inc()
         deliberation_started = time.perf_counter()
+        # The advisor's socket timeouts are clamped to what the TURN deadline has left. The
+        # ContextVar is how the clamp reaches _advisor_gateway_settings, several frames down.
+        advisor_deadline_token = ADVISOR_TURN_DEADLINE.set(deadline)
         try:
             advice_response = clone_advice(
                 body=CloneAdviceRequest(
@@ -16538,6 +17879,11 @@ def takeover_step(
             advisor_failure_reason = str(exc).strip()[:220] or exc.__class__.__name__
             fast_path_reason = "advisor_exception"
             logger.warning("takeover deliberation fallback to fast-path", exc_info=True)
+        finally:
+            ADVISOR_TURN_DEADLINE.reset(advisor_deadline_token)
+            advisor_clamped_by_deadline = bool(
+                state.takeover_context.pop("_advisor_clamped_by_deadline", False)
+            )
         deliberation_ms = int((time.perf_counter() - deliberation_started) * 1000)
         deliberation_timeout_ms = max(
             600,
@@ -16559,6 +17905,15 @@ def takeover_step(
             state.takeover_context.pop("advisor_last_error", None)
             state.takeover_context.pop("advisor_last_failure_turn", None)
             state.takeover_context.pop("advisor_runtime_cooloff_until_turn", None)
+        elif advisor_clamped_by_deadline and str(advisor_failure_reason or "").startswith(
+            "advisor_timeout_"
+        ):
+            # A latency event, not advisor ill-health. WE caused this timeout by clamping the
+            # advisor's socket budget to what the turn had left, so counting it would let a
+            # latency knob drive advisor_unhealthy -> SAFETY_GATE. The safety term is
+            # preserved through the skip disjunct instead.
+            advisor_skipped_for_deadline = True
+            state.takeover_context["advisor_last_error"] = "advisor_deadline_clamped"
         else:
             advisor_fail_streak += 1
             state.takeover_context["advisor_fail_streak"] = advisor_fail_streak
@@ -16781,7 +18136,30 @@ def takeover_step(
         and pending_execution is None
         and safety_decision == SafetyDecision.ALLOW
     )
-    if suppress_auto_directive:
+    # A cancelled task, or a turn whose plan is still being decomposed asynchronously, mints
+    # NOTHING. Under the cancel branch this is the second half of S4: the first half is
+    # plan_for_turn's early return, and without this a turn re-issuing the identical objective
+    # after a cancel would dispatch fresh work while the projection still read "cancelled".
+    if task_state_result.dispatch_blocked and pending_execution is None:
+        suppress_auto_directive = True
+        final_response = None
+        takeover_enforcement = {}
+        enforced = False
+        enforcement_reason = None
+    # C1-G13d, the second half: a stalled plan mints nothing either, and it must NOT borrow the
+    # "previous objective completed" copy below. The objective is not complete; it is stuck,
+    # and saying otherwise is what invites the owner to hand over a new objective while the
+    # blocker stands.
+    plan_blocked_response = bool(plan_blocked and pending_execution is None)
+    if plan_blocked_response:
+        suppress_auto_directive = True
+        takeover_enforcement = {}
+        enforced = False
+        enforcement_reason = None
+        final_response = _blocked_plan_message(
+            db, state, contract_revision=task_contract_revision
+        )
+    if suppress_auto_directive and not plan_blocked_response:
         if bool(state.takeover_context.get("force_user_objective_refresh")):
             final_response = "Objective drift detected. Provide one concrete next objective so I can continue correctly."
             state.takeover_context["objective_needs_refresh"] = True
@@ -17028,7 +18406,10 @@ def takeover_step(
     advisor_unhealthy = bool(
         state.mode == TakeoverMode.TAKEOVER
         and advisor_required_in_takeover
-        and should_call_clone_advice
+        # The extra disjunct is what stops a deadline skip from silently dropping the
+        # `or advisor_unhealthy` term out of needs_human — i.e. turning a latency knob into
+        # a safety knob, one env var away.
+        and (should_call_clone_advice or advisor_skipped_for_deadline)
         and advisor_fail_streak >= advisor_fail_streak_limit
     )
     behavior_fidelity_gate = {"enabled": False, "passed": True, "reason": "gate_disabled"}
@@ -17158,6 +18539,10 @@ def takeover_step(
         final_response = _capture_pause_text(capture_channel_state)
     if needs_human:
         TAKEOVER_NEEDS_HUMAN_COUNT.inc()
+    if ledger.degraded():
+        # One multiplicative penalty and nothing else. Without it a fully timed-out retrieval
+        # scores identically to a complete one, so a degraded turn is invisible to the caller.
+        context_quality_score = round(context_quality_score * 0.75, 4)
     quality_history = state.takeover_context.get("quality_history")
     if not isinstance(quality_history, list):
         quality_history = []
@@ -17355,6 +18740,14 @@ def takeover_step(
         behavior_fidelity_gate=behavior_fidelity_gate,
         capture_delivery_state=CaptureDeliveryState(capture_channel_state),
         open_decision_opportunity_id=open_decision_opportunity_id,
+        # (e) The P2 additions. task_state is built by ONE shared producer so Full and Lite
+        # cannot diverge on the derivations; the two enums cross the wire only through the
+        # declared fail-closed conversions.
+        planning_pending=planning_pending,
+        planning_job_id=_as_uuid_or_none(planning_job_id),
+        planning_pending_hint_ms=planning_pending_hint_ms,
+        task_state=_task_state_summary(task_projection, task_state_result.source_revision),
+        task_state_revision=int(task_projection.revision) if task_projection else 0,
     )
     write_audit_log(
         db,

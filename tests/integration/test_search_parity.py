@@ -16,6 +16,15 @@ from tce_lite_api.store import search_events
 from tce_shared.events import EventFilter, EventSearchRequest
 from tce_shared.policy import ConsumerContext
 
+# retrieval_meta keys that exist in Full and cannot exist in Lite: Lite has no embedding
+# backend at all, so it has no embedding timeout to report. Pre-P2, closed set, and it may
+# only ever SHRINK — every other key, including the ten P2 deadline/ledger keys (§6.5),
+# must appear on both sides or the assertion below fails.
+_FULL_ONLY_META_KEYS = frozenset({
+    "embedding_timeout_cooldown_applied",
+    "embedding_timeout_seconds",
+})
+
 
 class _UnavailableEmbeddingGateway:
     def embed(self, _text: str) -> list[float]:
@@ -108,13 +117,13 @@ def test_full_and_lite_top_three_retrieval_sets_overlap(tmp_path) -> None:
                 k=3,
             )
             with patch("tce_api.search.get_gateway", return_value=_UnavailableEmbeddingGateway()):
-                full_hits, _, _, _ = run_search(
+                full_hits, _, _, full_meta = run_search(
                     full_session,
                     request,
                     consumer,
                     PolicyEngine(),
                 )
-            lite_response, _, _ = search_events(
+            lite_response, _, lite_meta = search_events(
                 lite_conn,
                 request,
                 lite_settings,
@@ -124,6 +133,21 @@ def test_full_and_lite_top_three_retrieval_sets_overlap(tmp_path) -> None:
             full_titles = {hit.title for hit in full_hits[:3]}
             lite_titles = {hit.title for hit in lite_response.hits[:3]}
             assert len(full_titles & lite_titles) >= 2
+            # P2 §6.5: retrieval_meta's KEY SET is identical in Full and Lite; values may
+            # differ (Lite has no ANN backend, Full has no bundle cache). A backend that
+            # adds a key — a deadline/ledger key above all — on only one side is a parity
+            # break. _FULL_ONLY_META_KEYS is the pre-P2 exemption, and it may not grow.
+            full_meta_keys = set(full_meta) - _FULL_ONLY_META_KEYS
+            lite_meta_keys = set(lite_meta)
+            assert full_meta_keys == lite_meta_keys, (
+                "retrieval_meta key sets diverged — "
+                f"Full only: {sorted(full_meta_keys - lite_meta_keys)}, "
+                f"Lite only: {sorted(lite_meta_keys - full_meta_keys)}"
+            )
+            assert _FULL_ONLY_META_KEYS <= set(full_meta), (
+                "an exempted Full-only retrieval_meta key disappeared; shrink "
+                f"_FULL_ONLY_META_KEYS: {sorted(_FULL_ONLY_META_KEYS - set(full_meta))}"
+            )
     finally:
         full_session.rollback()
         full_session.execute(

@@ -1,3 +1,10 @@
+"""SQLAlchemy metadata parity for the Full backend.
+
+Alembic autogenerate is OFF for this project: every schema change is a hand-written
+revision under ``infra/alembic/versions``. These models exist so ORM readers and tests
+see the same columns the migrations create — nothing here creates a table.
+"""
+
 from __future__ import annotations
 
 import uuid
@@ -5,7 +12,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import JSON, REAL, TEXT, BigInteger, Boolean, DateTime, ForeignKey, Index, Integer
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -239,6 +246,11 @@ class HandoffRecord(Base):
     project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     git_remote: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     executor_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_state_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    contract_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verification_refs_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    unresolved_effects_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
 
 
 class HandoffOutbox(Base):
@@ -351,6 +363,14 @@ class AutonomyGoal(Base):
     status: Mapped[str] = mapped_column(TEXT, nullable=False, default="candidate")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    # Added by 20260802_0034; the ORM never caught up until now.
+    step_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    plan_contract_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    depends_on_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Descriptive record of what the plan step intends. Never an authorization input.
+    mutating: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class AutonomyGoalCache(Base):
@@ -1079,3 +1099,142 @@ class DashboardHumanScoreSnapshot(Base):
     subscores_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     inputs_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class TaskState(Base):
+    """The versioned projection. One row per (workspace, owner, task); ``revision`` is the CAS token."""
+
+    __tablename__ = "task_states"
+    __table_args__ = (
+        Index("uq_task_states_identity", "workspace_id", "owner_id", "task_id", unique=True),
+        Index("idx_task_states_session", "workspace_id", "session_id", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    contract_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    highest_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    objective_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    objective_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    objective_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    objective_set_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="awaiting_objective")
+    next_permitted_action: Mapped[str] = mapped_column(TEXT, nullable=False, default="await_owner_objective")
+    plan_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="absent")
+    plan_producer: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    plan_root_goal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    planning_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    constraints_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    open_decisions_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    plan_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    unresolved_effects_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    latest_verification_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    citations_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    source_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="empty")
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # The cancel epoch: never cleared, so a re-issued objective after a cancel keys differently.
+    last_cancel_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    cancel_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class TaskStateEventRow(Base):
+    """One immutable fact about a task. Append-only; the projection is folded from these."""
+
+    __tablename__ = "task_state_events"
+    __table_args__ = (
+        Index("uq_task_state_events_seq", "task_state_id", "seq", unique=True),
+        Index("idx_task_state_events_task", "workspace_id", "task_id", "seq"),
+        Index("idx_task_state_events_kind", "task_state_id", "kind", "seq"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_state_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    contract_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    goal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    actor: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class PlanningJob(Base):
+    """An asynchronous planning or dream-synthesis unit of work, leased by the worker."""
+
+    __tablename__ = "planning_jobs"
+    __table_args__ = (
+        Index("uq_planning_jobs_idem", "workspace_id", "idempotency_key", unique=True),
+        Index("idx_planning_jobs_dispatch", "state", "next_attempt_at"),
+        Index("idx_planning_jobs_task", "workspace_id", "task_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_state_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    job_kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(TEXT, nullable=False)
+    input_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    contract_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    objective_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    objective_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    charter_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # How the worker obtains a ResolvedScope: it has no request, so the enqueue site persists
+    # the scope it already has rather than the worker guessing one.
+    scope_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    state: Mapped[str] = mapped_column(TEXT, nullable=False, default="pending")
+    lease_owner: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    producer: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    result_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    queue_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="inline")
+    rq_job_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class TaskVerification(Base):
+    """Evidence that a plan holds. ``contract_revision``/``plan_id`` are the provenance that
+    stops a verification from a finished objective counting for the next one."""
+
+    __tablename__ = "task_verifications"
+    __table_args__ = (Index("idx_task_verifications_task", "workspace_id", "task_id", "recorded_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    directive_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    state: Mapped[str] = mapped_column(TEXT, nullable=False, default="unverified")
+    method: Mapped[str] = mapped_column(TEXT, nullable=False, default="none")
+    summary: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    evidence_event_ids_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    recorded_by: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+    contract_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    plan_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)

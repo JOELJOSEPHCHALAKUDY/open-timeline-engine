@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any
+
+from .task_state import effects_from_json, verification_from_json
 
 
 def normalize_file_path(value: Any) -> str:
@@ -257,3 +259,81 @@ def assess_anchor_freshness(
         if record_dt < now_dt - timedelta(hours=max_age_hours):
             reasons.append("older_than_max_age")
     return "current", reasons
+
+
+def build_resume_packet_extension(
+    *,
+    record: Mapping[str, Any],
+    projection: Mapping[str, Any] | None,
+    verifications: Sequence[Mapping[str, Any]],
+    current_git: Mapping[str, Any] | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """The eight P2 keys a resume packet gains, derived once for both backends.
+
+    Pure; no I/O. ``projection`` is the ``task_states`` ROW as a mapping — never a replayed
+    event stream, because this runs on the resume path's latency budget. ``verifications``
+    are ``task_verifications`` rows, newest first.
+
+    ``current_git`` is required: freshness cannot be assessed without the reader's checkout,
+    and both callers already have it.
+    """
+    row = dict(projection or {})
+    task_id = str(row.get("task_id") or "").strip() or None
+
+    verification_refs: list[dict[str, Any]] = []
+    for item in verifications:
+        ref = verification_from_json(dict(item))
+        if ref is None:
+            continue
+        verification_refs.append(
+            {
+                "verification_id": ref.verification_id,
+                "directive_id": ref.directive_id,
+                "state": ref.state,
+                "method": ref.method,
+                "recorded_at": ref.recorded_at,
+                "contract_revision": ref.contract_revision,
+                "plan_id": ref.plan_id,
+                "evidence_event_ids": list(ref.evidence_event_ids),
+                "summary": ref.summary,
+            }
+        )
+
+    unresolved_effects: list[dict[str, Any]] = []
+    raw_effects = row.get("unresolved_effects_json")
+    if isinstance(raw_effects, str):
+        try:
+            raw_effects = json.loads(raw_effects)
+        except json.JSONDecodeError:
+            raw_effects = []
+    for effect in effects_from_json(raw_effects):
+        unresolved_effects.append(
+            {
+                "effect_id": effect.effect_id,
+                "kind": effect.kind,
+                "description": effect.description,
+                "opened_at": effect.opened_at,
+                "directive_id": effect.directive_id,
+                "paths": list(effect.paths),
+            }
+        )
+
+    record_git = record.get("git_json") if isinstance(record.get("git_json"), Mapping) else record.get("git")
+    anchor_freshness, freshness_reasons = assess_anchor_freshness(
+        record_git=record_git if isinstance(record_git, Mapping) else None,
+        record_ts=_datetime(record.get("ts") or record.get("record_ts")),
+        current_git=current_git,
+        now=now,
+    )
+
+    return {
+        "task_id": task_id,
+        "task_state_revision": int(row.get("revision") or 0),
+        "contract_revision": int(row.get("contract_revision") or 0),
+        "verification_refs": verification_refs,
+        "unresolved_effects": unresolved_effects,
+        "source_event_id": record.get("event_id"),
+        "anchor_freshness": anchor_freshness,
+        "freshness_reasons": freshness_reasons,
+    }

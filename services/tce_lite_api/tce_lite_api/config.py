@@ -126,6 +126,22 @@ class Settings(BaseSettings):
     context_retrieval_trigger_score: float = 0.68
     context_retrieval_escalate_score: float = 0.52
     context_retrieval_budget_ms: int = 120
+    # --- P2 durable task state and bounded latency (§0.5) ---
+    takeover_turn_budget_ms: int = 3500
+    task_state_enabled: bool = True
+    task_state_markdown_enabled: bool = True
+    task_state_markdown_max_steps: int = 24
+    planning_async_enabled: bool | None = None
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    planning_pending_hint_ms: int = 1500
+    retrieval_deadline_enabled: bool = True
+    retrieval_deadline_floor_ms: int = 5
+    retrieval_statement_floor_ms: int = 10
+    retrieval_advisor_min_ms: int = 250
+    sqlite_progress_instructions: int = 1000
     context_backend_timeout_ms: int = 60
     takeover_retrieval_confidence_trigger: float = 0.70
     takeover_retrieval_low_evidence_threshold: int = 2
@@ -210,17 +226,14 @@ class Settings(BaseSettings):
     # default; with it off the plan code paths are inert.
     takeover_plan_enabled: bool = True
     takeover_plan_max_steps: int = 8
-    # Use the model gateway to decompose an objective. Off by default; the
-    # deterministic fallback runs whenever this is off or the model fails.
-    takeover_plan_llm_enabled: bool = True
-    takeover_plan_llm_timeout_seconds: int = 25
+    # NOTE (P2 §5.1): takeover_plan_llm_enabled / takeover_plan_llm_timeout_seconds /
+    # takeover_dream_llm_enabled are DELETED from Lite. Lite has no worker, no Redis and no
+    # model gateway (D2), so they were declared and read nowhere.
     # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
     # A hosted API is the better default here: decomposition runs once per
     # objective, quality matters more than latency, and a small local model is
     # both slower and weaker at planning.
     takeover_plan_llm_provider: str = "openai"
-    # Form dreams by reading the user's own messages instead of counting rows.
-    takeover_dream_llm_enabled: bool = True
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
@@ -351,6 +364,18 @@ class Settings(BaseSettings):
     @property
     def advisor_required_categories_set(self) -> list[str]:
         return [item.strip().lower() for item in self.advisor_required_categories.split(",") if item.strip()]
+
+    @property
+    def effective_planning_async_enabled(self) -> bool:
+        """R6: async planning follows the model planner.
+
+        Lite has no worker, no Redis and no model gateway (D2), so the fallback branch is the
+        literal False: planning stays inline and deterministic and planning_pending is never
+        emitted.
+        """
+        if self.planning_async_enabled is not None:
+            return bool(self.planning_async_enabled)
+        return False
 
     @property
     def effective_advisor_total_budget_ms(self) -> int:

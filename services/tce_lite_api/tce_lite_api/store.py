@@ -38,6 +38,13 @@ from tce_shared.autonomy_goals import (
     score_goal,
 )
 from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence, predict_behavior
+from tce_shared.deadline import (
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
+    SQLITE_INTERRUPT_MARKER,
+    Deadline,
+    RetrievalLedger,
+    retrieval_child,
+)
 from tce_shared.decision_capture import (
     HOST_CAPTURE_CAPABILITY,
     HOST_CAPTURE_SOURCE,
@@ -103,6 +110,9 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TaskStateSummary,
+    to_lifecycle_status,
+    to_next_permitted_action,
 )
 from tce_shared.execution_transitions import (
     SYSTEM_ACTOR,
@@ -174,6 +184,32 @@ from tce_shared.takeover import (
     should_trigger_deliberation,
     update_recent_outcomes,
 )
+from tce_shared.task_state import (
+    CANCEL_REASON_STAND_DOWN,
+    PLANNING_JOB_KIND_DECOMPOSE,
+    PLANNING_PRODUCER_DETERMINISTIC,
+    TASK_STATE_POLICY_REVISION,
+    InvalidationPlan,
+    PlanStepState,
+    TaskStateEvent,
+    TaskStateEventKind,
+    TaskStatePreconditionFailed,
+    TaskStateProjection,
+    TaskStateRevisionConflict,
+    TaskStatus,
+    charter_for_task,
+    charter_to_json,
+    deterministic_plan,
+    invalidation_for_objective_change,
+    objective_contract_revision,
+    objective_set_required,
+    plan_input_revision,
+    plan_steps_to_json,
+    root_status,
+    task_scope_digest,
+    task_state_summary_fields,
+)
+from tce_shared.task_state import approved_plan_id as shared_approved_plan_id
 
 from .auth import AuthContext
 from .behavior_control_store import freeze_shadow_prediction, resolve_shadow_prediction
@@ -196,11 +232,30 @@ from .continuity_store import (
     record_resume_attempt,
     record_resume_progress,
 )
+from .deadline_sqlite import (
+    absorb_sqlite_deadline,
+    begin_sqlite_deadline,
+    finish_sqlite_deadline,
+)
+from .plan_rows import write_plan_rows
+from .planning_store import (
+    enqueue_planning_job,
+    pending_directive_ids,
+    pending_planning_job_ids,
+    sweep_stale_planning_jobs,
+)
 from .store_graph import (
     _ensure_owner_membership,
     _index_graph,
     _scope_match,
     graph_snapshot_for_events,
+)
+from .task_state_store import (
+    ApplySideEffectsLite,
+    apply_task_state_events,
+    ensure_task_state,
+    load_task_state,
+    run_cas_section,
 )
 from .types import (
     CloneArbitrationRequest,
@@ -335,6 +390,12 @@ def _is_retryable_db_error(exc: Exception) -> bool:
     text = str(exc).strip().lower()
     if not text:
         return False
+    # A deadline abort raises sqlite3.OperationalError("interrupted"). It is the ONE
+    # OperationalError that must never be retried: the budget that produced it has not grown,
+    # so a retry can only spend the turn's remaining time to fail the same way. The token list
+    # happens not to match it today; this first check makes that a design property, not luck.
+    if SQLITE_INTERRUPT_MARKER in text:
+        return False
     return any(token in text for token in _RETRYABLE_DB_TOKENS)
 
 
@@ -342,6 +403,7 @@ def _run_sql_retry[T](
     fn: Callable[[], T],
     *,
     settings: Settings,
+    deadline: Deadline | None = None,
 ) -> T:
     retry_enabled = bool(getattr(settings, "search_retry_enabled", True))
     if not retry_enabled:
@@ -362,11 +424,56 @@ def _run_sql_retry[T](
             remaining_ms = retry_budget_ms - elapsed_ms
             if remaining_ms <= 0:
                 raise
+            # The sleeps are invisible to the progress handler, so without this a 40 ms retry
+            # budget could sit entirely outside the deadline (C3-G8).
+            if deadline is not None:
+                if not deadline.allows(int(getattr(settings, "retrieval_statement_floor_ms", 10))):
+                    raise
+                remaining_ms = min(remaining_ms, deadline.remaining_ms())
+                if remaining_ms <= 0:
+                    raise
             delay_ms = min(remaining_ms, backoff_ms * (2 ** attempt))
             time.sleep(float(delay_ms) / 1000.0)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("sqlite retry loop exited unexpectedly")
+
+
+def _guarded_read[T](
+    conn: sqlite3.Connection,
+    name: str,
+    fn: Callable[[], T],
+    *,
+    settings: Settings,
+    deadline: Deadline | None,
+    ledger: RetrievalLedger | None,
+    empty: Callable[[], T] = list,  # type: ignore[assignment]
+) -> T:
+    """Run one READ under the turn's retrieval deadline (§6.3).
+
+    Writes are NEVER wrapped in a deadline guard (R11) — this helper is for read queries only.
+    Every exit path tears the progress handler down, because the Lite connection is reused for
+    the turn's own writes and a leaked handler would abort its COMMIT.
+    """
+    guard = begin_sqlite_deadline(
+        conn,
+        deadline,
+        name=name,
+        ledger=ledger,
+        requested_ms=int(getattr(settings, "context_retrieval_budget_ms", 120)),
+        floor_ms=int(getattr(settings, "retrieval_statement_floor_ms", 10)),
+        instructions=int(getattr(settings, "sqlite_progress_instructions", 1000)),
+    )
+    if guard is None:
+        return empty()
+    try:
+        result = _run_sql_retry(fn, settings=settings, deadline=deadline)
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        if not absorb_sqlite_deadline(guard, exc):
+            raise
+        return empty()
+    finish_sqlite_deadline(guard)
+    return result
 
 
 def _bump_retrieval_counter(source: str) -> None:
@@ -2045,6 +2152,9 @@ def search_events(
     workspace_id: str,
     owner_id: str,
     scope: ResolvedScope | None = None,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[EventSearchResponse, int, dict[str, Any]]:
     retrieval_started = time.perf_counter()
     scope = _scope_for(scope, workspace_id=workspace_id, owner_id=owner_id)
@@ -2157,7 +2267,7 @@ def search_events(
                 local_params,
             ).fetchall()
 
-        return _run_sql_retry(_query, settings=settings)
+        return _guarded_read(conn, "lexical", _query, settings=settings, deadline=deadline, ledger=ledger)
 
     def _query_fts_rows(fts_query: str) -> list[sqlite3.Row]:
         local_params = [fts_query, *base_params, *scope_params, limit]
@@ -2179,7 +2289,7 @@ def search_events(
                 local_params,
             ).fetchall()
 
-        return _run_sql_retry(_query, settings=settings)
+        return _guarded_read(conn, "fts", _query, settings=settings, deadline=deadline, ledger=ledger)
 
     search_patterns: list[str] = []
     expansion_enabled = bool(getattr(settings, "search_query_expansion_enabled", False))
@@ -2217,7 +2327,12 @@ def search_events(
             try:
                 rows = _query_fts_rows(fts_query)
                 lexical_channel = "fts5_primary"
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                # A deadline abort must NOT be laundered into a LIKE fallback: the caller
+                # records it as deadline_expired_abort, and mislabelling it as
+                # like_fallback_error makes G8 unobservable.
+                if SQLITE_INTERRUPT_MARKER in str(exc).lower():
+                    raise
                 rows = []
                 lexical_channel = "like_fallback_error"
         fts_candidate_count = len(rows)
@@ -2607,6 +2722,11 @@ def search_events(
         "mmr_candidates": int(mmr_candidates),
         "citation_dup_ratio": float(round(citation_dup_ratio, 4)),
     }
+    # The ten deadline keys (§6.5). The KEY SET must be identical in Full and Lite; the values
+    # may differ. A parity test asserts key-set equality, not value equality.
+    retrieval_meta.update((ledger or RetrievalLedger()).to_meta(deadline))
+    if ledger is not None and ledger.degraded():
+        retrieval_meta["source"] = RETRIEVAL_SOURCE_DEADLINE_PARTIAL
     return response, blocked, retrieval_meta
 
 
@@ -2952,6 +3072,9 @@ def context_bundle(
     workspace_id: str,
     owner_id: str,
     scope: ResolvedScope | None = None,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[ContextBundleResponse, int]:
     scope = _scope_for(
         scope,
@@ -2996,6 +3119,8 @@ def context_bundle(
         workspace_id=workspace_id,
         owner_id=owner_id,
         scope=scope,
+        deadline=deadline,
+        ledger=ledger,
     )
     evidence_events = [
         EvidenceEvent(
@@ -5400,6 +5525,13 @@ def reset_takeover_state(
         (session_id, workspace_id, user_id),
     )
     conn.commit()
+    _record_stand_down_lite(
+        conn,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        session_id=session_id,
+        now=now_utc(),
+    )
     return takeover_state(
         conn=conn,
         session_id=session_id,
@@ -5419,7 +5551,22 @@ def _build_takeover_working_set(
     task: str,
     app_context: dict[str, Any],
     constraints: dict[str, Any],
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[str, Any]:
+    # S6: the retrieval child is built HERE, immediately above the bundle call, not at the top of
+    # the turn — a child's clock starts at construction, and everything the turn does before
+    # retrieval would otherwise burn the whole retrieval budget before retrieval began. With the
+    # knob off this returns the (unbounded) turn deadline unchanged, so no guard is installed.
+    retrieval_deadline = (
+        retrieval_child(
+            deadline,
+            enabled=bool(getattr(settings, "retrieval_deadline_enabled", True)),
+            budget_ms=int(getattr(settings, "context_retrieval_budget_ms", 120)),
+        )
+        if deadline is not None
+        else None
+    )
     bundle, _blocked = context_bundle(
         conn,
         ContextBundleRequest(task=task, app_context=app_context, constraints=constraints),
@@ -5427,6 +5574,8 @@ def _build_takeover_working_set(
         workspace_id=auth.workspace_id,
         owner_id=auth.user_id,
         scope=auth.resolved_scope(project_hint=app_context if isinstance(app_context, dict) else None),
+        deadline=retrieval_deadline,
+        ledger=ledger,
     )
     citation_limit = max(1, int(getattr(settings, "takeover_citation_snippet_max_items", 20)))
     citation_ids = list(bundle.citations[:citation_limit])
@@ -5969,7 +6118,32 @@ def _goal_from_row(row: sqlite3.Row) -> TakeoverGoal:
         status=AutonomyGoalStatus(str(row["status"] or AutonomyGoalStatus.CANDIDATE.value)),
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        step_index=_row_int_or_none(row, "step_index"),
+        parent_goal_id=_row_uuid_or_none(row, "parent_goal_id"),
+        depends_on=[int(item) for item in json_loads(_row_get(row, "depends_on_json"), []) if str(item).lstrip("-").isdigit()],
+        attempts=int(_row_get(row, "attempt_count") or 0),
+        mutating=bool(int(_row_get(row, "mutating") or 0)),
     )
+
+
+def _row_int_or_none(row: sqlite3.Row, name: str) -> int | None:
+    value = _row_get(row, name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_uuid_or_none(row: sqlite3.Row, name: str) -> UUID | None:
+    value = _row_get(row, name)
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _notice_from_row(row: sqlite3.Row) -> AutonomyNotice:
@@ -6287,7 +6461,13 @@ def _sync_enforcement_counters(conn: sqlite3.Connection, state: TakeoverState) -
     state.retry_backlog_count = int((retry_backlog_row["total"] if retry_backlog_row else 0) or 0)
 
 
-def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
+def _goal_cache_key_for_state(
+    state: TakeoverState,
+    auth: AuthContext,
+    *,
+    contract_revision: int = 0,
+    scope_digest: str = "",
+) -> str:
     objective_hash_value = state.objective_hash or objective_hash(str(state.takeover_context.get("objective", "")))
     state_version = f"{state.mode.value}:{state.autonomy_policy_profile.value}"
     return goal_cache_key(
@@ -6296,6 +6476,9 @@ def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
         session_id=state.session_id,
         objective_hash=objective_hash_value or "no-objective",
         state_version=state_version,
+        contract_revision=int(contract_revision),
+        scope_digest=scope_digest,
+        policy_revision=TASK_STATE_POLICY_REVISION,
     )
 
 
@@ -6808,6 +6991,7 @@ def list_takeover_goals(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE session_id = ? AND workspace_id = ? AND user_id = ?
@@ -6822,6 +7006,7 @@ def list_takeover_goals(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE session_id = ? AND workspace_id = ? AND user_id = ? AND status = ?
@@ -6877,6 +7062,7 @@ def select_takeover_goal(
         SELECT id, session_id, workspace_id, user_id, title, description, source,
                priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+               step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                status, created_at, updated_at
         FROM autonomy_goals
         WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -7094,6 +7280,7 @@ def takeover_autonomy_status(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -8525,6 +8712,23 @@ def report_execution(
     )
     state.recent_outcomes_json = updated_outcomes
     state.autonomy_score = updated_autonomy
+    # The durable projection, before the goal rows move: STEP_COMPLETED / STEP_BLOCKED /
+    # VERIFICATION_RECORDED with the REAL step_index and the S5 provenance stamp. Without this
+    # the Lite projection never leaves `candidate` and `root_status` has nothing to read.
+    report_contract_revision = _record_execution_task_state_lite(
+        conn,
+        auth=auth,
+        state=state,
+        body=body,
+        directive_id=str(current.directive_id),
+        # The SAME goal the two branches below mark done or blocked. A directive minted before
+        # the plan existed carries no goal of its own while the session is pointed at a plan
+        # step, and reading only `current.goal_id` there would emit an event with no step index
+        # for a report that does move a step.
+        goal_id=str(current.goal_id or state.active_goal_id or "") or None,
+        effective_state=effective_state,
+        now=now,
+    )
     if effective_state == DirectiveExecutionState.SUCCEEDED:
         goal_to_complete = current.goal_id or state.active_goal_id
         if goal_to_complete:
@@ -8571,6 +8775,45 @@ def report_execution(
             """,
             (state.session_id, state.workspace_id, state.user_id),
         )
+        # Must run last: it overrides awaiting_next_objective / objective / objective_hash that
+        # the lines above just set, which is the whole point of a plan. It is also the only
+        # place the root goal may be marked done, and only when root_status() agrees.
+        _advance_plan_after_completion_lite(
+            conn,
+            auth=auth,
+            state=state,
+            context=context,
+            contract_revision=report_contract_revision,
+        )
+    elif effective_state in {
+        DirectiveExecutionState.FAILED,
+        DirectiveExecutionState.BLOCKED,
+        DirectiveExecutionState.ABANDONED,
+        DirectiveExecutionState.CANCELLED,
+    }:
+        blocked_goal_id = current.goal_id or state.active_goal_id
+        if blocked_goal_id:
+            # The first write of AutonomyGoalStatus.BLOCKED anywhere in Lite, which is what
+            # makes _select_next_plan_step_lite's blocked guard live rather than dead code.
+            conn.execute(
+                """
+                UPDATE autonomy_goals
+                SET status = ?, blocked_reason = ?, attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
+                  AND plan_contract_revision = ?
+                """,
+                (
+                    AutonomyGoalStatus.BLOCKED.value,
+                    str(body.failure_reason or "")[:400],
+                    now.isoformat(),
+                    str(blocked_goal_id),
+                    state.session_id,
+                    state.workspace_id,
+                    state.user_id,
+                    int(report_contract_revision),
+                ),
+            )
     state.takeover_context = context
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
@@ -9305,12 +9548,808 @@ def _resolve_opportunity_from_feedback(
     resolve_opportunity(conn, opportunity_id=str(opportunity["id"]), resolved_at=now)
 
 
+# §S3.6's plan id. The uuid5 namespace lives in tce_shared.task_state and nowhere else, so
+# Full, Lite and the worker cannot drift; this name is kept as Lite's local spelling.
+approved_plan_id = shared_approved_plan_id
+
+
+def _owner_objective_hash(
+    body: TakeoverStepRequest,
+    state: TakeoverState,
+    *,
+    pending_objective: str | None,
+) -> str | None:
+    """The hash of the objective THE OWNER stated, not the one the plan is currently walking.
+
+    Completing a step rewrites the objective pointer to the next step's title. Hashing that would
+    bump ``contract_revision`` on every step advance, invalidating the plan the step belongs to.
+    The owner's objective is: an explicit ``body.task``, else the pinned user objective, else the
+    caller-supplied pending objective, else nothing.
+    """
+    explicit = str(getattr(body, "task", "") or "").strip()
+    if explicit:
+        return objective_hash(explicit)
+    context = state.takeover_context if isinstance(state.takeover_context, dict) else {}
+    pinned = str(context.get("pinned_user_objective") or "").strip()
+    if pinned:
+        return objective_hash(pinned)
+    pending = str(pending_objective or "").strip()
+    if pending:
+        return objective_hash(pending)
+    return None
+
+
+def _task_scope_digest_for(scope: ResolvedScope) -> str:
+    return task_scope_digest(
+        workspace_id=scope.workspace_id,
+        executor_id=scope.executor_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+        project_id=scope.project_id,
+        project_binding=scope.project_binding,
+    )
+
+
+def _load_task_projection(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> TaskStateProjection | None:
+    """The session's folded projection, or ``None`` when it has no task row yet.
+
+    A plain read: no ``BEGIN IMMEDIATE``, no row lock. It is the pre-dispatch read of §4.5 item 5
+    and of the cancellation gate, both of which must happen BEFORE the turn's directive decision
+    and therefore long before the CAS section opens.
+    """
+    loaded = load_task_state(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        task_id=state.session_id,
+    )
+    return loaded[0] if loaded is not None else None
+
+
+def _load_task_projection_status(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> TaskStatus:
+    """The lifecycle status of the session's task, or AWAITING_OBJECTIVE when it has none yet."""
+    projection = _load_task_projection(conn, auth=auth, state=state)
+    if projection is None:
+        return TaskStatus.AWAITING_OBJECTIVE
+    return projection.status
+
+
+def _objective_set_needed_lite(
+    projection: TaskStateProjection,
+    *,
+    owner_objective_hash: str | None,
+    objective_asserted: bool,
+) -> bool:
+    """Must THIS turn append ``OBJECTIVE_SET``? The shared rule, plus one Lite-side qualifier.
+
+    ``objective_set_required`` says yes on two counts: the hash moved, or the projection is
+    CANCELLED and a same-hash set would revive it (RULING V1). The qualifier is
+    ``objective_asserted``: the owner objective a Lite turn computes falls back to the pinned
+    objective in ``takeover_context``, which survives every later turn, so keying revival on the
+    hash alone would revive a cancelled task on a bare "continue" — and the cancellation gate
+    below would then never fire. Revival needs the owner to actually restate the objective or
+    re-activate, which is what the ruling means by "an activation arrives".
+    """
+    if not objective_set_required(projection, new_objective_hash=owner_objective_hash):
+        return False
+    changed = (
+        objective_contract_revision(
+            projection.contract_revision, projection.objective_hash, owner_objective_hash
+        )
+        != projection.contract_revision
+    )
+    return changed or objective_asserted
+
+
+def _record_stand_down_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    user_id: str,
+    session_id: str,
+    now: datetime,
+) -> None:
+    """Append CANCELLATION_REQUESTED on a stand-down. Best effort, never fatal.
+
+    The Lite twin of ``main.py::_record_stand_down``, and it is called from the same two places:
+    the stand-down turn inside ``takeover_step`` and ``POST /v1/takeover/reset``. Without it the
+    two backends disagree about what a stand-down means to the projection — Full records it,
+    Lite silently did not.
+
+    ``task_states`` and ``task_state_events`` are deliberately NOT deleted, even though the
+    ``takeover_sessions`` row is: the projection is the durable record, and the next activation's
+    OBJECTIVE_SET revives the task by timestamp order (RULING V1). That is what makes the
+    documented stand-down -> reactivate cycle work on one stable session id.
+    """
+    if not bool(getattr(get_settings(), "task_state_enabled", True)):
+        return
+    try:
+        loaded = load_task_state(
+            conn, workspace_id=workspace_id, owner_id=user_id, task_id=session_id
+        )
+        if loaded is None:
+            return
+        contract_revision = int(loaded[0].contract_revision)
+
+        def _body() -> None:
+            apply_task_state_events(
+                conn,
+                workspace_id=workspace_id,
+                owner_id=user_id,
+                session_id=session_id,
+                task_id=session_id,
+                new_events=[
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.CANCELLATION_REQUESTED,
+                        contract_revision=contract_revision,
+                        payload={"reason": CANCEL_REASON_STAND_DOWN, "actor": SYSTEM_ACTOR},
+                        occurred_at=now,
+                        actor=SYSTEM_ACTOR,
+                    )
+                ],
+                now=now,
+                expected_revision=None,
+            )
+
+        run_cas_section(conn, _body)
+    except Exception:
+        logger.warning("stand-down task-state event failed", exc_info=True)
+
+
+def _plan_root_status_lite(projection: TaskStateProjection | None) -> str:
+    """``root_status`` over the projection's approved plan; ``absent`` when there is no plan."""
+    if projection is None or projection.plan is None:
+        return "absent"
+    return root_status(projection.plan.steps)
+
+
+def _nothing_left_to_do(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> bool:
+    """True when the task has reached a terminal lifecycle state."""
+    return _load_task_projection_status(conn, auth=auth, state=state) in (
+        TaskStatus.DONE,
+        TaskStatus.CANCELLED,
+    )
+
+
+def _select_next_plan_step_lite(
+    conn: sqlite3.Connection,
+    state: TakeoverState,
+    *,
+    contract_revision: int,
+) -> TakeoverGoal | None:
+    """The lowest open step of THIS contract's plan, or None.
+
+    The ``plan_contract_revision = ?`` predicate is what stops a turn after an objective change
+    from selecting a step of the superseded plan.
+
+    A BLOCKED step is fetched and then refused rather than skipped over in SQL (Full's twin does
+    the same): skipping it would hand back step 3 while step 2 is stalled, which is building the
+    next floor on an unfinished one. Returning ``None`` is what lets the callers consult
+    ``root_status`` and stop.
+    """
+    row = conn.execute(
+        """
+        SELECT id, session_id, workspace_id, user_id, title, description, source,
+               priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
+               goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+               step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
+               status, created_at, updated_at
+        FROM autonomy_goals
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+          AND parent_goal_id IS NOT NULL
+          AND step_index IS NOT NULL AND step_index > 0
+          AND plan_contract_revision = ?
+          AND status NOT IN (?, ?)
+        ORDER BY step_index ASC
+        LIMIT 1
+        """,
+        (
+            state.session_id,
+            state.workspace_id,
+            state.user_id,
+            int(contract_revision),
+            AutonomyGoalStatus.DONE.value,
+            AutonomyGoalStatus.DROPPED.value,
+        ),
+    ).fetchone()
+    if row is None:
+        return None  # every step terminal — ask root_status whether that means "done"
+    if str(row["status"]) == AutonomyGoalStatus.BLOCKED.value:
+        # Stalled, not skippable.
+        return None
+    return _goal_from_row(row)
+
+
+def _write_objective_plan_lite(
+    conn: sqlite3.Connection,
+    *,
+    scope: ResolvedScope,
+    session_id: str,
+    task_id: str,
+    steps: Sequence[PlanStepState],
+    producer: str,
+    contract_revision: int,
+    now: datetime,
+    objective_text: str = "",
+) -> str:
+    """Write the plan's goal rows. Thin wrapper so the call site reads the same as Full's."""
+    return write_plan_rows(
+        conn,
+        scope=scope,
+        session_id=session_id,
+        task_id=task_id,
+        steps=steps,
+        producer=producer,
+        contract_revision=contract_revision,
+        now=now,
+        objective_text=objective_text,
+    )
+
+
+def _advance_plan_after_completion_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    context: dict[str, Any],
+    contract_revision: int,
+) -> None:
+    """Point the session at the next open step of this contract's plan, if there is one.
+
+    When no step remains, the plan is finished ONLY when ``root_status`` says ``done`` (§4.5
+    item 4). ``_select_next_plan_step_lite`` returns ``None`` for two very different reasons —
+    every step terminal, and the lowest open step is blocked — and treating both as "plan
+    complete" is what let a blocked sibling, or an all-dropped plan, flip the root goal to done.
+    The projection is re-read here so the decision is made on the fold that already carries this
+    report's STEP_COMPLETED / STEP_BLOCKED.
+    """
+    nxt = _select_next_plan_step_lite(conn, state, contract_revision=contract_revision)
+    if nxt is not None:
+        context["plan_next_step_index"] = int(nxt.step_index or 0)
+        context["plan_next_step_title"] = nxt.title
+        # The point of a plan: finishing floor 1 tells you to build floor 2, rather than
+        # dropping the objective and waiting for a fresh one.
+        context["objective"] = nxt.title
+        context["awaiting_next_objective"] = False
+        context["awaiting_next_objective_turns"] = 0
+        context.pop("plan_blocked_reason", None)
+        state.active_goal_id = nxt.id
+        state.objective_hash = objective_hash(nxt.title)
+        conn.execute(
+            "UPDATE autonomy_goals SET status = ?, updated_at = ? WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?",
+            (
+                AutonomyGoalStatus.SELECTED.value,
+                now_utc().isoformat(),
+                str(nxt.id),
+                state.session_id,
+                auth.workspace_id,
+                auth.user_id,
+            ),
+        )
+        return
+
+    context.pop("plan_next_step_index", None)
+    context.pop("plan_next_step_title", None)
+    root = _plan_root_status_lite(_load_task_projection(conn, auth=auth, state=state))
+    if root != "done":
+        # Blocked, or a plan that finished nothing. Leave the root where it is and record why,
+        # so the next turn surfaces the block instead of planning around it.
+        context["plan_blocked_reason"] = root
+        return
+
+    context.pop("plan_blocked_reason", None)
+    conn.execute(
+        """
+        UPDATE autonomy_goals SET status = ?, updated_at = ?
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+          AND step_index = 0 AND plan_contract_revision = ?
+        """,
+        (
+            AutonomyGoalStatus.DONE.value,
+            now_utc().isoformat(),
+            state.session_id,
+            auth.workspace_id,
+            auth.user_id,
+            int(contract_revision),
+        ),
+    )
+    context["plan_completed_at"] = now_utc().isoformat()
+    # The final step's title is still sitting in context; leaving it there makes the next turn
+    # author a brand new plan FROM that step. Wait for a genuinely new objective instead.
+    context.pop("objective", None)
+    context["awaiting_next_objective"] = True
+    context["awaiting_next_objective_turns"] = 0
+    state.objective_hash = ""
+    state.active_goal_id = None
+
+
+def _plan_step_index_for_goal_lite(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str | None,
+    session_id: str,
+    workspace_id: str,
+    user_id: str,
+) -> int | None:
+    """The REAL ``autonomy_goals.step_index`` behind a directive's goal, or ``None``.
+
+    Never a placeholder. The fold keys STEP_COMPLETED / STEP_BLOCKED on ``step_index``, so a
+    missing or hardcoded index makes every step of every projection stay ``candidate`` and the
+    whole status table unreachable. ``None`` here is honest — the directive was not a plan step —
+    and the caller omits the field so the fold counts it as an unknown step rather than
+    mislabelling step -1.
+    """
+    if not goal_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT step_index FROM autonomy_goals
+        WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
+        LIMIT 1
+        """,
+        (str(goal_id), session_id, workspace_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    value = _row_int_or_none(row, "step_index")
+    return value if value is not None and value > 0 else None
+
+
+def _verification_from_report_lite(body: ExecutionReportRequest) -> dict[str, Any] | None:
+    """Lift a verification out of the report's details map, or ``None``. Full's twin."""
+    details = body.details if isinstance(body.details, dict) else {}
+    raw = details.get("verification")
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "verification_id": str(raw.get("verification_id") or uuid.uuid4()),
+        "directive_id": str(body.directive_id),
+        "state": str(raw.get("state") or "unverified"),
+        "method": str(raw.get("method") or "none"),
+        "recorded_at": now_utc(),
+        "contract_revision": 0,
+        "plan_id": None,
+        "evidence_event_ids": [str(item) for item in (raw.get("evidence_event_ids") or [])][:40],
+        "summary": str(raw.get("summary") or "")[:500],
+    }
+
+
+def _insert_task_verification_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    task_id: str,
+    ref: dict[str, Any],
+    now: datetime,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO task_verifications(
+            id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
+            evidence_event_ids_json, recorded_by, recorded_at, schema_version,
+            contract_revision, plan_id
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            auth.workspace_id,
+            auth.user_id,
+            task_id,
+            ref.get("directive_id"),
+            ref.get("state"),
+            ref.get("method"),
+            ref.get("summary"),
+            json_dumps(list(ref.get("evidence_event_ids") or [])),
+            auth.consumer,
+            now.isoformat(),
+            int(ref.get("contract_revision") or 0),
+            ref.get("plan_id"),
+        ),
+    )
+
+
+def _record_execution_task_state_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: ExecutionReportRequest,
+    directive_id: str,
+    goal_id: str | None,
+    effective_state: DirectiveExecutionState,
+    now: datetime,
+) -> int:
+    """Append this report's task-state events and return the contract revision they used.
+
+    The Lite twin of ``main.py::_record_execution_task_state``: without it Lite's
+    ``report_execution`` emitted nothing at all, so no Lite projection could ever leave
+    ``candidate`` and the whole §4.5 lifecycle was Full-only.
+
+    Returns ``0`` when the projection is disabled or unreadable, which is also the value the
+    goal predicate then matches: a plan written under contract 0 stays addressable.
+    """
+    if not bool(getattr(get_settings(), "task_state_enabled", True)):
+        return 0
+    try:
+        scope = auth.resolved_scope(
+            session_project=state.takeover_context.get("project_context")
+            if isinstance(state.takeover_context, dict)
+            else None,
+            task_id=state.session_id,
+        )
+        step_index = _plan_step_index_for_goal_lite(
+            conn,
+            goal_id=goal_id,
+            session_id=state.session_id,
+            workspace_id=state.workspace_id,
+            user_id=state.user_id,
+        )
+
+        def _body() -> int:
+            _task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                subject_user_id=auth.behavior_subject_id,
+                session_id=state.session_id,
+                task_id=state.session_id,
+                project_id=scope.project_id,
+                now=now,
+            )
+            events: list[TaskStateEvent] = []
+            if effective_state == DirectiveExecutionState.SUCCEEDED:
+                completed: dict[str, Any] = {"goal_id": goal_id, "directive_id": directive_id}
+                if step_index is not None:
+                    completed["step_index"] = step_index
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.STEP_COMPLETED,
+                        contract_revision=projection.contract_revision,
+                        payload=completed,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                        goal_id=goal_id,
+                    )
+                )
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.EFFECT_RESOLVED,
+                        contract_revision=projection.contract_revision,
+                        payload={
+                            "effect_id": directive_id,
+                            "kind": "directive",
+                            "description": "",
+                            "opened_at": now,
+                            "directive_id": directive_id,
+                            "paths": [],
+                        },
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                    )
+                )
+            elif effective_state in {
+                DirectiveExecutionState.FAILED,
+                DirectiveExecutionState.BLOCKED,
+                DirectiveExecutionState.ABANDONED,
+                DirectiveExecutionState.CANCELLED,
+            }:
+                blocked: dict[str, Any] = {
+                    "goal_id": goal_id,
+                    "blocked_reason": str(body.failure_reason or "")[:400],
+                }
+                if step_index is not None:
+                    blocked["step_index"] = step_index
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.STEP_BLOCKED,
+                        contract_revision=projection.contract_revision,
+                        payload=blocked,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                        goal_id=goal_id,
+                    )
+                )
+            verification = _verification_from_report_lite(body)
+            if verification is not None:
+                # S5 provenance: a verification is evidence only for the contract AND the plan
+                # it was recorded against. Stamping both here is what stops a passing
+                # verification from a finished objective driving a later one to DONE.
+                verification["contract_revision"] = projection.contract_revision
+                verification["plan_id"] = (
+                    projection.plan.plan_id if projection.plan is not None else None
+                )
+                verification["directive_id"] = directive_id
+                _insert_task_verification_lite(
+                    conn, auth=auth, task_id=state.session_id, ref=verification, now=now
+                )
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.VERIFICATION_RECORDED,
+                        contract_revision=projection.contract_revision,
+                        payload=verification,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                    )
+                )
+            if not events:
+                return int(projection.contract_revision)
+            write = apply_task_state_events(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                task_id=state.session_id,
+                new_events=events,
+                now=now,
+                expected_revision=None,
+                retry_once=False,
+            )
+            state.takeover_context["task_state_revision"] = int(write.next_revision)
+            return int(write.projection.contract_revision)
+
+        return run_cas_section(conn, _body)
+    except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+        raise
+    except Exception:
+        logger.warning("task-state execution report failed", exc_info=True)
+        return 0
+
+
+def _task_state_summary_for(
+    projection: TaskStateProjection, *, source_revision: str
+) -> TaskStateSummary:
+    fields = dict(task_state_summary_fields(projection, source_revision=source_revision))
+    fields["status"] = to_lifecycle_status(fields["status"])
+    fields["next_permitted_action"] = to_next_permitted_action(fields["next_permitted_action"])
+    return TaskStateSummary(**fields)
+
+
+def _run_task_state_cas_section(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    settings: Settings,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    objective_text: str,
+    owner_objective_hash: str | None,
+    objective_asserted: bool,
+    now: datetime,
+) -> tuple[TaskStateSummary, int, str | None]:
+    """The whole read-then-write CAS section for one turn (§5.2 rule 2).
+
+    Retrieval, classification and the advisor decision have ALREADY run, outside the write lock.
+    Everything below runs under one ``BEGIN IMMEDIATE`` and commits or rolls back together.
+
+    D2: planning is inline and deterministic, so this returns ``planning_job_id`` for wire parity
+    and the caller always reports ``planning_pending=False``.
+    """
+    task_id = state.session_id  # D4: the task identity for a takeover turn IS the session
+
+    def _body() -> tuple[TaskStateSummary, int, str | None]:
+        task_state_id, projection, _highest_seq, source_revision = ensure_task_state(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=state.session_id,
+            task_id=task_id,
+            project_id=scope.project_id,
+            now=now,
+        )
+        contract_revision = objective_contract_revision(
+            projection.contract_revision, projection.objective_hash, owner_objective_hash
+        )
+        objective_changed = contract_revision != projection.contract_revision
+        # RULING V1: a cancelled projection accepts a same-hash OBJECTIVE_SET, so the documented
+        # stand-down -> re-activate cycle on ONE session id revives the task instead of bricking
+        # it. Without this the last retained CANCELLATION_REQUESTED stays newer than the last
+        # OBJECTIVE_SET forever and R1 returns CANCELLED for the life of the session.
+        objective_set_needed = bool(owner_objective_hash) and _objective_set_needed_lite(
+            projection,
+            owner_objective_hash=owner_objective_hash,
+            objective_asserted=objective_asserted,
+        )
+        events: list[TaskStateEvent] = []
+        invalidation: InvalidationPlan | None = None
+        apply_side_effects: ApplySideEffectsLite | None = None
+        job_id: str | None = None
+
+        if objective_set_needed:
+            # The FIRST objective set is not an objective CHANGE. invalidation_for_objective_change
+            # keys purely on the revision moving, so on a task whose stored hash is still NULL it
+            # would cancel the session's already-pending directives and expire its permits — the
+            # exact opposite of what "the owner restated the objective" means. Only a task that
+            # already carried an objective hash has a previous contract to close out.
+            if objective_changed and projection.objective_hash:
+                invalidation = invalidation_for_objective_change(
+                    projection,
+                    new_objective_hash=owner_objective_hash,
+                    pending_directive_ids=pending_directive_ids(
+                        conn,
+                        workspace_id=auth.workspace_id,
+                        owner_id=auth.user_id,
+                        session_id=state.session_id,
+                    ),
+                    pending_planning_job_ids=pending_planning_job_ids(
+                        conn, workspace_id=auth.workspace_id, task_id=task_id
+                    ),
+                )
+                if invalidation is not None:
+                    apply_side_effects = _apply_invalidation_lite
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.OBJECTIVE_SET,
+                    contract_revision=contract_revision,
+                    payload={
+                        "objective_text": objective_text,
+                        "objective_hash": owner_objective_hash,
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                )
+            )
+
+        needs_plan = objective_changed or projection.plan is None or (
+            projection.plan is not None and projection.plan.contract_revision != contract_revision
+        )
+        if needs_plan and owner_objective_hash and objective_text.strip():
+            charter = charter_for_task(
+                max_steps=int(getattr(settings, "takeover_plan_max_steps", 8)),
+                reason="deterministic read-only diagnosis",
+            )
+            input_revision = plan_input_revision(
+                objective_hash=owner_objective_hash,
+                contract_revision=contract_revision,
+                policy_revision=TASK_STATE_POLICY_REVISION,
+                scope_digest=_task_scope_digest_for(scope),
+                cancel_epoch=int(projection.last_cancel_seq),
+            )
+            job_id, _created = enqueue_planning_job(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                task_id=task_id,
+                task_state_id=task_state_id,
+                job_kind=PLANNING_JOB_KIND_DECOMPOSE,
+                input_revision=input_revision,
+                contract_revision=contract_revision,
+                objective_hash=owner_objective_hash,
+                objective_text=objective_text,
+                charter=charter,
+                scope=scope,
+                now=now,
+                max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+            )
+            steps = deterministic_plan(objective_text, charter=charter)
+            root_goal_id = _write_objective_plan_lite(
+                conn,
+                scope=scope,
+                session_id=state.session_id,
+                task_id=task_id,
+                steps=steps,
+                producer=PLANNING_PRODUCER_DETERMINISTIC,
+                contract_revision=contract_revision,
+                now=now,
+                objective_text=objective_text,
+            )
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.PLAN_APPROVED,
+                    contract_revision=contract_revision,
+                    payload={
+                        "producer": PLANNING_PRODUCER_DETERMINISTIC,
+                        "plan_id": approved_plan_id(task_id, contract_revision),
+                        "root_goal_id": root_goal_id,
+                        "steps": plan_steps_to_json(steps),
+                        "charter": charter_to_json(charter),
+                        "descriptive_sources": {},
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    goal_id=root_goal_id,
+                )
+            )
+
+        if not events:
+            summary = _task_state_summary_for(projection, source_revision=source_revision)
+            return summary, int(projection.revision), job_id
+
+        write = apply_task_state_events(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=state.session_id,
+            task_id=task_id,
+            new_events=events,
+            now=now,
+            expected_revision=None,
+            invalidation=invalidation,
+            apply_side_effects=apply_side_effects,
+            retry_once=False,
+        )
+        summary = _task_state_summary_for(
+            write.projection, source_revision=write.source_revision
+        )
+        return summary, int(write.next_revision), job_id
+
+    return run_cas_section(conn, _body)
+
+
+def _apply_invalidation_lite(conn: sqlite3.Connection, plan: InvalidationPlan) -> None:
+    """The objective-change side effects, in §0.8 lock order: planning jobs, then directives,
+    then permits. Keyed on ``session_id`` throughout (S1)."""
+    stamp = now_utc().isoformat()
+    for job_id in plan.discard_planning_job_ids:
+        conn.execute(
+            "UPDATE planning_jobs SET state = 'discarded', cancel_requested = 1, last_error = ?, updated_at = ? WHERE id = ?",
+            (plan.reason, stamp, job_id),
+        )
+    for directive_id in plan.cancel_directive_ids:
+        conn.execute(
+            """
+            UPDATE directive_executions
+               SET state = ?, updated_at = ?, finished_at = ?, cancelled_at = ?,
+                   cancel_reason = COALESCE(cancel_reason, ?)
+             WHERE directive_id = ? AND state IN (?, ?)
+            """,
+            (
+                DirectiveExecutionState.CANCELLED.value,
+                stamp,
+                stamp,
+                stamp,
+                plan.reason,
+                directive_id,
+                DirectiveExecutionState.PENDING.value,
+                DirectiveExecutionState.IN_PROGRESS.value,
+            ),
+        )
+    if plan.expire_permits_for_session:
+        conn.execute(
+            "UPDATE execution_permits SET expires_at = ? WHERE session_id = ? AND (expires_at IS NULL OR expires_at > ?)",
+            (stamp, plan.expire_permits_for_session, stamp),
+        )
+
+
 def takeover_step(
     conn: sqlite3.Connection,
     body: TakeoverStepRequest,
     auth: AuthContext,
     settings: Settings,
 ) -> TakeoverStepResponse:
+    # The ONE turn deadline and the ONE ledger, created as the first two statements of the turn.
+    # Both are passed BY VALUE downstream and never re-created. The retrieval CHILD is built at
+    # the retrieval call site (_build_takeover_working_set), not here (S6).
+    turn_deadline = (
+        Deadline.start(
+            budget_ms=int(getattr(settings, "takeover_turn_budget_ms", 3500)),
+            backend_budget_ms=int(getattr(settings, "context_backend_timeout_ms", 60)),
+            floor_ms=int(getattr(settings, "retrieval_deadline_floor_ms", 5)),
+            label="turn",
+        )
+        if bool(getattr(settings, "retrieval_deadline_enabled", True))
+        else Deadline.unbounded()
+    )
+    retrieval_ledger = RetrievalLedger()
     started_total = time.perf_counter()
     state_started = time.perf_counter()
     state = takeover_state(
@@ -9420,6 +10459,13 @@ def takeover_step(
             max_per_session=max(1, int(getattr(settings, "snapshot_max_per_session", 10))),
         )
         save_takeover_state(conn, state)
+        _record_stand_down_lite(
+            conn,
+            workspace_id=state.workspace_id,
+            user_id=state.user_id,
+            session_id=state.session_id,
+            now=now,
+        )
         return TakeoverStepResponse(
             state=state,
             action="stopped",
@@ -9586,6 +10632,7 @@ def takeover_step(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -9595,10 +10642,60 @@ def takeover_step(
         ).fetchone()
         if maybe_goal is not None:
             selected_goal = _goal_from_row(maybe_goal)
+        if selected_goal is not None and selected_goal.status in {
+            AutonomyGoalStatus.DONE,
+            AutonomyGoalStatus.DROPPED,
+        }:
+            # A pin left on a finished goal would be returned forever — the "propose the step
+            # you just completed" failure at the pin level.
+            selected_goal = None
+            state.active_goal_id = None
+
+    # --- the pre-dispatch task-state read (§4.5 item 5) --------------------------------------
+    # A PLAIN read. The CAS section is still hundreds of lines below and stays exactly as narrow
+    # as it was; this is the only way the turn's directive decision can see a cancelled task or
+    # a plan stalled on a blocked step, both of which must mint nothing.
+    task_owner_objective_hash = _owner_objective_hash(body, state, pending_objective=None)
+    task_objective_asserted = bool(has_new_objective_signal or activation_hit)
+    task_projection_pre = (
+        _load_task_projection(conn, auth=auth, state=state)
+        if bool(getattr(settings, "task_state_enabled", True))
+        else None
+    )
+    task_dispatch_blocked = False
+    plan_blocked = False
+    if task_projection_pre is not None:
+        task_dispatch_blocked = (
+            task_projection_pre.status is TaskStatus.CANCELLED
+            and not _objective_set_needed_lite(
+                task_projection_pre,
+                owner_objective_hash=task_owner_objective_hash,
+                objective_asserted=task_objective_asserted,
+            )
+        )
+        if (
+            selected_goal is None
+            and not task_dispatch_blocked
+            and task_projection_pre.plan is not None
+        ):
+            plan_step = _select_next_plan_step_lite(
+                conn, state, contract_revision=task_projection_pre.contract_revision
+            )
+            if plan_step is not None:
+                selected_goal = plan_step
+                state.active_goal_id = plan_step.id
+            elif _plan_root_status_lite(task_projection_pre) == "blocked":
+                # None here means "no open step", which is NOT the same as "plan complete".
+                # Short-circuit instead of falling through to discovery and authoring a fresh
+                # goal around the block.
+                plan_blocked = True
+    # --- end of the pre-dispatch read ---------------------------------------------------------
     goal_discovery_every_n_turns = max(6, int(getattr(settings, "takeover_goal_discovery_every_n_turns", 24)))
     periodic_goal_discovery_due = turn_count > 0 and (turn_count % goal_discovery_every_n_turns == 0)
     should_discover = bool(
         state.active
+        and not task_dispatch_blocked
+        and not plan_blocked
         and (not awaiting_next_objective or has_new_objective_signal)
         and (
             selected_goal is None
@@ -9692,6 +10789,8 @@ def takeover_step(
             task=resolved_task,
             app_context=body.app_context,
             constraints=body.constraints,
+            deadline=turn_deadline,
+            ledger=retrieval_ledger,
         )
         state.working_set_json = working_set
     retrieval_ms = int((time.perf_counter() - retrieval_started) * 1000)
@@ -10158,8 +11257,20 @@ def takeover_step(
         and pending_execution is None
         and safety_decision == SafetyDecision.ALLOW
     )
+    # A cancelled task, or a plan stalled on a blocked step, mints NOTHING. The status was read
+    # at the top of the turn precisely so this decision can see it: reading it after the
+    # directive block (where the projection used to first appear) is the same as not reading it.
+    task_state_suppressed = bool(
+        (task_dispatch_blocked or plan_blocked) and pending_execution is None
+    )
+    if task_state_suppressed:
+        suppress_auto_directive = True
     if suppress_auto_directive:
-        if bool(state.takeover_context.get("force_user_objective_refresh")):
+        if task_state_suppressed and plan_blocked:
+            final_response = "The plan is blocked on an unfinished step. Clear the blocker or restate the objective before I continue."
+        elif task_state_suppressed:
+            final_response = "This task was cancelled. Re-state the objective to revive it."
+        elif bool(state.takeover_context.get("force_user_objective_refresh")):
             final_response = "Objective drift detected. Provide one concrete next objective so I can continue correctly."
             state.takeover_context["objective_needs_refresh"] = True
         else:
@@ -10544,6 +11655,38 @@ def takeover_step(
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
 
+    # --- the CAS section (§5.2 rule 2) ------------------------------------------------------
+    # Everything above — retrieval, classification, the advisor decision — ran with NO write
+    # lock. Only the read-then-write task-state work below is bracketed by BEGIN IMMEDIATE, and
+    # the retry in run_cas_section re-runs only this section, never the turn.
+    task_state_summary = TaskStateSummary()
+    task_state_revision = 0
+    planning_job_id: str | None = None
+    if bool(getattr(settings, "task_state_enabled", True)):
+        try:
+            task_state_summary, task_state_revision, planning_job_id = _run_task_state_cas_section(
+                conn,
+                auth=auth,
+                settings=settings,
+                scope=request_scope,
+                state=state,
+                objective_text=resolved_task or "",
+                # NOT resolved_task: completing a step rewrites the objective pointer to the
+                # next step's title, and hashing that would bump contract_revision on every
+                # step advance — invalidating the plan the step belongs to and cancelling the
+                # directive that is executing it (R3-G3).
+                owner_objective_hash=task_owner_objective_hash,
+                objective_asserted=task_objective_asserted,
+                now=now_utc(),
+            )
+        except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+            raise
+        except Exception:
+            # A task-state failure must not take the turn down with it: the advisor answer is
+            # already computed and is the thing the caller needs.
+            logger.warning("task state CAS section failed", exc_info=True)
+    # --- end of the CAS section --------------------------------------------------------------
+
     total_ms = int((time.perf_counter() - started_total) * 1000)
     _record_takeover_action(
         conn,
@@ -10670,6 +11813,13 @@ def takeover_step(
         project_binding=project_binding,
         capture_delivery_state=CaptureDeliveryState(capture_state),
         open_decision_opportunity_id=UUID(open_decision_opportunity_id) if open_decision_opportunity_id else None,
+        # D2: Lite has no worker, no Redis and no gateway, so planning ran INLINE inside the CAS
+        # section above and planning_pending is always false. The wire shape is identical to Full.
+        planning_pending=False,
+        planning_job_id=UUID(planning_job_id) if planning_job_id else None,
+        planning_pending_hint_ms=int(getattr(settings, "planning_pending_hint_ms", 1500)),
+        task_state=task_state_summary,
+        task_state_revision=int(task_state_revision),
     )
 
 
@@ -11060,6 +12210,12 @@ def run_lifecycle_maintenance(
             settings=settings,
             limit=int(getattr(settings, "decision_extraction_batch_size", 100)),
         )
+    if not effective_dry_run:
+        # Lite's second (operator-driven) planning-job hygiene trigger; the first is _lifespan.
+        try:
+            summary["planning_jobs"] = sweep_stale_planning_jobs(conn, settings=settings, now=now)
+        except Exception:
+            logger.warning("planning job sweep failed", exc_info=True)
     conn.execute(
         """
         INSERT INTO runtime_settings(key, value, updated_at)

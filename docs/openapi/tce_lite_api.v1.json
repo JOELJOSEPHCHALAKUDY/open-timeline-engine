@@ -6858,6 +6858,10 @@
             "title": "Generated At",
             "type": "string"
           },
+          "next_permitted_action": {
+            "$ref": "#/components/schemas/TaskNextPermittedAction",
+            "default": "none"
+          },
           "pending": {
             "items": {
               "$ref": "#/components/schemas/DirectiveExecution"
@@ -6875,6 +6879,11 @@
           "session_id": {
             "title": "Session Id",
             "type": "string"
+          },
+          "task_state_revision": {
+            "default": 0,
+            "title": "Task State Revision",
+            "type": "integer"
           }
         },
         "required": [
@@ -7858,6 +7867,111 @@
         "title": "PatternItem",
         "type": "object"
       },
+      "PlanningJobStatusResponse": {
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "cancel_requested": {
+            "default": false,
+            "title": "Cancel Requested",
+            "type": "boolean"
+          },
+          "contract_revision": {
+            "default": 0,
+            "title": "Contract Revision",
+            "type": "integer"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "input_revision": {
+            "default": "",
+            "title": "Input Revision",
+            "type": "string"
+          },
+          "job_id": {
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "job_kind": {
+            "default": "",
+            "title": "Job Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "max_attempts": {
+            "default": 3,
+            "title": "Max Attempts",
+            "type": "integer"
+          },
+          "producer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producer"
+          },
+          "queue_state": {
+            "default": "inline",
+            "title": "Queue State",
+            "type": "string"
+          },
+          "state": {
+            "default": "pending",
+            "title": "State",
+            "type": "string"
+          },
+          "task_id": {
+            "default": "",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "PlanningJobStatusResponse",
+        "type": "object"
+      },
       "ProcessMiningRequest": {
         "properties": {
           "lookback_days": {
@@ -8360,6 +8474,11 @@
             "title": "Continuation Steps",
             "type": "array"
           },
+          "contract_revision": {
+            "default": 0,
+            "title": "Contract Revision",
+            "type": "integer"
+          },
           "contract_valid": {
             "default": true,
             "title": "Contract Valid",
@@ -8439,6 +8558,18 @@
             "title": "Selection Reason",
             "type": "string"
           },
+          "source_event_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Event Id"
+          },
           "source_owner_id": {
             "anyOf": [
               {
@@ -8465,9 +8596,39 @@
             "title": "Status",
             "type": "string"
           },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "task_state_revision": {
+            "default": 0,
+            "title": "Task State Revision",
+            "type": "integer"
+          },
           "task_summary": {
             "title": "Task Summary",
             "type": "string"
+          },
+          "unresolved_effects": {
+            "items": {
+              "$ref": "#/components/schemas/TaskStateUnresolvedEffect"
+            },
+            "title": "Unresolved Effects",
+            "type": "array"
+          },
+          "verification_refs": {
+            "items": {
+              "$ref": "#/components/schemas/TaskStateVerificationRef"
+            },
+            "title": "Verification Refs",
+            "type": "array"
           }
         },
         "required": [
@@ -9027,6 +9188,11 @@
             "title": "Affective Scores",
             "type": "object"
           },
+          "attempts": {
+            "default": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
           "cache_hit": {
             "default": false,
             "title": "Cache Hit",
@@ -9053,6 +9219,13 @@
             "title": "Created At",
             "type": "string"
           },
+          "depends_on": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
           "description": {
             "title": "Description",
             "type": "string"
@@ -9073,6 +9246,23 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "mutating": {
+            "default": false,
+            "title": "Mutating",
+            "type": "boolean"
+          },
+          "parent_goal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Goal Id"
           },
           "priority_score": {
             "default": 0.0,
@@ -9104,6 +9294,17 @@
           "status": {
             "$ref": "#/components/schemas/AutonomyGoalStatus",
             "default": "candidate"
+          },
+          "step_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Index"
           },
           "title": {
             "title": "Title",
@@ -10072,6 +10273,28 @@
             "title": "Planner Used",
             "type": "boolean"
           },
+          "planning_job_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planning Job Id"
+          },
+          "planning_pending": {
+            "default": false,
+            "title": "Planning Pending",
+            "type": "boolean"
+          },
+          "planning_pending_hint_ms": {
+            "default": 0,
+            "title": "Planning Pending Hint Ms",
+            "type": "integer"
+          },
           "project_binding": {
             "default": "unbound",
             "title": "Project Binding",
@@ -10191,6 +10414,14 @@
             "additionalProperties": true,
             "title": "Takeover Enforcement",
             "type": "object"
+          },
+          "task_state": {
+            "$ref": "#/components/schemas/TaskStateSummary"
+          },
+          "task_state_revision": {
+            "default": 0,
+            "title": "Task State Revision",
+            "type": "integer"
           }
         },
         "required": [
@@ -10199,6 +10430,421 @@
           "classification"
         ],
         "title": "TakeoverStepResponse",
+        "type": "object"
+      },
+      "TaskCancelRequest": {
+        "properties": {
+          "reason": {
+            "default": "owner_cancelled",
+            "maxLength": 400,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "TaskCancelRequest",
+        "type": "object"
+      },
+      "TaskCancelResponse": {
+        "properties": {
+          "cancelled_directives": {
+            "default": 0,
+            "title": "Cancelled Directives",
+            "type": "integer"
+          },
+          "cancelled_planning_jobs": {
+            "default": 0,
+            "title": "Cancelled Planning Jobs",
+            "type": "integer"
+          },
+          "cancelled_rq_jobs": {
+            "default": 0,
+            "title": "Cancelled Rq Jobs",
+            "type": "integer"
+          },
+          "expired_permits": {
+            "default": 0,
+            "title": "Expired Permits",
+            "type": "integer"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "revoked_constraints": {
+            "default": 0,
+            "title": "Revoked Constraints",
+            "type": "integer"
+          },
+          "task_id": {
+            "default": "",
+            "title": "Task Id",
+            "type": "string"
+          }
+        },
+        "title": "TaskCancelResponse",
+        "type": "object"
+      },
+      "TaskLifecycleStatus": {
+        "enum": [
+          "awaiting_objective",
+          "planning",
+          "active",
+          "blocked",
+          "awaiting_decision",
+          "awaiting_verification",
+          "done",
+          "cancelled"
+        ],
+        "title": "TaskLifecycleStatus",
+        "type": "string"
+      },
+      "TaskNextPermittedAction": {
+        "enum": [
+          "await_owner_objective",
+          "await_planning",
+          "execute_step",
+          "await_decision",
+          "await_verification",
+          "resolve_effects",
+          "blocked",
+          "none"
+        ],
+        "title": "TaskNextPermittedAction",
+        "type": "string"
+      },
+      "TaskStateProjectionResponse": {
+        "properties": {
+          "content": {
+            "default": "",
+            "title": "Content",
+            "type": "string"
+          },
+          "content_sha256": {
+            "default": "",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "contract_revision": {
+            "default": 0,
+            "title": "Contract Revision",
+            "type": "integer"
+          },
+          "evidence_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Evidence Count",
+            "type": "integer"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "format": {
+            "default": "markdown",
+            "title": "Format",
+            "type": "string"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "mime_type": {
+            "default": "text/markdown; charset=utf-8",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "projection_id": {
+            "format": "uuid",
+            "title": "Projection Id",
+            "type": "string"
+          },
+          "projection_learning_eligible": {
+            "default": false,
+            "title": "Projection Learning Eligible",
+            "type": "boolean"
+          },
+          "read_only": {
+            "default": true,
+            "title": "Read Only",
+            "type": "boolean"
+          },
+          "redaction_applied": {
+            "default": false,
+            "title": "Redaction Applied",
+            "type": "boolean"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "sensitivity": {
+            "default": 1,
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Sensitivity",
+            "type": "integer"
+          },
+          "source_evidence_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Source Evidence Ids",
+            "type": "array"
+          },
+          "source_revision": {
+            "default": "",
+            "title": "Source Revision",
+            "type": "string"
+          },
+          "task_id": {
+            "default": "",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "trust_level": {
+            "default": "projection",
+            "title": "Trust Level",
+            "type": "string"
+          },
+          "uri": {
+            "title": "Uri",
+            "type": "string"
+          },
+          "view": {
+            "default": "state",
+            "title": "View",
+            "type": "string"
+          }
+        },
+        "required": [
+          "projection_id",
+          "uri",
+          "generated_at"
+        ],
+        "title": "TaskStateProjectionResponse",
+        "type": "object"
+      },
+      "TaskStateSummary": {
+        "properties": {
+          "contract_revision": {
+            "default": 0,
+            "title": "Contract Revision",
+            "type": "integer"
+          },
+          "next_permitted_action": {
+            "$ref": "#/components/schemas/TaskNextPermittedAction",
+            "default": "await_owner_objective"
+          },
+          "open_decision_count": {
+            "default": 0,
+            "title": "Open Decision Count",
+            "type": "integer"
+          },
+          "open_step_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Step Index"
+          },
+          "plan_producer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Producer"
+          },
+          "plan_state": {
+            "default": "absent",
+            "title": "Plan State",
+            "type": "string"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "source_revision": {
+            "default": "",
+            "title": "Source Revision",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskLifecycleStatus",
+            "default": "awaiting_objective"
+          },
+          "task_id": {
+            "default": "",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "unresolved_effect_count": {
+            "default": 0,
+            "title": "Unresolved Effect Count",
+            "type": "integer"
+          }
+        },
+        "title": "TaskStateSummary",
+        "type": "object"
+      },
+      "TaskStateUnresolvedEffect": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "directive_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directive Id"
+          },
+          "effect_id": {
+            "title": "Effect Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "directive",
+            "title": "Kind",
+            "type": "string"
+          },
+          "opened_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opened At"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "effect_id"
+        ],
+        "title": "TaskStateUnresolvedEffect",
+        "type": "object"
+      },
+      "TaskStateVerificationRef": {
+        "properties": {
+          "contract_revision": {
+            "default": 0,
+            "title": "Contract Revision",
+            "type": "integer"
+          },
+          "directive_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directive Id"
+          },
+          "evidence_event_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Evidence Event Ids",
+            "type": "array"
+          },
+          "method": {
+            "default": "none",
+            "title": "Method",
+            "type": "string"
+          },
+          "plan_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Id"
+          },
+          "recorded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recorded At"
+          },
+          "state": {
+            "default": "unverified",
+            "title": "State",
+            "type": "string"
+          },
+          "summary": {
+            "default": "",
+            "title": "Summary",
+            "type": "string"
+          },
+          "verification_id": {
+            "title": "Verification Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verification_id"
+        ],
+        "title": "TaskStateVerificationRef",
         "type": "object"
       },
       "TeamMembershipUpsertRequest": {
@@ -20118,6 +20764,141 @@
         "summary": "Patterns Feedback"
       }
     },
+    "/v1/planning/jobs/{job_id}": {
+      "get": {
+        "operationId": "get_planning_job_status_v1_planning_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanningJobStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Planning Job Status"
+      }
+    },
     "/v1/retrieval/eval/run": {
       "post": {
         "operationId": "retrieval_eval_run_v1_retrieval_eval_run_post",
@@ -25535,6 +26316,421 @@
           }
         },
         "summary": "Takeover Step"
+      }
+    },
+    "/v1/tasks/{task_id}/cancel": {
+      "post": {
+        "operationId": "cancel_task_endpoint_v1_tasks__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCancelResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Task Endpoint"
+      }
+    },
+    "/v1/tasks/{task_id}/state": {
+      "get": {
+        "operationId": "get_task_state_v1_tasks__task_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskStateSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task State"
+      }
+    },
+    "/v1/tasks/{task_id}/state.md": {
+      "get": {
+        "operationId": "get_task_state_markdown_v1_tasks__task_id__state_md_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-User",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskStateProjectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Task State Markdown"
       }
     },
     "/v1/team/memberships": {

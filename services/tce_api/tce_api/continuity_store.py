@@ -14,8 +14,48 @@ from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
 from tce_shared.project_context import canonical_project_context
 from tce_shared.redaction import redact_payload, redact_text
+from tce_shared.task_state import (
+    TaskStateProjection,
+    effects_to_json,
+    verification_to_json,
+)
 
 from .models import ContinuityResumeAttempt, Event, HandoffOutbox, HandoffRecord
+
+
+def handoff_record_columns(
+    *,
+    record: Any,
+    projection: TaskStateProjection | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """The single P2 column/value mapping for ``handoff_records``.
+
+    Both writers — :func:`deliver_handoff` here and ``main.py::_persist_handoff_record`` — go
+    through this, so a future field cannot land in one and miss the other. It lives in this
+    module rather than in ``main.py`` because ``main.py`` already imports this one; the reverse
+    would be an import cycle.
+
+    With no projection every value is the column default, so a workspace with
+    ``task_state_enabled=False`` writes exactly what it wrote before P2.
+    """
+    _ = (record, now)
+    if projection is None:
+        return {
+            "task_id": None,
+            "task_state_revision": 0,
+            "contract_revision": 0,
+            "verification_refs_json": [],
+            "unresolved_effects_json": [],
+        }
+    verification = verification_to_json(projection.latest_verification)
+    return {
+        "task_id": projection.task_id,
+        "task_state_revision": int(projection.revision),
+        "contract_revision": int(projection.contract_revision),
+        "verification_refs_json": [verification] if verification is not None else [],
+        "unresolved_effects_json": effects_to_json(projection.unresolved_effects),
+    }
 
 
 class CompletionConflictError(ValueError):
@@ -107,7 +147,13 @@ def enqueue_handoff(
     return row
 
 
-def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -> HandoffOutbox:
+def deliver_handoff(
+    db: Session,
+    *,
+    outbox_id: uuid.UUID,
+    retention_days: int,
+    projection: TaskStateProjection | None = None,
+) -> HandoffOutbox:
     row = db.execute(
         select(HandoffOutbox).where(HandoffOutbox.id == outbox_id).with_for_update()
     ).scalar_one()
@@ -234,6 +280,7 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
                 project_id=str(record_project.get("project_id") or "").strip() or None,
                 git_remote=str(record_project.get("project_remote") or "").strip() or None,
                 executor_id=row.executor_id,
+                **handoff_record_columns(record=row, projection=projection, now=now),
             )
         )
     db.execute(
@@ -267,9 +314,17 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
     return row
 
 
-def deliver_handoff_safely(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -> HandoffOutbox:
+def deliver_handoff_safely(
+    db: Session,
+    *,
+    outbox_id: uuid.UUID,
+    retention_days: int,
+    projection: TaskStateProjection | None = None,
+) -> HandoffOutbox:
     try:
-        return deliver_handoff(db, outbox_id=outbox_id, retention_days=retention_days)
+        return deliver_handoff(
+            db, outbox_id=outbox_id, retention_days=retention_days, projection=projection
+        )
     except Exception as exc:
         db.rollback()
         row = db.get(HandoffOutbox, outbox_id)

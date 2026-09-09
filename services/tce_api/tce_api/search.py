@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
 import random
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
@@ -16,7 +15,7 @@ from typing import Any, TypedDict
 
 import httpx
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from tce_model_gateway import get_gateway
 from tce_shared.autonomy_context import (
@@ -25,6 +24,14 @@ from tce_shared.autonomy_context import (
     propagate_episode_score,
     summary_coverage_ratio,
 )
+from tce_shared.deadline import (
+    RETRIEVAL_REASON_DEADLINE_SKIP,
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
+    Deadline,
+    RetrievalLedger,
+    embedding_cache_key,
+    embedding_cooldown_key,
+)
 from tce_shared.events import EventSearchHit, EventSearchRequest
 from tce_shared.handoff import handoff_intent, task_overlap_score
 from tce_shared.policy import ConsumerContext
@@ -32,6 +39,7 @@ from tce_shared.scope import ResolvedScope, resolve_scope
 
 from .cache_clients import get_redis_client
 from .config import get_settings
+from .deadline_pg import absorb_pg_deadline, begin_pg_deadline, finish_pg_deadline
 from .policy import PolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -48,6 +56,7 @@ _RETRIEVAL_COUNTERS: dict[str, int] = {
     "lexical_only": 0,
     "hybrid_fallback": 0,
     "qdrant": 0,
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL: 0,
 }
 _QUERY_EXPANSION_SYNONYMS: dict[str, tuple[str, ...]] = {
     "bug": ("error", "issue", "defect"),
@@ -261,11 +270,21 @@ def _load_handoff_records_map(
     workspace_id: str,
     owner_ids: list[str],
     max_records: int,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not owner_ids:
         return {}
+    settings = get_settings()
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="handoff_records",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT id, event_id, anchors_json, schema_version
@@ -281,7 +300,8 @@ def _load_handoff_records_map(
                 "owner_ids": owner_ids,
                 "record_limit": max(1, int(max_records)),
             },
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         try:
             db.rollback()
@@ -299,6 +319,44 @@ def _load_handoff_records_map(
             "schema_version": str(row.get("schema_version") or "").strip().lower(),
         }
     return by_event
+
+
+def _guarded_rows(
+    db: Session,
+    deadline: Deadline | None,
+    ledger: RetrievalLedger | None,
+    *,
+    name: str,
+    requested_ms: int,
+    floor_ms: int,
+    run: Callable[[], Sequence[Any]],
+) -> list[Any]:
+    """Run one READ under a statement-timeout guard, or skip it when the budget is gone.
+
+    Writes never come through here: the guard is a read-only device, and a skipped write
+    would report a revision that was never persisted.
+    """
+    guard = begin_pg_deadline(
+        db, deadline, name=name, ledger=ledger, requested_ms=requested_ms, floor_ms=floor_ms
+    )
+    if guard is None:
+        return []
+    try:
+        rows = list(run())
+    except (OperationalError, DBAPIError) as exc:
+        if not absorb_pg_deadline(guard, db, exc):
+            raise
+        return []
+    finish_pg_deadline(guard, db, rows=len(rows))
+    return rows
+
+
+def _retrieval_floor_ms(settings: Any) -> int:
+    return max(1, int(getattr(settings, "retrieval_statement_floor_ms", 10)))
+
+
+def _backend_slice_ms(settings: Any) -> int:
+    return max(1, int(getattr(settings, "context_backend_timeout_ms", 60)))
 
 
 def _resolve_owner_scope(*, scope: ResolvedScope) -> tuple[set[str], bool, list[str]]:
@@ -381,75 +439,94 @@ def _search_scale_trigger_met(
     workspace_id: str,
     owner_id: str,
 ) -> bool:
+    """Best-effort scale probes. Each runs inside its own savepoint.
+
+    Both queries are optional diagnostics, but they used to run directly on the caller's request session
+    and call ``db.rollback()`` from a bare ``except``. On Postgres the ``retrieval_eval_runs`` probe
+    raised UndefinedTable on every request, so that rollback silently discarded whatever the turn had
+    already written -- including the task-state CAS. A savepoint keeps a failed probe local to itself.
+    """
+
     now = datetime.now(tz=UTC)
     try:
-        event_count = int(
-            db.execute(
-                text(
-                    """
-                    SELECT COUNT(1)
-                    FROM events
-                    WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
-                      AND (context->>'_tce_owner' IS NULL OR context->>'_tce_owner' = :owner_id)
-                    """
-                ),
-                {"workspace_id": workspace_id, "owner_id": owner_id},
-            ).scalar()
-            or 0
-        )
+        with db.begin_nested():
+            event_count = int(
+                db.execute(
+                    text(
+                        """
+                        SELECT COUNT(1)
+                        FROM events
+                        WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
+                          AND (context->>'_tce_owner' IS NULL OR context->>'_tce_owner' = :owner_id)
+                        """
+                    ),
+                    {"workspace_id": workspace_id, "owner_id": owner_id},
+                ).scalar()
+                or 0
+            )
         if event_count >= 10000:
             return True
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         pass
     try:
-        row = db.execute(
-            text(
-                """
-                SELECT
-                    COUNT(1) AS samples,
-                    AVG((COALESCE(style_alignment, 0) + COALESCE(decision_traceability, 0)) / 2.0) AS avg_score
-                FROM retrieval_eval_runs
-                WHERE workspace_id = :workspace_id
-                  AND user_id = :user_id
-                  AND completed_at >= :cutoff
-                """
-            ),
-            {
-                "workspace_id": workspace_id,
-                "user_id": owner_id,
-                "cutoff": now - timedelta(days=7),
-            },
-        ).mappings().first()
+        with db.begin_nested():
+            row = (
+                db.execute(
+                    text(
+                        """
+                        SELECT
+                            COUNT(1) AS samples,
+                            AVG((COALESCE(style_alignment, 0) + COALESCE(decision_traceability, 0)) / 2.0) AS avg_score
+                        FROM retrieval_eval_runs
+                        WHERE workspace_id = :workspace_id
+                          AND user_id = :user_id
+                          AND completed_at >= :cutoff
+                        """
+                    ),
+                    {
+                        "workspace_id": workspace_id,
+                        "user_id": owner_id,
+                        "cutoff": now - timedelta(days=7),
+                    },
+                )
+                .mappings()
+                .first()
+            )
         if row is not None and int(row.get("samples") or 0) >= 3:
             if float(row.get("avg_score") or 1.0) < 0.72:
                 return True
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         pass
     return False
 
 
 def _embed_cache_key(query: str) -> str:
-    normalized_query = _collapse_whitespace(query).strip().lower()
-    return f"tce:embed:{hashlib.sha256(normalized_query.encode()).hexdigest()[:16]}"
+    """Model- and dimension-scoped, so a model swap cannot serve stale vectors."""
+    settings = get_settings()
+    return embedding_cache_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        dimensions=int(getattr(settings, "embed_dimensions", 1024)),
+        query_text=query,
+    )
 
 
-def _embed_timeout_cooldown_key(query: str) -> str:
-    normalized_query = _collapse_whitespace(query).strip().lower()
-    return f"tce:embed:cooldown:{hashlib.sha256(normalized_query.encode()).hexdigest()[:16]}"
+def _embed_timeout_cooldown_key(cooldown_scope: str) -> str:
+    """Model- and scope-keyed cooldown.
+
+    ``cooldown_scope`` is the workspace id at every retrieval call site: one slow embedding
+    model should silence the workspace that hit it, not one exact query string.
+    """
+    settings = get_settings()
+    return embedding_cooldown_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        workspace_id=_collapse_whitespace(cooldown_scope).strip().lower(),
+    )
 
 
-def _is_embedding_timeout_cooldown_active(query: str, *, settings: Any) -> bool:
+def _is_embedding_timeout_cooldown_active(cooldown_scope: str, *, settings: Any) -> bool:
     if not bool(getattr(settings, "search_embedding_timeout_cooldown_enabled", True)):
         return False
-    key = _embed_timeout_cooldown_key(query)
+    key = _embed_timeout_cooldown_key(cooldown_scope)
     now = monotonic()
     memo_expiry = _EMBED_TIMEOUT_COOLDOWN_MEMO.get(key)
     if memo_expiry is not None:
@@ -469,10 +546,12 @@ def _is_embedding_timeout_cooldown_active(query: str, *, settings: Any) -> bool:
         return False
 
 
-def _mark_embedding_timeout_cooldown(query: str, *, settings: Any, cooldown_seconds: float) -> None:
+def _mark_embedding_timeout_cooldown(
+    cooldown_scope: str, *, settings: Any, cooldown_seconds: float
+) -> None:
     if cooldown_seconds <= 0:
         return
-    key = _embed_timeout_cooldown_key(query)
+    key = _embed_timeout_cooldown_key(cooldown_scope)
     if len(_EMBED_TIMEOUT_COOLDOWN_MEMO) >= _EMBED_TIMEOUT_COOLDOWN_MEMO_MAX_SIZE:
         _EMBED_TIMEOUT_COOLDOWN_MEMO.pop(next(iter(_EMBED_TIMEOUT_COOLDOWN_MEMO)))
     _EMBED_TIMEOUT_COOLDOWN_MEMO[key] = monotonic() + cooldown_seconds
@@ -615,11 +694,20 @@ def _read_feedback_signals(
     workspace_id: str,
     event_ids: list[Any],
     settings: Any,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[Any, float]:
     if not bool(getattr(settings, "search_feedback_enabled", True)) or not event_ids:
         return {}
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="feedback_signals",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT source_event_id AS event_id,
@@ -644,7 +732,8 @@ def _read_feedback_signals(
                 """
             ),
             {"workspace_id": workspace_id, "event_ids": [str(value) for value in event_ids]},
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         return {}
 
@@ -669,11 +758,21 @@ def _load_episode_score_lookup(
     owner_ids: list[str],
     query_text: str,
     max_rows: int = 180,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[Any, float]:
     if not owner_ids or not str(query_text or "").strip():
         return {}
+    settings = get_settings()
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="episode_scores",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT eel.event_id,
@@ -693,7 +792,8 @@ def _load_episode_score_lookup(
                 "owner_ids": owner_ids,
                 "row_limit": max(20, int(max_rows)),
             },
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         return {}
     scores: dict[Any, float] = {}
@@ -838,9 +938,22 @@ def _qdrant_search_longterm(
     search_limit: int,
     settings: Any,
     consumer_ctx: ConsumerContext,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[list[str], dict[str, float], str | None]:
     base_url = _qdrant_base_url(settings)
     timeout_seconds = _qdrant_timeout_seconds(settings)
+    qdrant_timeout_ms = max(20, int(getattr(settings, "qdrant_timeout_ms", 60)))
+    if deadline is not None:
+        if not deadline.allows(qdrant_timeout_ms):
+            if ledger is not None:
+                ledger.record_skip(
+                    "qdrant",
+                    remaining_ms=deadline.remaining_ms(),
+                    reason=RETRIEVAL_REASON_DEADLINE_SKIP,
+                )
+            return [], {}, "deadline_expired_skip"
+        timeout_seconds = max(0.01, deadline.slice_ms(qdrant_timeout_ms) / 1000.0)
     collection = _qdrant_collection(settings)
     retry_attempts = max(1, int(getattr(settings, "qdrant_retry_max_attempts", 2)))
     retry_backoff_ms = max(1, int(getattr(settings, "qdrant_retry_backoff_ms", 12)))
@@ -863,6 +976,8 @@ def _qdrant_search_longterm(
     started = monotonic()
     body: dict[str, Any] = {}
     for attempt in range(retry_attempts):
+        if deadline is not None and not deadline.allows(qdrant_timeout_ms):
+            break
         try:
             with httpx.Client(base_url=base_url, timeout=timeout_seconds) as client:
                 response = client.post(f"/collections/{collection}/points/search", json=payload)
@@ -952,8 +1067,18 @@ def run_search(
     search_request: EventSearchRequest,
     consumer_ctx: ConsumerContext,
     policy_engine: PolicyEngine,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[list[EventSearchHit], list[Any], int, dict[str, Any]]:
+    """``deadline`` and ``ledger`` are the retrieval child and the turn ledger, passed BY VALUE.
+
+    Both default to ``None`` so ``POST /v1/search`` and ``POST /v1/context/bundle`` are
+    unchanged: with no deadline the guard installs nothing at all.
+    """
     settings = get_settings()
+    retrieval_floor_ms = _retrieval_floor_ms(settings)
+    backend_slice_ms = _backend_slice_ms(settings)
     retrieval_started = monotonic()
     query_text = search_request.query.strip()
     match_all = bool(search_request.match_all) or query_text in {"", "*"}
@@ -1224,7 +1349,9 @@ def run_search(
             return result
 
         def _do_embed() -> list[float] | None:
-            if _is_embedding_timeout_cooldown_active(query_text, settings=settings):
+            if _is_embedding_timeout_cooldown_active(
+                consumer_ctx.workspace_id, settings=settings
+            ):
                 embed_state["reason"] = "embedding_timeout_cooldown"
                 return None
             try:
@@ -1242,7 +1369,7 @@ def run_search(
                     embed_state["reason"] = "embedding_retry_exhausted"
                     if embed_timeout_cooldown_enabled:
                         _mark_embedding_timeout_cooldown(
-                            query_text,
+                            consumer_ctx.workspace_id,
                             settings=settings,
                             cooldown_seconds=embed_timeout_cooldown_seconds,
                         )
@@ -1345,7 +1472,15 @@ def run_search(
         fts_rows: list[dict[str, Any]] = []
         if tsquery:
             try:
-                fts_rows = _run_fts_query(tsquery)
+                fts_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="fts_primary",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=lambda: _run_fts_query(tsquery),
+                )
                 lexical_channel = "fts_primary"
             except (ProgrammingError, DBAPIError) as exc:
                 logger.warning("event FTS query failed; continuing with ILIKE candidates: %s", exc)
@@ -1357,7 +1492,15 @@ def run_search(
         # fill the requested result set. Running both paths unconditionally made
         # every search pay for the legacy full scan.
         if len(fts_rows) < search_request.k:
-            ilike_rows = _run_lexical_query(lexical_terms, expansion_mode=False)
+            ilike_rows = _guarded_rows(
+                db,
+                deadline,
+                ledger,
+                name="lexical_fill",
+                requested_ms=backend_slice_ms,
+                floor_ms=retrieval_floor_ms,
+                run=lambda: _run_lexical_query(lexical_terms, expansion_mode=False),
+            )
             if fts_rows:
                 lexical_channel = "fts_plus_ilike_fill"
             elif lexical_channel != "ilike_fallback_error":
@@ -1411,7 +1554,15 @@ def run_search(
         trigram_rows: list[dict[str, Any]] = []
         if bool(getattr(settings, "search_rrf_enabled", False)):
             try:
-                trigram_rows = _run_trigram_query()
+                trigram_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="trigram",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=_run_trigram_query,
+                )
             except (ProgrammingError, DBAPIError) as exc:
                 logger.warning("event trigram query failed; continuing without trigram candidates: %s", exc)
                 db.rollback()
@@ -1431,7 +1582,20 @@ def run_search(
                 secondary_terms = [f"%{planned_query}%"]
                 if not secondary_terms[0].strip("%"):
                     continue
-                extra_rows = _run_lexical_query(secondary_terms, expansion_mode=False)
+                subquery_terms = list(secondary_terms)
+
+                def _run_subquery(terms: list[str] = subquery_terms) -> list[dict[str, Any]]:
+                    return _run_lexical_query(terms, expansion_mode=False)
+
+                extra_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name=f"lexical_subquery_{index}",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=_run_subquery,
+                )
                 for rank, row in enumerate(extra_rows):
                     ilike_rank_lookup.setdefault(row["id"], rank)
                 _merge_rows(extra_rows, str(planned.get("label") or "objective"))
@@ -1452,22 +1616,36 @@ def run_search(
             float(getattr(settings, "search_embedding_quick_timeout_seconds", configured_embed_timeout)),
         )
         embed_timeout = min(configured_embed_timeout, embed_quick_timeout)
+
+        def _join_timeout() -> float:
+            """Re-evaluated per join: slice_ms must never be cached, or the second join
+            spends a budget the first one already burned."""
+            if deadline is None:
+                return embed_timeout
+            return max(0.01, deadline.slice_ms(int(embed_timeout * 1000)) / 1000.0)
+
         try:
-            entity_event_ids = entity_future.result(timeout=embed_timeout)
+            entity_event_ids = entity_future.result(timeout=_join_timeout())
         except TimeoutError:
             logger.warning("entity-graph query timed out after %.2fs; continuing without graph bonus", embed_timeout)
             entity_event_ids = set()
+            if ledger is not None:
+                ledger.record_timeout("entity_graph", budget_ms=int(embed_timeout * 1000))
+            # cancel() is a no-op on a running future: the thread keeps working and the
+            # result is abandoned. P2 records the abandonment rather than resizing the pool.
             entity_future.cancel()
 
         try:
-            query_embedding = embed_future.result(timeout=embed_timeout)
+            query_embedding = embed_future.result(timeout=_join_timeout())
         except TimeoutError:
             logger.warning("vector embedding timed out after %.2fs; continuing lexical-only search", embed_timeout)
             query_embedding = None
             retrieval_reason = "embedding_timeout"
+            if ledger is not None:
+                ledger.record_timeout("embedding", budget_ms=int(embed_timeout * 1000))
             if embed_timeout_cooldown_enabled:
                 _mark_embedding_timeout_cooldown(
-                    query_text,
+                    consumer_ctx.workspace_id,
                     settings=settings,
                     cooldown_seconds=embed_timeout_cooldown_seconds,
                 )
@@ -1494,14 +1672,22 @@ def run_search(
                 LIMIT :ann_limit
             """
             try:
-                ann_rows = db.execute(
-                    text(ann_sql),
-                    {
-                        **params,
-                        "query_embedding": _embedding_as_vector_literal(query_embedding),
-                        "ann_limit": ann_limit,
-                    },
-                ).mappings().all()
+                ann_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="pgvector_ann",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=lambda: db.execute(
+                        text(ann_sql),
+                        {
+                            **params,
+                            "query_embedding": _embedding_as_vector_literal(query_embedding),
+                            "ann_limit": ann_limit,
+                        },
+                    ).mappings().all(),
+                )
                 for ann_row in ann_rows:
                     ann_similarity = float(ann_row.get("ann_similarity") or 0.0)
                     vector_similarity_lookup[ann_row["id"]] = max(
@@ -1532,6 +1718,8 @@ def run_search(
                         search_limit=ann_limit,
                         settings=settings,
                         consumer_ctx=consumer_ctx,
+                        deadline=deadline,
+                        ledger=ledger,
                     )
                     if qdrant_error:
                         if not retrieval_reason:
@@ -1545,14 +1733,22 @@ def run_search(
                               AND CAST(id AS TEXT) = ANY(:event_ids)
                             LIMIT :row_limit
                         """
-                        qdrant_rows = db.execute(
-                            text(qdrant_rows_sql),
-                            {
-                                **params,
-                                "event_ids": qdrant_ids,
-                                "row_limit": ann_limit,
-                            },
-                        ).mappings().all()
+                        qdrant_rows = _guarded_rows(
+                            db,
+                            deadline,
+                            ledger,
+                            name="qdrant_rows",
+                            requested_ms=backend_slice_ms,
+                            floor_ms=retrieval_floor_ms,
+                            run=lambda: db.execute(
+                                text(qdrant_rows_sql),
+                                {
+                                    **params,
+                                    "event_ids": qdrant_ids,
+                                    "row_limit": ann_limit,
+                                },
+                            ).mappings().all(),
+                        )
                         for q_row in qdrant_rows:
                             event_id_key = str(q_row.get("id") or "")
                             q_score = float(qdrant_scores.get(event_id_key, 0.0))
@@ -1636,12 +1832,16 @@ def run_search(
         workspace_id=consumer_ctx.workspace_id,
         event_ids=[row["id"] for row in rows],
         settings=settings,
+        deadline=deadline,
+        ledger=ledger,
     )
     handoff_map = _load_handoff_records_map(
         db,
         workspace_id=consumer_ctx.workspace_id,
         owner_ids=owner_scope_ids,
         max_records=max(search_request.k * 6, 30),
+        deadline=deadline,
+        ledger=ledger,
     )
     handoff_query_intent = handoff_intent(query_text)
     episode_score_lookup = _load_episode_score_lookup(
@@ -1650,6 +1850,8 @@ def run_search(
         owner_ids=owner_scope_ids,
         query_text=query_text,
         max_rows=max(search_request.k * 12, 120),
+        deadline=deadline,
+        ledger=ledger,
     ) if (planner_used and intent_retrieval_enabled) else {}
 
     def _score_rows(active_owner_scope: set[str]) -> tuple[list[tuple[float, dict[str, Any]]], int, int, bool]:
@@ -1811,6 +2013,11 @@ def run_search(
     )
     if match_all:
         retrieval_source = "none"
+    if ledger is not None and ledger.degraded():
+        # A truncated candidate set is LABELLED, never silently returned as complete.
+        retrieval_source = RETRIEVAL_SOURCE_DEADLINE_PARTIAL
+        if not retrieval_reason:
+            retrieval_reason = RETRIEVAL_REASON_DEADLINE_SKIP
     _bump_retrieval_counter(retrieval_source)
     episode_event_id_keys = {
         str(key) for key, value in episode_score_lookup.items() if float(value or 0.0) > 0.0
@@ -1863,4 +2070,9 @@ def run_search(
         "mmr_candidates": int(mmr_candidates),
         "citation_dup_ratio": float(round(citation_dup_ratio, 4)),
     }
+    # The ten deadline keys are always present, in both backends, whether or not a deadline
+    # was supplied — the parity assertion is on the key SET, not on the values.
+    retrieval_meta.update(
+        (ledger or RetrievalLedger()).to_meta(deadline)
+    )
     return hits, citations, blocked, retrieval_meta

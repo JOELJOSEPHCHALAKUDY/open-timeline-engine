@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from tce_shared.autonomy_context import summarize_hit_text
+from tce_shared.deadline import Deadline, RetrievalLedger
 from tce_shared.events import EventFilter, EventSearchRequest, EventSearchResponse
 from tce_shared.policy import ConsumerContext
 from tce_shared.scope import PROJECT_BOUND, ResolvedScope
 
 from .config import get_settings
 from .db import get_session_factory
+from .deadline_pg import absorb_pg_deadline, begin_pg_deadline, finish_pg_deadline
 from .graph import graph_snapshot_for_events
 from .policy import PolicyEngine
 from .schemas import ContextBundleRequest, ContextBundleResponse, EvidenceEvent, PatternItem
@@ -170,7 +172,11 @@ def build_context_bundle(
     request: ContextBundleRequest,
     consumer_ctx: ConsumerContext,
     policy_engine: PolicyEngine,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[ContextBundleResponse, int, list[str]]:
+    """``deadline`` is the retrieval child, built by the caller immediately above this call."""
     settings = get_settings()
     scope = consumer_ctx.scope or scope_from_consumer(consumer_ctx)
     domain = request.app_context.get("domain") if isinstance(request.app_context, dict) else None
@@ -189,44 +195,87 @@ def build_context_bundle(
     )
 
     # Run patterns + workflows + graph in parallel (each uses own DB session or is independent)
-    def _patterns_task() -> list[PatternItem]:
+    backend_ms = max(1, int(getattr(settings, "context_backend_timeout_ms", 60)))
+    floor_ms = max(1, int(getattr(settings, "retrieval_statement_floor_ms", 10)))
+
+    def _in_own_session[T](name: str, run: Any, empty: T) -> T:
+        """Each pool task opens its own session, so it needs its own guard: a
+        ``statement_timeout`` set on the request session does not reach another thread's."""
         s = get_session_factory()()
         try:
-            return _fetch_patterns_scoped(s, scope, domain=domain, min_confidence=min_confidence)
+            guard = begin_pg_deadline(
+                s, deadline, name=name, ledger=ledger, requested_ms=backend_ms, floor_ms=floor_ms
+            )
+            if guard is None:
+                return empty
+            try:
+                result: T = run(s)
+            except Exception as exc:  # noqa: BLE001 - absorb only a cancellation
+                if not absorb_pg_deadline(guard, s, exc):
+                    raise
+                return empty
+            finish_pg_deadline(guard, s)
+            return result
         finally:
             s.rollback()
             s.close()
+
+    def _patterns_task() -> list[PatternItem]:
+        empty_patterns: list[PatternItem] = []
+        return _in_own_session(
+            "patterns",
+            lambda s: _fetch_patterns_scoped(
+                s, scope, domain=domain, min_confidence=min_confidence
+            ),
+            empty_patterns,
+        )
 
     def _workflows_task() -> list[dict[str, Any]]:
-        s = get_session_factory()()
-        try:
-            return _fetch_workflows(s, scope, domain)
-        finally:
-            s.rollback()
-            s.close()
+        empty_workflows: list[dict[str, Any]] = []
+        return _in_own_session(
+            "workflows", lambda s: _fetch_workflows(s, scope, domain), empty_workflows
+        )
 
     def _graph_task(citation_ids: list[Any]) -> dict[str, Any]:
+        empty: dict[str, Any] = {"entities": [], "relationships": [], "facts": []}
         if not citation_ids:
-            return {"entities": [], "relationships": [], "facts": []}
-        s = get_session_factory()()
-        try:
-            return graph_snapshot_for_events(
+            return empty
+        return _in_own_session(
+            "graph_snapshot",
+            lambda s: graph_snapshot_for_events(
                 db=s,
                 workspace_id=consumer_ctx.workspace_id,
                 owner_id=consumer_ctx.owner_id,
                 event_ids=citation_ids,
-            )
-        finally:
-            s.rollback()
-            s.close()
+            ),
+            empty,
+        )
 
     patterns_future = _BUNDLE_EXECUTOR.submit(_patterns_task)
     workflows_future = _BUNDLE_EXECUTOR.submit(_workflows_task)
-    hits, citations, blocked, retrieval_meta = run_search(db, search_request, consumer_ctx, policy_engine)
+    hits, citations, blocked, retrieval_meta = run_search(
+        db, search_request, consumer_ctx, policy_engine, deadline=deadline, ledger=ledger
+    )
     graph_future = _BUNDLE_EXECUTOR.submit(_graph_task, citations)
-    top_patterns = patterns_future.result(timeout=5)
-    relevant_workflows = workflows_future.result(timeout=5)
-    graph_snapshot = graph_future.result(timeout=5)
+
+    def _join[T](future: Any, name: str, empty: T) -> T:
+        """The 5 s joins become budget-derived. ``future.cancel()`` is a no-op on a running
+        future, so the abandoned work is recorded rather than pretended away (residual R-2)."""
+        timeout = 5.0 if deadline is None else max(0.01, deadline.remaining_seconds())
+        try:
+            return future.result(timeout=timeout)  # type: ignore[no-any-return]
+        except TimeoutError:
+            if ledger is not None:
+                ledger.record_timeout(name, budget_ms=int(timeout * 1000))
+            future.cancel()
+            return empty
+
+    no_patterns: list[PatternItem] = []
+    no_workflows: list[dict[str, Any]] = []
+    no_graph: dict[str, Any] = {"entities": [], "relationships": [], "facts": []}
+    top_patterns = _join(patterns_future, "patterns_join", no_patterns)
+    relevant_workflows = _join(workflows_future, "workflows_join", no_workflows)
+    graph_snapshot = _join(graph_future, "graph_join", no_graph)
 
     evidence_events = [
         EvidenceEvent(

@@ -79,6 +79,27 @@ def behavior_evidence_json(workspace_id: str, subject_id: str, observation_id: s
     )
 
 
+def _require_task_resource_scope(workspace_id: str) -> None:
+    settings = get_settings()
+    if workspace_id != settings.mcp_workspace_id:
+        raise ValueError("task resource scope does not match the authenticated MCP identity")
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/task/{task_id}/state.md",
+    name="Task state projection",
+    description=(
+        "Deterministic read-only Markdown projection of one task's state: objective and contract "
+        "revision, status and next permitted action, approved constraints, open decisions, plan "
+        "steps, unresolved effects, latest verification and citations. Never re-ingested as evidence."
+    ),
+    mime_type="text/markdown; charset=utf-8",
+)
+def task_state_markdown(workspace_id: str, task_id: str) -> str:
+    _require_task_resource_scope(workspace_id)
+    return str(tools.get_task_state_projection(task_id=task_id)["content"])
+
+
 @mcp.tool(name="tce.search_events", description="Search timeline events with filters and citations")
 def search_events(query: str, filters: dict | None = None, k: int = 10, time_range: dict | None = None, app_context: dict | None = None) -> dict:
     return tools.search_events(query=query, filters=filters, k=k, time_range=time_range, app_context=app_context)
@@ -739,7 +760,8 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "the directive lease you must echo on tce.report_execution. capture_delivery_state (healthy|gap|unavailable|"
         "unknown) reports the trusted human-input capture channel: when it is gap or unavailable under an unattended "
         "autonomy profile the API pauses ('AUTONOMOUS MODE PAUSED: capture channel'); show that text and do not mutate. "
-        "open_decision_opportunity_id, when set, is the pending human choice awaiting host-captured input."
+        "open_decision_opportunity_id, when set, is the pending human choice awaiting host-captured input. "
+        "planning_pending=true means there is no executable directive yet; follow next_step and poll, never start work."
     ),
 )
 def takeover_step(

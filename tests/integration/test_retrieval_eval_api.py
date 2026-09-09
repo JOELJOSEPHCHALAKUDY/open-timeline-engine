@@ -26,6 +26,13 @@ def test_retrieval_eval_run_and_status_live() -> None:
         pytest.skip("TCE API is not reachable for integration test")
     if health.status_code >= 500:
         pytest.skip("TCE API unhealthy for integration test")
+    # Confirm this really is TCE. The default port is a common one, and another service answering 200
+    # with an HTML page here produced a 405 on the POST below that read as a TCE bug for weeks.
+    try:
+        if health.json().get("status") != "ok":
+            raise ValueError("unexpected health payload")
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        pytest.skip(f"{base_url} is not a TCE API (unexpected /v1/health payload)")
 
     run_resp = requests.post(
         f"{base_url}/v1/retrieval/eval/run",

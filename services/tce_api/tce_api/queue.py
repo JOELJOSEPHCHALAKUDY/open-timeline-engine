@@ -39,7 +39,11 @@ def queue_name_for_job(job_name: str) -> str:
         return settings.queue_patterns_name
     if job_name in {"tce_worker.jobs.archive_events.run"}:
         return settings.queue_lifecycle_name
-    if job_name in {"tce_worker.jobs.decision_extraction.run"}:
+    if job_name in {
+        "tce_worker.jobs.decision_extraction.run",
+        "tce_worker.jobs.planning.run",
+        "tce_worker.jobs.dream_synthesis.run",
+    }:
         return settings.queue_default_name
     return settings.queue_default_name
 

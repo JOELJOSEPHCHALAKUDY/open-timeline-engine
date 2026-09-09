@@ -57,6 +57,12 @@ def enqueue_maintenance_jobs() -> None:
             int(getattr(settings, "decision_extraction_batch_size", 100)),
             retry=retry,
         )
+    if bool(getattr(settings, "planning_enabled", True)):
+        # Full never sweeps planning jobs in-process; it enqueues the job, which is what gives
+        # a queue_unavailable job a specified path back to execution on the next tick.
+        default_queue.enqueue(
+            "tce_worker.jobs.planning.run", None, int(settings.planning_job_batch_size), retry=retry
+        )
     if bool(getattr(settings, "qdrant_enabled", False)) and bool(getattr(settings, "qdrant_sync_enabled", True)):
         lifecycle_queue.enqueue(
             "tce_worker.jobs.qdrant_sync.run",

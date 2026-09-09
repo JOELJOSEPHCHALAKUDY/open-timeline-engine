@@ -251,7 +251,10 @@ class Settings(BaseSettings):
     takeover_plan_max_steps: int = 8
     # Use the model gateway to decompose an objective. Off by default; the
     # deterministic fallback runs whenever this is off or the model fails.
-    takeover_plan_llm_enabled: bool = True
+    # P2 R6: this knob now selects whether the WORKER may use a model to decompose an
+    # objective, not whether the request thread may. The bounded control path never calls a
+    # model gateway on the plan path (exit gate G1a).
+    takeover_plan_llm_enabled: bool = False
     takeover_plan_llm_timeout_seconds: int = 25
     # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
     # A hosted API is the better default here: decomposition runs once per
@@ -259,7 +262,8 @@ class Settings(BaseSettings):
     # both slower and weaker at planning.
     takeover_plan_llm_provider: str = "openai"
     # Form dreams by reading the user's own messages instead of counting rows.
-    takeover_dream_llm_enabled: bool = True
+    # P2: consumed by the worker's dream_synthesis job, never by the request thread.
+    takeover_dream_llm_enabled: bool = False
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
@@ -352,6 +356,23 @@ class Settings(BaseSettings):
     cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
 
+    # --- P2 durable task state and bounded latency (design 0.5) ---
+    takeover_turn_budget_ms: int = 3500
+    task_state_enabled: bool = True
+    task_state_markdown_enabled: bool = True
+    task_state_markdown_max_steps: int = 24
+    planning_async_enabled: bool | None = None
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    planning_pending_hint_ms: int = 1500
+    retrieval_deadline_enabled: bool = True
+    retrieval_deadline_floor_ms: int = 5
+    retrieval_statement_floor_ms: int = 10
+    retrieval_advisor_min_ms: int = 250
+    sqlite_progress_instructions: int = 1000
+
     @property
     def token_set(self) -> set[str]:
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}
@@ -414,6 +435,14 @@ class Settings(BaseSettings):
             max(200, int(self.advisor_read_timeout_ms)),
             max(200, int(self.advisor_read_timeout_hard_cap_ms)),
         )
+
+    @property
+    def effective_planning_async_enabled(self) -> bool:
+        """R6: async planning follows the model planner. With the model off (the default),
+        planning stays inline and deterministic and planning_pending is never emitted."""
+        if self.planning_async_enabled is not None:
+            return bool(self.planning_async_enabled)
+        return bool(getattr(self, "takeover_plan_llm_enabled", False))
 
     @property
     def effective_search_embedding_timeout_seconds(self) -> float:

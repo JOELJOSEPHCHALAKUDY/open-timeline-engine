@@ -71,6 +71,25 @@ _GUARDED_SETTINGS = (
     "takeover_needs_human_threshold_hot",
     "takeover_needs_human_threshold_cold",
     "takeover_autonomy_policy_default",
+    # P2 §0.5 — the durable-task-state and retrieval-deadline settings. They are guarded
+    # here for the same reason as every name above: this fixture mutates the process-wide
+    # Settings singleton, and an unguarded name leaks into every later test in the run.
+    # getattr/_MISSING makes listing them safe before Builder C adds them to the Lite config.
+    "takeover_turn_budget_ms",
+    "task_state_enabled",
+    "task_state_markdown_enabled",
+    "task_state_markdown_max_steps",
+    "planning_async_enabled",
+    "planning_job_lease_seconds",
+    "planning_job_max_attempts",
+    "planning_job_batch_size",
+    "planning_job_backoff_cap_seconds",
+    "planning_pending_hint_ms",
+    "retrieval_deadline_enabled",
+    "retrieval_deadline_floor_ms",
+    "retrieval_statement_floor_ms",
+    "retrieval_advisor_min_ms",
+    "sqlite_progress_instructions",
 )
 
 _BOUND_APP_CONTEXT: dict[str, Any] = {

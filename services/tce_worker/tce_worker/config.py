@@ -76,6 +76,22 @@ class Settings(BaseSettings):
     behavior_storage_min_score: float = 0.55
     security_encryption_key_id: str = "local-dev"
     security_encryption_secret: str = ""
+    planning_enabled: bool = True
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    # These two knobs now select whether the WORKER may use a model, not whether a request
+    # thread may. Off by default: the bounded control path must never wait on one.
+    takeover_plan_llm_enabled: bool = False
+    takeover_dream_llm_enabled: bool = False
+    takeover_plan_llm_timeout_seconds: float = 25.0
+    takeover_plan_max_steps: int = 8
+    # Without these two, create_gateway falls through to its 30 s default in the worker.
+    advisor_attempt_timeout_ms: int = 900
+    advisor_read_timeout_ms: int = 900
+    # Read by the relocated dream-message reader on its first line.
+    block_sensitivity: int = 3
 
     @property
     def confidence_weights(self) -> tuple[float, float, float, float]:

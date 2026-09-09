@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import uuid
@@ -12,10 +11,17 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from tce_model_gateway import get_gateway
+from tce_shared.deadline import (
+    ADVISOR_TURN_DEADLINE,
+    Deadline,
+    RetrievalLedger,
+    embedding_cache_key,
+)
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 
 from .cache_clients import get_redis_client
 from .config import get_settings
+from .deadline_pg import absorb_pg_deadline, begin_pg_deadline, finish_pg_deadline
 
 logger = logging.getLogger(__name__)
 _OBS_EMBED_CACHE_TTL = 600
@@ -90,12 +96,18 @@ def query_similar_observations(
     situation_type: str,
     situation_text: str | None = None,
     limit: int = 5,
+    *,
+    ledger: RetrievalLedger | None = None,
 ) -> list[dict[str, Any]]:
     """Query promoted observations for one behavior subject.
 
     Executor identity is intentionally not part of this filter: multiple
     executors may contribute evidence for the same authorized human subject.
+
+    The deadline arrives through ``ADVISOR_TURN_DEADLINE`` rather than a parameter: this
+    function is reached from ``clone_advice``, several frames below the turn that owns it.
     """
+    deadline: Deadline | None = ADVISOR_TURN_DEADLINE.get()
     settings = get_settings()
     _ensure_decision_observation_schema(db)
     candidates = _situation_candidates(situation_type)
@@ -159,11 +171,22 @@ def query_similar_observations(
     if not query_embedding:
         return results[:limit]
 
+    # This block used to open a bare `with db.begin_nested(): SET LOCAL ...`. RELEASE does not
+    # revert SET LOCAL, so it left its timeout in force for the rest of the transaction.
+    timeout_ms = max(1, int(getattr(settings, "obs_semantic_query_timeout_ms", 80)))
+    floor_ms = max(1, int(getattr(settings, "retrieval_statement_floor_ms", 10)))
+    guard = begin_pg_deadline(
+        db,
+        deadline if deadline is not None else Deadline.unbounded("observations"),
+        name="observation_ann",
+        ledger=ledger,
+        requested_ms=timeout_ms,
+        floor_ms=floor_ms,
+    )
+    if guard is None:
+        return results[:limit]
     try:
-        timeout_ms = max(1, int(getattr(settings, "obs_semantic_query_timeout_ms", 80)))
-        with db.begin_nested():
-            db.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
-            vector_rows = db.execute(
+        vector_rows = db.execute(
                 text(
                     """
                     SELECT id, situation_type, situation_summary, context_snapshot,
@@ -191,8 +214,12 @@ def query_similar_observations(
                 },
             ).fetchall()
     except Exception as exc:
-        logger.warning("semantic observation recall failed; using exact-only observations: %s", exc)
+        if not absorb_pg_deadline(guard, db, exc):
+            logger.warning(
+                "semantic observation recall failed; using exact-only observations: %s", exc
+            )
         return results[:limit]
+    finish_pg_deadline(guard, db, rows=len(vector_rows))
 
     seen = {item["id"] for item in results}
     for row in vector_rows:
@@ -260,12 +287,21 @@ def _embedding_as_vector_literal(embedding: list[float]) -> str:
     return "[" + ",".join(f"{float(value):.8f}" for value in embedding) + "]"
 
 
+def _observation_embedding_cache_key(query: str, settings: Any) -> str:
+    """Model- and dimension-scoped, so a model swap cannot serve stale vectors."""
+    return embedding_cache_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        dimensions=int(getattr(settings, "embed_dimensions", 1024)),
+        query_text=query,
+    )
+
+
 def _get_cached_observation_embedding(query: str, settings: Any) -> list[float] | None:
     try:
         cache = get_redis_client(settings.redis_url)
         if cache is None:
             return None
-        key = f"tce:obs-embed:{hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]}"
+        key = _observation_embedding_cache_key(query, settings)
         raw = cache.get(key)
         if raw:
             decoded = json.loads(raw)
@@ -281,7 +317,7 @@ def _set_cached_observation_embedding(query: str, embedding: list[float], settin
         cache = get_redis_client(settings.redis_url)
         if cache is None:
             return
-        key = f"tce:obs-embed:{hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]}"
+        key = _observation_embedding_cache_key(query, settings)
         cache.setex(key, _OBS_EMBED_CACHE_TTL, json.dumps(embedding))
     except Exception:
         pass
