@@ -77,6 +77,18 @@ else
   COMPOSE_FILE="$FULL_COMPOSE"
 fi
 
+# The host-capture credential never lives in .env (that file is mounted into the API
+# container and readable from any executor shell). Compose bind-mounts the 0600 token file
+# read-only at /run/secrets/tce_host_capture_token instead; docker would create a
+# root-owned DIRECTORY if the source were missing, so make sure the file exists first.
+# An empty file simply means host capture stays disabled until ./scripts/install.sh runs.
+TCE_HOST_CAPTURE_TOKEN_FILE="${TCE_HOST_CAPTURE_TOKEN_FILE:-${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine/host_capture.token}"
+if [ ! -f "$TCE_HOST_CAPTURE_TOKEN_FILE" ]; then
+  (umask 077 && mkdir -p "$(dirname "$TCE_HOST_CAPTURE_TOKEN_FILE")" && : > "$TCE_HOST_CAPTURE_TOKEN_FILE") || true
+  chmod 600 "$TCE_HOST_CAPTURE_TOKEN_FILE" 2>/dev/null || true
+fi
+export TCE_HOST_CAPTURE_TOKEN_FILE
+
 echo "Starting mode: $MODE"
 echo "Compose file: $COMPOSE_FILE"
 

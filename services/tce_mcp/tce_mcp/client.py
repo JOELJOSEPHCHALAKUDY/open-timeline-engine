@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, cast
 from urllib.parse import quote
@@ -10,10 +11,46 @@ from urllib3.util.retry import Retry
 
 from .config import get_settings
 
+# The host capture credential (trusted human-input hook) is a separate capability. An executor
+# must never present it, and no executor tool may call the host-only endpoints.
+_HOST_CAPTURE_ENV_KEYS = ("TCE_HOST_CAPTURE_TOKENS", "TCE_HOST_CAPTURE_TOKEN")
+_HOST_ONLY_PATH_PREFIXES = ("/v1/inputs",)
+
+
+class HostCredentialLeakError(RuntimeError):
+    """The executor was started with the host capture credential as its API token."""
+
+
+def _host_capture_tokens_from_env() -> frozenset[str]:
+    tokens: set[str] = set()
+    for key in _HOST_CAPTURE_ENV_KEYS:
+        for item in (os.environ.get(key) or "").split(","):
+            if item.strip():
+                tokens.add(item.strip())
+    return frozenset(tokens)
+
+
+def _scrub_host_capture_env() -> None:
+    for key in _HOST_CAPTURE_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def assert_executor_credential_is_not_host_capture(api_token: str) -> None:
+    """Refuse to run the executor with the host attestation credential; drop it from the process env either way."""
+    host_tokens = _host_capture_tokens_from_env()
+    _scrub_host_capture_env()
+    if api_token and api_token in host_tokens:
+        raise HostCredentialLeakError("TCE_API_TOKEN equals a TCE_HOST_CAPTURE_TOKENS entry; the executor must never present the host capture credential (see docs/plugin-setup.md)")
+
+
+def is_host_only_path(path: str) -> bool:
+    return str(path).startswith(_HOST_ONLY_PATH_PREFIXES)
+
 
 class TCEApiClient:
     def __init__(self) -> None:
         settings = get_settings()
+        assert_executor_credential_is_not_host_capture(str(settings.api_token or ""))
         self.base_url = settings.api_base_url.rstrip("/")
         self.request_timeout_seconds = max(5.0, float(getattr(settings, "mcp_http_timeout_seconds", 90.0)))
         self.default_session_id = settings.mcp_effective_session_id
@@ -64,6 +101,8 @@ class TCEApiClient:
         return normalized
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        if is_host_only_path(path):
+            raise PermissionError(f"executor client refuses host-capture endpoint {path}")
         response = self.session.request(
             method,
             f"{self.base_url}{path}",

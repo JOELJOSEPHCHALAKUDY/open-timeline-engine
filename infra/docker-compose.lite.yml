@@ -28,11 +28,15 @@ services:
       TCE_BEHAVIOR_PROCESS_MIN_SUPPORT: ${TCE_BEHAVIOR_PROCESS_MIN_SUPPORT:-2}
       TCE_CAPABILITY_GRANT_TTL_SECONDS: ${TCE_CAPABILITY_GRANT_TTL_SECONDS:-120}
       TCE_BEHAVIOR_CONTROL_RETENTION_DAYS: ${TCE_BEHAVIOR_CONTROL_RETENTION_DAYS:-365}
+      # Trusted human-input credential: read from a read-only mount of the host's 0600 token
+      # file, never from .env (which is mounted into this container and readable by executors).
+      TCE_HOST_CAPTURE_TOKENS_FILE: /run/secrets/tce_host_capture_token
     ports:
       - "${TCE_API_PORT:-8080}:8080"
     volumes:
       - tce_lite_data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${TCE_HOST_CAPTURE_TOKEN_FILE:-${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine/host_capture.token}:/run/secrets/tce_host_capture_token:ro
     healthcheck:
       test:
         [

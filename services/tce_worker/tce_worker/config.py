@@ -68,6 +68,14 @@ class Settings(BaseSettings):
     qdrant_sync_max_batches: int = 10
     worker_listen_queues: str = "tce-default,tce-embeddings,tce-patterns,tce-lifecycle"
     worker_enable_scheduler: bool = True
+    decision_extraction_enabled: bool = True
+    decision_extraction_batch_size: int = 100
+    decision_extraction_lease_seconds: int = 300
+    decision_extraction_max_attempts: int = 10
+    capture_opportunity_ttl_seconds: int = 3600
+    behavior_storage_min_score: float = 0.55
+    security_encryption_key_id: str = "local-dev"
+    security_encryption_secret: str = ""
 
     @property
     def confidence_weights(self) -> tuple[float, float, float, float]:

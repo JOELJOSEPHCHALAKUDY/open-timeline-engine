@@ -34,6 +34,8 @@ from tce_lite_api.main import app
 from tce_shared.identity import credential_fingerprint
 
 _TOKEN = "trust-boundary-token"
+# A second credential the server binds to a human claim: identity_verified even in compat mode.
+_OPERATOR_TOKEN = "trust-boundary-operator-token"
 _MISSING = object()
 _GUARDED_SETTINGS = (
     "lite_db_path",
@@ -83,10 +85,22 @@ def lite_client(tmp_path: Path) -> Iterator[TestClient]:
     snapshot = _snapshot_settings()
     settings = get_settings()
     settings.lite_db_path = str(tmp_path / "trust-boundary.db")
-    settings.api_tokens = _TOKEN
+    settings.api_tokens = f"{_TOKEN},{_OPERATOR_TOKEN}"
     settings.default_operation_mode = "clone_advisor"
     settings.identity_claims_mode = "compat"
-    settings.identity_claims_json = ""
+    # Compat mode with ONE server-bound claim: everything asserted through X-TCE-* on _TOKEN stays
+    # unverified, while _OPERATOR_TOKEN carries a human identity the server established itself.
+    settings.identity_claims_json = json.dumps(
+        {
+            credential_fingerprint("bearer", _OPERATOR_TOKEN): {
+                "consumer": "operator-ui",
+                "role": "user",
+                "workspace_id": "personal",
+                "user_id": "shared-user",
+                "behavior_subject_id": "shared-user",
+            }
+        }
+    )
     settings.workspace_access_mode = "compat"
     try:
         with TestClient(app) as client:
@@ -151,6 +165,17 @@ def _headers(consumer: str = "worker-a", *, user: str | None = None, role: str =
     if workspace is not None:
         headers["X-TCE-Workspace"] = workspace
     return headers
+
+
+def _verified_operator_headers() -> dict[str, str]:
+    """A human identity the server bound to the credential, not one asserted in a header."""
+    return {
+        "Authorization": f"Bearer {_OPERATOR_TOKEN}",
+        "X-TCE-Consumer": "operator-ui",
+        "X-TCE-Role": "user",
+        "X-TCE-User": "shared-user",
+        "X-TCE-Behavior-Subject": "shared-user",
+    }
 
 
 def _bearer(token: str) -> dict[str, str]:
@@ -1142,9 +1167,20 @@ def test_takeover_feedback_executor_correction_is_review_gated_not_learned(lite_
     assert executor_rows[0]["storage_decision"] == "pending_review", executor_rows[0]
     assert executor_rows[0]["confirmed_at"] is None
 
-    # A human operator's correction keeps today's behaviour: explicit, learning-eligible, still unconfirmed.
-    human_text = f"operator correction {uuid.uuid4().hex[:6]}"
-    _feedback(lite_client, session_id, operator, human_text)
+    # A header-asserted operator (X-TCE-Role: user on the same unbound bearer) is authored as human-origin
+    # 'explicit' evidence but is held for review all the same: the role header is an assertion, not an identity.
+    asserted_text = f"operator correction {uuid.uuid4().hex[:6]}"
+    _feedback(lite_client, session_id, operator, asserted_text)
+    asserted_rows = _observations_for_choice(asserted_text)
+    assert len(asserted_rows) == 1, asserted_rows
+    assert asserted_rows[0]["evidence_source"] == "explicit"
+    assert asserted_rows[0]["learning_eligible"] == 0, asserted_rows[0]
+    assert asserted_rows[0]["storage_decision"] == "pending_review", asserted_rows[0]
+    assert asserted_rows[0]["confirmed_at"] is None
+
+    # The server-bound human is the control: explicit, learning-eligible, still unconfirmed.
+    human_text = f"verified operator correction {uuid.uuid4().hex[:6]}"
+    _feedback(lite_client, session_id, _verified_operator_headers(), human_text)
     human_rows = _observations_for_choice(human_text)
     assert len(human_rows) == 1, human_rows
     assert human_rows[0]["evidence_source"] == "explicit"
@@ -1202,11 +1238,29 @@ def test_behavior_evidence_from_executor_is_inferred_and_review_gated(lite_clien
         assert rows[0]["confirmed_at"] is None
 
 
-def test_behavior_evidence_from_operator_keeps_explicit_learning(lite_client: TestClient) -> None:
-    """A human operator's explicit evidence is stored as explicit and learning-eligible (today's behaviour)."""
-    operator = _headers("operator-ui", user="shared-user", role="user")
+def test_behavior_evidence_learning_needs_a_server_established_human(lite_client: TestClient) -> None:
+    """Explicit, learning-eligible evidence needs a human the SERVER identified, not one a header claims.
+
+    In compat mode ``X-TCE-Role: user`` rides on the executor's own bearer, so without this gate the
+    executor mints its owner's preferences in one call and the system learns its own output.
+    """
+    asserted = _headers("operator-ui", user="shared-user", role="user")
+    asserted_choice = f"asserted operator explicit {uuid.uuid4().hex[:6]}"
+    asserted_body = _record_evidence(lite_client, asserted, asserted_choice)
+    assert asserted_body["stored"] is True, asserted_body
+    assert asserted_body["learning_eligible"] is False, asserted_body
+    assert asserted_body["storage_decision"] == "pending_review", asserted_body
+    assert "identity_unverified" in asserted_body["storage_reasons"], asserted_body
+    asserted_rows = _observations_for_choice(asserted_choice)
+    assert len(asserted_rows) == 1, asserted_rows
+    assert asserted_rows[0]["evidence_source"] == "explicit", asserted_rows[0]
+    assert asserted_rows[0]["learning_eligible"] == 0, asserted_rows[0]
+    assert asserted_rows[0]["storage_decision"] == "pending_review", asserted_rows[0]
+    assert asserted_rows[0]["confirmed_at"] is None
+
+    # The server-bound human is the control: same payload, same role, learning-eligible.
     choice = f"operator explicit {uuid.uuid4().hex[:6]}"
-    body = _record_evidence(lite_client, operator, choice)
+    body = _record_evidence(lite_client, _verified_operator_headers(), choice)
     assert body["stored"] is True, body
     assert body["learning_eligible"] is True, body
     assert body["storage_decision"] == "learn", body

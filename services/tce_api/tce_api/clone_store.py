@@ -40,6 +40,7 @@ def _ensure_decision_observation_schema(db: Session) -> None:
         return
     try:
         db.execute(text("ALTER TABLE decision_observations ADD COLUMN IF NOT EXISTS superseded_by UUID"))
+        db.execute(text("ALTER TABLE decision_observations ADD COLUMN IF NOT EXISTS origin_kind TEXT"))
         db.execute(
             text(
                 """
@@ -494,11 +495,11 @@ def save_observation(db: Session, observation: dict[str, Any]) -> UUID:
             INSERT INTO decision_observations
                 (consumer_id, workspace_id, ts, situation_type, situation_summary,
                  context_snapshot, user_response, response_reasoning, outcome,
-                 outcome_sentiment, source_event_ids, confidence, superseded_by)
+                 outcome_sentiment, source_event_ids, confidence, superseded_by, origin_kind)
             VALUES
                 (:consumer_id, :workspace_id, :ts, :situation_type, :situation_summary,
                  CAST(:context_snapshot AS jsonb), :user_response, :response_reasoning, :outcome,
-                 :outcome_sentiment, :source_event_ids, :confidence, NULL)
+                 :outcome_sentiment, :source_event_ids, :confidence, NULL, :origin_kind)
             RETURNING id
             """
         ),
@@ -515,6 +516,8 @@ def save_observation(db: Session, observation: dict[str, Any]) -> UUID:
             "outcome_sentiment": observation.get("outcome_sentiment"),
             "source_event_ids": observation.get("source_event_ids", []),
             "confidence": observation.get("confidence", 1.0),
+            # P1: routine writers tag their origin so extraction treats them as context, never evidence.
+            "origin_kind": (str(observation.get("origin_kind") or "") or None),
         },
     )
     observation_id = result.scalar_one()

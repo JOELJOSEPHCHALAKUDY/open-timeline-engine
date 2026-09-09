@@ -1,5 +1,6 @@
 from .archive_events import run as run_archive_events
 from .compaction import run as run_compaction
+from .decision_extraction import run as run_decision_extraction
 from .embed_observations import run as run_embed_observations
 from .embedding import run as run_embedding
 from .episode_extraction import run as run_episode_extraction
@@ -19,6 +20,7 @@ __all__ = [
     "run_semantic_consolidation",
     "run_qdrant_sync",
     "run_compaction",
+    "run_decision_extraction",
     "run_archive_events",
     "run_patterns",
     "run_workflow",

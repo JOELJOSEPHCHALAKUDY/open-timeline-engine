@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from tce_shared.behavior_control import (
     capability_policy,
     mine_process_models,
@@ -60,3 +62,38 @@ def test_shadow_metrics_detect_recent_precision_drop() -> None:
     assert metrics["precision"] == 0.5
     assert metrics["drift_delta"] == -1.0
     assert metrics["drift_alert"] is True
+
+
+def test_shadow_metrics_exclude_pending_rows_from_precision_and_report_counts() -> None:
+    """Only resolved rows can be scored; everything else is counted, never averaged in.
+
+    A prospective prediction that has not been answered yet has no ground truth, so
+    treating it as 'incorrect' (or 'correct') would silently corrupt precision.
+    """
+    rows: list[dict[str, Any]] = [
+        {"abstained": False, "correct": True, "resolution_state": "resolved", "prediction_stage": "prospective"},
+        {"abstained": False, "correct": False, "resolution_state": "resolved", "prediction_stage": "retrospective"},
+        {"abstained": False, "correct": None, "resolution_state": "pending", "prediction_stage": "prospective"},
+        {"abstained": False, "correct": None, "resolution_state": "unanswered", "prediction_stage": "prospective"},
+        {"abstained": True, "correct": None, "resolution_state": "missing_label", "prediction_stage": "prospective"},
+        {"abstained": False, "correct": None, "resolution_state": "extraction_error", "prediction_stage": "prospective"},
+        {"abstained": False, "correct": None, "resolution_state": "missed_capture", "prediction_stage": "prospective"},
+        {"abstained": False, "correct": None, "resolution_state": "abandoned", "prediction_stage": "prospective"},
+    ]
+    metrics = shadow_evaluation_metrics(rows)
+    assert metrics["sample_count"] == 8
+    assert metrics["resolved_count"] == 2
+    assert metrics["precision"] == 0.5, "only the two resolved rows may be scored"
+    assert metrics["prospective_precision"] == 1.0, "the one resolved prospective row was correct"
+    for key, expected in {
+        "pending_count": 1, "unanswered_count": 1, "missing_label_count": 1, "extraction_error_count": 1,
+        "missed_capture_count": 1, "abandoned_count": 1, "prospective_count": 7, "retrospective_count": 1,
+    }.items():
+        assert metrics[key] == expected, (key, metrics[key])
+
+
+def test_shadow_metrics_treat_legacy_rows_without_resolution_state_as_resolved() -> None:
+    rows = [{"abstained": False, "correct": True}, {"abstained": False, "correct": True}]
+    metrics = shadow_evaluation_metrics(rows)
+    assert metrics["resolved_count"] == 2 and metrics["precision"] == 1.0
+    assert metrics["retrospective_count"] == 2 and metrics["prospective_precision"] is None

@@ -18,6 +18,7 @@ from tce_shared.behavior_control import (
     normalize_capability_operation,
     shadow_evaluation_metrics,
 )
+from tce_shared.decision_capture import resolve_prediction_fields
 
 
 def issue_capability_grant(
@@ -607,11 +608,13 @@ def save_shadow_prediction(
             INSERT INTO behavior_shadow_predictions (
                 id, workspace_id, subject_user_id, observation_id, predicted_choice,
                 actual_choice, confidence, abstained, correct, evidence_count, latency_ms,
-                query_json, citations_json, created_at, schema_version
+                query_json, citations_json, created_at, schema_version,
+                prediction_stage, resolution_state, resolved_at
             ) VALUES (
                 :id, :workspace_id, :subject_user_id, :observation_id, :predicted_choice,
                 :actual_choice, :confidence, :abstained, :correct, :evidence_count, :latency_ms,
-                CAST(:query_json AS jsonb), CAST(:citations_json AS jsonb), :created_at, 'v1'
+                CAST(:query_json AS jsonb), CAST(:citations_json AS jsonb), :created_at, 'v1',
+                'retrospective', 'resolved', :created_at
             )
             """
         ),
@@ -641,7 +644,9 @@ def shadow_status(db: Session, *, workspace_id: str, subject_user_id: str, limit
         text(
             """
             SELECT id, observation_id, predicted_choice, actual_choice, confidence, abstained,
-                   correct, evidence_count, latency_ms, created_at, schema_version
+                   correct, evidence_count, latency_ms, created_at, schema_version,
+                   prediction_stage, resolution_state, opportunity_id, decision_family,
+                   frozen_at, resolved_at
             FROM behavior_shadow_predictions
             WHERE workspace_id = :workspace_id AND subject_user_id = :subject_user_id
             ORDER BY created_at DESC LIMIT :limit
@@ -654,6 +659,156 @@ def shadow_status(db: Session, *, workspace_id: str, subject_user_id: str, limit
         "metrics": shadow_evaluation_metrics(items),
         "recent": [{"prediction_id": item.pop("id"), **item} for item in items[:20]],
     }
+
+
+def freeze_shadow_prediction(
+    db: Session,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    opportunity_id: UUID,
+    session_id: str,
+    turn: int,
+    decision_family: str,
+    query: dict[str, Any],
+    prediction: dict[str, Any],
+    evidence_count: int,
+    latency_ms: int,
+    evidence_cutoff_at: datetime | None,
+    evidence_revision: str,
+    advice_visible: bool,
+    frozen_at: datetime,
+) -> UUID:
+    """Persist a prospective prediction (or abstention) BEFORE the human answer exists.
+
+    No commit: the caller's transaction (takeover state save) commits it together with
+    the decision opportunity so the two never disagree.
+    """
+    prediction_id = uuid.uuid4()
+    predicted = prediction.get("predicted_choice")
+    abstained = bool(prediction.get("abstained", True))
+    db.execute(
+        text(
+            """
+            INSERT INTO behavior_shadow_predictions (
+                id, workspace_id, subject_user_id, observation_id, predicted_choice,
+                actual_choice, confidence, abstained, correct, evidence_count, latency_ms,
+                query_json, citations_json, created_at, schema_version,
+                opportunity_id, session_id, turn, decision_family, prediction_stage,
+                frozen_at, evidence_cutoff_at, evidence_revision, prediction_shown_at,
+                advice_visible, resolution_state
+            ) VALUES (
+                :id, :workspace_id, :subject_user_id, NULL, :predicted_choice,
+                '', :confidence, :abstained, NULL, :evidence_count, :latency_ms,
+                CAST(:query_json AS jsonb), CAST(:citations_json AS jsonb), :created_at, 'v1',
+                :opportunity_id, :session_id, :turn, :decision_family, 'prospective',
+                :frozen_at, :evidence_cutoff_at, :evidence_revision, NULL,
+                :advice_visible, 'pending'
+            )
+            """
+        ),
+        {
+            "id": prediction_id,
+            "workspace_id": workspace_id,
+            "subject_user_id": subject_user_id,
+            "predicted_choice": None if abstained else (str(predicted) if predicted is not None else None),
+            "confidence": float(prediction.get("confidence", 0.0) or 0.0),
+            "abstained": abstained,
+            "evidence_count": int(evidence_count),
+            "latency_ms": max(0, int(latency_ms)),
+            "query_json": json.dumps(query, default=str),
+            "citations_json": json.dumps(prediction.get("citations") or [], default=str),
+            "created_at": frozen_at,
+            "opportunity_id": opportunity_id,
+            "session_id": session_id,
+            "turn": int(turn),
+            "decision_family": decision_family,
+            "frozen_at": frozen_at,
+            "evidence_cutoff_at": evidence_cutoff_at,
+            "evidence_revision": evidence_revision,
+            "advice_visible": bool(advice_visible),
+        },
+    )
+    return prediction_id
+
+
+def resolve_shadow_prediction(
+    db: Session,
+    *,
+    prediction_id: UUID,
+    actual_choice: str,
+    observation_id: UUID | None,
+    resolution_source: str,
+    human_source_ref: str,
+    resolution_source_event_id: UUID | None,
+    resolved_at: datetime,
+) -> bool:
+    """Resolve a pending prospective prediction against an authenticated human answer. No commit."""
+    row = db.execute(
+        text("SELECT predicted_choice, abstained FROM behavior_shadow_predictions WHERE id = :id AND resolution_state = 'pending'"),
+        {"id": prediction_id},
+    ).mappings().first()
+    if row is None:
+        return False
+    correct = resolve_prediction_fields(row.get("predicted_choice"), bool(row.get("abstained", True)), actual_choice)["correct"]
+    result = db.execute(
+        text(
+            """
+            UPDATE behavior_shadow_predictions
+            SET actual_choice = :actual_choice,
+                correct = :correct,
+                observation_id = :observation_id,
+                resolved_at = :resolved_at,
+                resolution_state = 'resolved',
+                resolution_source = :resolution_source,
+                human_source_ref = :human_source_ref,
+                resolution_source_event_id = :resolution_source_event_id
+            WHERE id = :id AND resolution_state = 'pending'
+            """
+        ),
+        {
+            "actual_choice": actual_choice,
+            "correct": correct,
+            "observation_id": observation_id,
+            "resolved_at": resolved_at,
+            "resolution_source": resolution_source,
+            "human_source_ref": human_source_ref,
+            "resolution_source_event_id": resolution_source_event_id,
+            "id": prediction_id,
+        },
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+def append_shadow_correction(db: Session, *, prediction_id: UUID, correction: dict[str, Any]) -> None:
+    """Append-only correction history; never rewrites actual_choice/correct."""
+    db.execute(
+        text(
+            """
+            UPDATE behavior_shadow_predictions
+            SET corrections_json = COALESCE(corrections_json, '[]'::jsonb) || CAST(:entry AS jsonb)
+            WHERE id = :id
+            """
+        ),
+        {"id": prediction_id, "entry": json.dumps([correction], default=str)},
+    )
+
+
+def mark_shadow_unresolved(db: Session, *, prediction_id: UUID, resolution_state: str, resolution_source: str | None) -> None:
+    """Move a still-pending prediction into a separate non-resolved denominator."""
+    if resolution_state not in {"unanswered", "missing_label", "extraction_error", "missed_capture", "abandoned"}:
+        raise ValueError(f"invalid unresolved state: {resolution_state}")
+    db.execute(
+        text(
+            """
+            UPDATE behavior_shadow_predictions
+            SET resolution_state = :resolution_state,
+                resolution_source = :resolution_source
+            WHERE id = :id AND resolution_state = 'pending'
+            """
+        ),
+        {"id": prediction_id, "resolution_state": resolution_state, "resolution_source": resolution_source},
+    )
 
 
 def create_counterfactual(

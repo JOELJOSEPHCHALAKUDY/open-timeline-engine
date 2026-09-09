@@ -3012,9 +3012,32 @@
             "title": "Created At",
             "type": "string"
           },
+          "decision_family": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision Family"
+          },
           "evidence_count": {
             "title": "Evidence Count",
             "type": "integer"
+          },
+          "frozen_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frozen At"
           },
           "latency_ms": {
             "title": "Latency Ms",
@@ -3032,6 +3055,18 @@
             ],
             "title": "Observation Id"
           },
+          "opportunity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opportunity Id"
+          },
           "predicted_choice": {
             "anyOf": [
               {
@@ -3047,6 +3082,28 @@
             "format": "uuid",
             "title": "Prediction Id",
             "type": "string"
+          },
+          "prediction_stage": {
+            "default": "retrospective",
+            "title": "Prediction Stage",
+            "type": "string"
+          },
+          "resolution_state": {
+            "default": "resolved",
+            "title": "Resolution State",
+            "type": "string"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
           },
           "schema_version": {
             "default": "v1",
@@ -3344,6 +3401,18 @@
         ],
         "title": "CapabilityGrantResponse",
         "type": "object"
+      },
+      "CaptureDeliveryState": {
+        "enum": [
+          "unknown",
+          "healthy",
+          "degraded",
+          "spooling",
+          "gap",
+          "unavailable"
+        ],
+        "title": "CaptureDeliveryState",
+        "type": "string"
       },
       "CheckContextRequest": {
         "properties": {
@@ -6780,6 +6849,10 @@
       },
       "ExecutionStatusResponse": {
         "properties": {
+          "capture_delivery_state": {
+            "$ref": "#/components/schemas/CaptureDeliveryState",
+            "default": "unknown"
+          },
           "generated_at": {
             "format": "date-time",
             "title": "Generated At",
@@ -8873,6 +8946,18 @@
             ],
             "title": "Observation Ids"
           },
+          "opportunity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opportunity Id"
+          },
           "result": {
             "default": "success",
             "title": "Result",
@@ -9803,6 +9888,10 @@
             "title": "Behavior Fidelity Gate",
             "type": "object"
           },
+          "capture_delivery_state": {
+            "$ref": "#/components/schemas/CaptureDeliveryState",
+            "default": "unknown"
+          },
           "citations": {
             "items": {
               "format": "uuid",
@@ -9955,6 +10044,18 @@
               }
             ],
             "title": "Note"
+          },
+          "open_decision_opportunity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Decision Opportunity Id"
           },
           "pending_execution": {
             "anyOf": [
@@ -10121,6 +10222,239 @@
           "user_id"
         ],
         "title": "TeamMembershipUpsertRequest",
+        "type": "object"
+      },
+      "TrustedInputCapture": {
+        "properties": {
+          "content": {
+            "maxLength": 8000,
+            "title": "Content",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "content_truncated": {
+            "default": false,
+            "title": "Content Truncated",
+            "type": "boolean"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cwd"
+          },
+          "delivery_key": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Delivery Key",
+            "type": "string"
+          },
+          "gap_since": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gap Since"
+          },
+          "hook_event_name": {
+            "default": "UserPromptSubmit",
+            "title": "Hook Event Name",
+            "type": "string"
+          },
+          "host_client": {
+            "default": "claude",
+            "maxLength": 32,
+            "title": "Host Client",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "origin_kind": {
+            "$ref": "#/components/schemas/TrustedInputOriginKind",
+            "default": "human_input"
+          },
+          "original_char_count": {
+            "minimum": 0.0,
+            "title": "Original Char Count",
+            "type": "integer"
+          },
+          "project_hint": {
+            "additionalProperties": true,
+            "title": "Project Hint",
+            "type": "object"
+          },
+          "prompt_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt Id"
+          },
+          "redaction_applied": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Redaction Applied",
+            "type": "array"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sequence"
+          },
+          "session_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "spool_depth": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Spool Depth",
+            "type": "integer"
+          },
+          "spool_failures": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Spool Failures",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "delivery_key",
+          "content_sha256",
+          "content",
+          "observed_at",
+          "original_char_count"
+        ],
+        "title": "TrustedInputCapture",
+        "type": "object"
+      },
+      "TrustedInputOriginKind": {
+        "enum": [
+          "human_input",
+          "manager_instruction",
+          "executor_output",
+          "imported_transcript",
+          "tool_result"
+        ],
+        "title": "TrustedInputOriginKind",
+        "type": "string"
+      },
+      "TrustedInputReceipt": {
+        "properties": {
+          "capture_delivery_state": {
+            "$ref": "#/components/schemas/CaptureDeliveryState",
+            "default": "unknown"
+          },
+          "capture_principal": {
+            "title": "Capture Principal",
+            "type": "string"
+          },
+          "content_sha256": {
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "deduplicated": {
+            "default": false,
+            "title": "Deduplicated",
+            "type": "boolean"
+          },
+          "delivery_key": {
+            "title": "Delivery Key",
+            "type": "string"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
+          },
+          "extraction_state": {
+            "default": "pending",
+            "title": "Extraction State",
+            "type": "string"
+          },
+          "ingested_at": {
+            "format": "date-time",
+            "title": "Ingested At",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "origin_kind": {
+            "$ref": "#/components/schemas/TrustedInputOriginKind"
+          },
+          "queue_state": {
+            "default": "inline",
+            "title": "Queue State",
+            "type": "string"
+          },
+          "receipt_id": {
+            "format": "uuid",
+            "title": "Receipt Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "receipt_id",
+          "delivery_key",
+          "content_sha256",
+          "origin_kind",
+          "capture_principal",
+          "observed_at",
+          "ingested_at"
+        ],
+        "title": "TrustedInputReceipt",
         "type": "object"
       },
       "ValidationError": {
@@ -19454,6 +19788,311 @@
           }
         },
         "summary": "Health"
+      }
+    },
+    "/v1/inputs": {
+      "post": {
+        "description": "Trusted capture channel: the host's user-input boundary posts here, executors cannot.",
+        "operationId": "capture_input_v1_inputs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrustedInputCapture"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrustedInputReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Capture Input"
+      }
+    },
+    "/v1/inputs/{receipt_id}": {
+      "get": {
+        "operationId": "get_captured_input_v1_inputs__receipt_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "receipt_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Receipt Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrustedInputReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Captured Input"
       }
     },
     "/v1/memory/forget": {

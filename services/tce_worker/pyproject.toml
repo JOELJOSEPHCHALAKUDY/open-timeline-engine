@@ -11,6 +11,7 @@ dependencies = [
   "rq>=1.16,<2",
   "pgvector>=0.2.5,<1",
   "requests>=2.33,<3",
+  "cryptography>=42,<45",
   "opentelemetry-api>=1.26,<2",
   "opentelemetry-sdk>=1.26,<2"
 ]

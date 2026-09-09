@@ -386,6 +386,183 @@ def _ensure_continuity_v05_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_trusted_capture_schema(conn: sqlite3.Connection) -> None:
+    """P1 trusted capture: input receipts, decision opportunities/candidates, human resolutions,
+    and the prospective-vs-retrospective labelling on shadow predictions / observations.
+
+    Mirrors alembic revision 20260909_0036 (Full). Additive and idempotent only."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trusted_input_receipts (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            host_session_id TEXT NOT NULL,
+            sequence INTEGER,
+            prompt_id TEXT,
+            delivery_key TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            origin_kind TEXT NOT NULL,
+            capture_principal TEXT NOT NULL,
+            host_client TEXT NOT NULL DEFAULT 'claude',
+            event_id TEXT,
+            project_id TEXT,
+            observed_at TEXT NOT NULL,
+            ingested_at TEXT NOT NULL,
+            original_char_count INTEGER NOT NULL DEFAULT 0,
+            content_truncated INTEGER NOT NULL DEFAULT 0,
+            redaction_applied_json TEXT NOT NULL DEFAULT '[]',
+            spool_depth INTEGER NOT NULL DEFAULT 0,
+            spool_failures INTEGER NOT NULL DEFAULT 0,
+            gap_since TEXT,
+            queue_state TEXT NOT NULL DEFAULT 'inline',
+            extraction_state TEXT NOT NULL DEFAULT 'pending',
+            extraction_lease_until TEXT,
+            extraction_attempts INTEGER NOT NULL DEFAULT 0,
+            extraction_last_error TEXT,
+            extraction_version_done TEXT,
+            next_extraction_at TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_trusted_input_receipts_delivery ON trusted_input_receipts (workspace_id, owner_id, delivery_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trusted_input_receipts_subject_ingested ON trusted_input_receipts (workspace_id, subject_user_id, ingested_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trusted_input_receipts_extraction ON trusted_input_receipts (extraction_state, next_extraction_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_opportunities (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            turn INTEGER,
+            objective_hash TEXT,
+            task_id TEXT,
+            project_id TEXT,
+            decision_family TEXT NOT NULL,
+            situation_type TEXT NOT NULL DEFAULT 'choice_required',
+            question_text TEXT NOT NULL DEFAULT '',
+            alternatives_json TEXT NOT NULL DEFAULT '[]',
+            pre_answer_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            evidence_cutoff_at TEXT,
+            evidence_revision TEXT,
+            advice_exposure_json TEXT NOT NULL DEFAULT '{}',
+            shadow_prediction_id TEXT,
+            source_event_id TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            relayed_answer TEXT,
+            relayed_at TEXT,
+            resolved_at TEXT,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            frozen_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decision_opportunities_open ON decision_opportunities (workspace_id, subject_user_id, status, created_at DESC)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_opportunities_session ON decision_opportunities (session_id, status)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decision_candidates (
+            id TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL,
+            source_event_id TEXT,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            opportunity_id TEXT,
+            candidate_kind TEXT NOT NULL,
+            supporting_span TEXT NOT NULL,
+            span_sha256 TEXT NOT NULL,
+            observed_alternatives_json TEXT NOT NULL DEFAULT '[]',
+            selected_option TEXT,
+            stated_rationale TEXT,
+            is_negated INTEGER NOT NULL DEFAULT 0,
+            is_correction INTEGER NOT NULL DEFAULT 0,
+            project_id TEXT,
+            task_id TEXT,
+            origin_kind TEXT NOT NULL,
+            extraction_version TEXT NOT NULL,
+            promotion TEXT NOT NULL,
+            promotion_reason TEXT,
+            status TEXT NOT NULL DEFAULT 'new',
+            promoted_observation_id TEXT,
+            review_id TEXT,
+            created_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_decision_candidates_span ON decision_candidates (receipt_id, extraction_version, span_sha256)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_candidates_opportunity ON decision_candidates (opportunity_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS human_resolutions (
+            id TEXT PRIMARY KEY,
+            opportunity_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            receipt_id TEXT,
+            source_event_id TEXT,
+            candidate_id TEXT,
+            selected_choice TEXT NOT NULL DEFAULT '',
+            correction_text TEXT NOT NULL DEFAULT '',
+            stated_rationale TEXT,
+            resolution_source TEXT NOT NULL,
+            human_source_ref TEXT NOT NULL,
+            observation_id TEXT,
+            supersedes_resolution_id TEXT,
+            resolved_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_human_resolutions_opportunity ON human_resolutions (opportunity_id, resolved_at DESC)")
+    shadow_columns = {
+        "opportunity_id": "TEXT",
+        "session_id": "TEXT",
+        "turn": "INTEGER",
+        "decision_family": "TEXT",
+        "prediction_stage": "TEXT NOT NULL DEFAULT 'retrospective'",
+        "frozen_at": "TEXT",
+        "evidence_cutoff_at": "TEXT",
+        "evidence_revision": "TEXT",
+        "prediction_shown_at": "TEXT",
+        "advice_visible": "INTEGER NOT NULL DEFAULT 0",
+        "resolution_state": "TEXT NOT NULL DEFAULT 'resolved'",
+        "resolved_at": "TEXT",
+        "resolution_source": "TEXT",
+        "human_source_ref": "TEXT",
+        "resolution_source_event_id": "TEXT",
+        "corrections_json": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for name, ddl in shadow_columns.items():
+        if not _column_exists(conn, "behavior_shadow_predictions", name):
+            conn.execute(f"ALTER TABLE behavior_shadow_predictions ADD COLUMN {name} {ddl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_behavior_shadow_open ON behavior_shadow_predictions (workspace_id, subject_user_id, resolution_state, created_at DESC)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_behavior_shadow_opportunity ON behavior_shadow_predictions (opportunity_id)")
+    for name in ("opportunity_id", "origin_kind", "capture_receipt_id", "extraction_version"):
+        if not _column_exists(conn, "decision_observations", name):
+            conn.execute(f"ALTER TABLE decision_observations ADD COLUMN {name} TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_obs_opportunity ON decision_observations (opportunity_id)")
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -1565,6 +1742,7 @@ def init_db() -> None:
         _ensure_behavior_fidelity_schema(conn)
         _ensure_continuity_v04_schema(conn)
         _ensure_continuity_v05_schema(conn)
+        _ensure_trusted_capture_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

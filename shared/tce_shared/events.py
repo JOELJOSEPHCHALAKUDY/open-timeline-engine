@@ -10,6 +10,23 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .version import SCHEMA_VERSION
 
 
+class TrustedInputOriginKind(StrEnum):
+    HUMAN_INPUT = "human_input"
+    MANAGER_INSTRUCTION = "manager_instruction"
+    EXECUTOR_OUTPUT = "executor_output"
+    IMPORTED_TRANSCRIPT = "imported_transcript"
+    TOOL_RESULT = "tool_result"
+
+
+class CaptureDeliveryState(StrEnum):
+    UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    SPOOLING = "spooling"
+    GAP = "gap"
+    UNAVAILABLE = "unavailable"
+
+
 class EventType(StrEnum):
     TASK_START = "TASK_START"
     TASK_STEP = "TASK_STEP"
@@ -665,6 +682,8 @@ class TakeoverStepResponse(BaseModel):
     episode_boost_applied: bool = False
     activation_boost_applied: bool = False
     behavior_fidelity_gate: dict[str, Any] = Field(default_factory=dict)
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    open_decision_opportunity_id: UUID | None = None
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -955,6 +974,7 @@ class ExecutionStatusResponse(BaseModel):
     pending: list[DirectiveExecution] = Field(default_factory=list)
     recent: list[DirectiveExecution] = Field(default_factory=list)
     generated_at: datetime
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
 
 
 class TakeoverPreloadRequest(BaseModel):
@@ -988,6 +1008,7 @@ class TakeoverFeedbackRequest(BaseModel):
     correction_text: str | None = None
     observation_ids: list[UUID] | None = None
     situation_type: str | None = None
+    opportunity_id: UUID | None = None
 
 
 class TakeoverFeedbackResponse(BaseModel):
@@ -1345,6 +1366,12 @@ class BehaviorShadowPredictionItem(BaseModel):
     latency_ms: int
     created_at: datetime
     schema_version: str = "v1"
+    prediction_stage: str = "retrospective"
+    resolution_state: str = "resolved"
+    opportunity_id: UUID | None = None
+    decision_family: str | None = None
+    frozen_at: datetime | None = None
+    resolved_at: datetime | None = None
 
 
 class BehaviorShadowStatusResponse(BaseModel):
@@ -1451,3 +1478,41 @@ class CloneAdviceResponse(BaseModel):
     policy: dict[str, Any]
     clone_context: dict[str, Any] | None = None
     evidence_observations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TrustedInputCapture(BaseModel):
+    session_id: str = Field(min_length=1, max_length=200)
+    delivery_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: str = Field(max_length=8000)
+    origin_kind: TrustedInputOriginKind = TrustedInputOriginKind.HUMAN_INPUT
+    observed_at: datetime
+    original_char_count: int = Field(ge=0)
+    content_truncated: bool = False
+    redaction_applied: list[str] = Field(default_factory=list)
+    sequence: int | None = None
+    prompt_id: str | None = Field(default=None, max_length=200)
+    hook_event_name: str = "UserPromptSubmit"
+    host_client: str = Field(default="claude", max_length=32)
+    cwd: str | None = Field(default=None, max_length=1024)
+    project_hint: dict[str, Any] = Field(default_factory=dict)
+    spool_depth: int = Field(default=0, ge=0)
+    spool_failures: int = Field(default=0, ge=0)
+    gap_since: datetime | None = None
+    schema_version: str = "v1"
+
+
+class TrustedInputReceipt(BaseModel):
+    receipt_id: UUID
+    event_id: UUID | None = None
+    delivery_key: str
+    content_sha256: str
+    origin_kind: TrustedInputOriginKind
+    capture_principal: str
+    observed_at: datetime
+    ingested_at: datetime
+    deduplicated: bool = False
+    extraction_state: str = "pending"
+    queue_state: str = "inline"
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    schema_version: str = "v1"

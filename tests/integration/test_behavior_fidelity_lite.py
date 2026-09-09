@@ -14,6 +14,7 @@ from tce_lite_api.store import (
     load_behavior_evidence_lite,
     run_lifecycle_maintenance,
 )
+from tce_shared.identity import credential_fingerprint
 
 
 def _headers(
@@ -23,12 +24,41 @@ def _headers(
     behavior_subject: str | None = None,
 ) -> dict[str, str]:
     return {
-        "Authorization": "Bearer behavior-test-token",
+        "Authorization": f"Bearer {_TOKEN}",
         "X-TCE-Consumer": consumer,
         "X-TCE-Role": "user",
         "X-TCE-Workspace": "behavior-test-workspace",
         "X-TCE-User": user,
         "X-TCE-Behavior-Subject": behavior_subject or user,
+    }
+
+
+_TOKEN = "behavior-test-token"
+_WORKSPACE = "behavior-test-workspace"
+# Credentials the server binds to a human identity: identity_verified even in compat mode. Human-origin
+# promotion (explicit learning-eligible evidence, promoting a pending review) needs that, not a role header.
+_VERIFIED_IDENTITIES = (
+    ("behavior-test-user", "behavior-test-user", "behavior-test-user"),
+    ("codex-executor", "codex-owner", "human-a"),
+    ("claude-executor", "claude-owner", "human-a"),
+    ("claude-executor", "claude-owner", "human-b"),
+)
+
+
+def _verified_token(consumer: str, user: str, behavior_subject: str) -> str:
+    return f"verified-token:{consumer}:{user}:{behavior_subject}"
+
+
+def _verified_headers(
+    *,
+    consumer: str = "behavior-test-user",
+    user: str = "behavior-test-user",
+    behavior_subject: str | None = None,
+) -> dict[str, str]:
+    subject = behavior_subject or user
+    return {
+        **_headers(consumer=consumer, user=user, behavior_subject=subject),
+        "Authorization": f"Bearer {_verified_token(consumer, user, subject)}",
     }
 
 
@@ -67,9 +97,24 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
         "lifecycle_dry_run": settings.lifecycle_dry_run,
         "archive_enabled": settings.archive_enabled,
         "workspace_access_mode": settings.workspace_access_mode,
+        "identity_claims_mode": settings.identity_claims_mode,
+        "identity_claims_json": settings.identity_claims_json,
     }
     settings.lite_db_path = str(tmp_path / "behavior-fidelity.db")
-    settings.api_tokens = "behavior-test-token"
+    settings.api_tokens = ",".join([_TOKEN, *(_verified_token(*identity) for identity in _VERIFIED_IDENTITIES)])
+    settings.identity_claims_mode = "compat"
+    settings.identity_claims_json = json.dumps(
+        {
+            credential_fingerprint("bearer", _verified_token(consumer, user, subject)): {
+                "consumer": consumer,
+                "role": "user",
+                "workspace_id": _WORKSPACE,
+                "user_id": user,
+                "behavior_subject_id": subject,
+            }
+            for consumer, user, subject in _VERIFIED_IDENTITIES
+        }
+    )
     settings.behavior_storage_gate_mode = "shadow"
     settings.behavior_autonomy_gate_enabled = False
     settings.behavior_calibration_enabled = True
@@ -85,7 +130,7 @@ def client(tmp_path) -> Generator[TestClient, None, None]:
 def test_evidence_is_redacted_and_correction_supersedes_prior_record(client: TestClient) -> None:
     first_payload = _payload(1)
     first_payload["rationale"] = "Use token=plain-secret-value-12345 only in memory"
-    first = client.post("/v1/behavior/evidence", json=first_payload, headers=_headers())
+    first = client.post("/v1/behavior/evidence", json=first_payload, headers=_verified_headers())
     assert first.status_code == 200
     first_body = first.json()
     assert first_body["learning_eligible"] is True
@@ -99,7 +144,7 @@ def test_evidence_is_redacted_and_correction_supersedes_prior_record(client: Tes
             "supersedes_observation_id": first_body["observation_id"],
         }
     )
-    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_verified_headers())
     assert correction.status_code == 200
 
     settings = get_settings()
@@ -119,12 +164,12 @@ def test_evidence_is_redacted_and_correction_supersedes_prior_record(client: Tes
 
 def test_explicit_evidence_is_not_auto_confirmed(client: TestClient) -> None:
     """P0: 'the human approved this' is never minted from a caller-declared evidence_source."""
-    explicit = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    explicit = client.post("/v1/behavior/evidence", json=_payload(1), headers=_verified_headers())
     assert explicit.status_code == 200, explicit.text
 
     asserted = _payload(2)
     asserted["confirmed_at"] = "2026-09-09T00:00:00+00:00"
-    self_confirmed = client.post("/v1/behavior/evidence", json=asserted, headers=_headers())
+    self_confirmed = client.post("/v1/behavior/evidence", json=asserted, headers=_verified_headers())
     assert self_confirmed.status_code == 200, self_confirmed.text
 
     correction_payload = _payload(3, choice="broad refactor")
@@ -135,7 +180,7 @@ def test_explicit_evidence_is_not_auto_confirmed(client: TestClient) -> None:
             "supersedes_observation_id": explicit.json()["observation_id"],
         }
     )
-    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_verified_headers())
     assert correction.status_code == 200, correction.text
 
     settings = get_settings()
@@ -155,7 +200,7 @@ def test_explicit_evidence_is_not_auto_confirmed(client: TestClient) -> None:
 
 def test_prediction_evaluation_and_calibration_flow(client: TestClient) -> None:
     for index in range(30):
-        response = client.post("/v1/behavior/evidence", json=_payload(index), headers=_headers())
+        response = client.post("/v1/behavior/evidence", json=_payload(index), headers=_verified_headers())
         assert response.status_code == 200, response.text
 
     prediction = client.post(
@@ -166,7 +211,7 @@ def test_prediction_evaluation_and_calibration_flow(client: TestClient) -> None:
             "objective": "Fix production bug without broad regression",
             "candidate_choices": ["minimal verified fix", "broad refactor"],
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert prediction.status_code == 200
     assert prediction.json()["predicted_choice"] == "minimal verified fix"
@@ -175,18 +220,18 @@ def test_prediction_evaluation_and_calibration_flow(client: TestClient) -> None:
     evaluation = client.post(
         "/v1/behavior/evaluate",
         json={"holdout_ratio": 0.5, "min_train": 5, "max_cases": 100},
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert evaluation.status_code == 200
     evaluation_body = evaluation.json()
     assert evaluation_body["metrics"]["evaluation_count"] == 15
     assert evaluation_body["metrics"]["top1_accuracy"] == 1.0
 
-    history = client.get("/v1/behavior/evaluations", headers=_headers())
+    history = client.get("/v1/behavior/evaluations", headers=_verified_headers())
     assert history.status_code == 200
     assert history.json()["runs"][0]["run_id"] == evaluation_body["run_id"]
 
-    scenarios = client.get("/v1/behavior/calibration/scenarios", headers=_headers())
+    scenarios = client.get("/v1/behavior/calibration/scenarios", headers=_verified_headers())
     assert scenarios.status_code == 200
     scenario = scenarios.json()["scenarios"][0]
     answer = client.post(
@@ -196,20 +241,20 @@ def test_prediction_evaluation_and_calibration_flow(client: TestClient) -> None:
             "selected_choice": scenario["choices"][0],
             "rationale": "I prefer verified and reversible production changes",
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert answer.status_code == 200
     assert answer.json()["learning_eligible"] is True
 
 
 def test_behavior_is_shared_across_executors_but_isolated_between_users(client: TestClient) -> None:
-    codex_headers = _headers(
+    codex_headers = _verified_headers(
         consumer="codex-executor", user="codex-owner", behavior_subject="human-a"
     )
-    claude_headers = _headers(
+    claude_headers = _verified_headers(
         consumer="claude-executor", user="claude-owner", behavior_subject="human-a"
     )
-    other_user_headers = _headers(
+    other_user_headers = _verified_headers(
         consumer="claude-executor", user="claude-owner", behavior_subject="human-b"
     )
     first_observation_id = ""
@@ -252,7 +297,7 @@ def test_behavior_is_shared_across_executors_but_isolated_between_users(client: 
 def test_clone_recall_excludes_audit_only_evidence(client: TestClient) -> None:
     payload = _payload(1)
     payload.update({"evidence_source": "backfill", "confidence": 0.0, "rationale": ""})
-    stored = client.post("/v1/behavior/evidence", json=payload, headers=_headers())
+    stored = client.post("/v1/behavior/evidence", json=payload, headers=_verified_headers())
     assert stored.status_code == 200
     assert stored.json()["learning_eligible"] is False
 
@@ -282,7 +327,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
             "resource": "src/app.py",
             "arguments": {"line": 10},
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert grant.status_code == 200
     grant_body = grant.json()
@@ -299,7 +344,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
             "resource": "src/app.py",
             "arguments": {"line": 11},
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert mismatched.status_code == 200
     assert mismatched.json()["authorized"] is False
@@ -312,8 +357,8 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
         "resource": "src/app.py",
         "arguments": {"line": 10},
     }
-    consumed = client.post("/v1/capabilities/consume", json=exact_payload, headers=_headers())
-    replayed = client.post("/v1/capabilities/consume", json=exact_payload, headers=_headers())
+    consumed = client.post("/v1/capabilities/consume", json=exact_payload, headers=_verified_headers())
+    replayed = client.post("/v1/capabilities/consume", json=exact_payload, headers=_verified_headers())
     assert consumed.json()["authorized"] is True
     assert replayed.json()["authorized"] is False
 
@@ -346,7 +391,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
     unknown = client.post(
         "/v1/capabilities/grants",
         json={"capability": "shell.root", "action": "run", "resource": "/"},
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert unknown.json()["decision"] == "blocked"
     assert unknown.json()["token"] is None
@@ -354,7 +399,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
     blocked_write = client.post(
         "/v1/capabilities/grants",
         json={"capability": "filesystem.write", "action": "patch", "resource": "src/app.py"},
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert blocked_write.json()["decision"] == "blocked"
 
@@ -401,7 +446,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
             "resource": "src/app.py",
             "arguments": {"patch_hash": "abc123"},
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert allowed_write.status_code == 200
     assert allowed_write.json()["decision"] == "allow"
@@ -410,7 +455,7 @@ def test_capability_grants_are_exact_one_use_and_fail_closed(client: TestClient)
 def test_inferred_memory_requires_promotion_and_shadow_eval_is_prospective(client: TestClient) -> None:
     payload = _payload(501)
     payload.update({"evidence_source": "inferred", "outcome": "verified success", "action_taken": "patch then test"})
-    stored = client.post("/v1/behavior/evidence", json=payload, headers=_headers())
+    stored = client.post("/v1/behavior/evidence", json=payload, headers=_verified_headers())
     assert stored.status_code == 200, stored.text
     body = stored.json()
     assert body["learning_eligible"] is False
@@ -418,19 +463,19 @@ def test_inferred_memory_requires_promotion_and_shadow_eval_is_prospective(clien
     assert body["review_id"]
     assert body["shadow_prediction_id"]
 
-    reviews = client.get("/v1/behavior/reviews", headers=_headers())
+    reviews = client.get("/v1/behavior/reviews", headers=_verified_headers())
     assert reviews.status_code == 200
     assert reviews.json()["reviews"][0]["target_id"] == body["observation_id"]
 
     promoted = client.post(
         f"/v1/behavior/reviews/{body['review_id']}/resolve",
         json={"decision": "promote", "note": "Observed and verified by the user"},
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert promoted.status_code == 200
     assert promoted.json()["status"] == "promoted"
 
-    shadow = client.get("/v1/behavior/shadow/status", headers=_headers())
+    shadow = client.get("/v1/behavior/shadow/status", headers=_verified_headers())
     assert shadow.status_code == 200
     assert shadow.json()["metrics"]["sample_count"] >= 1
     assert shadow.json()["recent"][0]["observation_id"] == body["observation_id"]
@@ -506,7 +551,7 @@ def test_counterfactuals_are_redacted_and_resolvable(client: TestClient) -> None
             "assumptions": ["The API remains compatible"],
             "confidence": 0.4,
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert created.status_code == 200, created.text
     record = created.json()
@@ -521,11 +566,11 @@ def test_counterfactuals_are_redacted_and_resolvable(client: TestClient) -> None
             "lesson": "Keep the smaller verified change",
             "regret_score": 0.1,
         },
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert resolved.status_code == 200
     assert resolved.json()["status"] == "resolved"
-    listed = client.get("/v1/behavior/counterfactuals?status=resolved", headers=_headers())
+    listed = client.get("/v1/behavior/counterfactuals?status=resolved", headers=_verified_headers())
     assert listed.status_code == 200
     assert listed.json()["records"][0]["assessment"] == "refuted"
 
@@ -687,7 +732,7 @@ def test_strict_workspace_access_requires_membership_for_executor(client: TestCl
 
 def test_capped_evidence_load_uses_most_recent_records(client: TestClient) -> None:
     for index in range(3):
-        response = client.post("/v1/behavior/evidence", json=_payload(index), headers=_headers())
+        response = client.post("/v1/behavior/evidence", json=_payload(index), headers=_verified_headers())
         assert response.status_code == 200
 
     settings = get_settings()
@@ -710,7 +755,7 @@ def test_capped_evidence_load_uses_most_recent_records(client: TestClient) -> No
 
 
 def test_behavior_projections_are_scoped_deterministic_and_citation_addressable(client: TestClient) -> None:
-    first = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    first = client.post("/v1/behavior/evidence", json=_payload(1), headers=_verified_headers())
     assert first.status_code == 200
     first_id = first.json()["observation_id"]
     correction_payload = _payload(2, choice="broad refactor")
@@ -721,26 +766,26 @@ def test_behavior_projections_are_scoped_deterministic_and_citation_addressable(
             "supersedes_observation_id": first_id,
         }
     )
-    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_verified_headers())
     assert correction.status_code == 200
     correction_id = correction.json()["observation_id"]
 
-    current = client.get("/v1/behavior/projections/current", headers=_headers())
-    repeated = client.get("/v1/behavior/projections/current", headers=_headers())
+    current = client.get("/v1/behavior/projections/current", headers=_verified_headers())
+    repeated = client.get("/v1/behavior/projections/current", headers=_verified_headers())
     assert current.status_code == 200
     assert current.json() == repeated.json()
     assert current.json()["source_evidence_ids"] == [correction_id]
     assert first_id not in current.json()["content"]
     assert current.json()["mime_type"].startswith("text/markdown")
 
-    topic = client.get("/v1/behavior/projections/decisions/production?format=json", headers=_headers())
+    topic = client.get("/v1/behavior/projections/decisions/production?format=json", headers=_verified_headers())
     assert topic.status_code == 200
     assert topic.json()["source_evidence_ids"] == [correction_id]
     assert json.loads(topic.json()["content"])["metadata"]["view"] == "decisions"
 
     historical = client.get(
         f"/v1/behavior/projections/evidence/{first_id}",
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert historical.status_code == 200
     assert historical.json()["trust_level"] == "historical"
@@ -775,7 +820,7 @@ def test_behavior_projection_feature_flag_is_a_safe_rollback(client: TestClient)
     settings = get_settings()
     settings.behavior_projections_enabled = False
     try:
-        response = client.get("/v1/behavior/projections/current", headers=_headers())
+        response = client.get("/v1/behavior/projections/current", headers=_verified_headers())
     finally:
         settings.behavior_projections_enabled = True
     assert response.status_code == 404
@@ -785,7 +830,7 @@ def test_behavior_projection_feature_flag_is_a_safe_rollback(client: TestClient)
 def test_behavior_review_html_is_sanitized_and_includes_historical_records(client: TestClient) -> None:
     first_payload = _payload(1)
     first_payload["situation_summary"] = '<script src="https://evil.invalid/x.js">attack</script>'
-    first = client.post("/v1/behavior/evidence", json=first_payload, headers=_headers())
+    first = client.post("/v1/behavior/evidence", json=first_payload, headers=_verified_headers())
     assert first.status_code == 200
     correction_payload = _payload(2, choice="broad refactor")
     correction_payload.update(
@@ -795,11 +840,11 @@ def test_behavior_review_html_is_sanitized_and_includes_historical_records(clien
             "supersedes_observation_id": first.json()["observation_id"],
         }
     )
-    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_headers())
+    correction = client.post("/v1/behavior/evidence", json=correction_payload, headers=_verified_headers())
     assert correction.status_code == 200
 
-    wrapped = client.get("/v1/behavior/projections/review", headers=_headers())
-    raw = client.get("/v1/behavior/projections/review.html", headers=_headers())
+    wrapped = client.get("/v1/behavior/projections/review", headers=_verified_headers())
+    raw = client.get("/v1/behavior/projections/review.html", headers=_verified_headers())
     assert wrapped.status_code == 200
     assert raw.status_code == 200
     assert wrapped.json()["format"] == "html"
@@ -814,7 +859,7 @@ def test_behavior_review_html_is_sanitized_and_includes_historical_records(clien
 
 
 def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client: TestClient) -> None:
-    evidence = client.post("/v1/behavior/evidence", json=_payload(1), headers=_headers())
+    evidence = client.post("/v1/behavior/evidence", json=_payload(1), headers=_verified_headers())
     assert evidence.status_code == 200
     assignment_payload = {
         "trial_key": "pilot-trial-1",
@@ -828,12 +873,12 @@ def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client:
     assigned = client.post(
         "/v1/behavior/projections/pilot/assign",
         json=assignment_payload,
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     replayed = client.post(
         "/v1/behavior/projections/pilot/assign",
         json=assignment_payload,
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert assigned.status_code == 200, assigned.text
     assert replayed.status_code == 200
@@ -845,7 +890,7 @@ def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client:
     conflict = client.post(
         "/v1/behavior/projections/pilot/assign",
         json=conflicting,
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert conflict.status_code == 409
 
@@ -864,19 +909,19 @@ def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client:
     outcome = client.post(
         "/v1/behavior/projections/pilot/outcome",
         json=outcome_payload,
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     outcome_replay = client.post(
         "/v1/behavior/projections/pilot/outcome",
         json=outcome_payload,
-        headers=_headers(),
+        headers=_verified_headers(),
     )
     assert outcome.status_code == 200, outcome.text
     assert outcome_replay.status_code == 200
     assert outcome.json() == outcome_replay.json()
     assert outcome.json()["stale_evidence_used"] is False
 
-    status = client.get("/v1/behavior/projections/pilot/status", headers=_headers())
+    status = client.get("/v1/behavior/projections/pilot/status", headers=_verified_headers())
     assert status.status_code == 200
     assert status.json()["status"] == "collecting"
     assert status.json()["assignment_count"] == 1
@@ -906,7 +951,7 @@ def test_behavior_projection_pilot_feature_flag_is_a_safe_rollback(client: TestC
     settings = get_settings()
     settings.behavior_projection_pilot_enabled = False
     try:
-        response = client.get("/v1/behavior/projections/pilot/status", headers=_headers())
+        response = client.get("/v1/behavior/projections/pilot/status", headers=_verified_headers())
     finally:
         settings.behavior_projection_pilot_enabled = True
     assert response.status_code == 404

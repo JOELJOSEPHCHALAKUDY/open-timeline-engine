@@ -16,6 +16,7 @@ from tce_shared.behavior_control import (
     normalize_capability_operation,
     shadow_evaluation_metrics,
 )
+from tce_shared.decision_capture import resolve_prediction_fields
 
 
 def _now() -> datetime:
@@ -517,13 +518,16 @@ def save_shadow_prediction(
     predicted = prediction.get("predicted_choice")
     abstained = bool(prediction.get("abstained", True))
     correct = None if abstained else str(predicted).strip().casefold() == actual_choice.strip().casefold()
+    created_at = _now().isoformat()
+    # A prediction made in the same request as the answer is retrospective by construction.
     conn.execute(
         """
         INSERT INTO behavior_shadow_predictions (
             id, workspace_id, subject_user_id, observation_id, predicted_choice,
             actual_choice, confidence, abstained, correct, evidence_count, latency_ms,
-            query_json, citations_json, created_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1')
+            query_json, citations_json, created_at, schema_version,
+            prediction_stage, resolution_state, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', 'retrospective', 'resolved', ?)
         """,
         (
             prediction_id,
@@ -539,11 +543,147 @@ def save_shadow_prediction(
             max(0, latency_ms),
             _json(query),
             _json(prediction.get("citations") or []),
-            _now().isoformat(),
+            created_at,
+            created_at,
         ),
     )
     conn.commit()
     return prediction_id
+
+
+def freeze_shadow_prediction(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    opportunity_id: str,
+    session_id: str,
+    turn: int,
+    decision_family: str,
+    query: dict[str, Any],
+    prediction: dict[str, Any],
+    evidence_count: int,
+    latency_ms: int,
+    evidence_cutoff_at: datetime | None,
+    evidence_revision: str,
+    advice_visible: bool,
+    frozen_at: datetime,
+) -> str:
+    """Store a prospective prediction (or abstention) BEFORE the human answer exists. No commit."""
+    prediction_id = str(uuid.uuid4())
+    abstained = bool(prediction.get("abstained", True))
+    frozen_iso = frozen_at.isoformat()
+    conn.execute(
+        """
+        INSERT INTO behavior_shadow_predictions (
+            id, workspace_id, subject_user_id, observation_id, predicted_choice,
+            actual_choice, confidence, abstained, correct, evidence_count, latency_ms,
+            query_json, citations_json, created_at, schema_version,
+            opportunity_id, session_id, turn, decision_family, prediction_stage,
+            frozen_at, evidence_cutoff_at, evidence_revision, prediction_shown_at, advice_visible,
+            resolution_state, corrections_json
+        ) VALUES (?, ?, ?, NULL, ?, '', ?, ?, NULL, ?, ?, ?, ?, ?, 'v1',
+                  ?, ?, ?, ?, 'prospective', ?, ?, ?, NULL, ?, 'pending', '[]')
+        """,
+        (
+            prediction_id,
+            workspace_id,
+            subject_user_id,
+            prediction.get("predicted_choice"),
+            float(prediction.get("confidence", 0.0) or 0.0),
+            1 if abstained else 0,
+            max(0, int(evidence_count)),
+            max(0, int(latency_ms)),
+            _json(query),
+            _json(prediction.get("citations") or []),
+            frozen_iso,
+            opportunity_id,
+            session_id,
+            max(0, int(turn)),
+            decision_family,
+            frozen_iso,
+            evidence_cutoff_at.isoformat() if isinstance(evidence_cutoff_at, datetime) else None,
+            evidence_revision,
+            1 if advice_visible else 0,
+        ),
+    )
+    return prediction_id
+
+
+def resolve_shadow_prediction(
+    conn: sqlite3.Connection,
+    *,
+    prediction_id: str,
+    actual_choice: str,
+    observation_id: str | None,
+    resolution_source: str,
+    human_source_ref: str,
+    resolution_source_event_id: str | None,
+    resolved_at: datetime,
+    retrospective: bool = False,
+) -> bool:
+    """Resolve a pending prospective prediction against an authenticated human answer. No commit."""
+    row = conn.execute(
+        "SELECT predicted_choice, abstained FROM behavior_shadow_predictions WHERE id = ? AND resolution_state = 'pending'",
+        (prediction_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    correct = resolve_prediction_fields(row["predicted_choice"], bool(row["abstained"]), actual_choice)["correct"]
+    cursor = conn.execute(
+        """
+        UPDATE behavior_shadow_predictions
+        SET actual_choice = ?, correct = ?, observation_id = ?, resolved_at = ?, resolution_state = 'resolved',
+            resolution_source = ?, human_source_ref = ?, resolution_source_event_id = ?,
+            prediction_stage = CASE WHEN ? THEN 'retrospective' ELSE prediction_stage END
+        WHERE id = ? AND resolution_state = 'pending'
+        """,
+        (
+            actual_choice,
+            None if correct is None else (1 if correct else 0),
+            observation_id,
+            resolved_at.isoformat(),
+            resolution_source,
+            human_source_ref,
+            resolution_source_event_id,
+            1 if retrospective else 0,
+            prediction_id,
+        ),
+    )
+    return int(cursor.rowcount or 0) == 1
+
+
+def append_shadow_correction(conn: sqlite3.Connection, *, prediction_id: str, correction: dict[str, Any]) -> None:
+    """Append-only correction history; never rewrites actual_choice/correct."""
+    row = conn.execute("SELECT corrections_json FROM behavior_shadow_predictions WHERE id = ?", (prediction_id,)).fetchone()
+    if row is None:
+        return
+    try:
+        existing = json.loads(str(row["corrections_json"] or "[]"))
+    except (TypeError, ValueError):
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+    existing.append(dict(correction))
+    conn.execute("UPDATE behavior_shadow_predictions SET corrections_json = ? WHERE id = ?", (_json(existing), prediction_id))
+
+
+def mark_shadow_unresolved(
+    conn: sqlite3.Connection,
+    *,
+    prediction_id: str,
+    resolution_state: str,
+    resolution_source: str | None,
+) -> None:
+    """Move a pending prediction into a separate denominator (unanswered/missing_label/...). Only when pending."""
+    conn.execute(
+        """
+        UPDATE behavior_shadow_predictions
+        SET resolution_state = ?, resolution_source = COALESCE(?, resolution_source)
+        WHERE id = ? AND resolution_state = 'pending'
+        """,
+        (resolution_state, resolution_source, prediction_id),
+    )
 
 
 def shadow_status(
@@ -552,7 +692,8 @@ def shadow_status(
     rows = conn.execute(
         """
         SELECT id, observation_id, predicted_choice, actual_choice, confidence, abstained,
-               correct, evidence_count, latency_ms, created_at, schema_version
+               correct, evidence_count, latency_ms, created_at, schema_version,
+               prediction_stage, resolution_state, opportunity_id, decision_family, frozen_at, resolved_at
         FROM behavior_shadow_predictions
         WHERE workspace_id = ? AND subject_user_id = ? ORDER BY created_at DESC LIMIT ?
         """,
@@ -564,6 +705,11 @@ def shadow_status(
         item["abstained"] = bool(item["abstained"])
         item["correct"] = None if item["correct"] is None else bool(item["correct"])
         item["created_at"] = datetime.fromisoformat(item["created_at"])
+        item["prediction_stage"] = str(item.get("prediction_stage") or "retrospective")
+        item["resolution_state"] = str(item.get("resolution_state") or "resolved")
+        for key in ("frozen_at", "resolved_at"):
+            value = item.get(key)
+            item[key] = datetime.fromisoformat(str(value)) if value else None
         items.append(item)
     return {
         "metrics": shadow_evaluation_metrics(items),

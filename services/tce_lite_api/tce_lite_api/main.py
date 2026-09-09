@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import re
 import shlex
@@ -66,6 +67,7 @@ from tce_shared.behavior_pilot import (
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.dashboard import timeline_dashboard_html
+from tce_shared.decision_capture import HOST_CAPTURE_CAPABILITY, HOST_CAPTURE_SOURCE, HUMAN_INPUT_TASK_TYPE, TRUSTED_ORIGINS
 from tce_shared.events import (
     AgentRole,
     AutonomyGoalStatus,
@@ -92,6 +94,7 @@ from tce_shared.events import (
     CapabilityConsumeResponse,
     CapabilityGrantRequest,
     CapabilityGrantResponse,
+    CaptureDeliveryState,
     CloneAdviceRequest,
     CloneAdviceResponse,
     CompletionCaptureRequest,
@@ -142,6 +145,9 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TrustedInputCapture,
+    TrustedInputOriginKind,
+    TrustedInputReceipt,
 )
 from tce_shared.execution_transitions import completion_payload_fingerprint
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
@@ -149,7 +155,7 @@ from tce_shared.governance import build_governance_status
 from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
-from tce_shared.redaction import redact_text
+from tce_shared.redaction import redact_project_hint, redact_text
 from tce_shared.scope import PROJECT_BOUND
 
 from .auth import AuthContext, get_auth_context
@@ -185,6 +191,15 @@ from .behavior_pilot_store import (
 from .behavior_pilot_store import (
     record_outcome_lite as record_behavior_pilot_outcome,
 )
+from .capture_store import (
+    capture_delivery_state,
+    extract_pending_inputs,
+    get_receipt,
+    get_receipt_by_delivery_key,
+    insert_receipt,
+    open_opportunities_for_subject,
+    validate_source_event_provenance,
+)
 from .config import get_settings
 from .continuity_store import (
     CompletionConflictError,
@@ -206,6 +221,7 @@ from .store import (
     discover_takeover_goals,
     get_event,
     get_resume_packet,
+    human_origin_verified,
     invalidate_takeover_goal_cache,
     json_dumps,
     json_loads,
@@ -403,6 +419,9 @@ from .types import (
 settings = get_settings()
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     init_db()
@@ -410,6 +429,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     conn = next(connection_scope)
     try:
         drain_pending_handoffs(conn, retention_days=int(settings.handoff_retention_days))
+        if bool(getattr(settings, "capture_extraction_enabled", True)):
+            try:
+                extract_pending_inputs(conn, settings=settings, limit=int(getattr(settings, "decision_extraction_batch_size", 100)))
+            except Exception:
+                _LOGGER.warning("startup decision extraction sweep failed", exc_info=True)
     finally:
         connection_scope.close()
     yield
@@ -2430,7 +2454,9 @@ def _behavior_subject_access_allowed(auth: AuthContext) -> bool:
 
 def _enforce_workspace_access(auth: AuthContext, conn: sqlite3.Connection) -> None:
     access_mode = str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower()
-    if access_mode != "strict" and auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR}:
+    if access_mode != "strict" and (auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR} or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        # Compat mode: credential-bound principals (executors, the host-capture adapter) are not gated on
+        # team_memberships, which the first stored event auto-seeds with the executor. Strict mode gates everyone.
         return
     try:
         allowed = workspace_access_allowed(
@@ -2452,6 +2478,48 @@ def _enforce_workspace_access(auth: AuthContext, conn: sqlite3.Connection) -> No
 def _reject_advisor_writes(auth: AuthContext) -> None:
     if auth.role == AgentRole.ADVISOR:
         raise HTTPException(status_code=403, detail="advisor role is read-only")
+
+
+_INSECURE_API_TOKENS = {"", "changeme", "local-dev-token"}
+
+
+def _require_host_capture(auth: AuthContext) -> None:
+    """Only the host-capture capability (credential-bound, never header-derived) may attest human input."""
+    if HOST_CAPTURE_CAPABILITY not in auth.capabilities:
+        raise HTTPException(status_code=403, detail="host capture capability required")
+    cfg = get_settings()
+    if not bool(getattr(cfg, "allow_default_token", False)) and (cfg.host_capture_token_set & _INSECURE_API_TOKENS):
+        raise HTTPException(status_code=403, detail="host capture disabled: default token in use")
+
+
+def _capture_delivery_state_for_auth(auth: AuthContext, conn: sqlite3.Connection, *, now: datetime) -> str:
+    try:
+        return capture_delivery_state(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            stale_seconds=int(getattr(settings, "capture_delivery_stale_seconds", 21600)),
+            now=now,
+        )
+    except sqlite3.Error:
+        return "unknown"
+
+
+def _receipt_response(receipt: dict[str, Any], *, deduplicated: bool, capture_state: str) -> TrustedInputReceipt:
+    return TrustedInputReceipt(
+        receipt_id=UUID(str(receipt["id"])),
+        event_id=UUID(str(receipt["event_id"])) if receipt.get("event_id") else None,
+        delivery_key=str(receipt["delivery_key"]),
+        content_sha256=str(receipt["content_sha256"]),
+        origin_kind=TrustedInputOriginKind(str(receipt["origin_kind"])),
+        capture_principal=str(receipt["capture_principal"]),
+        observed_at=datetime.fromisoformat(str(receipt["observed_at"])),
+        ingested_at=datetime.fromisoformat(str(receipt["ingested_at"])),
+        deduplicated=deduplicated,
+        extraction_state=str(receipt.get("extraction_state") or "pending"),
+        queue_state=str(receipt.get("queue_state") or "inline"),
+        capture_delivery_state=CaptureDeliveryState(capture_state),
+    )
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -2772,6 +2840,160 @@ def read_event(
     if not event:
         raise HTTPException(status_code=404, detail="event not found")
     return event
+
+
+@app.post("/v1/inputs", response_model=TrustedInputReceipt, status_code=201)
+def capture_input(
+    body: TrustedInputCapture,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TrustedInputReceipt:
+    """Trusted capture channel: the host adapter delivers the human's raw input BEFORE any executor rewrites it.
+
+    Restricted to the host-capture capability; the durable receipt is persisted before acknowledging.
+    Lite parity gap: payloads are stored redacted in plaintext (no AES-GCM at rest) and extraction runs inline."""
+    _require_host_capture(auth)
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="inputs", method="POST").inc()
+    start = time.perf_counter()
+    if body.origin_kind == TrustedInputOriginKind.HUMAN_INPUT and auth.behavior_subject_id != auth.user_id:
+        raise HTTPException(status_code=403, detail="host capture must authenticate as the human subject")
+    now = datetime.now(tz=UTC)
+    # Host clock clamp: `observed_at` is host-supplied. A clock running ahead would otherwise make a prediction
+    # frozen AFTER the answer look prospective (inflating the exit-gate denominator) and let a message promote as
+    # the answer to a question that did not exist yet.
+    host_observed_at = body.observed_at if body.observed_at.tzinfo else body.observed_at.replace(tzinfo=UTC)
+    observed_at = min(host_observed_at.astimezone(UTC), now)
+    existing = get_receipt_by_delivery_key(conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, delivery_key=body.delivery_key)
+    if existing is not None:
+        return _receipt_response(existing, deduplicated=True, capture_state=_capture_delivery_state_for_auth(auth, conn, now=now))
+
+    # Server-side re-redaction + cap: the hook's redaction is not trusted on its own.
+    max_chars = max(1, int(getattr(settings, "capture_max_chars", 2000)))
+    redacted, applied = redact_text(body.content)
+    content = redacted[:max_chars]
+    truncated = bool(body.content_truncated) or len(redacted) > max_chars
+    # project_hint is untrusted host input: the hook redacts client-side, but the server does not trust that.
+    # A credential URL hides in exactly the keys ('repo', 'project', 'branch') the content allowlist would spare,
+    # so it is sanitized before it reaches scope resolution or the event context.
+    project_hint, hint_redactions = redact_project_hint(dict(body.project_hint) if isinstance(body.project_hint, dict) else {})
+    scope = auth.resolved_scope(project_hint=project_hint or None)
+    project_id = scope.project_id if scope.project_binding == PROJECT_BOUND else None
+    redaction_applied = sorted(set(body.redaction_applied) | set(applied) | set(hint_redactions))
+    observed_iso = observed_at.isoformat()
+    ingested_iso = now.isoformat()
+    first_line = next((line.strip() for line in content.splitlines() if line.strip()), "") or "human input"
+    event = EventEnvelope(
+        schema_version=1,
+        ts=observed_at,
+        actor="user",
+        source=HOST_CAPTURE_SOURCE,
+        domain="coding",
+        task_type=HUMAN_INPUT_TASK_TYPE,
+        event_type=EventType.TASK_STEP,
+        title=first_line[:150],
+        sensitivity=2,
+        idempotency_key=body.delivery_key,
+        source_id=body.session_id,
+        source_seq=body.sequence,
+        tags=["human_input", str(body.host_client or "claude")],
+        context={
+            "input_origin": body.origin_kind.value,
+            "capture_principal": auth.consumer,
+            "host_session_id": body.session_id,
+            "prompt_id": body.prompt_id,
+            "cwd": body.cwd,
+            "hook_event_name": body.hook_event_name,
+            "host_client": body.host_client,
+            "project": project_hint.get("project"),
+            "project_root": project_hint.get("project_root"),
+            "git_remote": project_hint.get("git_remote"),
+            "branch": project_hint.get("branch"),
+            "project_id": project_id,
+            "observed_at": observed_iso,
+            "ingested_at": ingested_iso,
+        },
+        payload={
+            "input_excerpt": content,
+            "original_char_count": int(body.original_char_count),
+            "content_truncated": truncated,
+            "conversation_session_id": body.session_id,
+            "input_sha256": body.content_sha256,
+            "redaction_applied": redaction_applied,
+            "hook_event_name": body.hook_event_name,
+            "live_capture": True,
+        },
+    )
+    event_id = store_event(conn, event, settings, auth)
+    receipt_id = str(uuid.uuid4())
+    insert_receipt(
+        conn,
+        receipt_id=receipt_id,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        subject_user_id=auth.behavior_subject_id,
+        host_session_id=body.session_id,
+        sequence=body.sequence,
+        prompt_id=body.prompt_id,
+        delivery_key=body.delivery_key,
+        content_sha256=body.content_sha256,
+        origin_kind=body.origin_kind.value,
+        capture_principal=auth.consumer,
+        host_client=str(body.host_client or "claude"),
+        event_id=str(event_id),
+        project_id=project_id,
+        observed_at=observed_at,
+        ingested_at=now,
+        original_char_count=int(body.original_char_count),
+        content_truncated=truncated,
+        redaction_applied=redaction_applied,
+        spool_depth=int(body.spool_depth),
+        spool_failures=int(body.spool_failures),
+        gap_since=body.gap_since,
+        queue_state="inline" if bool(getattr(settings, "capture_extraction_enabled", True)) else "disabled",
+    )
+    conn.commit()
+    if bool(getattr(settings, "capture_extraction_enabled", True)):
+        # Lite has no worker: derive decision candidates inline, never failing the capture itself.
+        try:
+            extract_pending_inputs(conn, settings=settings, limit=1, receipt_id=receipt_id)
+        except Exception:
+            _LOGGER.warning("inline decision extraction failed for receipt %s", receipt_id, exc_info=True)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    REQUEST_LATENCY.labels(endpoint="inputs", method="POST").observe(latency_ms / 1000.0)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="capture_input",
+        query={
+            "receipt_id": receipt_id,
+            "delivery_key": body.delivery_key,
+            "origin_kind": body.origin_kind.value,
+            "host_client": str(body.host_client or "claude"),
+            "project_hint_redactions": hint_redactions,
+        },
+        result_event_ids=[event_id],
+        policy_decisions={"mode": "bearer", "role": auth.role.value, "capabilities": sorted(auth.capabilities)},
+        latency_ms=latency_ms,
+    )
+    stored = get_receipt(conn, receipt_id=receipt_id)
+    if stored is None:  # pragma: no cover - defensive: the row was just committed
+        raise HTTPException(status_code=500, detail="receipt persistence failed")
+    return _receipt_response(stored, deduplicated=False, capture_state=_capture_delivery_state_for_auth(auth, conn, now=now))
+
+
+@app.get("/v1/inputs/{receipt_id}", response_model=TrustedInputReceipt)
+def read_input_receipt(
+    receipt_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TrustedInputReceipt:
+    REQUEST_COUNT.labels(endpoint="inputs_get", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    receipt = get_receipt(conn, receipt_id=str(receipt_id))
+    if receipt is None or str(receipt["workspace_id"]) != auth.workspace_id or str(receipt["subject_user_id"]) != auth.behavior_subject_id:
+        raise HTTPException(status_code=404, detail="receipt not found")
+    return _receipt_response(receipt, deduplicated=False, capture_state=_capture_delivery_state_for_auth(auth, conn, now=datetime.now(tz=UTC)))
 
 
 @app.post("/v1/search", response_model=dict)
@@ -4723,7 +4945,7 @@ def takeover_execution_status(
 ) -> ExecutionStatusResponse:
     _enforce_workspace_access(auth, conn)
     REQUEST_COUNT.labels(endpoint="takeover_execution_status", method="GET").inc()
-    return store_execution_status(conn, auth=auth, session_id=session_id)
+    return store_execution_status(conn, auth=auth, session_id=session_id, settings=settings)
 
 
 @app.get("/v1/workflow/templates")
@@ -4971,14 +5193,66 @@ def _store_behavior_evidence_lite_api(
     # is downgraded to inferred, may not supersede prior observations, and is held out of learning as
     # pending_review below regardless of score.
     is_human = auth.role == AgentRole.USER
+    # P1: only a server-established human identity (bound claim, mTLS, or the host-capture credential) mints
+    # learning-eligible human evidence. In compat mode `X-TCE-Role: user` is caller-asserted on the executor's
+    # own bearer, so a header-asserted USER stores for audit but stays pending review.
+    identity_verified = human_origin_verified(auth)
+    human_verified = is_human and identity_verified
     if not is_human:
         raw["evidence_source"] = BehaviorEvidenceSource.INFERRED.value
         raw["supersedes_observation_id"] = None
     normalized = normalize_behavior_evidence(raw)
+    # P1: a source-event id is meaningful only when the server validates its ownership, origin and scope.
+    identity_unverified_link = False
+    source_event_ids = [str(value) for value in (body.source_event_ids or [])]
+    if source_event_ids:
+        provenance = validate_source_event_provenance(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            event_ids=source_event_ids,
+        )
+        if any(not bool(info.get("owned")) for info in provenance.values()):
+            raise HTTPException(status_code=403, detail="source_event_ids outside caller scope")
+        # Binding manual evidence to a receipt/opportunity as human-origin is a human-origin promotion:
+        # it needs a server-established identity, not an X-TCE-Role header on the executor's own bearer.
+        verified_human = human_verified
+        if is_human and provenance and all(str(info.get("origin_kind") or "") in TRUSTED_ORIGINS for info in provenance.values()):
+            now = datetime.now(tz=UTC)
+            since = now - timedelta(seconds=max(0, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600))))
+            selected = str(normalized.get("selected_choice") or "").strip().casefold()
+            matching = [
+                item
+                for item in open_opportunities_for_subject(
+                    conn,
+                    workspace_id=auth.workspace_id,
+                    subject_user_id=auth.behavior_subject_id,
+                    project_id=None,
+                    since=since,
+                )
+                if str(item.get("situation_type")) == str(normalized.get("situation_type"))
+                and (not item.get("alternatives") or selected in {str(alt).strip().casefold() for alt in item.get("alternatives") or []})
+            ]
+            if len(matching) == 1 and verified_human:
+                normalized["opportunity_id"] = str(matching[0]["id"])
+                normalized["capture_receipt_id"] = next((info.get("receipt_id") for info in provenance.values() if info.get("receipt_id")), None)
+                normalized["origin_kind"] = "human_input"
+            elif len(matching) == 1:
+                # Stored for audit, but a header-asserted human never mints receipt-bound human-origin evidence.
+                identity_unverified_link = True
+    # The HTTP evidence path never confirms: only the receipt-backed extraction path sets confirmed_at.
+    normalized["confirmed_at"] = None
     storage_gate = behavior_storage_gate(
         normalized,
         threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
     )
+    if identity_unverified_link and storage_gate["learning_eligible"]:
+        storage_gate = {
+            **storage_gate,
+            "learning_eligible": False,
+            "decision": "pending_review",
+            "reasons": [*list(storage_gate.get("reasons") or []), "identity_unverified"],
+        }
     prior_evidence: list[dict[str, Any]] = []
     shadow_prediction: dict[str, Any] | None = None
     shadow_latency_ms = 0
@@ -5024,7 +5298,7 @@ def _store_behavior_evidence_lite_api(
     review_pending = bool(
         storage_gate["learning_eligible"]
         and (
-            not is_human
+            not human_verified
             or (
                 getattr(settings, "behavior_memory_review_enabled", True)
                 and normalized.get("evidence_source") in {"inferred", "backfill"}
@@ -5035,6 +5309,8 @@ def _store_behavior_evidence_lite_api(
         review_reasons = [*list(storage_gate.get("reasons") or []), "human_review_required"]
         if not is_human:
             review_reasons.append("non_human_caller")
+        elif not identity_verified:
+            review_reasons.append("identity_unverified")
         storage_gate = {
             **storage_gate,
             "learning_eligible": False,
@@ -5927,6 +6203,22 @@ def behavior_memory_review_resolve(
     _reject_advisor_writes(auth)
     REQUEST_COUNT.labels(endpoint="behavior_memory_review_resolve", method="POST").inc()
     _enforce_workspace_access(auth, conn)
+    # Promotion turns a pending_review row into learning-eligible evidence, so it is the same gate as
+    # minting that evidence directly: a header-asserted USER (compat mode) must not be able to round-trip
+    # its own pending row past the identity gate. Rejection needs no such proof.
+    is_human = auth.role == AgentRole.USER
+    if body.decision == "promote" and not human_origin_verified(auth):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "behavior_review_promotion_rejected",
+                "message": "only a server-verified human may promote a pending review",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
     note, _ = redact_control_text(body.note, limit=1000)
     row = resolve_memory_review(
         conn,

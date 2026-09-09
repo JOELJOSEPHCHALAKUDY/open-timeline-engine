@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -226,6 +228,18 @@ class Settings(BaseSettings):
     takeover_confirm_keyword: str = "confirm"
     takeover_deny_keyword: str = "abort"
     takeover_autonomy_policy_default: str = "human_consultative"
+    # P1 trusted capture: host-capture credential + extraction/opportunity knobs.
+    host_capture_tokens: str = ""
+    # One token per line; missing/unreadable => empty set (logged once). Lets the host-capture credential
+    # live outside the repo .env that is mounted into the API container.
+    host_capture_tokens_file: str = ""
+    capture_max_chars: int = 2000
+    capture_delivery_stale_seconds: int = 21600
+    capture_opportunity_ttl_seconds: int = 3600
+    capture_extraction_enabled: bool = True
+    decision_extraction_batch_size: int = 100
+    decision_extraction_lease_seconds: int = 300
+    decision_extraction_max_attempts: int = 10
     takeover_goal_source: str = "open_discovery"
     takeover_goal_min_confidence: float = 0.62
     takeover_goal_selection_min_confidence: float = 0.62
@@ -343,6 +357,11 @@ class Settings(BaseSettings):
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}
 
     @property
+    def host_capture_token_set(self) -> set[str]:
+        tokens = {t.strip() for t in self.host_capture_tokens.split(",") if t.strip()}
+        return tokens | _read_host_capture_tokens_file(self.host_capture_tokens_file)
+
+    @property
     def redaction_zones(self) -> list[str]:
         return [path.strip() for path in self.redaction_zone_paths.split(",") if path.strip()]
 
@@ -402,6 +421,25 @@ class Settings(BaseSettings):
             max(0.05, float(self.search_embedding_timeout_seconds)),
             max(0.05, float(self.search_embedding_timeout_hard_cap_seconds)),
         )
+
+
+_logger = logging.getLogger(__name__)
+_tokens_file_warned: set[str] = set()
+
+
+def _read_host_capture_tokens_file(path: str) -> set[str]:
+    """Union source for host-capture tokens: one token per line; missing/unreadable => empty (logged once)."""
+    target = str(path or "").strip()
+    if not target:
+        return set()
+    try:
+        lines = Path(target).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        if target not in _tokens_file_warned:
+            _tokens_file_warned.add(target)
+            _logger.warning("host capture tokens file %s unreadable: %s", target, exc)
+        return set()
+    return {line.strip() for line in lines if line.strip() and not line.strip().startswith("#")}
 
 
 @lru_cache(maxsize=1)

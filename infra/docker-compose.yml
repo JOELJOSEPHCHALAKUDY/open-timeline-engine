@@ -92,6 +92,9 @@ services:
       TCE_BEHAVIOR_PROCESS_MIN_SUPPORT: ${TCE_BEHAVIOR_PROCESS_MIN_SUPPORT:-2}
       TCE_CAPABILITY_GRANT_TTL_SECONDS: ${TCE_CAPABILITY_GRANT_TTL_SECONDS:-120}
       TCE_BEHAVIOR_CONTROL_RETENTION_DAYS: ${TCE_BEHAVIOR_CONTROL_RETENTION_DAYS:-365}
+      # Trusted human-input credential: read from a read-only mount of the host's 0600 token
+      # file, never from .env (which is mounted into this container and readable by executors).
+      TCE_HOST_CAPTURE_TOKENS_FILE: /run/secrets/tce_host_capture_token
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,6 +107,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ../.env:/workspace/.env
+      - ${TCE_HOST_CAPTURE_TOKEN_FILE:-${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine/host_capture.token}:/run/secrets/tce_host_capture_token:ro
     deploy:
       resources:
         limits:
@@ -137,6 +141,11 @@ services:
       TCE_QDRANT_URL: http://qdrant:6333
       TCE_WORKER_LISTEN_QUEUES: ${TCE_WORKER_LISTEN_QUEUES:-tce-default,tce-embeddings}
       TCE_WORKER_ENABLE_SCHEDULER: ${TCE_WORKER_ENABLE_SCHEDULER:-true}
+      # Trusted human-input credential: read from a read-only mount of the host's 0600 token
+      # file, never from .env (which is mounted into this container and readable by executors).
+      TCE_HOST_CAPTURE_TOKENS_FILE: /run/secrets/tce_host_capture_token
+    volumes:
+      - ${TCE_HOST_CAPTURE_TOKEN_FILE:-${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine/host_capture.token}:/run/secrets/tce_host_capture_token:ro
     depends_on:
       postgres:
         condition: service_healthy

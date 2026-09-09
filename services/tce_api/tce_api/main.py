@@ -90,6 +90,14 @@ from tce_shared.behavior_pilot import (
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
 from tce_shared.continuity import assess_anchor_freshness
+from tce_shared.decision_capture import (
+    HOST_CAPTURE_CAPABILITY,
+    HOST_CAPTURE_SOURCE,
+    HUMAN_INPUT_TASK_TYPE,
+    TRUSTED_ORIGINS,
+    HumanResolution,
+    evidence_revision,
+)
 from tce_shared.dreams import (
     DreamSeed,
     DreamSignals,
@@ -126,6 +134,7 @@ from tce_shared.events import (
     CapabilityConsumeResponse,
     CapabilityGrantRequest,
     CapabilityGrantResponse,
+    CaptureDeliveryState,
     CloneAdviceRequest,
     CloneAdviceResponse,
     CompletionCaptureRequest,
@@ -197,6 +206,9 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TrustedInputCapture,
+    TrustedInputOriginKind,
+    TrustedInputReceipt,
 )
 from tce_shared.execution_transitions import (
     SYSTEM_ACTOR,
@@ -281,6 +293,7 @@ from .behavior_control_store import (
     consume_capability_grant,
     create_counterfactual,
     create_memory_review,
+    freeze_shadow_prediction,
     issue_capability_grant,
     list_counterfactuals,
     list_process_models,
@@ -288,6 +301,7 @@ from .behavior_control_store import (
     mine_and_time,
     resolve_counterfactual,
     resolve_memory_review,
+    resolve_shadow_prediction,
     save_process_models,
     save_shadow_prediction,
     shadow_status,
@@ -319,6 +333,22 @@ from .behavior_store import (
 )
 from .bundle import _pattern_rows_in_scope, build_context_bundle, search_response
 from .cache_clients import get_redis_client
+from .capture_store import (
+    capture_delivery_state,
+    close_opportunities,
+    get_opportunity,
+    get_receipt,
+    get_receipt_by_delivery_key,
+    insert_human_resolution,
+    insert_opportunity,
+    insert_receipt,
+    mark_opportunity_relayed,
+    open_opportunities_for_subject,
+    open_opportunity_for_session,
+    resolve_opportunity,
+    set_receipt_queue_state,
+    validate_source_event_provenance,
+)
 from .clone import (
     advisor_reason,
     arbitrate,
@@ -375,7 +405,7 @@ from .models import (
 from .otel import setup_otel
 from .policy import PolicyEngine
 from .queue import enqueue_job, get_queue_depth, queue_name_for_job
-from .redaction import apply_redaction_zones, redact_payload, redact_text
+from .redaction import apply_redaction_zones, redact_payload, redact_project_hint, redact_text
 from .routes.system import build_system_router
 from .schemas import (
     ActivitySummaryResponse,
@@ -3225,12 +3255,59 @@ def _ingest_source_allowed(source: str) -> bool:
     return normalized.startswith("api-") or normalized.startswith("tce-")
 
 
+def _seed_behavior_subject_membership(db: Session, auth: AuthContext) -> None:
+    """Compat mode: keep the human subject a member of the workspace an executor writes into.
+
+    ``index_event_graph`` seeds ``team_memberships`` with the acting principal as ``owner``; once any row
+    exists ``workspace_access_allowed`` denies every non-member, which would 403 the human (and the
+    host-capture adapter acting as them) out of their own workspace. Strict mode stays explicit.
+    """
+    subject = str(auth.behavior_subject_id or "").strip()
+    if not subject or subject == auth.user_id:
+        return
+    if str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower() == "strict":
+        return
+    try:
+        with db.begin_nested():
+            db.execute(
+                text(
+                    """
+                    INSERT INTO team_memberships (id, workspace_id, user_id, role, added_by, created_at, active)
+                    VALUES (:id, :workspace_id, :user_id, 'owner', :added_by, :created_at, true)
+                    ON CONFLICT (workspace_id, user_id)
+                    DO UPDATE SET active = true
+                    """
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "user_id": subject,
+                    "added_by": auth.user_id,
+                    "created_at": datetime.now(tz=UTC),
+                },
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _store_event(db: Session, event: EventEnvelope, auth: AuthContext) -> UUID:
     if not _ingest_source_allowed(event.source):
         raise HTTPException(
             status_code=403,
             detail=f"event source '{event.source}' is not allowed for ingest",
         )
+    if HOST_CAPTURE_CAPABILITY not in auth.capabilities:
+        # Human-origin events are only writable by the host-capture capability: an executor may
+        # not mint a human_input event, borrow the capture source, or stamp a trusted origin.
+        context_input = event.context if isinstance(event.context, dict) else {}
+        if (
+            str(event.task_type or "") == HUMAN_INPUT_TASK_TYPE
+            or str(event.source or "").strip().lower() == HOST_CAPTURE_SOURCE
+            or str(context_input.get("input_origin") or "") in TRUSTED_ORIGINS
+            or "capture_principal" in context_input
+        ):
+            raise HTTPException(status_code=403, detail="human-origin events require the host capture capability")
     idempotency_key = str(getattr(event, "idempotency_key", "") or "").strip() or None
     source_id = str(getattr(event, "source_id", "") or "").strip() or None
     source_seq_raw = getattr(event, "source_seq", None)
@@ -3385,6 +3462,7 @@ def _store_event(db: Session, event: EventEnvelope, auth: AuthContext) -> UUID:
         )
     except Exception:
         graph_index = {}
+    _seed_behavior_subject_membership(db, auth)
     enqueue_job("tce_worker.jobs.embedding.run", str(row.id))
     if settings.episode_extraction_enabled:
         if settings.episode_extraction_async:
@@ -3842,6 +3920,173 @@ def _reject_advisor_writes(auth: AuthContext) -> None:
 _INSECURE_API_TOKENS = {"", "changeme", "local-dev-token"}
 
 
+def _require_host_capture(auth: AuthContext) -> None:
+    """Only a host-capture credential may attest human input; capability is never header-derived."""
+    if HOST_CAPTURE_CAPABILITY not in auth.capabilities:
+        raise HTTPException(status_code=403, detail="host capture capability required")
+    cfg = get_settings()
+    if not cfg.allow_default_token and (cfg.host_capture_token_set & _INSECURE_API_TOKENS):
+        raise HTTPException(status_code=403, detail="host capture disabled: default token in use")
+
+
+def _is_unattended_profile(profile: Any) -> bool:
+    value = str(getattr(profile, "value", profile) or settings.takeover_autonomy_policy_default or "").strip().lower()
+    return value != AutonomyPolicyProfile.HUMAN_CONSULTATIVE.value
+
+
+def _capture_delivery_state_for(db: Session, auth: AuthContext, now: datetime) -> str:
+    # Savepoint, not rollback: a failed lookup mid-turn must not discard freeze rows the turn already
+    # wrote (pending_safety/open_decision would then point at nothing), but a failed statement on
+    # Postgres has to be unwound or every later statement in the request fails too.
+    try:
+        with db.begin_nested():
+            return capture_delivery_state(
+                db,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                stale_seconds=int(getattr(settings, "capture_delivery_stale_seconds", 21600)),
+                now=now,
+            )
+    except Exception:
+        logger.warning("capture delivery state lookup failed", exc_info=True)
+        return str(CaptureDeliveryState.UNKNOWN.value)
+
+
+_CAPTURE_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: capture channel unavailable"
+
+
+def _capture_pause_text(state_value: str) -> str:
+    return (
+        f"{_CAPTURE_PAUSE_PREFIX} (state={state_value}). Unattended mutation requires the trusted "
+        "human-input audit channel. Ask the user to restore the host capture hook or switch the "
+        "autonomy profile to human_consultative."
+    )
+
+
+def _freeze_decision_opportunity(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: TakeoverStepRequest,
+    turn: int,
+    decision_family: str,
+    situation_type: str,
+    question_text: str,
+    alternatives: list[str],
+    objective_text: str,
+    objective_hash_value: str | None,
+    snapshot: dict[str, Any],
+    advice_visible: bool,
+    project_id: str | None,
+) -> UUID | None:
+    """Freeze the pre-answer context and a prospective prediction BEFORE the human answers.
+
+    Never fails the takeover turn: any error is logged and returns None. No commit here —
+    save_takeover_state commits the same transaction.
+    """
+    try:
+        with db.begin_nested():
+            prior = load_behavior_evidence(
+                db,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                limit=500,
+                eligible_only=True,
+            )
+            revision, cutoff = evidence_revision(prior)
+            query = {
+                "situation_type": situation_type,
+                "situation_summary": question_text[:500],
+                "objective_text": objective_text,
+                "constraints": dict(body.constraints or {}),
+                "context_snapshot": snapshot,
+            }
+            started = time.perf_counter()
+            prediction = predict_behavior(
+                prior,
+                query,
+                candidate_choices=list(alternatives),
+                min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
+            )
+            latency_ms = max(0, int((time.perf_counter() - started) * 1000))
+            now = datetime.now(tz=UTC)
+            opportunity_id = uuid.uuid4()
+            prediction_id = freeze_shadow_prediction(
+                db,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                opportunity_id=opportunity_id,
+                session_id=state.session_id,
+                turn=turn,
+                decision_family=decision_family,
+                query=query,
+                prediction=prediction,
+                evidence_count=len(prior),
+                latency_ms=latency_ms,
+                evidence_cutoff_at=cutoff,
+                evidence_revision=revision,
+                advice_visible=advice_visible,
+                frozen_at=now,
+            )
+            ttl = max(60, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600)))
+            insert_opportunity(
+                db,
+                opportunity_id=opportunity_id,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                turn=turn,
+                objective_hash=objective_hash_value,
+                task_id=None,
+                project_id=project_id,
+                decision_family=decision_family,
+                situation_type=situation_type,
+                question_text=question_text,
+                alternatives=list(alternatives),
+                pre_answer_snapshot={
+                    **snapshot,
+                    "final_response": question_text,
+                    "turn": turn,
+                },
+                evidence_cutoff_at=cutoff,
+                evidence_revision=revision,
+                advice_exposure={"advice_visible": bool(advice_visible), "prediction_shown": False},
+                shadow_prediction_id=prediction_id,
+                source_event_id=None,
+                expires_at=now + timedelta(seconds=ttl),
+                created_at=now,
+                frozen_at=now,
+            )
+        return opportunity_id
+    except Exception:
+        logger.warning("failed to freeze decision opportunity", exc_info=True)
+        return None
+
+
+def _opportunity_uuid(value: Any) -> UUID | None:
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _relay_pending_safety_answer(db: Session, pending_safety: Any, message: str, now: datetime) -> None:
+    """The executor relayed a confirm/deny; record it on the opportunity but never resolve it."""
+    if not isinstance(pending_safety, dict):
+        return
+    opportunity_id = _opportunity_uuid(pending_safety.get("opportunity_id"))
+    if opportunity_id is None:
+        return
+    try:
+        mark_opportunity_relayed(db, opportunity_id, relayed_answer=str(message or "")[:500], relayed_at=now)
+    except Exception:
+        logger.warning("failed to mark safety opportunity relayed", exc_info=True)
+
+
 def _reject_privileged_default_token(settings_obj: Settings | None = None) -> None:
     """Refuse privileged operations while a well-known default token is live.
 
@@ -3877,7 +4122,9 @@ def _behavior_subject_access_allowed(auth: AuthContext) -> bool:
 def _enforce_workspace_access(auth: AuthContext, db: Session) -> None:
     access_mode = str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower()
     strict = access_mode == "strict"
-    if not strict and auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR}:
+    if not strict and (auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR} or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        # Compat mode: credential-bound principals (executors, the host-capture adapter) are not gated on
+        # team_memberships, which the first stored event auto-seeds with the executor. Strict mode gates everyone.
         return
     try:
         allowed = workspace_access_allowed(
@@ -4105,6 +4352,205 @@ def ingest_event(
         latency_ms=latency_ms,
     )
     return IngestResponse(event_id=event_id)
+
+
+def _receipt_response(row: dict[str, Any], *, deduplicated: bool, delivery_state: str) -> TrustedInputReceipt:
+    return TrustedInputReceipt(
+        receipt_id=UUID(str(row["id"])),
+        event_id=UUID(str(row["event_id"])) if row.get("event_id") else None,
+        delivery_key=str(row["delivery_key"]),
+        content_sha256=str(row["content_sha256"]),
+        origin_kind=TrustedInputOriginKind(str(row["origin_kind"])),
+        capture_principal=str(row["capture_principal"]),
+        observed_at=row["observed_at"],
+        ingested_at=row["ingested_at"],
+        deduplicated=deduplicated,
+        extraction_state=str(row.get("extraction_state") or "pending"),
+        queue_state=str(row.get("queue_state") or "inline"),
+        capture_delivery_state=CaptureDeliveryState(delivery_state),
+    )
+
+
+@app.post("/v1/inputs", response_model=TrustedInputReceipt, status_code=201)
+def capture_input(
+    body: TrustedInputCapture,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> TrustedInputReceipt:
+    """Trusted capture channel: the host's user-input boundary posts here, executors cannot."""
+    start = time.perf_counter()
+    _require_host_capture(auth)
+    _enforce_workspace_access(auth, db)
+    REQUEST_COUNT.labels(endpoint="inputs", method="POST").inc()
+    origin_kind = str(body.origin_kind.value)
+    if origin_kind in TRUSTED_ORIGINS and auth.behavior_subject_id != auth.user_id:
+        raise HTTPException(status_code=403, detail="host capture must authenticate as the human subject")
+    if bool(settings.security_encrypt_sensitive_required) and not (
+        str(settings.security_encryption_secret or "").strip() or os.getenv("TCE_SECURITY_ENCRYPTION_SECRET", "").strip()
+    ):
+        raise HTTPException(status_code=503, detail="capture channel requires TCE_SECURITY_ENCRYPTION_SECRET")
+    now = datetime.now(tz=UTC)
+    existing = get_receipt_by_delivery_key(
+        db,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        delivery_key=body.delivery_key,
+    )
+    if existing is not None:
+        return _receipt_response(existing, deduplicated=True, delivery_state=_capture_delivery_state_for(db, auth, now))
+
+    # Server-side re-redaction + cap; the hook already redacted, the server never trusts that alone.
+    redacted, applied = redact_text(body.content)
+    max_chars = max(1, int(getattr(settings, "capture_max_chars", 2000)))
+    content = redacted[:max_chars]
+    truncated = bool(body.content_truncated) or len(redacted) > max_chars
+    observed_at = body.observed_at if body.observed_at.tzinfo is not None else body.observed_at.replace(tzinfo=UTC)
+    # A host clock running ahead must not let a capture claim a moment the server has not reached yet:
+    # that would let a prompt POSTed now be judged as predating a question frozen later, inflating the
+    # prospective denominator. Nothing can be observed after it was ingested, so clamp to server now.
+    observed_at = min(observed_at, now)
+    # project_hint is host-supplied and just as untrusted as content: a git remote routinely carries
+    # userinfo credentials ("https://user:ghp_...@github.com/o/r"), and the server never trusts the
+    # hook's own redaction. Sanitize before the hint is used for scope resolution or stamped into the event.
+    project_hint, hint_redactions = redact_project_hint(dict(body.project_hint or {}))
+    redaction_applied = sorted(set(body.redaction_applied) | set(applied) | set(hint_redactions))
+    project_id: str | None = None
+    try:
+        resolved = auth.resolved_scope(project_hint=project_hint or None)
+        project_id = resolved.project_id if resolved.is_bound() else None
+    except Exception:
+        project_id = None
+    first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
+    event = EventEnvelope(
+        schema_version=1,
+        ts=observed_at,
+        actor="user",
+        source=HOST_CAPTURE_SOURCE,
+        domain="coding",
+        task_type=HUMAN_INPUT_TASK_TYPE,
+        event_type=EventType.TASK_STEP,
+        title=(first_line or "human input")[:150],
+        sensitivity=2,
+        idempotency_key=body.delivery_key,
+        source_id=body.session_id,
+        source_seq=body.sequence,
+        tags=["human_input", body.host_client],
+        context={
+            "input_origin": origin_kind,
+            "capture_principal": auth.consumer,
+            "host_session_id": body.session_id,
+            "prompt_id": body.prompt_id,
+            "cwd": body.cwd,
+            "hook_event_name": body.hook_event_name,
+            "host_client": body.host_client,
+            "project": project_hint.get("project"),
+            "project_root": project_hint.get("project_root"),
+            "git_remote": project_hint.get("git_remote"),
+            "branch": project_hint.get("branch"),
+            "project_id": project_id,
+            "observed_at": observed_at.isoformat(),
+            "ingested_at": now.isoformat(),
+        },
+        payload={
+            "input_excerpt": content,
+            "original_char_count": int(body.original_char_count),
+            "content_truncated": truncated,
+            "conversation_session_id": body.session_id,
+            "input_sha256": body.content_sha256,
+            "redaction_applied": redaction_applied,
+            "hook_event_name": body.hook_event_name,
+            "live_capture": True,
+        },
+    )
+    try:
+        event_id = _store_event(db, event, auth)
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=f"capture channel encryption failed: {exc}") from exc
+    receipt_id = uuid.uuid4()
+    insert_receipt(
+        db,
+        receipt_id=receipt_id,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        subject_user_id=auth.behavior_subject_id,
+        host_session_id=body.session_id,
+        sequence=body.sequence,
+        prompt_id=body.prompt_id,
+        delivery_key=body.delivery_key,
+        content_sha256=body.content_sha256,
+        origin_kind=origin_kind,
+        capture_principal=auth.consumer,
+        host_client=body.host_client,
+        event_id=event_id,
+        project_id=project_id,
+        observed_at=observed_at,
+        ingested_at=now,
+        original_char_count=int(body.original_char_count),
+        content_truncated=truncated,
+        redaction_applied=redaction_applied,
+        spool_depth=int(body.spool_depth),
+        spool_failures=int(body.spool_failures),
+        gap_since=body.gap_since,
+        queue_state="inline",
+    )
+    db.commit()
+    queue_state = "inline"
+    if not bool(getattr(settings, "capture_extraction_enabled", True)):
+        queue_state = "disabled"
+    else:
+        try:
+            enqueue_job("tce_worker.jobs.decision_extraction.run", str(receipt_id))
+            queue_state = "queued"
+        except Exception:
+            logger.warning("decision extraction enqueue failed", exc_info=True)
+            queue_state = "queue_unavailable"
+    set_receipt_queue_state(db, receipt_id, queue_state)
+    db.commit()
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    REQUEST_LATENCY.labels(endpoint="inputs", method="POST").observe(latency_ms / 1000)
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="capture_input",
+        query={
+            "receipt_id": str(receipt_id),
+            "delivery_key": body.delivery_key,
+            "origin_kind": origin_kind,
+            "host_client": body.host_client,
+        },
+        result_event_ids=[event_id],
+        policy_decisions={"mode": auth.mode, "role": auth.role.value, "capabilities": sorted(auth.capabilities)},
+        latency_ms=latency_ms,
+    )
+    return TrustedInputReceipt(
+        receipt_id=receipt_id,
+        event_id=event_id,
+        delivery_key=body.delivery_key,
+        content_sha256=body.content_sha256,
+        origin_kind=body.origin_kind,
+        capture_principal=auth.consumer,
+        observed_at=observed_at,
+        ingested_at=now,
+        deduplicated=False,
+        extraction_state="pending",
+        queue_state=queue_state,
+        capture_delivery_state=CaptureDeliveryState(_capture_delivery_state_for(db, auth, now)),
+    )
+
+
+@app.get("/v1/inputs/{receipt_id}", response_model=TrustedInputReceipt)
+def get_captured_input(
+    receipt_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> TrustedInputReceipt:
+    REQUEST_COUNT.labels(endpoint="inputs", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    row = get_receipt(db, receipt_id=receipt_id, workspace_id=auth.workspace_id, subject_user_id=auth.behavior_subject_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="receipt not found")
+    return _receipt_response(row, deduplicated=False, delivery_state=_capture_delivery_state_for(db, auth, datetime.now(tz=UTC)))
 
 
 @app.post("/v1/events/batch", response_model=BatchIngestResponse)
@@ -8073,10 +8519,61 @@ def _store_behavior_evidence_full(
     # is downgraded to inferred, may not supersede prior observations, and is held out of learning as
     # pending_review below regardless of score.
     is_human = auth.role == AgentRole.USER
+    # P1: a header-asserted USER (compat identity mode) is not an authenticated human. Only a
+    # server-bound/mTLS claim or the host-capture credential carries human origin into memory;
+    # an unverified USER still gets its evidence stored, but held for review below.
+    identity_verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    human_verified = is_human and identity_verified
     if not is_human:
         raw["evidence_source"] = BehaviorEvidenceSource.INFERRED.value
         raw["supersedes_observation_id"] = None
+    # P1: a source-event id only means something once the server has validated its ownership and
+    # origin. Any id outside the caller's scope is refused; a trusted human_input receipt that matches
+    # a still-open opportunity links the evidence to it. confirmed_at stays None on this path.
+    provenance_link: dict[str, Any] = {}
+    if body.source_event_ids:
+        provenance = validate_source_event_provenance(
+            db,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            event_ids=list(body.source_event_ids),
+        )
+        if any(not item.get("owned") for item in provenance.values()):
+            raise HTTPException(status_code=403, detail="source_event_ids outside caller scope")
+        if human_verified and provenance and all(item.get("origin_kind") == "human_input" for item in provenance.values()):
+            try:
+                candidates = open_opportunities_for_subject(
+                    db,
+                    workspace_id=auth.workspace_id,
+                    subject_user_id=auth.behavior_subject_id,
+                    project_id=None,
+                    since=datetime.now(tz=UTC) - timedelta(seconds=int(getattr(settings, "capture_opportunity_ttl_seconds", 3600))),
+                )
+            except Exception:
+                logger.warning("open opportunity lookup failed for evidence provenance", exc_info=True)
+                candidates = []
+            wanted_type = str(raw.get("situation_type") or "").strip().lower()
+            selected = str(raw.get("selected_choice") or "").strip().casefold()
+            matched = [
+                item
+                for item in candidates
+                if str(item.get("situation_type") or "").lower() == wanted_type
+                and (
+                    not list(item.get("alternatives_json") or [])
+                    or selected in {str(alt).casefold() for alt in list(item.get("alternatives_json") or [])}
+                )
+            ]
+            if len(matched) == 1:
+                first_receipt = next((item.get("receipt_id") for item in provenance.values() if item.get("receipt_id")), None)
+                provenance_link = {
+                    "opportunity_id": str(matched[0]["id"]),
+                    "capture_receipt_id": str(first_receipt) if first_receipt else None,
+                    "origin_kind": "human_input",
+                }
     normalized = normalize_behavior_evidence(raw)
+    if provenance_link:
+        normalized.update(provenance_link)
+    normalized["confirmed_at"] = None
     storage_gate = behavior_storage_gate(
         normalized,
         threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
@@ -8126,7 +8623,7 @@ def _store_behavior_evidence_full(
     review_pending = bool(
         storage_gate["learning_eligible"]
         and (
-            not is_human
+            not human_verified
             or (
                 getattr(settings, "behavior_memory_review_enabled", True)
                 and normalized.get("evidence_source") in {"inferred", "backfill"}
@@ -8137,6 +8634,8 @@ def _store_behavior_evidence_full(
         review_reasons = [*list(storage_gate.get("reasons") or []), "human_review_required"]
         if not is_human:
             review_reasons.append("non_human_caller")
+        elif not identity_verified:
+            review_reasons.append("identity_unverified")
         storage_gate = {
             **storage_gate,
             "learning_eligible": False,
@@ -9035,6 +9534,23 @@ def behavior_memory_review_resolve(
     _reject_advisor_writes(auth)
     REQUEST_COUNT.labels(endpoint="behavior_memory_review_resolve", method="POST").inc()
     _enforce_workspace_access(auth, db)
+    # Promotion turns a pending_review row into learning-eligible evidence, so it is the same gate as
+    # minting that evidence directly: a header-asserted USER (compat mode) must not be able to round-trip
+    # its own pending row past the identity gate. Rejection needs no such proof.
+    is_human = auth.role == AgentRole.USER
+    identity_verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if body.decision == "promote" and not (is_human and identity_verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "behavior_review_promotion_rejected",
+                "message": "only a server-verified human may promote a pending review",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
     note, _ = redact_control_text(body.note, limit=1000)
     row = resolve_memory_review(
         db,
@@ -10512,6 +11028,10 @@ def resolve_execution_permit(
         if auth.role == AgentRole.EXECUTOR and str(row["requested_by"] or "") == auth.consumer:
             raise HTTPException(status_code=403, detail="executor cannot self-approve a confirm_required permit")
         raise HTTPException(status_code=403, detail="only an operator may resolve a confirm_required permit")
+    if not (auth.identity_verified or HOST_CAPTURE_CAPABILITY in auth.capabilities) and str(row["requested_by"] or "") == auth.consumer:
+        # Same self-approval, laundered through the compat `X-TCE-Role: user` header on the requester's own
+        # bearer. Only a server-established identity may confirm a permit that this consumer requested.
+        raise HTTPException(status_code=403, detail="executor cannot self-approve a confirm_required permit")
     if expires_at and expires_at < datetime.now(tz=UTC):
         decision = ExecutionPermitDecision.BLOCKED
         reason = "permit expired"
@@ -10568,6 +11088,58 @@ def resolve_execution_permit(
         _invalidate_goal_queue_cache(db, auth=auth, state=state)
     except Exception:
         logger.warning("failed to invalidate takeover goal cache after permit resolve", exc_info=True)
+    try:
+        # An operator's permit decision is a human answer to the open safety question, but only a
+        # server-verified identity may confirm it. A header-asserted USER (compat `X-TCE-Role: user`)
+        # still gets its answer recorded for audit, tagged 'operator_unverified': the question is left
+        # open, the frozen shadow row is never scored from it, and nothing becomes confirmed evidence.
+        human_verified = auth.identity_verified or HOST_CAPTURE_CAPABILITY in auth.capabilities
+        open_opportunity = open_opportunity_for_session(
+            db,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=session_id,
+            decision_family="safety_confirmation",
+        )
+        if open_opportunity is not None:
+            alternatives = [str(item) for item in list(open_opportunity.get("alternatives_json") or [])]
+            confirm_word = alternatives[0] if alternatives else settings.takeover_confirm_keyword
+            deny_word = alternatives[1] if len(alternatives) > 1 else settings.takeover_deny_keyword
+            actual = confirm_word if decision == ExecutionPermitDecision.ALLOW else deny_word
+            resolved_at = datetime.now(tz=UTC)
+            opportunity_id = UUID(str(open_opportunity["id"]))
+            insert_human_resolution(
+                db,
+                resolution=HumanResolution(
+                    opportunity_id=str(opportunity_id),
+                    selected_choice=actual,
+                    resolution_source="operator_permit" if human_verified else "operator_unverified",
+                    human_source_ref=str(body.permit_id),
+                    resolved_at=resolved_at,
+                ),
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                receipt_id=None,
+                source_event_id=None,
+                candidate_id=None,
+                observation_id=None,
+            )
+            if human_verified:
+                shadow_id = _opportunity_uuid(open_opportunity.get("shadow_prediction_id"))
+                if shadow_id is not None:
+                    resolve_shadow_prediction(
+                        db,
+                        prediction_id=shadow_id,
+                        actual_choice=actual,
+                        observation_id=None,
+                        resolution_source="operator_permit",
+                        human_source_ref=str(body.permit_id),
+                        resolution_source_event_id=None,
+                        resolved_at=resolved_at,
+                    )
+                resolve_opportunity(db, opportunity_id=opportunity_id, resolved_at=resolved_at)
+    except Exception:
+        logger.warning("failed to resolve decision opportunity from permit", exc_info=True)
     db.commit()
     return ExecutionPermitResponse(
         decision=decision,
@@ -10918,6 +11490,10 @@ def takeover_execution_claim(
         activation_keywords=None,
         stop_keywords=None,
     )
+    if _is_unattended_profile(getattr(state, "autonomy_policy_profile", None)):
+        channel_state = _capture_delivery_state_for(db, auth, datetime.now(tz=UTC))
+        if channel_state in {CaptureDeliveryState.GAP.value, CaptureDeliveryState.UNAVAILABLE.value}:
+            raise HTTPException(status_code=409, detail=_CAPTURE_PAUSE_PREFIX)
     if body.directive_id:
         row = db.execute(
             text(
@@ -12232,6 +12808,7 @@ def takeover_execution_report(
                 "outcome_sentiment": outcome_sentiment,
                 "confidence": 0.82 if effective_state == DirectiveExecutionState.SUCCEEDED else 0.66,
                 "context_snapshot": context_snapshot,
+                "origin_kind": "executor_output",
             },
         )
         merged_meta["observation_id"] = str(execution_observation_id)
@@ -12476,11 +13053,13 @@ def takeover_execution_status(
         ),
         {"session_id": session_id, "workspace_id": auth.workspace_id, "user_id": auth.user_id},
     ).mappings().all()
+    status_now = datetime.now(tz=UTC)
     return ExecutionStatusResponse(
         session_id=session_id,
         pending=[_directive_from_row(row) for row in pending_rows],
         recent=[_directive_from_row(row) for row in recent_rows],
-        generated_at=datetime.now(tz=UTC),
+        generated_at=status_now,
+        capture_delivery_state=CaptureDeliveryState(_capture_delivery_state_for(db, auth, status_now)),
     )
 
 
@@ -13876,7 +14455,7 @@ Reply with JSON only:
 
 
 def _recent_messages_for_dreaming(
-    db: Session, *, scope: ResolvedScope, limit: int = 60
+    db: Session, *, scope: ResolvedScope, limit: int = 60, subject_user_id: str | None = None
 ) -> list[tuple[str, str]]:
     """Return (event_id, the real message text) for recent human messages.
 
@@ -13891,20 +14470,29 @@ def _recent_messages_for_dreaming(
         "limit": limit,
         "workspace_id": scope.workspace_id,
         "owner_id": scope.owner_id,
+        "subject_user_id": subject_user_id or scope.owner_id,
     }
     project_clause = ""
     if scope.is_bound() and scope.project_id:
         project_clause = "AND context->>'project_id' = :project_id"
         message_params["project_id"] = scope.project_id
+    # Live receipts (task_type='human_input') are accepted only when a trusted receipt row binds the
+    # event to this behavior subject; historical backfills keep the owner-scoped rule.
     rows = db.execute(
         text(
             f"""
             SELECT id, payload
             FROM events
-            WHERE task_type = 'human_input_backfill'
+            WHERE task_type IN ('human_input_backfill', '{HUMAN_INPUT_TASK_TYPE}')
               AND sensitivity <= :max_sensitivity
               AND context->>'_tce_workspace' = :workspace_id
-              AND context->>'_tce_owner' = :owner_id
+              AND (
+                    (task_type = 'human_input_backfill' AND context->>'_tce_owner' = :owner_id)
+                 OR (task_type = '{HUMAN_INPUT_TASK_TYPE}' AND EXISTS (
+                        SELECT 1 FROM trusted_input_receipts r
+                        WHERE r.event_id = events.id AND r.subject_user_id = :subject_user_id
+                    ))
+              )
               {project_clause}
             ORDER BY ts DESC
             LIMIT :limit
@@ -13940,7 +14528,7 @@ def _dreams_from_own_words(
         return []
     if not _plan_model_available(settings):
         return []
-    messages = _recent_messages_for_dreaming(db, scope=scope)
+    messages = _recent_messages_for_dreaming(db, scope=scope, subject_user_id=auth.behavior_subject_id)
     if len(messages) < 10:
         return []
     numbered = "\n\n".join(f"{i}. {body}" for i, (_, body) in enumerate(messages, start=1))
@@ -13997,6 +14585,8 @@ def _nothing_left_to_do(db: Session, *, auth: AuthContext, state: TakeoverState)
     context = state.takeover_context or {}
     # An unanswered question to the user outranks anything the system might want.
     if context.get("pending_safety"):
+        return False
+    if context.get("open_decision"):
         return False
     if state.active_goal_id or context.get("plan_root_goal_id"):
         return False
@@ -14892,6 +15482,50 @@ def takeover_preload(
     )
 
 
+def _feedback_target_opportunity(
+    db: Session,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: TakeoverFeedbackRequest,
+) -> dict[str, Any] | None:
+    """The open opportunity an operator's feedback answers (mirrors Lite store._feedback_target_opportunity)."""
+    candidate_ids: list[UUID] = []
+    requested = getattr(body, "opportunity_id", None)
+    if requested is not None:
+        candidate = _opportunity_uuid(requested)
+        if candidate is not None:
+            candidate_ids.append(candidate)
+    current = state.takeover_context.get("open_decision")
+    if isinstance(current, dict) and current.get("opportunity_id"):
+        candidate = _opportunity_uuid(current.get("opportunity_id"))
+        if candidate is not None:
+            candidate_ids.append(candidate)
+    try:
+        for opportunity_id in candidate_ids:
+            opportunity = get_opportunity(
+                db,
+                opportunity_id=opportunity_id,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+            )
+            if opportunity is not None and str(opportunity.get("status")) == "open":
+                return opportunity
+        if candidate_ids:
+            return None
+        # The takeover session state is keyed by the executor's user id, so a human operator's request never
+        # sees its open_decision; opportunities are subject-scoped, so fall back to the newest open one.
+        return open_opportunity_for_session(
+            db,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=body.session_id,
+        )
+    except Exception:
+        logger.warning("feedback opportunity lookup failed", exc_info=True)
+        return None
+
+
 @app.post("/v1/takeover/feedback", response_model=TakeoverFeedbackResponse)
 def takeover_feedback(
     body: TakeoverFeedbackRequest,
@@ -14934,8 +15568,15 @@ def takeover_feedback(
         # clears the storage score, is forced to learning_eligible=false / pending_review so it cannot
         # influence behavior until a human reviews it. confirmed_at is never caller-asserted on either path.
         is_human = auth.role == AgentRole.USER
+        # P1: only a server-verified human identity (bound claim, mTLS, or the host-capture credential)
+        # may answer a frozen decision opportunity. A header-asserted USER still stores its correction
+        # evidence, but resolves nothing and stays pending review.
+        human_verified = is_human and (auth.identity_verified or HOST_CAPTURE_CAPABILITY in auth.capabilities)
         supersedes_id = body.observation_ids[0] if (body.observation_ids and is_human) else None
         origin_label = "Human" if is_human else "Executor"
+        feedback_opportunity: dict[str, Any] | None = None
+        if human_verified:
+            feedback_opportunity = _feedback_target_opportunity(db, auth=auth, state=state, body=body)
         if is_human:
             evidence_source = BehaviorEvidenceSource.CORRECTION.value if supersedes_id else BehaviorEvidenceSource.EXPLICIT.value
         else:
@@ -14958,16 +15599,22 @@ def takeover_feedback(
                 "confirmed_at": None,
             }
         )
+        if feedback_opportunity is not None:
+            correction_evidence["opportunity_id"] = str(feedback_opportunity["id"])
         correction_gate = behavior_storage_gate(
             correction_evidence,
             threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
         )
-        if not is_human and correction_gate["learning_eligible"]:
+        if not human_verified and correction_gate["learning_eligible"]:
             correction_gate = {
                 **correction_gate,
                 "learning_eligible": False,
                 "decision": "pending_review",
-                "reasons": [*list(correction_gate.get("reasons") or []), "human_review_required", "non_human_caller"],
+                "reasons": [
+                    *list(correction_gate.get("reasons") or []),
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
             }
         try:
             behavior_evidence_id = save_behavior_evidence(
@@ -14981,6 +15628,50 @@ def takeover_feedback(
             feedback_details["behavior_evidence_id"] = str(behavior_evidence_id)
         except Exception:
             logger.warning("failed to persist behavior correction evidence", exc_info=True)
+        if feedback_opportunity is not None and behavior_evidence_id is not None:
+            # Authenticated (identity-verified) operator feedback resolves the open decision opportunity.
+            try:
+                resolved_at = datetime.now(tz=UTC)
+                opportunity_id = UUID(str(feedback_opportunity["id"]))
+                actual = str(correction_evidence.get("selected_choice") or body.correction_text or "")[:500]
+                insert_human_resolution(
+                    db,
+                    resolution=HumanResolution(
+                        opportunity_id=str(opportunity_id),
+                        selected_choice=actual,
+                        resolution_source="operator_feedback",
+                        human_source_ref=str(behavior_evidence_id),
+                        resolved_at=resolved_at,
+                        correction_text=str(body.correction_text or "")[:500],
+                    ),
+                    workspace_id=auth.workspace_id,
+                    subject_user_id=auth.behavior_subject_id,
+                    receipt_id=None,
+                    source_event_id=None,
+                    candidate_id=None,
+                    observation_id=behavior_evidence_id,
+                )
+                shadow_id = _opportunity_uuid(feedback_opportunity.get("shadow_prediction_id"))
+                if shadow_id is not None:
+                    resolve_shadow_prediction(
+                        db,
+                        prediction_id=shadow_id,
+                        actual_choice=actual,
+                        observation_id=behavior_evidence_id,
+                        resolution_source="operator_feedback",
+                        human_source_ref=str(behavior_evidence_id),
+                        resolution_source_event_id=None,
+                        resolved_at=resolved_at,
+                    )
+                resolve_opportunity(db, opportunity_id=opportunity_id, resolved_at=resolved_at)
+                open_decision = state.takeover_context.get("open_decision")
+                if isinstance(open_decision, dict) and str(open_decision.get("opportunity_id")) == str(opportunity_id):
+                    state.takeover_context.pop("open_decision", None)
+                feedback_details["resolved_opportunity_id"] = str(opportunity_id)
+                db.commit()
+            except Exception:
+                logger.warning("failed to resolve decision opportunity from feedback", exc_info=True)
+                db.rollback()
 
     feedback_observation_ids: list[UUID] = list(body.observation_ids or [])
     if behavior_evidence_id is not None and not feedback_observation_ids:
@@ -15189,6 +15880,18 @@ def takeover_step(
         )
         state.pending_directive_count = 0
         state.retry_backlog_count = 0
+        try:
+            close_opportunities(
+                db,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                session_id=state.session_id,
+                status="abandoned",
+                resolved_at=now,
+            )
+        except Exception:
+            logger.warning("failed to abandon open decision opportunities on stand-down", exc_info=True)
+        state.takeover_context.pop("open_decision", None)
         save_session_memory_snapshot(
             db,
             state=state,
@@ -15210,6 +15913,7 @@ def takeover_step(
                         "user_response": str(turn.get("message_preview", "")),
                         "outcome_sentiment": "neutral",
                         "confidence": 0.6,
+                        "origin_kind": "imported_transcript",
                     }
                     save_observation(db, obs)
             except Exception:
@@ -15339,6 +16043,15 @@ def takeover_step(
         awaiting_next_objective = False
         state.takeover_context.pop("force_user_objective_refresh", None)
         state.takeover_context.pop("objective_needs_refresh", None)
+        relayed_decision = state.takeover_context.get("open_decision")
+        if isinstance(relayed_decision, dict) and str(relayed_decision.get("family") or "") == "next_objective":
+            relayed_id = _opportunity_uuid(relayed_decision.get("opportunity_id"))
+            if relayed_id is not None:
+                try:
+                    mark_opportunity_relayed(db, relayed_id, relayed_answer=body.message[:500], relayed_at=now)
+                except Exception:
+                    logger.warning("failed to mark next-objective opportunity relayed", exc_info=True)
+            state.takeover_context.pop("open_decision", None)
     elif awaiting_next_objective:
         state.takeover_context["awaiting_next_objective_turns"] = int(
             state.takeover_context.get("awaiting_next_objective_turns", 0)
@@ -15974,6 +16687,11 @@ def takeover_step(
             "note": note,
         }
     if safety_decision == SafetyDecision.CONFIRM_REQUIRED:
+        previous_pending_safety = state.takeover_context.get("pending_safety")
+        previous_opportunity_id = (
+            str(previous_pending_safety.get("opportunity_id") or "") if isinstance(previous_pending_safety, dict) else ""
+        )
+        pending_response_text = final_response
         state.takeover_context["pending_safety"] = {
             "reason": safety_reason or "high-risk-action",
             "pending_response": final_response,
@@ -15982,11 +16700,40 @@ def takeover_step(
             f"Safety pause: high-risk action detected ({safety_reason or 'high-risk'}). "
             f"Type '{resolved_policy.confirm_keyword}' to continue or '{resolved_policy.deny_keyword}' to abort."
         )
+        if previous_opportunity_id:
+            # Re-ask turn: the question is unchanged, keep the frozen opportunity.
+            state.takeover_context["pending_safety"]["opportunity_id"] = previous_opportunity_id
+        elif safety_reason != "awaiting_high_risk_confirmation":
+            frozen_id = _freeze_decision_opportunity(
+                db,
+                auth=auth,
+                state=state,
+                body=body,
+                turn=turn_count,
+                decision_family="safety_confirmation",
+                situation_type="approval_requested",
+                question_text=final_response,
+                alternatives=[resolved_policy.confirm_keyword, resolved_policy.deny_keyword],
+                objective_text=str(resolved_task or ""),
+                objective_hash_value=state.objective_hash or None,
+                snapshot={
+                    "safety_reason": safety_reason,
+                    "pending_response": str(pending_response_text or "")[:1000],
+                    "objective": state.takeover_context.get("objective"),
+                    "citations": [str(item) for item in citations][:20],
+                },
+                advice_visible=bool(clone_payload),
+                project_id=scope.project_id if scope.is_bound() else None,
+            )
+            if frozen_id is not None:
+                state.takeover_context["pending_safety"]["opportunity_id"] = str(frozen_id)
     elif safety_decision == SafetyDecision.BLOCKED:
-        state.takeover_context.pop("pending_safety", None)
+        popped_safety = state.takeover_context.pop("pending_safety", None)
+        _relay_pending_safety_answer(db, popped_safety, body.message, now)
         final_response = "High-risk action aborted by operator decision."
     elif safety_reason == "confirmed_high_risk":
-        state.takeover_context.pop("pending_safety", None)
+        popped_safety = state.takeover_context.pop("pending_safety", None)
+        _relay_pending_safety_answer(db, popped_safety, body.message, now)
 
     autonomy_value = max(0.0, min(1.0, float(state.autonomy_score or 0.5)))
     low_threshold = max(0.0, min(1.0, float(settings.takeover_needs_human_threshold_cold)))
@@ -16043,6 +16790,42 @@ def takeover_step(
         takeover_enforcement = {}
         enforced = False
         enforcement_reason = None
+        existing_decision = state.takeover_context.get("open_decision")
+        reuse_next_objective = (
+            isinstance(existing_decision, dict)
+            and str(existing_decision.get("family") or "") == "next_objective"
+            and str(existing_decision.get("objective_hash") or "") == str(state.objective_hash or "")
+            and _opportunity_uuid(existing_decision.get("opportunity_id")) is not None
+        )
+        if not reuse_next_objective:
+            frozen_id = _freeze_decision_opportunity(
+                db,
+                auth=auth,
+                state=state,
+                body=body,
+                turn=turn_count,
+                decision_family="next_objective",
+                situation_type="prioritization_needed",
+                question_text=str(final_response),
+                alternatives=[],
+                objective_text=str(resolved_task or ""),
+                objective_hash_value=state.objective_hash or None,
+                snapshot={
+                    "last_completed_directive_id": state.takeover_context.get("last_completed_directive_id"),
+                    "objective_hash": state.objective_hash,
+                    "objective_needs_refresh": bool(state.takeover_context.get("objective_needs_refresh")),
+                },
+                advice_visible=bool(clone_payload),
+                project_id=scope.project_id if scope.is_bound() else None,
+            )
+            if frozen_id is not None:
+                state.takeover_context["open_decision"] = {
+                    "opportunity_id": str(frozen_id),
+                    "family": "next_objective",
+                    "objective_hash": state.objective_hash,
+                    "turn": turn_count,
+                    "created_at": now.isoformat(),
+                }
     execution_permit_required = (
         (not suppress_auto_directive)
         and state.mode == TakeoverMode.TAKEOVER
@@ -16240,6 +17023,7 @@ def takeover_step(
         safety_decision == SafetyDecision.ALLOW
         and ((execution_permit_required and execution_permit_id is None) or execution_claim_required)
     )
+    capture_channel_state = _capture_delivery_state_for(db, auth, now)
     advisor_fail_streak_limit = max(1, int(getattr(settings, "takeover_advisor_fail_streak_escalate", 2)))
     advisor_unhealthy = bool(
         state.mode == TakeoverMode.TAKEOVER
@@ -16298,6 +17082,80 @@ def takeover_step(
             "autonomy threshold for this turn. Ask the user how to proceed on this "
             "objective. Do not execute further and do not switch to natural-response mode."
         )
+    if needs_human and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
+        # Point B: a question is being posed to the human. Freeze the pre-answer context and the
+        # prospective prediction now, before any answer can exist.
+        if behavior_gate_blocked:
+            decision_family = "behavior_gate"
+        elif advisor_unhealthy:
+            decision_family = "operator_action"
+        else:
+            decision_family = "needs_human"
+        existing_decision = state.takeover_context.get("open_decision")
+        reuse_decision = False
+        if (
+            isinstance(existing_decision, dict)
+            and str(existing_decision.get("family") or "") == decision_family
+            and str(existing_decision.get("objective_hash") or "") == str(state.objective_hash or "")
+        ):
+            try:
+                still_open = open_opportunity_for_session(
+                    db,
+                    workspace_id=auth.workspace_id,
+                    subject_user_id=auth.behavior_subject_id,
+                    session_id=state.session_id,
+                )
+            except Exception:
+                still_open = None
+            reuse_decision = still_open is not None and str(still_open.get("id")) == str(existing_decision.get("opportunity_id"))
+        if not reuse_decision:
+            gate_choices = behavior_fidelity_gate.get("candidate_choices") if decision_family == "behavior_gate" else None
+            frozen_id = _freeze_decision_opportunity(
+                db,
+                auth=auth,
+                state=state,
+                body=body,
+                turn=turn_count,
+                decision_family=decision_family,
+                situation_type="escalation_point" if decision_family == "operator_action" else "choice_required",
+                question_text=str(final_response or "Ask the user how to proceed on this objective."),
+                alternatives=[str(item) for item in gate_choices] if isinstance(gate_choices, list) else [],
+                objective_text=str(resolved_task or ""),
+                objective_hash_value=state.objective_hash or None,
+                snapshot={
+                    "decision_confidence": float(round(decision_confidence, 4)),
+                    "needs_human_threshold": needs_human_threshold,
+                    "context_quality_score": float(round(context_quality_score, 4)),
+                    "retrieval_triggered": bool(retrieval_triggered),
+                    "objective": state.takeover_context.get("objective"),
+                    "objective_hash": state.objective_hash,
+                    "citations": [str(item) for item in citations][:20],
+                },
+                advice_visible=bool(clone_payload),
+                project_id=scope.project_id if scope.is_bound() else None,
+            )
+            if frozen_id is not None:
+                state.takeover_context["open_decision"] = {
+                    "opportunity_id": str(frozen_id),
+                    "family": decision_family,
+                    "objective_hash": state.objective_hash,
+                    "turn": turn_count,
+                    "created_at": now.isoformat(),
+                }
+    if (
+        # No `enforced` term: ensure_takeover_response returns enforced=False whenever the advisor text is
+        # already decisive, which would make this gate flap. Parity with Lite (store.py capture pause).
+        state.mode == TakeoverMode.TAKEOVER
+        and safety_decision == SafetyDecision.ALLOW
+        and not actionable_lifecycle_pause
+        and _is_unattended_profile(state.autonomy_policy_profile)
+        and capture_channel_state in {CaptureDeliveryState.GAP.value, CaptureDeliveryState.UNAVAILABLE.value}
+    ):
+        # Unattended mutation pauses while its required audit channel is down; the execution
+        # lock is kept so takeover never degrades to natural chat.
+        needs_human = True
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        final_response = _capture_pause_text(capture_channel_state)
     if needs_human:
         TAKEOVER_NEEDS_HUMAN_COUNT.inc()
     quality_history = state.takeover_context.get("quality_history")
@@ -16341,6 +17199,45 @@ def takeover_step(
     state.last_safety_decision = safety_decision
     state.autonomy_score = round((0.8 * float(state.autonomy_score)) + (0.2 * decision_confidence), 4)
     state.enforcement_mode = settings.takeover_enforcement_mode
+    # Only surface a decision opportunity while its row is still open: the worker resolves Point B/C
+    # opportunities from a receipt without touching this session state, and a stale id would keep the
+    # session reporting an answered question forever (and _nothing_left_to_do false). Mirrors Lite.
+    open_decision_opportunity_id: UUID | None = None
+    pending_safety_ctx = state.takeover_context.get("pending_safety")
+    open_decision_ctx = state.takeover_context.get("open_decision")
+    def _opportunity_still_open(candidate: UUID | None) -> bool:
+        if candidate is None:
+            return False
+        try:
+            row = get_opportunity(
+                db,
+                opportunity_id=candidate,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+            )
+        except Exception:
+            logger.warning("open decision status lookup failed", exc_info=True)
+            return False
+        return row is not None and str(row.get("status")) == "open"
+
+    if isinstance(pending_safety_ctx, dict) and pending_safety_ctx.get("opportunity_id"):
+        pending_candidate = _opportunity_uuid(pending_safety_ctx.get("opportunity_id"))
+        if _opportunity_still_open(pending_candidate):
+            open_decision_opportunity_id = pending_candidate
+        else:
+            # Keep the rest of pending_safety (it drives the confirm/deny flow); only the answered
+            # question's id must stop travelling with it.
+            pending_safety_ctx.pop("opportunity_id", None)
+    if (
+        open_decision_opportunity_id is None
+        and isinstance(open_decision_ctx, dict)
+        and open_decision_ctx.get("opportunity_id")
+    ):
+        candidate_id = _opportunity_uuid(open_decision_ctx.get("opportunity_id"))
+        if _opportunity_still_open(candidate_id):
+            open_decision_opportunity_id = candidate_id
+        else:
+            state.takeover_context.pop("open_decision", None)
     _sync_enforcement_counters(db, state)
     save_takeover_state(db, state)
 
@@ -16350,6 +17247,10 @@ def takeover_step(
         directive_for_note = final_response
         actual_final_response = None
     if safety_decision in {SafetyDecision.CONFIRM_REQUIRED, SafetyDecision.BLOCKED}:
+        directive_for_note = None
+        actual_final_response = final_response
+    if final_response and final_response.startswith(_CAPTURE_PAUSE_PREFIX):
+        # The capture-channel pause is a message for the human, not a directive for the executor.
         directive_for_note = None
         actual_final_response = final_response
 
@@ -16452,6 +17353,8 @@ def takeover_step(
         episode_boost_applied=bool(working_set.get("episode_boost_applied", False)),
         activation_boost_applied=bool(working_set.get("activation_boost_applied", False)),
         behavior_fidelity_gate=behavior_fidelity_gate,
+        capture_delivery_state=CaptureDeliveryState(capture_channel_state),
+        open_decision_opportunity_id=open_decision_opportunity_id,
     )
     write_audit_log(
         db,
@@ -16486,6 +17389,8 @@ def takeover_step(
             "directive_state": response.directive_state.value if response.directive_state else None,
             "retry_scheduled": response.retry_scheduled,
             "continuity_ok": response.continuity_ok,
+            "capture_delivery_state": capture_channel_state,
+            "opportunity_id": str(open_decision_opportunity_id) if open_decision_opportunity_id else None,
         },
         latency_ms=total_ms,
     )
@@ -16521,6 +17426,8 @@ def takeover_step(
             "directive_state": response.directive_state.value if response.directive_state else None,
             "retry_scheduled": response.retry_scheduled,
             "continuity_ok": response.continuity_ok,
+            "capture_delivery_state": capture_channel_state,
+            "opportunity_id": str(open_decision_opportunity_id) if open_decision_opportunity_id else None,
         },
     )
     _auto_capture_interaction(

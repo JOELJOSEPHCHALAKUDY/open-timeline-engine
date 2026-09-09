@@ -17,8 +17,18 @@ _BEHAVIOR_EVIDENCE_COLUMNS = """
     action_taken, correction_text, memory_class, evidence_source,
     lifecycle_status, valid_from, valid_until, contradicts_ids_json,
     confirmed_at, behavior_schema_version, redaction_applied,
-    learning_eligible, storage_score, storage_decision
+    learning_eligible, storage_score, storage_decision,
+    opportunity_id, origin_kind, capture_receipt_id, extraction_version
 """
+
+
+def _optional_uuid(value: Any) -> UUID | None:
+    if value is None or value == "":
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _uuid_list(values: list[Any]) -> list[UUID]:
@@ -56,7 +66,8 @@ def save_behavior_evidence(
                 action_taken, correction_text, memory_class, evidence_source,
                 lifecycle_status, valid_from, valid_until, contradicts_ids_json,
                 confirmed_at, behavior_schema_version, redaction_applied,
-                learning_eligible, storage_score, storage_decision
+                learning_eligible, storage_score, storage_decision,
+                opportunity_id, origin_kind, capture_receipt_id, extraction_version
             ) VALUES (
                 :id, :consumer_id, :workspace_id, :subject_user_id, :ts, :situation_type, :situation_summary,
                 CAST(:context_snapshot AS jsonb), :user_response, :response_reasoning, :outcome,
@@ -65,7 +76,8 @@ def save_behavior_evidence(
                 :selected_choice, :action_taken, :correction_text, :memory_class,
                 :evidence_source, :lifecycle_status, :valid_from, :valid_until,
                 CAST(:contradicts_ids_json AS jsonb), :confirmed_at, :behavior_schema_version,
-                :redaction_applied, :learning_eligible, :storage_score, :storage_decision
+                :redaction_applied, :learning_eligible, :storage_score, :storage_decision,
+                :opportunity_id, :origin_kind, :capture_receipt_id, :extraction_version
             )
             """
         ),
@@ -102,6 +114,12 @@ def save_behavior_evidence(
             "learning_eligible": bool(storage_gate.get("learning_eligible", False)),
             "storage_score": float(storage_gate.get("score", 0.0) or 0.0),
             "storage_decision": str(storage_gate.get("decision") or "audit_only"),
+            # P1 provenance: only the verified capture path (extraction job / server-side
+            # provenance validation) fills these; the HTTP evidence path leaves them null.
+            "opportunity_id": _optional_uuid(evidence.get("opportunity_id")),
+            "origin_kind": (str(evidence.get("origin_kind") or "") or None),
+            "capture_receipt_id": _optional_uuid(evidence.get("capture_receipt_id")),
+            "extraction_version": (str(evidence.get("extraction_version") or "") or None),
         },
     )
     if supersedes:

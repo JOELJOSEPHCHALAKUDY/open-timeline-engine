@@ -13,6 +13,7 @@ class BoundIdentity:
     workspace_id: str
     user_id: str
     behavior_subject_id: str
+    capabilities: tuple[str, ...] = ()
 
 
 def credential_fingerprint(kind: str, credential: str) -> str:
@@ -41,6 +42,7 @@ def parse_identity_claims(raw: str | dict[str, Any] | None) -> dict[str, BoundId
             workspace_id=str(value.get("workspace_id") or "personal").strip()[:160] or "personal",
             user_id=user_id[:160],
             behavior_subject_id=str(value.get("behavior_subject_id") or user_id).strip()[:160] or user_id[:160],
+            capabilities=tuple(sorted({str(c) for c in (value.get("capabilities") or []) if str(c) in {"host_capture"}})) if isinstance(value.get("capabilities"), list) else (),
         )
     return claims
 

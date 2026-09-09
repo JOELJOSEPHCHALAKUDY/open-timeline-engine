@@ -378,6 +378,9 @@ PROTECTED_PATH_PREFIXES = [
     "infra/",
 ]
 
+# Verbatim prefix of the API's capture-channel pause text (tce_api/tce_lite_api takeover_step, design §4.8).
+CAPTURE_CHANNEL_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: capture channel"
+
 HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
@@ -416,6 +419,20 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
         "reason": (
             "Before editing ANY file, call tce.check_context(file_path). "
             "If signal='block', do NOT edit. If signal='warn', review past_decisions."
+        ),
+    },
+    {
+        "directive_type": "hard_constraint",
+        "rule_id": "pause-when-capture-channel-down",
+        "scope": {
+            "actions": ["edit", "write", "delete", "execute"],
+        },
+        "enforcement": "pre_action_required",
+        "reason": (
+            "Before any mutating action, check capture_delivery_state in this result. If it is 'gap' or "
+            "'unavailable' and the autonomy profile is unattended, do NOT edit, write, delete, or execute; "
+            "tell the user the trusted human-input capture channel is down and ask them to restore the host "
+            "capture hook or approve continuing consultatively (autonomy profile human_consultative)."
         ),
     },
 ]
@@ -1674,6 +1691,12 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             final_response
             or "Execution claim required for this mutating directive. Call tce.claim_execution and then continue."
         )
+    elif needs_human and safety == "allow" and str(final_response or "").startswith(CAPTURE_CHANNEL_PAUSE_PREFIX):
+        # Capture-channel pause (design §4.8): the API's text must reach the
+        # executor verbatim in BOTH fields so it is shown to the user unchanged.
+        has_directive = False
+        next_step = str(final_response)
+        visible_response = str(final_response)
     elif needs_human and safety == "allow":
         has_directive = False
         next_step = (
@@ -1737,6 +1760,8 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "execution_permit_required": execution_permit_required,
         "execution_permit_id": execution_permit_id,
         "continuity_ok": bool(result.get("continuity_ok", True)),
+        "capture_delivery_state": str(result.get("capture_delivery_state") or "unknown"),
+        "open_decision_opportunity_id": result.get("open_decision_opportunity_id"),
         "project_binding": str(result.get("project_binding") or "unbound"),
         "directive_id": result.get("directive_id"),
         "directive_state": result.get("directive_state"),

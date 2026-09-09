@@ -187,13 +187,23 @@ def mine_process_models(
     return output[:100]
 
 
+_RESOLUTION_STATES = ("pending", "unanswered", "missing_label", "extraction_error", "missed_capture", "abandoned")
+
+
 def shadow_evaluation_metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     values = [dict(row) for row in rows]
     total = len(values)
-    non_abstained = [row for row in values if not bool(row.get("abstained"))]
+    # Only a resolved row has ground truth. Prospective predictions that are still
+    # pending, unanswered, or lost to a capture gap are counted separately and never
+    # averaged into precision — scoring them either way would corrupt the number.
+    # Rows without the key predate P1 and were always resolved at write time.
+    resolved = [row for row in values if str(row.get("resolution_state") or "resolved") == "resolved"]
+    non_abstained = [row for row in resolved if not bool(row.get("abstained"))]
     correct = sum(1 for row in non_abstained if bool(row.get("correct")))
-    recent = values[: min(30, total)]
-    previous = values[min(30, total) : min(60, total)]
+    recent = resolved[: min(30, len(resolved))]
+    previous = resolved[min(30, len(resolved)) : min(60, len(resolved))]
+    prospective_decided = [row for row in non_abstained if str(row.get("prediction_stage") or "retrospective") == "prospective"]
+    state_counts = {f"{state}_count": sum(1 for row in values if str(row.get("resolution_state") or "resolved") == state) for state in _RESOLUTION_STATES}
 
     def precision(window: list[dict[str, Any]]) -> float | None:
         decided = [row for row in window if not bool(row.get("abstained"))]
@@ -218,6 +228,14 @@ def shadow_evaluation_metrics(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "previous_precision": round(previous_precision, 4) if previous_precision is not None else None,
         "drift_delta": round(drift_delta, 4) if drift_delta is not None else None,
         "drift_alert": bool(drift_delta is not None and drift_delta <= -0.15),
+        "resolved_count": len(resolved),
+        **state_counts,
+        "prospective_count": sum(1 for row in values if str(row.get("prediction_stage") or "retrospective") == "prospective"),
+        "retrospective_count": sum(1 for row in values if str(row.get("prediction_stage") or "retrospective") != "prospective"),
+        "prospective_precision": (
+            round(sum(1 for row in prospective_decided if bool(row.get("correct"))) / len(prospective_decided), 4)
+            if prospective_decided else None
+        ),
         "schema_version": CONTROL_SCHEMA_VERSION,
     }
 

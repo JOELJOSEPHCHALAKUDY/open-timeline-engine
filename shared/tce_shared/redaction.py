@@ -4,7 +4,19 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+# Order matters: `url_credentials` must run before `email`, or 'https://user:tok@github.com/o/r' is merely
+# email-mangled ('https://user:<REDACTED:EMAIL>/o/r') and the credential shape survives in the record.
 SECRET_PATTERNS = {
+    "url_credentials": re.compile(r"(?<=://)[^/@\s]+(?::[^/@\s]*)?@"),
+    "token": re.compile(
+        r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
+        r"|github_pat_[A-Za-z0-9_]{20,}"
+        r"|glpat-[A-Za-z0-9_-]{16,}"
+        r"|sk-[A-Za-z0-9_-]{16,}"
+        r"|AKIA[0-9A-Z]{12,}"
+        r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+        r"|eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]+)?)"
+    ),
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
     "api_key": re.compile(r"(?i)(api[_-]?key|token|secret|password)[\"' :=]+([^\s,;]+)"),
     "private_key": re.compile(r"-----BEGIN (?:RSA|EC|OPENSSH|PGP)? ?PRIVATE KEY-----"),
@@ -63,6 +75,18 @@ def redact_payload(
         return redact_text(payload, hints=hints)
 
     return payload, []
+
+
+def redact_project_hint(hint: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Sanitize an untrusted host-supplied `project_hint` server-side.
+
+    The capture hook redacts the hint client-side, but the server does not trust hook redaction for content and must
+    not trust it here either. Unlike `redact_payload`, this deliberately does NOT honour DEFAULT_ALLOWLIST_KEYS:
+    'repo', 'project' and 'branch' are exactly the keys a credential URL hides in.
+    """
+
+    sanitized, applied = redact_payload(hint, allowlist_keys=set())
+    return (sanitized if isinstance(sanitized, dict) else {}), applied
 
 
 def apply_redaction_zones(

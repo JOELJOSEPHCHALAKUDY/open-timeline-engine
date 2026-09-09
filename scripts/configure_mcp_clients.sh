@@ -128,6 +128,39 @@ if [ -z "$TOKEN" ]; then
   TOKEN="local-dev-token"
 fi
 
+HOST_CAPTURE_TOKEN_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine/host_capture.token"
+
+# The host capture credential (TCE_HOST_CAPTURE_TOKENS / ~/.config/open-timeline-engine/host_capture.token)
+# is a separate capability for the trusted human-input hook. It must never be written into an MCP client
+# config or passed as an --env argument: executors would then be able to attest "human" input themselves.
+guard_host_capture_leak() {
+  local subject="$1"
+  local label="$2"
+  if printf '%s' "$subject" | grep -q "HOST_CAPTURE"; then
+    echo "Refusing to continue: ${label} references HOST_CAPTURE. Host capture credentials must not be handed to executors." >&2
+    exit 1
+  fi
+}
+
+guard_token_is_not_host_capture() {
+  local host_tokens=""
+  local candidate
+  if [ -f "$ROOT/.env" ]; then
+    host_tokens="$(awk -F= '$1=="TCE_HOST_CAPTURE_TOKENS" {print $2}' "$ROOT/.env" | tail -n1)"
+  fi
+  for candidate in $(printf '%s' "$host_tokens" | tr ',' ' '); do
+    if [ -n "$candidate" ] && [ "$candidate" = "$TOKEN" ]; then
+      echo "Refusing to continue: the MCP token equals a TCE_HOST_CAPTURE_TOKENS entry. Executors must never present the host capture credential." >&2
+      exit 1
+    fi
+  done
+  if [ -s "$HOST_CAPTURE_TOKEN_FILE" ] && [ "$(head -n 1 "$HOST_CAPTURE_TOKEN_FILE" | tr -d '[:space:]')" = "$TOKEN" ]; then
+    echo "Refusing to continue: the MCP token equals ${HOST_CAPTURE_TOKEN_FILE}. Executors must never present the host capture credential." >&2
+    exit 1
+  fi
+}
+guard_token_is_not_host_capture
+
 if [ -z "$TOOL_PROFILE" ] && [ "$OPERATION_MODE" = "clone_advisor" ]; then
   TOOL_PROFILE="autonomy"
 fi
@@ -346,6 +379,7 @@ install_codex_via_cli() {
   codex mcp remove tce-secondary >/dev/null 2>&1 || true
   codex mcp remove tce-advisor >/dev/null 2>&1 || true
 
+  guard_host_capture_leak "PYTHONPATH=${pythonpath} TCE_API_BASE_URL=${API_URL} TCE_API_TOKEN=${TOKEN} TCE_MCP_CONSUMER_ID=${codex_consumer_id} TCE_MCP_WORKSPACE_ID=${codex_workspace} TCE_MCP_USER_ID=${codex_user_id} TCE_MCP_SESSION_ID=${codex_session_id} TCE_MCP_TOOL_PROFILE=${TOOL_PROFILE}" "codex --env arguments"
   codex mcp add tce-executor \
     --env "PYTHONPATH=${pythonpath}" \
     --env "TCE_API_BASE_URL=${API_URL}" \
@@ -470,6 +504,7 @@ for client in "${clients[@]-}"; do
   client_session="$(session_for_client "$client")"
   generated_file="$(generated_path "$client")"
   write_config "$generated_file" "$client" "$client_workspace" "$client_identity" "$client_consumer" "$client_session"
+  guard_host_capture_leak "$(cat "$generated_file")" "$generated_file"
   echo "  generated: $generated_file (workspace=${client_workspace}, user=${client_identity}, session=${client_session}, profile=${TOOL_PROFILE})"
 
   if [ "$INSTALL_TARGETS" = "true" ]; then

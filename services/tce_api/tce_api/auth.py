@@ -4,12 +4,24 @@ from collections.abc import Mapping
 from typing import Any
 
 from fastapi import Header, HTTPException, Request, status
+from tce_shared.decision_capture import HOST_CAPTURE_CAPABILITY
 from tce_shared.events import AgentRole
-from tce_shared.identity import claim_conflicts, parse_identity_claims, resolve_bound_identity
+from tce_shared.identity import BoundIdentity, claim_conflicts, parse_identity_claims, resolve_bound_identity
 from tce_shared.scope import ResolvedScope, resolve_scope
 
 from .config import get_settings
 from .token_store import resolve_active_tokens
+
+
+def _bound_capabilities(bound: BoundIdentity) -> frozenset[str]:
+    """Capabilities granted by a server-bound claim (only ``host_capture`` is recognised).
+
+    No executor receives host attestation: ``host_capture`` on a claim whose role is not ``user`` is ignored.
+    """
+    if str(getattr(bound, "role", "") or "") != AgentRole.USER.value:
+        return frozenset()
+    raw = getattr(bound, "capabilities", ()) or ()
+    return frozenset(str(item) for item in raw if str(item) == HOST_CAPTURE_CAPABILITY)
 
 
 class AuthContext:
@@ -21,6 +33,8 @@ class AuthContext:
         workspace_id: str,
         user_id: str,
         behavior_subject_id: str | None = None,
+        capabilities: frozenset[str] | None = None,
+        identity_verified: bool = False,
     ) -> None:
         self.consumer = consumer
         self.mode = mode
@@ -28,6 +42,13 @@ class AuthContext:
         self.workspace_id = workspace_id
         self.user_id = user_id
         self.behavior_subject_id = (behavior_subject_id or user_id).strip() or user_id
+        # Capabilities come only from the credential (host-capture token set or a bound
+        # server claim), never from any X-TCE-* header.
+        self.capabilities: frozenset[str] = frozenset(capabilities or ())
+        # True only when identity was established by the server (a server-bound bearer/mTLS claim or the
+        # host-capture credential). False on the compat path where role/user come from X-TCE-* headers;
+        # an unverified USER is never treated as an authenticated human for evidence promotion.
+        self.identity_verified: bool = bool(identity_verified)
 
     def resolved_scope(
         self,
@@ -104,6 +125,8 @@ async def get_auth_context(
                 workspace_id=bound.workspace_id,
                 user_id=bound.user_id,
                 behavior_subject_id=bound.behavior_subject_id,
+                capabilities=_bound_capabilities(bound),
+                identity_verified=True,
             )
         if settings.identity_claims_mode.lower() == "enforce":
             raise HTTPException(status_code=403, detail="mTLS identity is not bound to a server claim")
@@ -119,11 +142,59 @@ async def get_auth_context(
     if mode in {"bearer", "dual"} and authorization:
         parts = authorization.strip().split(" ", 1)
         active_tokens = resolve_active_tokens(settings.token_set)
-        if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] in active_tokens:
+        token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else None
+        host_tokens = settings.host_capture_token_set
+        if token is not None and token in host_tokens:
+            # Host-capture credential: a separate capability that executors cannot present.
+            if token in active_tokens:
+                raise HTTPException(status_code=403, detail="credential is configured as both api and host-capture token")
             bound = resolve_bound_identity(
                 claims=parse_identity_claims(settings.identity_claims_json),
                 kind="bearer",
-                credential=parts[1],
+                credential=token,
+            )
+            if bound is not None:
+                if settings.identity_claims_mode.lower() == "enforce" and claim_conflicts(
+                    bound,
+                    {
+                        "consumer": x_tce_consumer,
+                        "role": None,
+                        "workspace_id": x_tce_workspace,
+                        "user_id": x_tce_user,
+                        "behavior_subject_id": x_tce_behavior_subject,
+                    },
+                ):
+                    raise HTTPException(status_code=403, detail="asserted identity conflicts with server-bound host-capture claim")
+                return AuthContext(
+                    consumer=f"host:{bound.consumer}",
+                    mode="bearer",
+                    role=AgentRole.USER,
+                    workspace_id=bound.workspace_id,
+                    user_id=bound.user_id,
+                    behavior_subject_id=bound.behavior_subject_id,
+                    capabilities=_bound_capabilities(bound) | {HOST_CAPTURE_CAPABILITY},
+                    identity_verified=True,
+                )
+            if settings.identity_claims_mode.lower() == "enforce":
+                raise HTTPException(status_code=403, detail="host capture token is not bound to a server claim")
+            host_consumer = (x_tce_consumer or "host-capture").strip() or "host-capture"
+            host_user_id = (x_tce_user or host_consumer).strip() or host_consumer
+            host_subject = (x_tce_behavior_subject or host_user_id).strip() or host_user_id
+            return AuthContext(
+                consumer=f"host:{host_consumer}",
+                mode="bearer",
+                role=AgentRole.USER,
+                workspace_id=workspace_id,
+                user_id=host_user_id,
+                behavior_subject_id=host_subject,
+                capabilities=frozenset({HOST_CAPTURE_CAPABILITY}),
+                identity_verified=True,
+            )
+        if token is not None and token in active_tokens:
+            bound = resolve_bound_identity(
+                claims=parse_identity_claims(settings.identity_claims_json),
+                kind="bearer",
+                credential=token,
             )
             if bound is not None:
                 if settings.identity_claims_mode.lower() == "enforce" and claim_conflicts(
@@ -144,6 +215,10 @@ async def get_auth_context(
                     workspace_id=bound.workspace_id,
                     user_id=bound.user_id,
                     behavior_subject_id=bound.behavior_subject_id,
+                    # A bound claim may grant host_capture to an api token; the compat
+                    # (headerless) path below never receives capabilities.
+                    capabilities=_bound_capabilities(bound),
+                    identity_verified=True,
                 )
             if settings.identity_claims_mode.lower() == "enforce":
                 raise HTTPException(status_code=403, detail="bearer token is not bound to a server claim")

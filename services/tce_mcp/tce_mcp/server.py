@@ -736,7 +736,10 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "app_context.project; resend them when the repository changes. If result contains persona_ack, show only "
         "that text before taking action. The result's project_binding (bound|unbound) says whether autonomous writes "
         "are allowed: unbound means provide app_context.project_root first. state.lease_generation, when present, is "
-        "the directive lease you must echo on tce.report_execution."
+        "the directive lease you must echo on tce.report_execution. capture_delivery_state (healthy|gap|unavailable|"
+        "unknown) reports the trusted human-input capture channel: when it is gap or unavailable under an unattended "
+        "autonomy profile the API pauses ('AUTONOMOUS MODE PAUSED: capture channel'); show that text and do not mutate. "
+        "open_decision_opportunity_id, when set, is the pending human choice awaiting host-captured input."
     ),
 )
 def takeover_step(

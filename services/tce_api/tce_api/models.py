@@ -638,6 +638,11 @@ class DecisionObservation(Base):
     learning_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     storage_score: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
     storage_decision: Mapped[str] = mapped_column(TEXT, nullable=False, default="audit_only")
+    # P1 trusted capture provenance (all nullable; raw text() SQL is the writer).
+    opportunity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    origin_kind: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    capture_receipt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    extraction_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class BehaviorFidelityRun(Base):
@@ -731,6 +736,156 @@ class BehaviorShadowPrediction(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     query_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     citations_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+    # P1 prospective evaluation: frozen-before-answer predictions and their resolution.
+    opportunity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    session_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision_family: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    prediction_stage: Mapped[str] = mapped_column(TEXT, nullable=False, default="retrospective")
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    prediction_shown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    advice_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    resolution_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="resolved")
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_source: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    human_source_ref: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    resolution_source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    corrections_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+
+class TrustedInputReceipt(Base):
+    __tablename__ = "trusted_input_receipts"
+    __table_args__ = (
+        Index("uq_trusted_input_receipts_delivery", "workspace_id", "owner_id", "delivery_key", unique=True),
+        Index("idx_trusted_input_receipts_subject_ingested", "workspace_id", "subject_user_id", "ingested_at"),
+        Index("idx_trusted_input_receipts_extraction", "extraction_state", "next_extraction_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    host_session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    prompt_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    delivery_key: Mapped[str] = mapped_column(TEXT, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(TEXT, nullable=False)
+    origin_kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    capture_principal: Mapped[str] = mapped_column(TEXT, nullable=False)
+    host_client: Mapped[str] = mapped_column(TEXT, nullable=False, default="claude")
+    event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    original_char_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    redaction_applied_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    spool_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    spool_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gap_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queue_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="inline")
+    extraction_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="pending")
+    extraction_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    extraction_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    extraction_last_error: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    extraction_version_done: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    next_extraction_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class DecisionOpportunity(Base):
+    __tablename__ = "decision_opportunities"
+    __table_args__ = (
+        Index("idx_decision_opportunities_open", "workspace_id", "subject_user_id", "status", "created_at"),
+        Index("idx_decision_opportunities_session", "session_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    turn: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    objective_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    decision_family: Mapped[str] = mapped_column(TEXT, nullable=False)
+    situation_type: Mapped[str] = mapped_column(TEXT, nullable=False, default="choice_required")
+    question_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    alternatives_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    pre_answer_snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    evidence_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    advice_exposure_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    shadow_prediction_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="open")
+    relayed_answer: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    relayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class DecisionCandidate(Base):
+    __tablename__ = "decision_candidates"
+    __table_args__ = (
+        Index("uq_decision_candidates_span", "receipt_id", "extraction_version", "span_sha256", unique=True),
+        Index("idx_decision_candidates_opportunity", "opportunity_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    receipt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    opportunity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    candidate_kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    supporting_span: Mapped[str] = mapped_column(TEXT, nullable=False)
+    span_sha256: Mapped[str] = mapped_column(TEXT, nullable=False)
+    observed_alternatives_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    selected_option: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    stated_rationale: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    is_negated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_correction: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    origin_kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    extraction_version: Mapped[str] = mapped_column(TEXT, nullable=False)
+    promotion: Mapped[str] = mapped_column(TEXT, nullable=False)
+    promotion_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="new")
+    promoted_observation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    review_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class HumanResolution(Base):
+    __tablename__ = "human_resolutions"
+    __table_args__ = (Index("idx_human_resolutions_opportunity", "opportunity_id", "resolved_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    opportunity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    receipt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    selected_choice: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    correction_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    stated_rationale: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    resolution_source: Mapped[str] = mapped_column(TEXT, nullable=False)
+    human_source_ref: Mapped[str] = mapped_column(TEXT, nullable=False)
+    observation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    supersedes_resolution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
 
