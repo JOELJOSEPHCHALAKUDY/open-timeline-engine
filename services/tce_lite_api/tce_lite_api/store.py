@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -38,6 +39,12 @@ from tce_shared.autonomy_goals import (
     score_goal,
 )
 from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence, predict_behavior
+from tce_shared.charter import (
+    CharterRequired,
+    charter_constraints,
+    charter_sensitive_path_hit,
+    require_charter_for_action,
+)
 from tce_shared.deadline import (
     RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
     SQLITE_INTERRUPT_MARKER,
@@ -118,6 +125,7 @@ from tce_shared.execution_transitions import (
     SYSTEM_ACTOR,
     TERMINAL_STATES,
     TransitionReason,
+    completion_payload_fingerprint,
     idempotency_outcome,
     permit_binding_ok,
     permit_scope_digest,
@@ -206,6 +214,7 @@ from tce_shared.task_state import (
     plan_input_revision,
     plan_steps_to_json,
     root_status,
+    stamp_verification_provenance,
     task_scope_digest,
     task_state_summary_fields,
 )
@@ -225,6 +234,7 @@ from .capture_store import (
     resolve_opportunity,
     resolved_opportunity_for_objective,
 )
+from .charter_store import load_active_charter
 from .config import Settings, get_settings
 from .continuity_store import (
     deliver_handoff_safely,
@@ -244,6 +254,7 @@ from .planning_store import (
     pending_planning_job_ids,
     sweep_stale_planning_jobs,
 )
+from .reconcile import pause_guard_for_session, resolve_effects_for_directive
 from .store_graph import (
     _ensure_owner_membership,
     _index_graph,
@@ -254,6 +265,7 @@ from .task_state_store import (
     ApplySideEffectsLite,
     apply_task_state_events,
     ensure_task_state,
+    insert_task_verification,
     load_task_state,
     run_cas_section,
 )
@@ -265,6 +277,7 @@ from .types import (
     EvidenceEvent,
     PatternItem,
 )
+from .verification_store import verification_stats_for_session
 
 _FTS5_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _FTS5_MAX_TERMS = 32
@@ -4481,17 +4494,19 @@ def autonomy_project_kpis(
             DirectiveExecutionState.ABANDONED.value,
         } and bool(state_bucket.get("has_success")):
             state_bucket["reopened_after_success"] = True
-        meta = json_loads(row["meta"], {})
-        if not isinstance(meta, dict):
-            meta = {}
-        verification_summary = meta.get("verification_summary")
-        verification_map = verification_summary if isinstance(verification_summary, dict) else meta.get("verification")
-        if isinstance(verification_map, dict):
-            required_checks = _required_verification_checks_lite(settings)
-            verification_runs += 1
-            verification_ok = all(bool(verification_map.get(check, False)) for check in required_checks)
-            if verification_ok:
-                verification_passed += 1
+    # F3 -- verification_runs/passed come from `verification_results`, rows the API graded from
+    # evidence a distinct principal submitted.  They used to come from the directive's own
+    # meta["verification"] booleans, i.e. the implementer grading itself on the one metric that
+    # decides whether it may keep running unattended.
+    try:
+        verification_runs, verification_passed = verification_stats_for_session(
+            conn,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except sqlite3.Error:
+        verification_runs, verification_passed = 0, 0
     project_count = len(project_state)
     completed_projects = sum(1 for item in project_state.values() if bool(item.get("has_success")))
     reopened_projects = sum(1 for item in project_state.values() if bool(item.get("reopened_after_success")))
@@ -4502,7 +4517,9 @@ def autonomy_project_kpis(
         else float(needs_human_turns)
     )
     reopen_rate = (float(reopened_projects) / max(1, completed_projects)) if completed_projects > 0 else 0.0
-    verification_pass_rate = (float(verification_passed) / max(1, verification_runs)) if verification_runs > 0 else 1.0
+    # Fail CLOSED with no verification runs: passing vacuously at zero runs is what let the
+    # autonomy band reach project_autonomy_ready without a single verification ever happening.
+    verification_pass_rate = (float(verification_passed) / max(1, verification_runs)) if verification_runs > 0 else 0.0
     thresholds = {
         "min_project_completion_rate": float(getattr(settings, "autonomy_kpi_min_project_completion_rate", 0.80)),
         "max_manual_interventions_per_project": float(
@@ -4520,7 +4537,7 @@ def autonomy_project_kpis(
         "verification_pass_rate": (
             verification_pass_rate >= thresholds["min_verification_pass_rate"]
             if verification_runs > 0
-            else True
+            else False
         ),
     }
     passed = all(bool(value) for value in checks.values())
@@ -6373,7 +6390,9 @@ def _load_pending_directive(
                     policy_decisions={"reason": "claim_window_expired", "policy_revision": SCOPE_POLICY_REVISION},
                 )
         return None
-    stale_seconds = 900
+    # Parity with Full's max(120, claim_ttl * 3): Lite hardcoded 900, which silently diverged from
+    # the claim TTL the operator actually configured.
+    stale_seconds = max(120, int(get_settings().takeover_execution_claim_ttl_seconds) * 3)
     stale_anchor = directive.started_at or directive.updated_at or directive.created_at
     if (
         directive.state == DirectiveExecutionState.IN_PROGRESS
@@ -6407,6 +6426,22 @@ def _load_pending_directive(
                     lease.lease_generation,
                 ),
             )
+            effects_unknown = 0
+            if reaped.rowcount == 1:
+                # G1 -- the LIVE reaper resolves the effect journal too, in the SAME transaction as
+                # the lease bump.  Bumping the lease alone left every open effect open, so the
+                # `pause_guard_for_session` call a few lines later in this same takeover_step found
+                # nothing and the unknown-effect pause only ever fired after a restart.  The pause
+                # must fire on the step that reaps.
+                effects_unknown = int(
+                    resolve_effects_for_directive(
+                        conn,
+                        directive_id=str(directive.directive_id),
+                        bumped_lease=int(decision.next_lease),
+                        settings=get_settings(),
+                        now=now_stamp,
+                    )["effects_unknown"]
+                )
             conn.commit()
             if reaped.rowcount == 1:
                 _write_directive_audit(
@@ -6420,6 +6455,7 @@ def _load_pending_directive(
                         "lease_generation": lease.lease_generation,
                         "next_lease": decision.next_lease,
                         "claimed_executor": lease.claimed_executor,
+                        "effects_unknown": effects_unknown,
                     },
                     policy_decisions={"reason": "stale_timeout", "policy_revision": SCOPE_POLICY_REVISION},
                 )
@@ -7103,16 +7139,25 @@ def request_execution_permit_lite(
         command_preview=body.command_preview,
         estimated_change_size=body.estimated_change_size,
     )
-    sensitive_hit = any(
-        any(token in path.lower() for token in ("services/tce_mcp", "infra/", "secrets", ".env"))
-        for path in body.target_paths
+    # The charter is resolved SERVER-SIDE from auth + session. ExecutionPermitRequest is 100%
+    # client-supplied; a charter read from it would be the caller grading its own homework.
+    charter = load_active_charter(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=now,
     )
+    sensitive_hit = charter_sensitive_path_hit(charter, body.target_paths)
     decision, reason = evaluate_execution_permit(
         policy_profile=policy_profile,
         risk_tier=risk_tier,
         estimated_change_size=body.estimated_change_size,
         role=auth.role.value,
         sensitive_path_hit=sensitive_hit,
+        charter=charter,
+        action_kind=body.action_kind,
+        target_paths=body.target_paths,
     )
     permit_id = uuid.uuid4()
     expires_at = now + timedelta(seconds=max(30, int(permit_ttl_seconds)))
@@ -7127,9 +7172,10 @@ def request_execution_permit_lite(
         INSERT INTO execution_permits(
             id, session_id, workspace_id, action_kind, target_paths, command_preview,
             estimated_change_size, decision, reason, confirmed_by, expires_at, created_at, resolved_at,
-            user_id, requested_by, directive_id, attempt, objective_hash, policy_revision, scope_digest
+            user_id, requested_by, directive_id, attempt, objective_hash, policy_revision, scope_digest,
+            charter_id, charter_version
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(permit_id),
@@ -7152,6 +7198,8 @@ def request_execution_permit_lite(
             bound_objective_hash,
             SCOPE_POLICY_REVISION,
             permit_scope_digest(action_kind=body.action_kind, target_paths=list(body.target_paths), command_preview=body.command_preview),
+            (charter.charter_id if charter is not None else None),
+            (charter.charter_version if charter is not None else None),
         ),
     )
     conn.commit()
@@ -7559,6 +7607,47 @@ def claim_execution(
     directive = _directive_from_row(row)
     lease = _directive_lease_from_row(row)
     now = now_utc()
+    # U2 --- the charter gate, BEFORE any state transition and never a fall-through to legacy
+    # behaviour. A revoked, expired or absent charter refuses the claim outright; the audit row is
+    # written first, because a refusal that is not durably recorded is not evidence.
+    charter = load_active_charter(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=now,
+    )
+    try:
+        require_charter_for_action(
+            charter,
+            action_kind=str(_row_get(row, "action_kind") or ""),
+            enforcement_enabled=bool(settings.charter_enforcement_enabled),
+            now=now,
+        )
+    except CharterRequired as exc:
+        conn.rollback()
+        _write_directive_audit(
+            conn,
+            consumer=auth.consumer,
+            action="claim_refused_no_charter",
+            query={
+                "directive_id": str(directive.directive_id),
+                "action_kind": exc.action_kind,
+                "session_id": body.session_id,
+            },
+            policy_decisions={"reason": exc.reason, "charter_enforcement_enabled": True},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "no_active_charter",
+                "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be created and "
+                "approved by the owner before mutating work may be claimed. Ask the owner to approve "
+                "one, then retry.",
+                "action_kind": exc.action_kind,
+                "reason": exc.reason,
+            },
+        ) from exc
     # Residual: in identity_claims_mode=compat auth.consumer derives from the X-TCE-Consumer header, so
     # the lease binding is header-asserted; it is server-bound only under enforce. Two processes sharing
     # one consumer identity are only fenced when takeover_lease_strict=True (lease echo required).
@@ -7643,7 +7732,8 @@ def claim_execution(
             directive.permit_id = permit_id
         permit_row = conn.execute(
             """
-            SELECT decision, expires_at, user_id, directive_id, objective_hash
+            SELECT decision, expires_at, user_id, directive_id, objective_hash, scope_digest,
+                   action_kind, target_paths, command_preview, charter_id
             FROM execution_permits
             WHERE id = ? AND session_id = ? AND workspace_id = ?
             LIMIT 1
@@ -7660,6 +7750,18 @@ def claim_execution(
             permit_user_id=str(_row_get(permit_row, "user_id")) if _row_get(permit_row, "user_id") else None,
             permit_directive_id=str(_row_get(permit_row, "directive_id")) if _row_get(permit_row, "directive_id") else None,
             permit_objective_hash=str(_row_get(permit_row, "objective_hash")) if _row_get(permit_row, "objective_hash") else None,
+            # C12/S-G16(b): the permit's recorded scope must still match the scope it was issued
+            # for. Under enforcement a NULL digest REFUSES rather than silently skipping the check.
+            permit_scope_digest=str(_row_get(permit_row, "scope_digest")) if _row_get(permit_row, "scope_digest") else None,
+            expected_scope_digest=permit_scope_digest(
+                action_kind=str(_row_get(permit_row, "action_kind") or ""),
+                target_paths=list(json_loads(_row_get(permit_row, "target_paths"), [])),
+                command_preview=(str(_row_get(permit_row, "command_preview")) if _row_get(permit_row, "command_preview") else None),
+            ),
+            scope_digest_enforced=bool(settings.permit_scope_digest_enforced),
+            # U3/S11: a permit minted under a charter that is no longer the active one is stale.
+            permit_charter_id=str(_row_get(permit_row, "charter_id")) if _row_get(permit_row, "charter_id") else None,
+            active_charter_id=(charter.charter_id if charter is not None else None),
             directive_id=str(directive.directive_id),
             directive_user_id=directive.user_id,
             directive_objective_hash=directive.objective_hash,
@@ -7958,6 +8060,55 @@ def _normalize_change_summary_map_lite(raw: Any) -> tuple[dict[str, dict[str, An
     return normalized, redacted_any
 
 
+def _charter_step_fields(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    session_id: str,
+    now: datetime,
+) -> tuple[bool, str, str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """The five charter/effect fields carried by ``TakeoverStepResponse`` (§9.3).
+
+    ``constraints`` is the load-bearing one: it is the only channel that carries the charter's
+    machine-readable scope (``charter-roots-only``, the protected-write prefixes, the
+    confirm-required capabilities) to an executor. The MCP firewall merges it over its own floor,
+    so an EMPTY list here is not neutral -- it means the executor sees the floor and nothing about
+    this charter. ``unresolved_effects`` rows carry ``state`` because the firewall's pause reads it.
+
+    Fail-soft is deliberate and narrow: a step response that 500s because the charter tables are
+    unreachable would take down normal chat, and the ENFORCING paths (claim, dispatch, effect open)
+    resolve the charter themselves and fail closed there. This function only decides what an
+    executor is TOLD, never what it is allowed to do.
+    """
+    from tce_shared.effect_journal import unresolved_effects_json
+
+    from .effect_store import list_open_effects
+
+    try:
+        charter = load_active_charter(
+            conn, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id, now=now
+        )
+    except Exception:
+        charter = None
+    try:
+        records = list_open_effects(
+            conn, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id
+        )
+    except Exception:
+        records = []
+    unresolved = unresolved_effects_json(records)
+    if charter is None:
+        return (False, "", None, unresolved, [])
+    return (
+        True,
+        str(charter.charter_version),
+        str(charter.enforcement_tier),
+        unresolved,
+        charter_constraints(charter),
+    )
+
+
 def _compute_git_change_summary_lite(
     *,
     files: list[str],
@@ -7966,18 +8117,33 @@ def _compute_git_change_summary_lite(
 ) -> dict[str, dict[str, Any]]:
     if not files:
         return {}
-    repo = str(git_payload.get("repo") or "").strip() or str(Path.cwd())
-    if not Path(repo).exists():
-        repo = str(Path.cwd())
+    # The repo path is constrained to the server's own working tree. It used to be
+    # `os.path.isdir(caller_supplied) or cwd`, which is an arbitrary-directory read the moment git
+    # is present in an image: a report could name any path on the host and have it inspected.
+    repo_root = Path.cwd().resolve()
+    requested = str(git_payload.get("repo") or "").strip()
+    repo = str(repo_root)
+    if requested:
+        try:
+            candidate = Path(requested).resolve()
+        except OSError:
+            candidate = repo_root
+        if candidate == repo_root or repo_root in candidate.parents:
+            repo = str(candidate)
+    git_binary = shutil.which("git")
+    if git_binary is None:
+        # An empty summary reads as "no changes"; this marker says "we could not look". They are
+        # different facts and the handoff must not conflate them.
+        return {"__unavailable__": {"unavailable": "git_not_present"}}
     commit = str(git_payload.get("commit") or "").strip()
     if commit:
-        args = ["git", "-C", repo, "show", "--numstat", "--format=", commit]
+        args = [git_binary, "-C", repo, "show", "--numstat", "--format=", commit]
     else:
-        args = ["git", "-C", repo, "diff", "--numstat", "HEAD~1", "HEAD"]
+        args = [git_binary, "-C", repo, "diff", "--numstat", "HEAD~1", "HEAD"]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=1.5, check=False)
     except Exception:
-        return {}
+        return {"__unavailable__": {"unavailable": "git_not_present"}}
     if proc.returncode != 0:
         return {}
     stats: dict[str, dict[str, Any]] = {}
@@ -8423,6 +8589,17 @@ def report_execution(
     merged_meta["reported_state"] = effective_state.value
     merged_meta["reported_at"] = now.isoformat()
 
+    # §6.5 step 4, the SECOND guard site. Full carries it (main.py, `report_paused`); without it
+    # here the report path mints a replacement PENDING directive over an effect whose outcome
+    # nobody can see -- which is exactly the silent restart the journal exists to stop.
+    report_paused, report_pause_reason, report_pause_effect = pause_guard_for_session(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        settings=settings,
+    )
+
     if effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED, DirectiveExecutionState.ABANDONED}:
         failure_class = classify_failure(
             result=body.result,
@@ -8434,6 +8611,14 @@ def report_execution(
             failure_class=failure_class,
             rollback_available=rollback_available,
         )
+        if report_paused:
+            # An unresolved, possibly-irreversible effect means we do not know what happened.
+            # Scheduling a retry on top of it would repeat work whose outcome nobody can see.
+            retry_strategy = None
+            merged_meta["autonomy_pause"] = {
+                "reason": report_pause_reason,
+                "effect_id": report_pause_effect,
+            }
         if bool(getattr(settings, "retry_feedback_enabled", False)):
             retry_feedback = build_retry_feedback(
                 action_kind=current.action_kind,
@@ -8502,10 +8687,14 @@ def report_execution(
         redaction_applied=bool(milestone_result.get("redaction_applied", False)),
         now=now,
         executor_id=auth.consumer,
+        # Without a payload_hash the CompletionConflictError guard is dead on this path: a second
+        # report with a DIFFERENT payload under the same completion_key would be accepted silently.
+        payload_hash=completion_payload_fingerprint(milestone),
     )
 
     if (
         settings.takeover_retry_enabled
+        and not report_paused
         and effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED}
         and int(current.attempt) < int(settings.takeover_retry_max_attempts)
         and retry_strategy not in {None, RetryStrategy.ESCALATE}
@@ -9903,7 +10092,13 @@ def _plan_step_index_for_goal_lite(
 
 
 def _verification_from_report_lite(body: ExecutionReportRequest) -> dict[str, Any] | None:
-    """Lift a verification out of the report's details map, or ``None``. Full's twin."""
+    """Lift a verification out of the report's details map, or ``None``. Full's twin.
+
+    The report carries EVIDENCE, never a verdict -- see the note on Full's ``_verification_from_report``.
+    An agent must not be able to declare its own work verified, so the state is pinned to ``unverified``
+    and only the evidence-graded path may write anything else.
+    """
+
     details = body.details if isinstance(body.details, dict) else {}
     raw = details.get("verification")
     if not isinstance(raw, dict):
@@ -9911,7 +10106,7 @@ def _verification_from_report_lite(body: ExecutionReportRequest) -> dict[str, An
     return {
         "verification_id": str(raw.get("verification_id") or uuid.uuid4()),
         "directive_id": str(body.directive_id),
-        "state": str(raw.get("state") or "unverified"),
+        "state": "unverified",
         "method": str(raw.get("method") or "none"),
         "recorded_at": now_utc(),
         "contract_revision": 0,
@@ -9929,30 +10124,19 @@ def _insert_task_verification_lite(
     ref: dict[str, Any],
     now: datetime,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO task_verifications(
-            id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
-            evidence_event_ids_json, recorded_by, recorded_at, schema_version,
-            contract_revision, plan_id
-        )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?)
-        """,
-        (
-            str(uuid.uuid4()),
-            auth.workspace_id,
-            auth.user_id,
-            task_id,
-            ref.get("directive_id"),
-            ref.get("state"),
-            ref.get("method"),
-            ref.get("summary"),
-            json_dumps(list(ref.get("evidence_event_ids") or [])),
-            auth.consumer,
-            now.isoformat(),
-            int(ref.get("contract_revision") or 0),
-            ref.get("plan_id"),
-        ),
+    """The report path's binding of the one shared ``task_verifications`` writer.
+
+    The statement itself lives in ``task_state_store.insert_task_verification`` so that this path
+    and the evidence-graded path in ``verification_store`` cannot drift column-for-column.
+    """
+    insert_task_verification(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        task_id=task_id,
+        recorded_by=auth.consumer,
+        ref=ref,
+        now=now,
     )
 
 
@@ -10065,14 +10249,14 @@ def _record_execution_task_state_lite(
                 )
             verification = _verification_from_report_lite(body)
             if verification is not None:
-                # S5 provenance: a verification is evidence only for the contract AND the plan
-                # it was recorded against. Stamping both here is what stops a passing
-                # verification from a finished objective driving a later one to DONE.
-                verification["contract_revision"] = projection.contract_revision
-                verification["plan_id"] = (
-                    projection.plan.plan_id if projection.plan is not None else None
+                # S5 provenance, through the one shared stamper Full's report path and both
+                # evidence-graded paths also use. No ``work_contract_revision`` here on purpose:
+                # the report IS the end of the work, so the contract in force now is the contract
+                # the work happened under -- and this row's state is pinned to ``'unverified'``
+                # anyway, so it can never satisfy R9 whatever it is stamped with.
+                stamp_verification_provenance(
+                    verification, projection=projection, directive_id=directive_id
                 )
-                verification["directive_id"] = directive_id
                 _insert_task_verification_lite(
                     conn, auth=auth, task_id=state.session_id, ref=verification, now=now
                 )
@@ -11361,6 +11545,39 @@ def takeover_step(
                     "Fix dependency_plan and retry."
                 )
                 decision_source = TakeoverDecisionSource.SAFETY_GATE
+    # §9.3 -- the five charter/effect fields on TakeoverStepResponse. Without this block they are
+    # declared on the wire model and never populated, which means `charter_constraints()` has no
+    # production caller and the executor never receives the charter's machine-readable scope.
+    (
+        step_charter_active,
+        step_charter_version,
+        step_enforcement_tier,
+        step_unresolved_effects,
+        step_constraints,
+    ) = _charter_step_fields(
+        conn,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        now=now,
+    )
+    # §6.5 step 4, the LOAD-BEARING guard. This is where work actually restarts after a reap:
+    # _load_pending_directive reaps and returns None, and this block then mints a brand-new PENDING
+    # directive. Guarding only the retry ladder would never fire, because a reaped directive is
+    # ABANDONED and the ladder looks at FAILED/BLOCKED.
+    effect_paused, _effect_pause_reason, effect_pause_id = pause_guard_for_session(
+        conn,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        settings=settings,
+    )
+    if effect_paused:
+        final_response = (
+            "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved and may be "
+            f"irreversible. Resolve effect {effect_pause_id} before continuing."
+        )
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
     directive_id: UUID | None = pending_execution.directive_id if pending_execution is not None else None
     directive_state: DirectiveExecutionState | None = pending_execution.state if pending_execution is not None else None
     retry_scheduled = False
@@ -11371,6 +11588,7 @@ def takeover_step(
         and safety_decision == SafetyDecision.ALLOW
         and pending_execution is None
         and not suppress_auto_directive
+        and not effect_paused
         and bool(dependency_preflight.get("valid", True))
     ):
         directive_id = uuid.uuid4()
@@ -11471,10 +11689,20 @@ def takeover_step(
             execution_claim_required = True
             directive_id = pending_execution.directive_id
             directive_state = pending_execution.state
-    if execution_claim_required and safety_decision == SafetyDecision.ALLOW:
+    if execution_claim_required and safety_decision == SafetyDecision.ALLOW and not effect_paused:
         final_response = (
             "Execution claim required for this mutating directive. "
             "Call tce.claim_execution and then continue."
+        )
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+    if effect_paused:
+        # The pause outranks every later handoff line in this turn. Telling the executor to claim a
+        # new directive while an effect from the last run is unresolved is exactly the restart the
+        # pause exists to prevent, so it is re-asserted here, after the last writer of
+        # final_response above it.
+        final_response = (
+            "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved and may be "
+            f"irreversible. Resolve effect {effect_pause_id} before continuing."
         )
         decision_source = TakeoverDecisionSource.SAFETY_GATE
     actionable_lifecycle_pause = (
@@ -11776,6 +12004,11 @@ def takeover_step(
             total=total_ms,
         ),
         needs_human=needs_human,
+        charter_active=step_charter_active,
+        charter_version=step_charter_version,
+        enforcement_tier=step_enforcement_tier,
+        unresolved_effects=step_unresolved_effects,
+        constraints=step_constraints,
         selected_goal=selected_goal,
         execution_permit_required=execution_permit_required,
         execution_permit_id=str(execution_permit_id) if execution_permit_id else None,

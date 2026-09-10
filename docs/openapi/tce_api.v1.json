@@ -1,6 +1,169 @@
 {
   "components": {
     "schemas": {
+      "AcceptanceCheckPayload": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Argv",
+            "type": "array"
+          },
+          "check_id": {
+            "title": "Check Id",
+            "type": "string"
+          },
+          "cwd_rel": {
+            "default": ".",
+            "title": "Cwd Rel",
+            "type": "string"
+          },
+          "expect_exit_code": {
+            "default": 0,
+            "title": "Expect Exit Code",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "default": 900,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "check_id",
+          "argv"
+        ],
+        "title": "AcceptanceCheckPayload",
+        "type": "object"
+      },
+      "AcceptanceCriteriaRequest": {
+        "properties": {
+          "charter_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter Id"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptanceCheckPayload"
+            },
+            "minItems": 1,
+            "title": "Checks",
+            "type": "array"
+          },
+          "corpus_manifest": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Corpus Manifest",
+            "type": "array"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "directive_id",
+          "checks"
+        ],
+        "title": "AcceptanceCriteriaRequest",
+        "type": "object"
+      },
+      "AcceptanceCriteriaResponse": {
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/AcceptanceCheckPayload"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "corpus_digest": {
+            "title": "Corpus Digest",
+            "type": "string"
+          },
+          "corpus_manifest": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Corpus Manifest",
+            "type": "array"
+          },
+          "criteria_digest": {
+            "title": "Criteria Digest",
+            "type": "string"
+          },
+          "criteria_id": {
+            "format": "uuid",
+            "title": "Criteria Id",
+            "type": "string"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "frozen_at": {
+            "format": "date-time",
+            "title": "Frozen At",
+            "type": "string"
+          },
+          "frozen_by": {
+            "title": "Frozen By",
+            "type": "string"
+          },
+          "policy_revision": {
+            "default": "",
+            "title": "Policy Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "criteria_id",
+          "directive_id",
+          "criteria_digest",
+          "corpus_digest",
+          "frozen_at",
+          "frozen_by"
+        ],
+        "title": "AcceptanceCriteriaResponse",
+        "type": "object"
+      },
       "ActivitySummaryResponse": {
         "properties": {
           "by_domain": {
@@ -3414,6 +3577,451 @@
         "title": "CaptureDeliveryState",
         "type": "string"
       },
+      "CharterCapsPayload": {
+        "properties": {
+          "budget_currency": {
+            "default": "USD",
+            "title": "Budget Currency",
+            "type": "string"
+          },
+          "budget_minor_units": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Budget Minor Units",
+            "type": "integer"
+          },
+          "max_attempts": {
+            "default": 3,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Max Attempts",
+            "type": "integer"
+          },
+          "max_concurrent_dispatches": {
+            "default": 1,
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Max Concurrent Dispatches",
+            "type": "integer"
+          },
+          "max_wall_seconds": {
+            "default": 1800,
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "title": "Max Wall Seconds",
+            "type": "integer"
+          },
+          "spend_enforcement": {
+            "default": "unsupported",
+            "title": "Spend Enforcement",
+            "type": "string"
+          }
+        },
+        "title": "CharterCapsPayload",
+        "type": "object"
+      },
+      "CharterCreateRequest": {
+        "properties": {
+          "caps": {
+            "$ref": "#/components/schemas/CharterCapsPayload"
+          },
+          "charter_version": {
+            "default": "v1",
+            "title": "Charter Version",
+            "type": "string"
+          },
+          "confirm_required_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Confirm Required Capabilities",
+            "type": "array"
+          },
+          "credential_risk_acknowledged": {
+            "default": false,
+            "title": "Credential Risk Acknowledged",
+            "type": "boolean"
+          },
+          "denied_read_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Denied Read Paths",
+            "type": "array"
+          },
+          "egress_mode": {
+            "default": "deny_all",
+            "title": "Egress Mode",
+            "type": "string"
+          },
+          "enforcement_tier": {
+            "default": "container",
+            "title": "Enforcement Tier",
+            "type": "string"
+          },
+          "permitted_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Permitted Capabilities",
+            "type": "array"
+          },
+          "permitted_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Permitted Roots",
+            "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "protected_write_prefixes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Protected Write Prefixes",
+            "type": "array"
+          },
+          "runtime_allowlist": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Runtime Allowlist",
+            "type": "array"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "source_receipt_id": {
+            "format": "uuid",
+            "title": "Source Receipt Id",
+            "type": "string"
+          },
+          "task_families": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Task Families",
+            "type": "array"
+          },
+          "ttl_seconds": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ttl Seconds"
+          }
+        },
+        "required": [
+          "source_receipt_id"
+        ],
+        "title": "CharterCreateRequest",
+        "type": "object"
+      },
+      "CharterNarrowingRequest": {
+        "properties": {
+          "add_denied_read_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Add Denied Read Paths",
+            "type": "array"
+          },
+          "add_protected_write_prefixes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Add Protected Write Prefixes",
+            "type": "array"
+          },
+          "budget_minor_units": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Minor Units"
+          },
+          "charter_id": {
+            "format": "uuid",
+            "title": "Charter Id",
+            "type": "string"
+          },
+          "egress_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Egress Mode"
+          },
+          "enforcement_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enforcement Tier"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "max_attempts": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Attempts"
+          },
+          "max_concurrent_dispatches": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Concurrent Dispatches"
+          },
+          "max_wall_seconds": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Wall Seconds"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "remove_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Remove Capabilities",
+            "type": "array"
+          },
+          "remove_roots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Remove Roots",
+            "type": "array"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "source_receipt_id": {
+            "format": "uuid",
+            "title": "Source Receipt Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "charter_id",
+          "source_receipt_id"
+        ],
+        "title": "CharterNarrowingRequest",
+        "type": "object"
+      },
+      "CharterResponse": {
+        "properties": {
+          "approved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved At"
+          },
+          "approved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved By"
+          },
+          "charter": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter"
+          },
+          "charter_digest": {
+            "default": "",
+            "title": "Charter Digest",
+            "type": "string"
+          },
+          "charter_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter Id"
+          },
+          "charter_version": {
+            "default": "v1",
+            "title": "Charter Version",
+            "type": "string"
+          },
+          "credential_risk_acknowledged": {
+            "default": false,
+            "title": "Credential Risk Acknowledged",
+            "type": "boolean"
+          },
+          "enforcement_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enforcement Tier"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "narrowing_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Narrowing Ids",
+            "type": "array"
+          },
+          "policy_revision": {
+            "default": "",
+            "title": "Policy Revision",
+            "type": "string"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "status": {
+            "default": "draft",
+            "title": "Status",
+            "type": "string"
+          },
+          "superseded_by": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded By"
+          }
+        },
+        "required": [
+          "generated_at"
+        ],
+        "title": "CharterResponse",
+        "type": "object"
+      },
       "CheckContextRequest": {
         "properties": {
           "file_path": {
@@ -3468,6 +4076,53 @@
           "past_decisions"
         ],
         "title": "CheckContextResponse",
+        "type": "object"
+      },
+      "CheckResultPayload": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Argv",
+            "type": "array"
+          },
+          "check_id": {
+            "title": "Check Id",
+            "type": "string"
+          },
+          "duration_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "excerpt": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Excerpt",
+            "type": "string"
+          },
+          "exit_code": {
+            "title": "Exit Code",
+            "type": "integer"
+          },
+          "stderr_sha256": {
+            "title": "Stderr Sha256",
+            "type": "string"
+          },
+          "stdout_sha256": {
+            "title": "Stdout Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "check_id",
+          "exit_code",
+          "stdout_sha256",
+          "stderr_sha256"
+        ],
+        "title": "CheckResultPayload",
         "type": "object"
       },
       "CloneAdviceRequest": {
@@ -5667,6 +6322,784 @@
         "title": "DirectiveExecutionState",
         "type": "string"
       },
+      "DispatchOpenRequest": {
+        "properties": {
+          "attempt": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "contract_digest": {
+            "default": "",
+            "title": "Contract Digest",
+            "type": "string"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "enforcement_tier": {
+            "title": "Enforcement Tier",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "default": "",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "model_id": {
+            "default": "",
+            "title": "Model Id",
+            "type": "string"
+          },
+          "provider_run_id": {
+            "title": "Provider Run Id",
+            "type": "string"
+          },
+          "provider_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Turn Id"
+          },
+          "request_minor_units": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Minor Units"
+          },
+          "runtime_id": {
+            "title": "Runtime Id",
+            "type": "string"
+          },
+          "runtime_version": {
+            "title": "Runtime Version",
+            "type": "string"
+          },
+          "sandbox_profile_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Digest"
+          },
+          "sandbox_provider": {
+            "title": "Sandbox Provider",
+            "type": "string"
+          },
+          "sandbox_self_test_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Self Test Id"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "surface": {
+            "title": "Surface",
+            "type": "string"
+          },
+          "task_family": {
+            "default": "unspecified",
+            "title": "Task Family",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "directive_id",
+          "runtime_id",
+          "runtime_version",
+          "surface",
+          "enforcement_tier",
+          "sandbox_provider",
+          "provider_run_id"
+        ],
+        "title": "DispatchOpenRequest",
+        "type": "object"
+      },
+      "DispatchReconcileRequest": {
+        "properties": {
+          "human_intervention_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Human Intervention Count",
+            "type": "integer"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reconciliation": {
+            "additionalProperties": true,
+            "title": "Reconciliation",
+            "type": "object"
+          },
+          "terminal_reason": {
+            "default": "",
+            "title": "Terminal Reason",
+            "type": "string"
+          },
+          "wall_ms": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Wall Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "DispatchReconcileRequest",
+        "type": "object"
+      },
+      "DispatchResponse": {
+        "properties": {
+          "attempt": {
+            "default": 1,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "budget_currency": {
+            "default": "USD",
+            "title": "Budget Currency",
+            "type": "string"
+          },
+          "budget_reserved_minor_units": {
+            "default": 0,
+            "title": "Budget Reserved Minor Units",
+            "type": "integer"
+          },
+          "cap_applied": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cap Applied"
+          },
+          "capability_matrix": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Capability Matrix",
+            "type": "object"
+          },
+          "charter_digest": {
+            "default": "",
+            "title": "Charter Digest",
+            "type": "string"
+          },
+          "charter_id": {
+            "format": "uuid",
+            "title": "Charter Id",
+            "type": "string"
+          },
+          "contract_digest": {
+            "default": "",
+            "title": "Contract Digest",
+            "type": "string"
+          },
+          "cost_minor_units": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Minor Units"
+          },
+          "cost_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Source"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "dispatch_id": {
+            "format": "uuid",
+            "title": "Dispatch Id",
+            "type": "string"
+          },
+          "enforcement_tier": {
+            "title": "Enforcement Tier",
+            "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "human_intervention_count": {
+            "default": 0,
+            "title": "Human Intervention Count",
+            "type": "integer"
+          },
+          "model_id": {
+            "default": "",
+            "title": "Model Id",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "provider_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Run Id"
+          },
+          "provider_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Turn Id"
+          },
+          "reconciled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reconciled At"
+          },
+          "runtime_id": {
+            "default": "",
+            "title": "Runtime Id",
+            "type": "string"
+          },
+          "runtime_version": {
+            "default": "",
+            "title": "Runtime Version",
+            "type": "string"
+          },
+          "sandbox_profile_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Profile Digest"
+          },
+          "sandbox_provider": {
+            "default": "",
+            "title": "Sandbox Provider",
+            "type": "string"
+          },
+          "sandbox_self_test_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Self Test Id"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "spend_enforcement": {
+            "default": "unsupported",
+            "title": "Spend Enforcement",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "surface": {
+            "default": "",
+            "title": "Surface",
+            "type": "string"
+          },
+          "task_family": {
+            "default": "unspecified",
+            "title": "Task Family",
+            "type": "string"
+          },
+          "terminal_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Reason"
+          },
+          "tokens_cached_input": {
+            "default": 0,
+            "title": "Tokens Cached Input",
+            "type": "integer"
+          },
+          "tokens_input": {
+            "default": 0,
+            "title": "Tokens Input",
+            "type": "integer"
+          },
+          "tokens_output": {
+            "default": 0,
+            "title": "Tokens Output",
+            "type": "integer"
+          },
+          "tokens_reasoning": {
+            "default": 0,
+            "title": "Tokens Reasoning",
+            "type": "integer"
+          },
+          "wall_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wall Ms"
+          }
+        },
+        "required": [
+          "dispatch_id",
+          "directive_id",
+          "charter_id",
+          "enforcement_tier",
+          "generated_at"
+        ],
+        "title": "DispatchResponse",
+        "type": "object"
+      },
+      "EffectOpenRequest": {
+        "properties": {
+          "action_tracing": {
+            "title": "Action Tracing",
+            "type": "string"
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Argv",
+            "type": "array"
+          },
+          "capability": {
+            "title": "Capability",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "dispatch_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatch Id"
+          },
+          "enforcement_tier": {
+            "title": "Enforcement Tier",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "lease_generation": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
+          "model_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Id"
+          },
+          "provider_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Run Id"
+          },
+          "provider_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Turn Id"
+          },
+          "resource": {
+            "default": "",
+            "title": "Resource",
+            "type": "string"
+          },
+          "reversibility": {
+            "title": "Reversibility",
+            "type": "string"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "runtime_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Version"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "directive_id",
+          "kind",
+          "capability",
+          "reversibility",
+          "enforcement_tier",
+          "action_tracing"
+        ],
+        "title": "EffectOpenRequest",
+        "type": "object"
+      },
+      "EffectResolveRequest": {
+        "properties": {
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "expected_lease": {
+            "minimum": 0.0,
+            "title": "Expected Lease",
+            "type": "integer"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "resolution_source": {
+            "title": "Resolution Source",
+            "type": "string"
+          },
+          "target_state": {
+            "title": "Target State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_state",
+          "resolution_source",
+          "expected_lease"
+        ],
+        "title": "EffectResolveRequest",
+        "type": "object"
+      },
+      "EffectResponse": {
+        "properties": {
+          "action_tracing": {
+            "default": "",
+            "title": "Action Tracing",
+            "type": "string"
+          },
+          "capability": {
+            "default": "",
+            "title": "Capability",
+            "type": "string"
+          },
+          "claimed_executor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed Executor"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "effect_id": {
+            "format": "uuid",
+            "title": "Effect Id",
+            "type": "string"
+          },
+          "enforcement_tier": {
+            "default": "",
+            "title": "Enforcement Tier",
+            "type": "string"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "intent_digest": {
+            "default": "",
+            "title": "Intent Digest",
+            "type": "string"
+          },
+          "kind": {
+            "default": "",
+            "title": "Kind",
+            "type": "string"
+          },
+          "lease_generation": {
+            "default": 0,
+            "title": "Lease Generation",
+            "type": "integer"
+          },
+          "opened_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opened At"
+          },
+          "pause_reason": {
+            "default": "",
+            "title": "Pause Reason",
+            "type": "string"
+          },
+          "pause_required": {
+            "default": false,
+            "title": "Pause Required",
+            "type": "boolean"
+          },
+          "provider_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Run Id"
+          },
+          "resolution_source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution Source"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          },
+          "resource": {
+            "default": "",
+            "title": "Resource",
+            "type": "string"
+          },
+          "reversibility": {
+            "default": "unknown",
+            "title": "Reversibility",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "seq": {
+            "default": 0,
+            "title": "Seq",
+            "type": "integer"
+          },
+          "state": {
+            "default": "prepared",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "effect_id",
+          "directive_id",
+          "generated_at"
+        ],
+        "title": "EffectResponse",
+        "type": "object"
+      },
       "EpisodeDecisionItem": {
         "properties": {
           "alternatives": {
@@ -6853,6 +8286,17 @@
             "$ref": "#/components/schemas/CaptureDeliveryState",
             "default": "unknown"
           },
+          "enforcement_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enforcement Tier"
+          },
           "generated_at": {
             "format": "date-time",
             "title": "Generated At",
@@ -6884,6 +8328,19 @@
             "default": 0,
             "title": "Task State Revision",
             "type": "integer"
+          },
+          "unresolved_effects": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Unresolved Effects",
+            "type": "array"
+          },
+          "verification_state": {
+            "default": "unverified",
+            "title": "Verification State",
+            "type": "string"
           }
         },
         "required": [
@@ -7008,6 +8465,11 @@
       },
       "GovernanceStatusResponse": {
         "properties": {
+          "action_tracing_available": {
+            "default": false,
+            "title": "Action Tracing Available",
+            "type": "boolean"
+          },
           "audit_write_mode": {
             "title": "Audit Write Mode",
             "type": "string"
@@ -7016,9 +8478,58 @@
             "title": "Auth Mode",
             "type": "string"
           },
+          "charter_active": {
+            "default": false,
+            "title": "Charter Active",
+            "type": "boolean"
+          },
+          "charter_expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter Expires At"
+          },
+          "charter_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter Id"
+          },
+          "charter_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Charter Version"
+          },
           "effective_execution_enforcement": {
             "title": "Effective Execution Enforcement",
             "type": "string"
+          },
+          "enforcement_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enforcement Tier"
           },
           "host_mutation_interception": {
             "title": "Host Mutation Interception",
@@ -7074,6 +8585,27 @@
             "title": "Runtime Profile",
             "type": "string"
           },
+          "sandbox_provider": {
+            "default": "",
+            "title": "Sandbox Provider",
+            "type": "string"
+          },
+          "sandbox_self_test_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Self Test At"
+          },
+          "sandbox_self_test_passed": {
+            "default": false,
+            "title": "Sandbox Self Test Passed",
+            "type": "boolean"
+          },
           "schema_version": {
             "default": "v1",
             "title": "Schema Version",
@@ -7088,6 +8620,16 @@
           },
           "server_boundary_secure": {
             "title": "Server Boundary Secure",
+            "type": "boolean"
+          },
+          "spend_enforcement": {
+            "default": "unsupported",
+            "title": "Spend Enforcement",
+            "type": "string"
+          },
+          "uid_separation": {
+            "default": false,
+            "title": "Uid Separation",
             "type": "boolean"
           },
           "workspace_access_mode": {
@@ -8847,6 +10389,131 @@
         "title": "SafetyDecision",
         "type": "string"
       },
+      "SandboxAssertionPayload": {
+        "properties": {
+          "expected": {
+            "default": "",
+            "title": "Expected",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "observed": {
+            "default": "",
+            "title": "Observed",
+            "type": "string"
+          },
+          "passed": {
+            "default": false,
+            "title": "Passed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SandboxAssertionPayload",
+        "type": "object"
+      },
+      "SandboxSelfTestRequest": {
+        "properties": {
+          "assertions": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxAssertionPayload"
+            },
+            "title": "Assertions",
+            "type": "array"
+          },
+          "host_id": {
+            "default": "",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "passed": {
+            "default": false,
+            "title": "Passed",
+            "type": "boolean"
+          },
+          "profile_digest": {
+            "default": "",
+            "title": "Profile Digest",
+            "type": "string"
+          },
+          "provider_version": {
+            "default": "",
+            "title": "Provider Version",
+            "type": "string"
+          },
+          "sandbox_provider": {
+            "title": "Sandbox Provider",
+            "type": "string"
+          },
+          "uid_separation": {
+            "default": false,
+            "title": "Uid Separation",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sandbox_provider"
+        ],
+        "title": "SandboxSelfTestRequest",
+        "type": "object"
+      },
+      "SandboxSelfTestResponse": {
+        "properties": {
+          "assertions": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxAssertionPayload"
+            },
+            "title": "Assertions",
+            "type": "array"
+          },
+          "passed": {
+            "default": false,
+            "title": "Passed",
+            "type": "boolean"
+          },
+          "profile_digest": {
+            "default": "",
+            "title": "Profile Digest",
+            "type": "string"
+          },
+          "ran_at": {
+            "format": "date-time",
+            "title": "Ran At",
+            "type": "string"
+          },
+          "sandbox_provider": {
+            "title": "Sandbox Provider",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "self_test_id": {
+            "format": "uuid",
+            "title": "Self Test Id",
+            "type": "string"
+          },
+          "uid_separation": {
+            "default": false,
+            "title": "Uid Separation",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "self_test_id",
+          "sandbox_provider",
+          "ran_at"
+        ],
+        "title": "SandboxSelfTestResponse",
+        "type": "object"
+      },
       "ServiceStatusInfo": {
         "properties": {
           "connected": {
@@ -10093,6 +11760,16 @@
             "$ref": "#/components/schemas/CaptureDeliveryState",
             "default": "unknown"
           },
+          "charter_active": {
+            "default": false,
+            "title": "Charter Active",
+            "type": "boolean"
+          },
+          "charter_version": {
+            "default": "",
+            "title": "Charter Version",
+            "type": "string"
+          },
           "citations": {
             "items": {
               "format": "uuid",
@@ -10108,6 +11785,14 @@
             "additionalProperties": true,
             "title": "Clone Advice",
             "type": "object"
+          },
+          "constraints": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Constraints",
+            "type": "array"
           },
           "context_quality_score": {
             "default": 0.0,
@@ -10170,6 +11855,17 @@
               }
             ],
             "title": "Enforcement Reason"
+          },
+          "enforcement_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enforcement Tier"
           },
           "episode_boost_applied": {
             "default": false,
@@ -10422,6 +12118,14 @@
             "default": 0,
             "title": "Task State Revision",
             "type": "integer"
+          },
+          "unresolved_effects": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Unresolved Effects",
+            "type": "array"
           }
         },
         "required": [
@@ -11141,6 +12845,189 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VerificationResultRequest": {
+        "properties": {
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "observed_corpus_digest": {
+            "title": "Observed Corpus Digest",
+            "type": "string"
+          },
+          "observed_corpus_manifest": {
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Observed Corpus Manifest",
+            "type": "array"
+          },
+          "platform": {
+            "default": "",
+            "title": "Platform",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/CheckResultPayload"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
+          "tree_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tree Sha"
+          }
+        },
+        "required": [
+          "directive_id",
+          "observed_corpus_digest"
+        ],
+        "title": "VerificationResultRequest",
+        "type": "object"
+      },
+      "VerificationResultResponse": {
+        "properties": {
+          "advisory": {
+            "default": true,
+            "title": "Advisory",
+            "type": "boolean"
+          },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
+          "corpus_digest_at_run": {
+            "default": "",
+            "title": "Corpus Digest At Run",
+            "type": "string"
+          },
+          "corpus_digest_match": {
+            "default": false,
+            "title": "Corpus Digest Match",
+            "type": "boolean"
+          },
+          "criteria_digest_at_run": {
+            "default": "",
+            "title": "Criteria Digest At Run",
+            "type": "string"
+          },
+          "criteria_digest_match": {
+            "default": false,
+            "title": "Criteria Digest Match",
+            "type": "boolean"
+          },
+          "directive_id": {
+            "format": "uuid",
+            "title": "Directive Id",
+            "type": "string"
+          },
+          "executing_identity": {
+            "default": "",
+            "title": "Executing Identity",
+            "type": "string"
+          },
+          "platform": {
+            "default": "",
+            "title": "Platform",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "recorded_at": {
+            "format": "date-time",
+            "title": "Recorded At",
+            "type": "string"
+          },
+          "runner_principal": {
+            "default": "",
+            "title": "Runner Principal",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "tree_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tree Sha"
+          },
+          "verdict": {
+            "title": "Verdict",
+            "type": "string"
+          },
+          "verification_id": {
+            "format": "uuid",
+            "title": "Verification Id",
+            "type": "string"
+          },
+          "verification_state": {
+            "default": "unverified",
+            "title": "Verification State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "verification_id",
+          "directive_id",
+          "verdict",
+          "recorded_at"
+        ],
+        "title": "VerificationResultResponse",
         "type": "object"
       }
     }
@@ -15284,6 +17171,784 @@
         "summary": "Capability Grant Create"
       }
     },
+    "/v1/charters": {
+      "post": {
+        "operationId": "charter_create_v1_charters_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CharterCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharterResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Charter Create"
+      }
+    },
+    "/v1/charters/active": {
+      "get": {
+        "operationId": "charter_active_v1_charters_active_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharterResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Charter Active"
+      }
+    },
+    "/v1/charters/narrowings": {
+      "post": {
+        "operationId": "charter_narrow_v1_charters_narrowings_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CharterNarrowingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharterResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Charter Narrow"
+      }
+    },
+    "/v1/charters/{charter_id}/approve": {
+      "post": {
+        "operationId": "charter_approve_v1_charters__charter_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "charter_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Charter Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharterResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Charter Approve"
+      }
+    },
+    "/v1/charters/{charter_id}/revoke": {
+      "post": {
+        "operationId": "charter_revoke_v1_charters__charter_id__revoke_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "charter_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Charter Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CharterResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Charter Revoke"
+      }
+    },
     "/v1/clone/advice": {
       "post": {
         "operationId": "clone_advice_v1_clone_advice_post",
@@ -18586,6 +21251,1108 @@
         "summary": "Get System Status"
       }
     },
+    "/v1/dispatch": {
+      "post": {
+        "operationId": "dispatch_open_v1_dispatch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchOpenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DispatchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Open"
+      }
+    },
+    "/v1/dispatch/{dispatch_id}": {
+      "get": {
+        "operationId": "dispatch_get_v1_dispatch__dispatch_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dispatch_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Dispatch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DispatchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Get"
+      }
+    },
+    "/v1/dispatch/{dispatch_id}/provider": {
+      "post": {
+        "operationId": "dispatch_bind_provider_v1_dispatch__dispatch_id__provider_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dispatch_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Dispatch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DispatchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Bind Provider"
+      }
+    },
+    "/v1/dispatch/{dispatch_id}/reconcile": {
+      "post": {
+        "description": "Allowed on a revoked charter: this records what happened, it does not do more.",
+        "operationId": "dispatch_reconcile_v1_dispatch__dispatch_id__reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dispatch_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Dispatch Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchReconcileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DispatchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Reconcile"
+      }
+    },
+    "/v1/effects": {
+      "post": {
+        "operationId": "effect_open_v1_effects_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EffectOpenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Effect Open"
+      }
+    },
+    "/v1/effects/open": {
+      "get": {
+        "operationId": "effects_open_v1_effects_open_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/EffectResponse"
+                  },
+                  "title": "Response Effects Open V1 Effects Open Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Effects Open"
+      }
+    },
+    "/v1/effects/{effect_id}/resolve": {
+      "post": {
+        "description": "The actor is derived SERVER-SIDE from the authenticated identity.\n\n``EffectResolveRequest`` deliberately has no ``actor`` field: a caller that could name itself\n``system:reconciler`` would satisfy the \"system actors only\" rule the pure validator\nadvertises, which is no rule at all.",
+        "operationId": "effect_resolve_v1_effects__effect_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "effect_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Effect Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EffectResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Effect Resolve"
+      }
+    },
     "/v1/episodes": {
       "get": {
         "operationId": "list_episodes_v1_episodes_get",
@@ -20416,6 +24183,161 @@
           }
         },
         "summary": "Handoff Resume Packet"
+      }
+    },
+    "/v1/handoffs/outbox/{outbox_id}/requeue": {
+      "post": {
+        "description": "The operator escape hatch.  A dead outbox row is never retried and never clears the\ncompletion obligation, which otherwise blocks every future mutating grant in that session.",
+        "operationId": "handoff_outbox_requeue_v1_handoffs_outbox__outbox_id__requeue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "outbox_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Outbox Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Handoff Outbox Requeue V1 Handoffs Outbox  Outbox Id  Requeue Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Handoff Outbox Requeue"
       }
     },
     "/v1/health": {
@@ -22629,6 +26551,159 @@
           }
         },
         "summary": "Set Mode"
+      }
+    },
+    "/v1/sandbox/self-test": {
+      "post": {
+        "description": "A measurement, recorded.  open_dispatch later checks this row for freshness and digest\nmatch, so the enforcement tier cannot be a label with nothing behind it.",
+        "operationId": "sandbox_self_test_v1_sandbox_self_test_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SandboxSelfTestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxSelfTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Sandbox Self Test"
       }
     },
     "/v1/search": {
@@ -28840,6 +32915,464 @@
           }
         },
         "summary": "Upsert Membership"
+      }
+    },
+    "/v1/verification/criteria": {
+      "post": {
+        "description": "Freeze the criteria beyond the implementing agent's reach.\n\nRefused when the caller is the identity that claimed the dispatch: an agent that can write its\nown acceptance criteria is grading its own homework.",
+        "operationId": "verification_criteria_freeze_v1_verification_criteria_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptanceCriteriaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptanceCriteriaResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verification Criteria Freeze"
+      }
+    },
+    "/v1/verification/criteria/{directive_id}": {
+      "get": {
+        "operationId": "verification_criteria_get_v1_verification_criteria__directive_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "directive_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Directive Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptanceCriteriaResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verification Criteria Get"
+      }
+    },
+    "/v1/verification/results": {
+      "post": {
+        "description": "EVIDENCE IN, VERDICT OUT.  The body carries no verdict and no runner_principal; both are\nproduced here.  Allowed on a revoked charter \u2014 recording, not doing.",
+        "operationId": "verification_results_record_v1_verification_results_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationResultRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationResultResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verification Results Record"
       }
     },
     "/v1/workflow/templates": {

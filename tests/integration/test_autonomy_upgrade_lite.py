@@ -84,6 +84,11 @@ def lite_client(tmp_path) -> Generator[TestClient, None, None]:
     settings.lite_db_path = str(tmp_path / "tce-lite-autonomy-upgrade.db")
     settings.api_tokens = "lite-test-token"
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     settings.context_tiers_enabled = False
     settings.intent_retrieval_enabled = False
     settings.retry_feedback_enabled = False

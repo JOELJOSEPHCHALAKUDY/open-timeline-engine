@@ -34,6 +34,7 @@ from tce_shared.task_state import (
     PINNED_KIND_VALUES,
     PINNED_KINDS,
     TASK_STATE_SCHEMA_VERSION,
+    UNKNOWN_CONTRACT_REVISION,
     ApprovedPlan,
     FoldResult,
     InvalidationPlan,
@@ -815,3 +816,95 @@ def _as_action(value: Any) -> Any:
         return NextPermittedAction(str(value))
     except ValueError:
         return NextPermittedAction.NONE
+
+
+# ------------------------------------------------------------------ verification provenance
+
+
+def directive_contract_revision(
+    db: Session,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    task_id: str,
+    directive_id: str,
+) -> int:
+    """The contract revision the DIRECTIVE's work happened under, read from its own history.
+
+    ``task_state_events`` stamps every row with the ``contract_revision`` in force when it was
+    appended and with the ``directive_id`` that caused it, so the earliest such row for a
+    directive is the contract the work was done for.  This is the fact a verification's stamp has
+    to come from: read from the projection at grading time instead, the stamp says only "the
+    contract as of now", which is true of every verification and therefore excludes none.
+
+    A directive with no rows at all -- one cancelled by an objective-change invalidation before it
+    ever touched the projection, or reported while task state was off -- returns
+    :data:`UNKNOWN_CONTRACT_REVISION`, which no real revision equals.  Guessing "current" there
+    would restore exactly the hole this function exists to close.
+    """
+    row = db.execute(
+        text(
+            """
+            SELECT MIN(e.contract_revision) AS contract_revision
+            FROM task_state_events e
+            JOIN task_states t ON t.id = e.task_state_id
+            WHERE t.workspace_id = :workspace_id
+              AND t.owner_id = :owner_id
+              AND t.task_id = :task_id
+              AND e.directive_id = CAST(:directive_id AS UUID)
+            """
+        ),
+        {
+            "workspace_id": workspace_id,
+            "owner_id": owner_id,
+            "task_id": task_id,
+            "directive_id": str(directive_id),
+        },
+    ).mappings().first()
+    if row is None or row.get("contract_revision") is None:
+        return UNKNOWN_CONTRACT_REVISION
+    return int(row["contract_revision"])
+
+
+def insert_task_verification(
+    db: Session,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    task_id: str,
+    ref: dict[str, Any],
+    recorded_by: str,
+    now: datetime,
+) -> None:
+    """Persist a stamped verification row. Callers stamp first; this only writes."""
+    db.execute(
+        text(
+            """
+            INSERT INTO task_verifications(
+                id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
+                evidence_event_ids_json, recorded_by, recorded_at, schema_version,
+                contract_revision, plan_id
+            )
+            VALUES(
+                gen_random_uuid(), :workspace_id, :owner_id, :task_id,
+                CAST(:directive_id AS UUID), :state, :method, :summary,
+                CAST(:evidence_event_ids_json AS JSONB), :recorded_by, :recorded_at, 'v1',
+                :contract_revision, :plan_id
+            )
+            """
+        ),
+        {
+            "workspace_id": workspace_id,
+            "owner_id": owner_id,
+            "task_id": task_id,
+            "directive_id": ref.get("directive_id"),
+            "state": ref.get("state"),
+            "method": ref.get("method"),
+            "summary": ref.get("summary"),
+            "evidence_event_ids_json": json.dumps(list(ref.get("evidence_event_ids") or [])),
+            "recorded_by": recorded_by,
+            "recorded_at": now,
+            "contract_revision": int(ref.get("contract_revision") or 0),
+            "plan_id": ref.get("plan_id"),
+        },
+    )

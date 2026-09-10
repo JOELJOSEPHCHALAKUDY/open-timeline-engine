@@ -266,6 +266,37 @@ class Settings(BaseSettings):
     typed_contract_enabled: bool = False
     workflow_template_reuse_min_reliability: float = 0.70
     takeover_execution_claim_ttl_seconds: int = 300
+    # ---- P3: authority charter, effect journal, verification, dispatch budget --------------
+    # Every one of these has a named read site; a setting with no reader is deleted, not documented.
+    # True here and True in Full (services/tce_api/tce_api/config.py), per design §0.7.
+    # With it on, claim_execution refuses a mutating directive minted before a charter exists --
+    # exactly what U2/G6(d) intends. That turned 18 pre-P3 integration tests red, because they
+    # claim without a charter; each of those fixtures now pins TCE_CHARTER_ENFORCEMENT_ENABLED=0
+    # explicitly and says why, so they keep measuring the pre-charter transitions they were
+    # written for. Both switch positions are exercised by tests/integration/test_charter_lite.py
+    # (test_claim_is_refused_without_a_charter, test_claim_succeeds_under_an_active_charter).
+    # NOTE the honest limit: with this on, a deployment is charter-GATED at claim. That is a
+    # protocol gate, not an OS one -- GET /v1/governance/status reports
+    # effective_execution_enforcement, which is "sandbox_enforced" only when a passing sandbox
+    # self-test backs it and "protocol_only" otherwise.
+    charter_enforcement_enabled: bool = True
+    charter_default_ttl_seconds: int = 43200
+    charter_max_ttl_seconds: int = 604800
+    charter_min_ttl_seconds: int = 300
+    effect_journal_enabled: bool = True
+    effect_unknown_pause_enabled: bool = True
+    effect_journal_retention_days: int = 365
+    verification_enabled: bool = True
+    verification_runner_principal: str = "system:verifier"
+    verification_reviewer_model_enabled: bool = False
+    verification_max_checks: int = 8
+    verification_check_timeout_seconds: int = 900
+    dispatch_startup_reconcile_enabled: bool = True
+    dispatch_startup_reconcile_batch: int = 200
+    budget_default_minor_units: int = 200
+    budget_currency: str = "USD"
+    permit_scope_digest_enforced: bool = True
+    sandbox_self_test_max_age_seconds: int = 3600
     # P0 trust boundary: require reporters to echo the lease they hold (fencing token) and
     # require exact workspace/owner tags on events (drop the legacy untagged-row branch).
     takeover_lease_strict: bool = False

@@ -83,6 +83,38 @@ RESEARCH_TOOLS = AUTONOMY_TOOLS | {
     "tce.search_entities",
 }
 
+# ---------------------------------------------------------------------------
+# Tool names that must NEVER be exposed over MCP (P3 §9.3).
+#
+# P3 adds no MCP tool.  The supervisor talks to the API over HTTP with its own
+# credential; giving an executor a `tce.dispatch` tool would let the thing being
+# governed start its own governed work, and a `tce.record_verification` tool would
+# let the implementing identity grade itself.  This set is asserted absent from
+# every profile and from the running server by
+# tests/mcp/test_charter_constraints.py::test_no_supervisor_tool_is_exposed.
+#
+# This is a naming guard, not an authorization control: it stops these names from
+# being added here by accident.  What actually keeps an executor away from those
+# routes is the API's own auth (a distinct supervisor credential and a distinct
+# verifier credential) — see docs/supervisor.md.
+# ---------------------------------------------------------------------------
+SUPERVISOR_ONLY_TOOL_NAMES = frozenset(
+    {
+        "tce.dispatch",
+        "tce.open_dispatch",
+        "tce.reconcile_dispatch",
+        "tce.open_effect",
+        "tce.resolve_effect",
+        "tce.freeze_acceptance_criteria",
+        "tce.record_verification",
+        "tce.create_charter",
+        "tce.revoke_charter",
+        "tce.narrow_charter",
+        "tce.record_sandbox_self_test",
+    }
+)
+
+
 PROFILE_TOOLS = {
     "core": CORE_TOOLS,
     "continuity": CONTINUITY_TOOLS,

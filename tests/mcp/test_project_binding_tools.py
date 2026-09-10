@@ -10,8 +10,15 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from tce_mcp import server, tools
 from tce_shared.project_context import canonical_project_context
+
+# tce_mcp.project_context.discover_project_context shells out to `git rev-parse` on its
+# first call (services/tce_mcp/tce_mcp/project_context.py:18). It is @lru_cache(maxsize=1),
+# so WHICH test in this module pays for that spawn depends on collection order — hence a
+# module-level marker rather than per-test ones. See tests/conftest.py::_no_subprocess.
+pytestmark = pytest.mark.subprocess
 
 _APP_CONTEXT: dict[str, Any] = {"domain": "coding", "project": "open-timeline-engine", "project_root": "/work/open-timeline-engine"}
 _PROJECT_ID = canonical_project_context(dict(_APP_CONTEXT))["project_id"]

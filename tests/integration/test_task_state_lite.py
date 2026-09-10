@@ -35,6 +35,7 @@ from tce_lite_api.task_state_store import (
     load_task_state_events,
     rebuild_task_state,
 )
+from tce_shared.identity import credential_fingerprint
 from tce_shared.task_state import (
     MAX_TASK_STATE_EVENTS_PER_FOLD,
     PINNED_KINDS,
@@ -44,12 +45,19 @@ from tce_shared.task_state import (
     TaskStatePreconditionFailed,
     TaskStateProjection,
     TaskStateRevisionConflict,
+    TaskStatus,
     canonical_json,
     fold_task_state,
     root_status,
 )
+from tce_shared.verification import corpus_digest
 
 _TOKEN = "task-state-lite-token"
+_VERIFIER_TOKEN = "task-state-lite-verifier-token"
+# R9 needs a verification the IMPLEMENTING agent did not write, so the verifier carries its own
+# bound credential. A bound claim resolves by credential fingerprint even in compat mode.
+_VERIFY_MANIFEST: list[list[str]] = [["pyproject.toml", "a" * 64]]
+_VERIFY_MANIFEST_DIGEST = corpus_digest([("pyproject.toml", "a" * 64)])
 _MISSING = object()
 _GUARDED_SETTINGS = (
     "lite_db_path",
@@ -115,10 +123,27 @@ def lite_client(db_path: Path) -> Iterator[TestClient]:
     snapshot = _snapshot_settings()
     settings = get_settings()
     settings.lite_db_path = str(db_path)
-    settings.api_tokens = _TOKEN
+    settings.api_tokens = f"{_TOKEN},{_VERIFIER_TOKEN}"
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     settings.identity_claims_mode = "compat"
-    settings.identity_claims_json = "{}"
+    settings.verification_enabled = True
+    settings.verification_runner_principal = "system:verifier"
+    settings.identity_claims_json = json.dumps(
+        {
+            credential_fingerprint("bearer", _VERIFIER_TOKEN): {
+                "consumer": "system:verifier",
+                "role": "user",
+                "workspace_id": "personal",
+                "user_id": "human-1",
+                "behavior_subject_id": "human-1",
+            }
+        }
+    )
     settings.workspace_access_mode = "compat"
     settings.task_state_enabled = True
     settings.task_state_markdown_enabled = True
@@ -127,6 +152,57 @@ def lite_client(db_path: Path) -> Iterator[TestClient]:
             yield client
     finally:
         _restore_settings(snapshot)
+
+
+def _verifier_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_VERIFIER_TOKEN}"}
+
+
+def _verify_directive(client: TestClient, directive_id: str) -> None:
+    """Reach a passing verification the only way R9 accepts: frozen criteria graded against evidence."""
+
+    frozen = client.post(
+        "/v1/verification/criteria",
+        json={
+            "directive_id": directive_id,
+            "checks": [
+                {
+                    "check_id": "test",
+                    "argv": ["/bin/sh", "-c", "exit 0"],
+                    "cwd_rel": ".",
+                    "expect_exit_code": 0,
+                    "timeout_seconds": 60,
+                }
+            ],
+            "corpus_manifest": _VERIFY_MANIFEST,
+        },
+        headers=_verifier_headers(),
+    )
+    assert frozen.status_code == 200, frozen.text
+    graded = client.post(
+        "/v1/verification/results",
+        json={
+            "directive_id": directive_id,
+            "results": [
+                {
+                    "check_id": "test",
+                    "argv": ["/bin/sh", "-c", "exit 0"],
+                    "exit_code": 0,
+                    "duration_ms": 9,
+                    "stdout_sha256": "b" * 64,
+                    "stderr_sha256": "c" * 64,
+                    "excerpt": "",
+                }
+            ],
+            "observed_corpus_digest": _VERIFY_MANIFEST_DIGEST,
+            "observed_corpus_manifest": _VERIFY_MANIFEST,
+            "platform": "darwin/arm64 python3.12.12",
+            "commit_sha": "d" * 40,
+            "tree_sha": "e" * 40,
+        },
+        headers=_verifier_headers(),
+    )
+    assert graded.status_code == 200, graded.text
 
 
 def _headers(consumer: str = "codex", user_id: str = "human-1") -> dict[str, str]:
@@ -661,6 +737,7 @@ def test_a_finished_plan_reaches_done_through_r9(lite_client: TestClient, db_pat
                 "directive_id": directive_id,
                 "state": "succeeded",
                 "result": "success",
+                # The agent's own claim about its own work. R9 must not accept it.
                 "details": {
                     "verification": {"state": "passed", "method": "tests", "summary": "ok"}
                 },
@@ -668,6 +745,19 @@ def test_a_finished_plan_reaches_done_through_r9(lite_client: TestClient, db_pat
             headers=_headers(),
         )
         assert response.status_code == 200, response.text
+        last_directive_id = directive_id
+
+    # Every step is reported done, but the only verification on file is the agent's self-report, so the
+    # task is held at AWAITING_VERIFICATION rather than DONE.
+    self_reported = _projection(session_id)
+    assert self_reported.plan is not None
+    assert root_status(self_reported.plan.steps) == "done"
+    assert self_reported.status is TaskStatus.AWAITING_VERIFICATION
+    assert self_reported.latest_verification is not None
+    assert self_reported.latest_verification.state == "unverified"
+
+    # Grade the frozen criteria against recorded evidence, under the verifier's own bound credential.
+    _verify_directive(lite_client, last_directive_id)
 
     projection = _projection(session_id)
     assert projection.plan is not None

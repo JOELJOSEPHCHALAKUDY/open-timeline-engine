@@ -6,6 +6,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+# All three tests below run scripts/configure_mcp_clients.sh as a real subprocess.
+# See tests/conftest.py::_no_subprocess.
+pytestmark = pytest.mark.subprocess
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     loaded = json.loads(path.read_text(encoding="utf-8"))

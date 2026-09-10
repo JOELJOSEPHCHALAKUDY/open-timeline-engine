@@ -106,6 +106,11 @@ def lite_client(tmp_path: Path) -> Iterator[TestClient]:
     settings.lite_db_path = str(tmp_path / "trust-boundary.db")
     settings.api_tokens = f"{_TOKEN},{_OPERATOR_TOKEN}"
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     settings.identity_claims_mode = "compat"
     # Compat mode with ONE server-bound claim: everything asserted through X-TCE-* on _TOKEN stays
     # unverified, while _OPERATOR_TOKEN carries a human identity the server established itself.
@@ -136,6 +141,11 @@ def bound_client(tmp_path: Path) -> Iterator[TestClient]:
     settings.lite_db_path = str(tmp_path / "trust-boundary-bound.db")
     settings.api_tokens = "codex-token,claude-token,other-token"
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     settings.identity_claims_mode = "enforce"
     settings.workspace_access_mode = "compat"
     settings.identity_claims_json = json.dumps(

@@ -13,9 +13,10 @@ import threading
 import time
 import uuid
 from collections import Counter as CollectionCounter
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -75,7 +76,7 @@ from tce_shared.autonomy_goals import (
     evaluate_execution_permit,
     score_goal,
 )
-from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
+from tce_shared.behavior_control import capability_policy, normalize_counterfactual, redact_control_text
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
     behavior_storage_gate,
@@ -92,6 +93,13 @@ from tce_shared.behavior_pilot import (
     sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.charter import (
+    CharterRequired,
+    ResolvedCharter,
+    charter_constraints,
+    charter_sensitive_path_hit,
+    resolved_charter_to_json,
+)
 from tce_shared.continuity import assess_anchor_freshness
 from tce_shared.deadline import (
     ADVISOR_TURN_DEADLINE,
@@ -117,7 +125,20 @@ from tce_shared.dreams import (
     derive_dream_seeds,
     select_dream_to_pursue,
 )
+from tce_shared.effect_journal import (
+    DEFAULT_REVERSIBILITY_BY_KIND,
+    EFFECT_ACTOR_OWNER,
+    EFFECT_ACTOR_VERIFIER,
+    EffectTransitionRejected,
+    effect_intent_from_json,
+    effect_record_to_json,
+    pause_required,
+    unresolved_effects_json,
+)
 from tce_shared.events import (
+    AcceptanceCheckPayload,
+    AcceptanceCriteriaRequest,
+    AcceptanceCriteriaResponse,
     AgentRole,
     AutonomyGoalSource,
     AutonomyGoalStatus,
@@ -147,6 +168,9 @@ from tce_shared.events import (
     CapabilityGrantRequest,
     CapabilityGrantResponse,
     CaptureDeliveryState,
+    CharterCreateRequest,
+    CharterNarrowingRequest,
+    CharterResponse,
     CloneAdviceRequest,
     CloneAdviceResponse,
     CompletionCaptureRequest,
@@ -158,6 +182,12 @@ from tce_shared.events import (
     CounterfactualResolveRequest,
     DirectiveExecution,
     DirectiveExecutionState,
+    DispatchOpenRequest,
+    DispatchReconcileRequest,
+    DispatchResponse,
+    EffectOpenRequest,
+    EffectResolveRequest,
+    EffectResponse,
     EventDecision,
     EventEnvelope,
     EventLinks,
@@ -194,6 +224,8 @@ from tce_shared.events import (
     ResumePacketRetrievalMeta,
     RetryStrategy,
     SafetyDecision,
+    SandboxSelfTestRequest,
+    SandboxSelfTestResponse,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
     TakeoverAutonomyTickResponse,
@@ -227,6 +259,8 @@ from tce_shared.events import (
     TrustedInputCapture,
     TrustedInputOriginKind,
     TrustedInputReceipt,
+    VerificationResultRequest,
+    VerificationResultResponse,
     to_lifecycle_status,
     to_next_permitted_action,
 )
@@ -328,11 +362,19 @@ from tce_shared.task_state import (
     reconcile_constraint_events,
     render_task_state_markdown,
     root_status,
+    stamp_verification_provenance,
     task_scope_digest,
     task_state_summary_fields,
 )
+from tce_shared.verification import (
+    AcceptanceCheck,
+    CheckResult,
+    CriteriaFrozen,
+    VerificationEvidence,
+    acceptance_check_to_json,
+)
 
-from .audit import write_audit_log
+from .audit import _write_audit_sync, write_audit_log
 from .auth import AuthContext, get_auth_context
 from .behavior_control_store import (
     consume_capability_grant,
@@ -394,6 +436,14 @@ from .capture_store import (
     set_receipt_queue_state,
     validate_source_event_provenance,
 )
+from .charter_store import (
+    apply_narrowing,
+    approve_charter,
+    create_charter,
+    load_active_charter,
+    resolve_charter_or_refuse,
+    revoke_charter,
+)
 from .clone import (
     advisor_reason,
     arbitrate,
@@ -418,9 +468,24 @@ from .continuity_store import (
     pilot_metrics,
     record_resume_attempt,
     record_resume_progress,
+    requeue_dead_handoff,
 )
 from .crypto import maybe_encrypt_payload
 from .db import get_db, get_session_factory
+from .dispatch_store import (
+    bind_provider_run,
+    latest_self_test,
+    load_dispatch,
+    open_dispatch,
+    reconcile_dispatch,
+    record_self_test,
+)
+from .effect_store import (
+    list_open_effects,
+    load_effect,
+    open_effect,
+    resolve_effect,
+)
 from .graph import (
     graph_for_event,
     index_event_graph,
@@ -460,6 +525,12 @@ from .planning_store import (
 )
 from .policy import PolicyEngine
 from .queue import enqueue_job, get_queue_depth, queue_name_for_job
+from .reconcile import (
+    pause_guard_for_session,
+    pause_text_for,
+    resolve_effects_for_directive,
+    startup_reconcile,
+)
 from .redaction import apply_redaction_zones, redact_payload, redact_project_hint, redact_text
 from .routes.system import build_system_router
 from .schemas import (
@@ -559,15 +630,41 @@ from .task_state_store import (
     apply_task_state_events,
     cancel_task,
     ensure_task_state,
+    insert_task_verification,
     load_task_state,
     rebuild_task_state,
+)
+from .verification_store import (
+    freeze_acceptance_criteria,
+    load_acceptance_criteria,
+    record_verification,
+    verification_stats_for_session,
 )
 
 settings = get_settings()
 configure_logging(settings.log_level)
 setup_otel("tce-api")
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Open Timeline Engine API", version="0.4.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """The manager owns restart.  Startup reconciliation runs before anything can dispatch.
+
+    A failure here never blocks boot: the refusal lives at ``POST /v1/dispatch``, which returns
+    409 ``reconcile_pending`` for as long as ``reconcile_complete()`` is False.
+    """
+    if get_settings().dispatch_startup_reconcile_enabled:
+        scope = get_db()
+        db = next(scope)
+        try:
+            startup_reconcile(db, settings=get_settings())
+        except Exception:
+            logger.exception("startup reconcile failed")
+        finally:
+            scope.close()
+    yield
+
+
+app = FastAPI(title="Open Timeline Engine API", version="0.4.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins or ["*"],
@@ -4131,6 +4228,50 @@ def _capture_delivery_state_for(db: Session, auth: AuthContext, now: datetime) -
         return str(CaptureDeliveryState.UNKNOWN.value)
 
 
+_CREDENTIAL_KIND_PREFIXES: tuple[str, ...] = ("bearer:", "mtls:", "host:")
+
+
+def _runner_principal_for(auth: AuthContext) -> str:
+    """The verification runner's identity, DERIVED FROM AUTH and never from the request body.
+
+    ``AuthContext.consumer`` always carries the credential kind that established it
+    (``bearer:``/``mtls:``/``host:``).  The configured principal names the identity, not the
+    transport, so the kind prefix is stripped before the comparison; everything else about the
+    string comes from the credential.
+    """
+    consumer = str(auth.consumer or "")
+    for prefix in _CREDENTIAL_KIND_PREFIXES:
+        if consumer.startswith(prefix):
+            return consumer[len(prefix) :]
+    return consumer
+
+
+def _require_verified_human(auth: AuthContext, *, action: str) -> None:
+    """U1 — the one gate for every charter route.
+
+    ``auth.py`` reads the role straight off the client's ``X-TCE-Role`` header and
+    ``identity_claims_mode`` defaults to ``compat`` with no claims bound, so **"role user" is not
+    authentication**.  Any bearer-token holder — including the MCP executor client whose token
+    sits in the operator's shell config — could otherwise POST a charter granting itself every
+    capability and approve it.  P1 closed exactly this laundering for the weaker permit authority;
+    P3 must not reopen it for the stronger charter authority above it.
+    """
+    is_human = auth.role == AgentRole.USER
+    identity_verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and identity_verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "charter_authority_required",
+                "message": "only a server-verified human may " + action,
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
+
+
 _CAPTURE_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: capture channel unavailable"
 
 
@@ -5253,7 +5394,31 @@ def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]
 @app.get("/v1/governance/status", response_model=GovernanceStatusResponse)
 def governance_status(
     _auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
 ) -> GovernanceStatusResponse:
+    now = datetime.now(tz=UTC)
+    try:
+        status_charter = load_active_charter(
+            db,
+            workspace_id=_auth.workspace_id,
+            owner_id=_auth.user_id,
+            session_id="default",
+            now=now,
+        )
+    except SQLAlchemyError:
+        # The charter tables are the authority surface; if they cannot be read we report no
+        # charter, which is the fail-closed reading, rather than 500-ing the status endpoint.
+        db.rollback()
+        status_charter = None
+    try:
+        status_self_test = (
+            latest_self_test(db, workspace_id=_auth.workspace_id, sandbox_provider="seatbelt")
+            if status_charter is not None
+            else None
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        status_self_test = None
     return GovernanceStatusResponse(
         **build_governance_status(
             runtime="full",
@@ -5269,6 +5434,11 @@ def governance_status(
             requested_execution_enforcement=settings.execution_enforcement_level,
             execution_interception_attested=settings.execution_interception_attested,
             execution_interception_provider=settings.execution_interception_provider,
+            charter=status_charter,
+            sandbox_self_test=status_self_test,
+            # Per-command action tracing is not available on this host: the sandbox binds a
+            # process tree, not individual commands.  Reported, never claimed.
+            action_tracing_available=False,
         )
     )
 
@@ -7508,25 +7678,19 @@ def _autonomy_project_kpis_payload(
             DirectiveExecutionState.ABANDONED.value,
         } and bool(state_bucket.get("has_success")):
             state_bucket["reopened_after_success"] = True
-        raw_meta = row.get("meta")
-        if isinstance(raw_meta, dict):
-            meta = raw_meta
-        elif isinstance(raw_meta, str):
-            try:
-                parsed = json.loads(raw_meta)
-            except Exception:
-                parsed = {}
-            meta = parsed if isinstance(parsed, dict) else {}
-        else:
-            meta = {}
-        verification_summary = meta.get("verification_summary")
-        verification_map = verification_summary if isinstance(verification_summary, dict) else meta.get("verification")
-        if isinstance(verification_map, dict):
-            required_checks = _required_verification_checks()
-            verification_runs += 1
-            verification_ok = all(bool(verification_map.get(check, False)) for check in required_checks)
-            if verification_ok:
-                verification_passed += 1
+    # verification_runs/passed come from verification_results — rows the API graded from evidence
+    # a distinct principal submitted — never from the executor's own details["verification"]
+    # booleans, which are the implementer asserting its own work is correct.
+    try:
+        verification_runs, verification_passed = verification_stats_for_session(
+            db,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        verification_runs, verification_passed = 0, 0
 
     project_count = len(project_state)
     completed_projects = sum(1 for item in project_state.values() if bool(item.get("has_success")))
@@ -7549,7 +7713,7 @@ def _autonomy_project_kpis_payload(
     verification_pass_rate = (
         float(verification_passed) / max(1, verification_runs)
         if verification_runs > 0
-        else 1.0
+        else 0.0
     )
     thresholds = {
         "min_project_completion_rate": float(getattr(settings, "autonomy_kpi_min_project_completion_rate", 0.80)),
@@ -7565,10 +7729,12 @@ def _autonomy_project_kpis_payload(
         "project_completion_rate": completion_rate >= thresholds["min_project_completion_rate"],
         "manual_interventions_per_project": manual_interventions_per_project <= thresholds["max_manual_interventions_per_project"],
         "reopen_rate_after_completion": reopen_rate <= thresholds["max_reopen_rate_after_completion"],
+        # Fail CLOSED with no verification runs.  Passing vacuously at zero runs is what let the
+        # autonomy band reach project_autonomy_ready without a single verification ever happening.
         "verification_pass_rate": (
             verification_pass_rate >= thresholds["min_verification_pass_rate"]
             if verification_runs > 0
-            else True
+            else False
         ),
     }
     passed = all(bool(value) for value in checks.values())
@@ -9520,12 +9686,37 @@ def capability_grant_create(
     payload = body.model_dump(mode="python")
     if body.ttl_seconds == 120:
         payload["ttl_seconds"] = int(getattr(settings, "capability_grant_ttl_seconds", 120))
+    grant_session_id = str(payload.get("session_id") or "default")
+    grant_charter: ResolvedCharter | None = None
+    if capability_policy(str(body.capability))["mutating"]:
+        try:
+            grant_charter = resolve_charter_or_refuse(
+                db,
+                auth=auth,
+                session_id=grant_session_id,
+                action_kind="execute",
+                settings=settings,
+                now=datetime.now(tz=UTC),
+            )
+        except CharterRequired as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "no_active_charter",
+                    "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be "
+                    "created and approved by the owner before a mutating capability may be granted.",
+                    "action_kind": exc.action_kind,
+                    "reason": exc.reason,
+                },
+            ) from exc
     response = CapabilityGrantResponse(
         **issue_capability_grant(
             db,
             workspace_id=auth.workspace_id,
             owner_id=auth.user_id,
             body=payload,
+            charter_id=(uuid.UUID(grant_charter.charter_id) if grant_charter is not None else None),
+            effect_journal_enabled=bool(settings.effect_journal_enabled),
         )
     )
     write_audit_log(
@@ -11175,16 +11366,25 @@ def request_execution_permit(
         command_preview=body.command_preview,
         estimated_change_size=body.estimated_change_size,
     )
-    sensitive_hit = any(
-        any(token in path.lower() for token in ("services/tce_mcp", "infra/", "secrets", ".env"))
-        for path in body.target_paths
+    # The charter is resolved SERVER-SIDE from the authenticated identity and the session.  It is
+    # never read out of ExecutionPermitRequest, every field of which is client-supplied.
+    permit_charter = load_active_charter(
+        db,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=datetime.now(tz=UTC),
     )
+    sensitive_hit = charter_sensitive_path_hit(permit_charter, body.target_paths)
     decision, reason = evaluate_execution_permit(
         policy_profile=state.autonomy_policy_profile,
         risk_tier=risk_tier,
         estimated_change_size=body.estimated_change_size,
         role=auth.role.value,
         sensitive_path_hit=sensitive_hit,
+        charter=permit_charter,
+        action_kind=body.action_kind,
+        target_paths=body.target_paths,
     )
     permit_id = uuid.uuid4()
     expires_at = datetime.now(tz=UTC) + timedelta(seconds=max(30, int(settings.takeover_permit_ttl_seconds)))
@@ -11196,12 +11396,14 @@ def request_execution_permit(
             INSERT INTO execution_permits(
               id, session_id, workspace_id, action_kind, target_paths, command_preview,
               estimated_change_size, decision, reason, confirmed_by, expires_at, created_at, resolved_at,
-              user_id, requested_by, directive_id, attempt, objective_hash, policy_revision, scope_digest
+              user_id, requested_by, directive_id, attempt, objective_hash, policy_revision, scope_digest,
+              charter_id, charter_version
             )
             VALUES(
               :id, :session_id, :workspace_id, :action_kind, CAST(:target_paths AS JSONB), :command_preview,
               :estimated_change_size, :decision, :reason, NULL, :expires_at, :created_at, NULL,
-              :user_id, :requested_by, :directive_id, :attempt, :objective_hash, :policy_revision, :scope_digest
+              :user_id, :requested_by, :directive_id, :attempt, :objective_hash, :policy_revision, :scope_digest,
+              :charter_id, :charter_version
             )
             """
         ),
@@ -11228,6 +11430,9 @@ def request_execution_permit(
                 target_paths=body.target_paths,
                 command_preview=body.command_preview,
             ),
+            # Stamped so the claim can refuse a permit issued under a superseded authority.
+            "charter_id": (uuid.UUID(permit_charter.charter_id) if permit_charter is not None else None),
+            "charter_version": (permit_charter.charter_version if permit_charter is not None else None),
         },
     )
     db.commit()
@@ -11806,6 +12011,44 @@ def takeover_execution_claim(
         raise HTTPException(status_code=404, detail="no pending directive found")
     directive = _directive_from_row(row)
     now = datetime.now(tz=UTC)
+    # U2 — no charter, no mutating work.  This runs BEFORE any state transition and never falls
+    # through to legacy behaviour.  Off switch: TCE_CHARTER_ENFORCEMENT_ENABLED=0.
+    try:
+        active_charter = resolve_charter_or_refuse(
+            db,
+            auth=auth,
+            session_id=body.session_id,
+            action_kind=directive.action_kind,
+            settings=settings,
+            now=now,
+        )
+    except CharterRequired as exc:
+        # A refusal that is not durably recorded is not evidence, so this audit row is written
+        # synchronously regardless of audit_write_mode (Full defaults to a fire-and-forget thread).
+        _write_audit_sync(
+            auth.consumer,
+            "claim_refused_no_charter",
+            {
+                "directive_id": str(directive.directive_id),
+                "action_kind": exc.action_kind,
+                "session_id": body.session_id,
+            },
+            [],
+            {"reason": exc.reason, "charter_enforcement_enabled": True},
+            0,
+            raise_on_error=False,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "no_active_charter",
+                "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be "
+                "created and approved by the owner before mutating work may be claimed. Ask the "
+                "owner to approve one, then retry.",
+                "action_kind": exc.action_kind,
+                "reason": exc.reason,
+            },
+        ) from exc
     # The lease is bound to the authenticated executor; claimed_by stays a free-text label only.
     executor_id = auth.consumer
     claimer = body.claimed_by or auth.user_id
@@ -11884,7 +12127,8 @@ def takeover_execution_claim(
         permit = db.execute(
             text(
                 """
-                SELECT id, decision, expires_at, user_id, directive_id, objective_hash
+                SELECT id, decision, expires_at, user_id, directive_id, objective_hash,
+                       scope_digest, charter_id, target_paths, command_preview
                 FROM execution_permits
                 WHERE id = :id AND workspace_id = :workspace_id
                 LIMIT 1
@@ -11901,6 +12145,15 @@ def takeover_execution_claim(
             permit_user_id=str(permit["user_id"]) if permit["user_id"] else None,
             permit_directive_id=str(permit["directive_id"]) if permit["directive_id"] else None,
             permit_objective_hash=str(permit["objective_hash"]) if permit["objective_hash"] else None,
+            permit_scope_digest=(str(permit["scope_digest"]) if permit["scope_digest"] else None),
+            expected_scope_digest=permit_scope_digest(
+                action_kind=directive.action_kind,
+                target_paths=[str(item) for item in (permit["target_paths"] or [])],
+                command_preview=str(permit["command_preview"] or ""),
+            ),
+            scope_digest_enforced=bool(settings.permit_scope_digest_enforced),
+            permit_charter_id=(str(permit["charter_id"]) if permit["charter_id"] else None),
+            active_charter_id=(active_charter.charter_id if active_charter is not None else None),
             directive_id=str(directive.directive_id),
             directive_user_id=directive.user_id,
             directive_objective_hash=directive.objective_hash,
@@ -12006,6 +12259,11 @@ def takeover_execution_claim(
             late_payload=None,
             action="directive_claim_rejected",
         )
+    if active_charter is not None:
+        db.execute(
+            text("UPDATE directive_executions SET charter_id = :charter_id WHERE directive_id = :directive_id"),
+            {"charter_id": uuid.UUID(active_charter.charter_id), "directive_id": directive.directive_id},
+        )
     _sync_enforcement_counters(db, state)
     save_takeover_state(db, state)
     updated = db.execute(
@@ -12020,6 +12278,19 @@ def takeover_execution_claim(
         {"directive_id": directive.directive_id},
     ).mappings().first()
     db.commit()
+    # Lite records a positive lifecycle audit row on both claim and reap; Full recorded neither.
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="directive_claimed",
+        query={"directive_id": str(directive.directive_id), "session_id": body.session_id},
+        result_event_ids=[],
+        policy_decisions={
+            "charter_id": (active_charter.charter_id if active_charter is not None else None),
+            "permit_reason": permit_reason,
+        },
+        latency_ms=0,
+    )
     return _directive_from_row(updated)
 
 
@@ -12065,6 +12336,55 @@ def _normalize_change_summary_map(raw: Any) -> tuple[dict[str, dict[str, Any]], 
     return normalized, redacted_any
 
 
+def _charter_step_fields(
+    db: Session,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    session_id: str,
+    now: datetime,
+) -> tuple[bool, str, str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """The five charter/effect fields carried by ``TakeoverStepResponse`` (§9.3). Lite's twin is
+    ``tce_lite_api.store._charter_step_fields`` and the two return the same shapes.
+
+    ``constraints`` is the load-bearing one: it is the only channel that carries the charter's
+    machine-readable scope (``charter-roots-only``, the protected-write prefixes, the
+    confirm-required capabilities) to an executor. The MCP firewall merges it over its own floor,
+    so an EMPTY list here is not neutral -- it means the executor sees the floor and nothing about
+    this charter. ``unresolved_effects`` rows carry ``state`` because the firewall's pause reads it.
+
+    Fail-soft is deliberate and narrow: a step response that 500s because the charter tables are
+    unreachable would take down normal chat, and the ENFORCING paths (claim, dispatch, effect open)
+    resolve the charter themselves and fail closed there. This function only decides what an
+    executor is TOLD, never what it is allowed to do.
+    """
+    charter: ResolvedCharter | None
+    try:
+        charter = load_active_charter(
+            db, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id, now=now
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        charter = None
+    try:
+        records = list_open_effects(
+            db, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id
+        )
+    except SQLAlchemyError:
+        db.rollback()
+        records = []
+    unresolved = unresolved_effects_json(records)
+    if charter is None:
+        return (False, "", None, unresolved, [])
+    return (
+        True,
+        str(charter.charter_version),
+        str(charter.enforcement_tier),
+        unresolved,
+        charter_constraints(charter),
+    )
+
+
 def _compute_git_change_summary(
     *,
     files: list[str],
@@ -12073,8 +12393,15 @@ def _compute_git_change_summary(
 ) -> dict[str, dict[str, Any]]:
     if not files:
         return {}
+    # The repo path is constrained to a configured allowlist.  Taking it from the caller's
+    # milestone and falling back to os.getcwd() made this an arbitrary-directory read the moment
+    # git is installed in an image; the allowlist is empty by default, which is the honest state
+    # inside the service containers (no git binary and no repo bind-mount).
+    allowlist = [os.path.realpath(item) for item in settings.git_change_summary_repos]
     repo_raw = str(git_payload.get("repo") or "").strip()
-    repo = repo_raw if repo_raw and os.path.isdir(repo_raw) else os.getcwd()
+    repo = os.path.realpath(repo_raw) if repo_raw else ""
+    if not repo or repo not in allowlist or not os.path.isdir(repo):
+        return {"unavailable": {"reason": "repo_not_allowlisted", "added": 0, "removed": 0}}
     commit = str(git_payload.get("commit") or "").strip()
     args: list[str]
     if commit:
@@ -12083,10 +12410,13 @@ def _compute_git_change_summary(
         args = ["git", "-C", repo, "diff", "--numstat", "HEAD~1", "HEAD"]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=1.5, check=False)
+    except FileNotFoundError:
+        # An empty summary is indistinguishable from "no changes"; say which it is.
+        return {"unavailable": {"reason": "git_not_present", "added": 0, "removed": 0}}
     except Exception:
-        return {}
+        return {"unavailable": {"reason": "git_failed", "added": 0, "removed": 0}}
     if proc.returncode != 0:
-        return {}
+        return {"unavailable": {"reason": "git_failed", "added": 0, "removed": 0}}
     stats: dict[str, dict[str, Any]] = {}
     for line in (proc.stdout or "").splitlines():
         parts = line.strip().split("\t")
@@ -12617,16 +12947,18 @@ def _record_execution_task_state(
             )
         verification = _verification_from_report(body)
         if verification is not None:
-            # S5 provenance: a verification is evidence only for the contract AND the plan it
-            # was recorded against. Stamping both here is what stops a passing verification
-            # from a finished objective driving a later one to DONE.
-            verification["contract_revision"] = projection.contract_revision
-            verification["plan_id"] = (
-                projection.plan.plan_id if projection.plan is not None else None
+            # S5 provenance, through the one shared stamper the graded path also uses.
+            stamp_verification_provenance(
+                verification, projection=projection, directive_id=directive_id
             )
-            verification["directive_id"] = directive_id
-            _insert_task_verification(
-                db, auth=auth, task_id=state.session_id, ref=verification, now=now
+            insert_task_verification(
+                db,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                task_id=state.session_id,
+                ref=verification,
+                recorded_by=auth.consumer,
+                now=now,
             )
             events.append(
                 TaskStateEvent(
@@ -12661,12 +12993,21 @@ def _record_execution_task_state(
 
 
 def _verification_from_report(body: ExecutionReportRequest) -> dict[str, Any] | None:
-    """Lift a verification out of the report's details map, or ``None``."""
+    """Lift a verification out of the report's details map, or ``None``.
+
+    The report carries EVIDENCE, never a verdict. ``details["verification"]["state"]`` is written by the
+    implementing agent about its own work, and this row feeds the VERIFICATION_RECORDED event that the
+    status table reads as the only route to DONE -- so honouring it would let an agent declare its own
+    task complete. The state is pinned to ``unverified`` here; the only writer of any other value is the
+    evidence-graded path (``decide_verdict`` behind POST /v1/verification/results), which grades frozen
+    acceptance criteria against recorded command output rather than against a claim.
+    """
+
     details = body.details if isinstance(body.details, dict) else {}
     raw = details.get("verification")
     if not isinstance(raw, dict):
         return None
-    state_value = str(raw.get("state") or "unverified")
+    state_value = "unverified"
     return {
         "verification_id": str(raw.get("verification_id") or uuid.uuid4()),
         "directive_id": str(body.directive_id),
@@ -12678,47 +13019,6 @@ def _verification_from_report(body: ExecutionReportRequest) -> dict[str, Any] | 
         "evidence_event_ids": [str(item) for item in (raw.get("evidence_event_ids") or [])][:40],
         "summary": str(raw.get("summary") or "")[:500],
     }
-
-
-def _insert_task_verification(
-    db: Session,
-    *,
-    auth: AuthContext,
-    task_id: str,
-    ref: dict[str, Any],
-    now: datetime,
-) -> None:
-    db.execute(
-        text(
-            """
-            INSERT INTO task_verifications(
-                id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
-                evidence_event_ids_json, recorded_by, recorded_at, schema_version,
-                contract_revision, plan_id
-            )
-            VALUES(
-                gen_random_uuid(), :workspace_id, :owner_id, :task_id,
-                CAST(:directive_id AS UUID), :state, :method, :summary,
-                CAST(:evidence_event_ids_json AS JSONB), :recorded_by, :recorded_at, 'v1',
-                :contract_revision, :plan_id
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "owner_id": auth.user_id,
-            "task_id": task_id,
-            "directive_id": ref.get("directive_id"),
-            "state": ref.get("state"),
-            "method": ref.get("method"),
-            "summary": ref.get("summary"),
-            "evidence_event_ids_json": json.dumps(list(ref.get("evidence_event_ids") or [])),
-            "recorded_by": auth.consumer,
-            "recorded_at": now,
-            "contract_revision": int(ref.get("contract_revision") or 0),
-            "plan_id": ref.get("plan_id"),
-        },
-    )
 
 
 @app.post("/v1/takeover/execution/report", response_model=dict)
@@ -13090,6 +13390,13 @@ def takeover_execution_report(
     merged_meta["outcome_recorded"] = True
     merged_meta["reported_state"] = effective_state.value
     merged_meta["reported_at"] = now.isoformat()
+    report_paused, report_pause_reason, report_pause_effect = pause_guard_for_session(
+        db,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        settings=settings,
+    )
     if effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED, DirectiveExecutionState.ABANDONED}:
         failure_class = classify_failure(
             result=body.result,
@@ -13101,6 +13408,15 @@ def takeover_execution_report(
             failure_class=failure_class,
             rollback_available=bool(body.rollback_performed or bool((details_map or {}).get("rollback_available"))),
         )
+        if report_paused:
+            # An unresolved, possibly-irreversible effect from the previous run means we do not
+            # know what happened.  Scheduling a retry on top of it would repeat work whose outcome
+            # nobody can see.
+            retry_strategy = None
+            merged_meta["autonomy_pause"] = {
+                "reason": report_pause_reason,
+                "effect_id": report_pause_effect,
+            }
         if bool(getattr(settings, "retry_feedback_enabled", False)):
             retry_feedback = build_retry_feedback(
                 action_kind=current.action_kind,
@@ -13199,11 +13515,44 @@ def takeover_execution_report(
         redaction_applied=bool(milestone_result.get("redaction_applied", False)),
         now=now,
         executor_id=auth.consumer,
+        # Without a payload hash the CompletionConflictError guard is dead on this path: the same
+        # completion key with a different payload replayed the first receipt silently.
+        payload_hash=completion_payload_fingerprint(milestone),
     )
+    # Lite audits both the successful report and the reap; Full audited neither, so the two
+    # backends did not have the same positive lifecycle record.
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="directive_reported",
+        query={
+            "directive_id": str(body.directive_id),
+            "session_id": body.session_id,
+            "state": effective_state.value,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "failure_reason": (effective_failure_reason or "")[:200],
+            "autonomy_paused": bool(report_paused),
+        },
+        latency_ms=0,
+    )
+    report_charter = load_active_charter(
+        db,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=now,
+    )
+    max_attempts_cap = int(settings.takeover_retry_max_attempts)
+    if report_charter is not None:
+        # The enforcement site for CharterCaps.max_attempts.
+        max_attempts_cap = min(max_attempts_cap, int(report_charter.caps.max_attempts))
     if (
         settings.takeover_retry_enabled
+        and not report_paused
         and effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED}
-        and int(current.attempt) < int(settings.takeover_retry_max_attempts)
+        and int(current.attempt) < max_attempts_cap
         and retry_strategy not in {None, RetryStrategy.ESCALATE}
     ):
         window_start = now - timedelta(minutes=max(1, int(settings.takeover_retry_window_minutes)))
@@ -14724,8 +15073,21 @@ def _load_pending_directive(db: Session, *, state: TakeoverState) -> DirectiveEx
                 "expected_lease": int(directive.lease_generation),
             },
         )
+        won = int(getattr(reaped, "rowcount", 0) or 0) == 1
+        if won and bool(getattr(settings, "effect_journal_enabled", False)):
+            # G1: the LIVE reaper must resolve the journal too, in the SAME transaction as the
+            # lease bump.  startup_reconcile does this only on restart; without it here, the
+            # effect row stays 'running', pause_guard_for_session reads that as a healthy
+            # dispatch in flight, and takeover_step's mint below happily starts the work over
+            # while a possibly-irreversible effect from the reaped attempt is still unaccounted
+            # for.  Same function the reconciler calls, so the two paths cannot drift: a
+            # reversible effect goes to 'failed' and the retry ladder proceeds; an irreversible
+            # or unknown one goes to 'unknown', which is not terminal and which PAUSES.  If it
+            # raises, the whole reap rolls back — an unfenced worker is safer than a silently
+            # unresolved effect.
+            resolve_effects_for_directive(db, directive_id=directive.directive_id, now=now_stamp)
         db.commit()
-        if int(getattr(reaped, "rowcount", 0) or 0) == 1:
+        if won:
             _audit_directive_reaped(db, state=state, directive=directive, reason="directive stale timeout", next_lease=reap.next_lease)
         return None  # a concurrent legitimate report won
     return directive
@@ -18256,11 +18618,39 @@ def takeover_step(
     directive_state: DirectiveExecutionState | None = pending_execution.state if pending_execution is not None else None
     retry_scheduled = False
     execution_claim_required = False
+    # THE load-bearing pause site.  After a reap, _load_pending_directive returns None and this
+    # is where work actually restarts — a brand-new PENDING directive, hardcoded attempt 1, which
+    # is why the retry-ladder guards above can never fire for a reaped directive.
+    step_paused, step_pause_reason, step_pause_effect = pause_guard_for_session(
+        db,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        settings=settings,
+    )
+    (
+        step_charter_active,
+        step_charter_version,
+        step_enforcement_tier,
+        step_unresolved_effects,
+        step_constraints,
+    ) = _charter_step_fields(
+        db,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        now=now,
+    )
+    if step_paused and pending_execution is None:
+        final_response = pause_text_for(step_pause_effect)
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        takeover_enforcement["autonomy_pause"] = step_pause_reason
     if (
         state.mode == TakeoverMode.TAKEOVER
         and final_response
         and safety_decision == SafetyDecision.ALLOW
         and pending_execution is None
+        and not step_paused
         and not suppress_auto_directive
         and bool(dependency_preflight.get("valid", True))
     ):
@@ -18704,6 +19094,11 @@ def takeover_step(
             total=total_ms,
         ),
         needs_human=needs_human,
+        charter_active=step_charter_active,
+        charter_version=step_charter_version,
+        enforcement_tier=step_enforcement_tier,
+        unresolved_effects=step_unresolved_effects,
+        constraints=step_constraints,
         selected_goal=selected_goal,
         execution_permit_required=execution_permit_required,
         execution_permit_id=str(execution_permit_id) if execution_permit_id else None,
@@ -18911,6 +19306,798 @@ def clone_arbitrate(
 # ---------------------------------------------------------------------------
 # Static file mount for Angular dashboard (must be LAST — catch-all for /dashboard)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------------------
+# P3 — authority charters, dispatch records, the effect journal and verification.
+#
+# Every route below is audited with a distinct action string.  The charter routes are gated on
+# _require_verified_human (U1), not on a bare X-TCE-Role header, and creating a charter costs at
+# least what narrowing one costs: a trusted_input_receipts row.
+# ---------------------------------------------------------------------------------------------
+
+
+@app.post("/v1/charters", response_model=CharterResponse)
+def charter_create(
+    body: CharterCreateRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> CharterResponse:
+    REQUEST_COUNT.labels(endpoint="charter_create", method="POST").inc()
+    _require_verified_human(auth, action="create an authority charter")
+    _enforce_workspace_access(auth, db)
+    result = create_charter(db, auth=auth, body=body, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="charter_create",
+        query={"charter_id": str(result["charter_id"]), "enforcement_tier": result["enforcement_tier"]},
+        result_event_ids=[],
+        policy_decisions={"status": result["status"], "source_receipt_id": str(body.source_receipt_id)},
+        latency_ms=0,
+    )
+    return CharterResponse(**result)
+
+
+@app.post("/v1/charters/{charter_id}/approve", response_model=CharterResponse)
+def charter_approve(
+    charter_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> CharterResponse:
+    REQUEST_COUNT.labels(endpoint="charter_approve", method="POST").inc()
+    _require_verified_human(auth, action="approve an authority charter")
+    _enforce_workspace_access(auth, db)
+    result = approve_charter(db, auth=auth, charter_id=charter_id, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="charter_approve",
+        query={"charter_id": str(charter_id)},
+        result_event_ids=[],
+        policy_decisions={"status": result["status"], "approved_by": result["approved_by"]},
+        latency_ms=0,
+    )
+    return CharterResponse(**result)
+
+
+@app.post("/v1/charters/{charter_id}/revoke", response_model=CharterResponse)
+def charter_revoke(
+    charter_id: UUID,
+    body: dict[str, Any] | None = None,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> CharterResponse:
+    REQUEST_COUNT.labels(endpoint="charter_revoke", method="POST").inc()
+    _require_verified_human(auth, action="revoke an authority charter")
+    _enforce_workspace_access(auth, db)
+    reason = str((body or {}).get("reason") or "")
+    result = revoke_charter(db, auth=auth, charter_id=charter_id, reason=reason, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="charter_revoke",
+        query={"charter_id": str(charter_id), "reason": reason[:200]},
+        result_event_ids=[],
+        policy_decisions={"status": result["status"]},
+        latency_ms=0,
+    )
+    return CharterResponse(**result)
+
+
+@app.post("/v1/charters/narrowings", response_model=CharterResponse)
+def charter_narrow(
+    body: CharterNarrowingRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> CharterResponse:
+    REQUEST_COUNT.labels(endpoint="charter_narrow", method="POST").inc()
+    _require_verified_human(auth, action="narrow an authority charter")
+    _enforce_workspace_access(auth, db)
+    result = apply_narrowing(db, auth=auth, body=body, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="charter_narrow",
+        query={"charter_id": str(body.charter_id), "source_receipt_id": str(body.source_receipt_id)},
+        result_event_ids=[],
+        policy_decisions={"reason": body.reason[:200]},
+        latency_ms=0,
+    )
+    return CharterResponse(**result)
+
+
+@app.get("/v1/charters/active", response_model=CharterResponse)
+def charter_active(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> CharterResponse:
+    REQUEST_COUNT.labels(endpoint="charter_active", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    now = datetime.now(tz=UTC)
+    charter = load_active_charter(
+        db, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id, now=now
+    )
+    if charter is None:
+        return CharterResponse(charter=None, status="none", generated_at=now)
+    return CharterResponse(
+        charter=resolved_charter_to_json(charter),
+        charter_id=UUID(charter.charter_id),
+        status=charter.status,
+        charter_digest=charter.charter_digest,
+        charter_version=charter.charter_version,
+        policy_revision=charter.policy_revision,
+        enforcement_tier=charter.enforcement_tier,
+        credential_risk_acknowledged=charter.credential_risk_acknowledged,
+        approved_by=charter.approved_by or None,
+        approved_at=charter.approved_at,
+        expires_at=charter.expires_at,
+        revoked_at=charter.revoked_at,
+        narrowing_ids=list(charter.narrowing_ids),
+        generated_at=now,
+    )
+
+
+def _require_executor_role(auth: AuthContext, *, action: str) -> None:
+    if auth.role not in {AgentRole.EXECUTOR, AgentRole.USER}:
+        raise HTTPException(status_code=403, detail={"error": "executor_role_required", "action": action})
+
+
+@app.post("/v1/dispatch", response_model=DispatchResponse)
+def dispatch_open(
+    body: DispatchOpenRequest,
+    request: Request,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DispatchResponse:
+    REQUEST_COUNT.labels(endpoint="dispatch_open", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _require_executor_role(auth, action="open a dispatch")
+    _enforce_workspace_access(auth, db)
+    idempotency_key = str(request.headers.get("Idempotency-Key") or body.idempotency_key or "").strip()
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail={"error": "idempotency_key_required"})
+    now = datetime.now(tz=UTC)
+    try:
+        charter = resolve_charter_or_refuse(
+            db, auth=auth, session_id=body.session_id, action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _no_active_charter(exc, "dispatched") from exc
+    if charter is None:
+        raise HTTPException(status_code=409, detail={"error": "no_active_charter", "reason": "no_active_charter"})
+    result = open_dispatch(
+        db, auth=auth, charter=charter, body=body, idempotency_key=idempotency_key, settings=settings, now=now
+    )
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="dispatch_open",
+        query={"dispatch_id": str(result["dispatch_id"]), "directive_id": str(body.directive_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "enforcement_tier": result["enforcement_tier"],
+            "spend_enforcement": result["spend_enforcement"],
+            "idempotency_key": idempotency_key[:120],
+        },
+        latency_ms=0,
+    )
+    return DispatchResponse(**result)
+
+
+def _no_active_charter(exc: CharterRequired, verb: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "no_active_charter",
+            "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be "
+            f"created and approved by the owner before mutating work may be {verb}. Ask the owner "
+            "to approve one, then retry.",
+            "action_kind": exc.action_kind,
+            "reason": exc.reason,
+        },
+    )
+
+
+@app.post("/v1/dispatch/{dispatch_id}/provider", response_model=DispatchResponse)
+def dispatch_bind_provider(
+    dispatch_id: UUID,
+    body: dict[str, Any],
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DispatchResponse:
+    REQUEST_COUNT.labels(endpoint="dispatch_bind_provider", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _require_executor_role(auth, action="bind a provider run")
+    _enforce_workspace_access(auth, db)
+    bind_provider_run(
+        db,
+        dispatch_id=dispatch_id,
+        provider_run_id=str(body.get("provider_run_id") or ""),
+        provider_turn_id=(str(body["provider_turn_id"]) if body.get("provider_turn_id") else None),
+        now=datetime.now(tz=UTC),
+    )
+    result = load_dispatch(db, dispatch_id=dispatch_id, workspace_id=auth.workspace_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**result)
+
+
+@app.post("/v1/dispatch/{dispatch_id}/reconcile", response_model=DispatchResponse)
+def dispatch_reconcile(
+    dispatch_id: UUID,
+    body: DispatchReconcileRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DispatchResponse:
+    """Allowed on a revoked charter: this records what happened, it does not do more."""
+    REQUEST_COUNT.labels(endpoint="dispatch_reconcile", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _require_executor_role(auth, action="reconcile a dispatch")
+    _enforce_workspace_access(auth, db)
+    result = reconcile_dispatch(db, dispatch_id=dispatch_id, body=body, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="dispatch_reconcile",
+        query={"dispatch_id": str(dispatch_id), "outcome": body.outcome},
+        result_event_ids=[],
+        policy_decisions={
+            "cost_minor_units": result["cost_minor_units"],
+            "budget_reserved_minor_units": result["budget_reserved_minor_units"],
+        },
+        latency_ms=0,
+    )
+    return DispatchResponse(**result)
+
+
+@app.get("/v1/dispatch/{dispatch_id}", response_model=DispatchResponse)
+def dispatch_get(
+    dispatch_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DispatchResponse:
+    REQUEST_COUNT.labels(endpoint="dispatch_get", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    result = load_dispatch(db, dispatch_id=dispatch_id, workspace_id=auth.workspace_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**result)
+
+
+@app.post("/v1/sandbox/self-test", response_model=SandboxSelfTestResponse)
+def sandbox_self_test(
+    body: SandboxSelfTestRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> SandboxSelfTestResponse:
+    """A measurement, recorded.  open_dispatch later checks this row for freshness and digest
+    match, so the enforcement tier cannot be a label with nothing behind it."""
+    REQUEST_COUNT.labels(endpoint="sandbox_self_test", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _require_executor_role(auth, action="record a sandbox self-test")
+    _enforce_workspace_access(auth, db)
+    result = record_self_test(db, auth=auth, body=body, now=datetime.now(tz=UTC))
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="sandbox_self_test",
+        query={"self_test_id": str(result["self_test_id"]), "sandbox_provider": body.sandbox_provider},
+        result_event_ids=[],
+        policy_decisions={"passed": bool(body.passed), "uid_separation": bool(body.uid_separation)},
+        latency_ms=0,
+    )
+    return SandboxSelfTestResponse(**result)
+
+
+def _effect_response_payload(row: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    return {
+        "effect_id": row["effect_id"],
+        "directive_id": row["directive_id"],
+        "seq": int(row["seq"] or 0),
+        "state": str(row["state"]),
+        "intent_digest": str(row["intent_digest"] or ""),
+        "kind": str(row["kind"] or ""),
+        "capability": str(row["capability"] or ""),
+        "resource": str(row["resource"] or ""),
+        "reversibility": str(row["reversibility"] or "unknown"),
+        "enforcement_tier": str(row["enforcement_tier"] or ""),
+        "action_tracing": str(row["action_tracing"] or ""),
+        "lease_generation": int(row["lease_generation"] or 0),
+        "claimed_executor": (str(row["claimed_executor"]) if row["claimed_executor"] else None),
+        "provider_run_id": row["provider_run_id"],
+        "opened_at": row["opened_at"],
+        "resolved_at": row["resolved_at"],
+        "resolution_source": row["resolution_source"],
+        "generated_at": now,
+    }
+
+
+@app.post("/v1/effects", response_model=EffectResponse)
+def effect_open(
+    body: EffectOpenRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> EffectResponse:
+    REQUEST_COUNT.labels(endpoint="effect_open", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _require_executor_role(auth, action="open an effect")
+    _enforce_workspace_access(auth, db)
+    if not bool(settings.effect_journal_enabled):
+        raise HTTPException(status_code=503, detail={"error": "effect_journal_disabled"})
+    now = datetime.now(tz=UTC)
+    try:
+        resolve_charter_or_refuse(
+            db, auth=auth, session_id=body.session_id, action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _no_active_charter(exc, "recorded") from exc
+    reversibility = str(body.reversibility or DEFAULT_REVERSIBILITY_BY_KIND.get(str(body.kind), "unknown"))
+    intent = effect_intent_from_json(
+        {
+            "kind": str(body.kind),
+            "capability": str(body.capability),
+            "resource": str(body.resource or ""),
+            "argv": [str(item) for item in body.argv],
+            "reversibility": reversibility,
+            "description": str(body.description or ""),
+        }
+    )
+    try:
+        effect_id = open_effect(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=body.session_id,
+            task_id=body.task_id,
+            directive_id=body.directive_id,
+            dispatch_id=body.dispatch_id,
+            intent=intent,
+            enforcement_tier=str(body.enforcement_tier),
+            action_tracing=str(body.action_tracing),
+            lease_generation=int(body.lease_generation),
+            claimed_executor=auth.consumer,
+            provider_run_id=body.provider_run_id,
+            provider_turn_id=body.provider_turn_id,
+            runtime_id=str(body.runtime_id or ""),
+            runtime_version=str(body.runtime_version or ""),
+            model_id=str(body.model_id or ""),
+            now=now,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail={"error": "effect_invalid", "message": str(exc)}) from exc
+    except LookupError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+    db.commit()
+    row = load_effect(db, effect_id=UUID(effect_id))
+    if row is None:
+        raise HTTPException(status_code=500, detail={"error": "effect_open_failed"})
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="effect_open",
+        query={"effect_id": effect_id, "directive_id": str(body.directive_id), "kind": body.kind},
+        result_event_ids=[],
+        policy_decisions={"enforcement_tier": body.enforcement_tier, "action_tracing": body.action_tracing},
+        latency_ms=0,
+    )
+    return EffectResponse(**_effect_response_payload(row, now=now))
+
+
+@app.post("/v1/effects/{effect_id}/resolve", response_model=EffectResponse)
+def effect_resolve(
+    effect_id: UUID,
+    body: EffectResolveRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> EffectResponse:
+    """The actor is derived SERVER-SIDE from the authenticated identity.
+
+    ``EffectResolveRequest`` deliberately has no ``actor`` field: a caller that could name itself
+    ``system:reconciler`` would satisfy the "system actors only" rule the pure validator
+    advertises, which is no rule at all.
+    """
+    REQUEST_COUNT.labels(endpoint="effect_resolve", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, db)
+    now = datetime.now(tz=UTC)
+    row = load_effect(db, effect_id=effect_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail={"error": "effect_not_found"})
+    current_state = str(row["state"])
+    target_state = str(body.target_state)
+    is_owner_transition = current_state == "unknown" or (current_state, target_state) == ("failed", "unknown")
+    # F1, FOURTH DOOR — the same laundering class as POST /v1/verification/results below.
+    # `_runner_principal_for` reads `auth.consumer`, and under the shipped default
+    # `identity_claims_mode="compat"` that is simply whatever `X-TCE-Consumer` said.  Without this
+    # bind an ordinary bearer holder asserts `X-TCE-Consumer: system:verifier`, is handed
+    # EFFECT_ACTOR_VERIFIER — a member of `_SYSTEM_ONLY_SOURCES` — and thereby defeats BOTH
+    # `validate_effect_transition` rule 5 (G2's `irreversible_actor`) and `resolve_effect`'s
+    # executor fence, because both ask only "is the actor a system source?".
+    #
+    # Measured before this bind, against the live Postgres: `running -> failed` and
+    # `running -> confirmed` on an irreversible `git push` effect both returned 200 and wrote
+    # `resolved_by_actor='system:verifier'`, while the honest executor got
+    # `409 irreversible_actor`.  Burying the row that way is terminal, so the reap that followed
+    # found nothing open, `pause_guard_for_session` saw nothing to pause on, and the very same
+    # `POST /v1/takeover/step` minted replacement work over an unresolved irreversible push
+    # (`autonomy_pause=None`, a fresh `directive_id`).  That is precisely the burial G2's rule 5
+    # exists to refuse.  The identity must come from a server-bound claim or the host-capture
+    # credential, never from a header; the "must be a human" half is deliberately NOT required,
+    # because the verifier is a system principal.  Lite needs no twin: its route has no verifier
+    # branch at all, and every attempted burial there already returns `409 irreversible_actor`.
+    server_bound_identity = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    is_human = auth.role == AgentRole.USER and server_bound_identity
+    if is_owner_transition:
+        _require_verified_human(auth, action="resolve an effect out of the unknown state")
+        actor = EFFECT_ACTOR_OWNER
+    elif server_bound_identity and _runner_principal_for(auth) == str(settings.verification_runner_principal):
+        actor = EFFECT_ACTOR_VERIFIER
+    elif is_human:
+        actor = EFFECT_ACTOR_OWNER
+    else:
+        _require_executor_role(auth, action="resolve an effect")
+        actor = f"executor:{auth.consumer}"
+    # U3: a revoked charter must not stop the system RECORDING what happened, only doing more.
+    if str(body.resolution_source) not in ("reaper", "provider_read", "owner"):
+        try:
+            resolve_charter_or_refuse(
+                db,
+                auth=auth,
+                session_id=str(row["session_id"]),
+                action_kind="execute",
+                settings=settings,
+                now=now,
+            )
+        except CharterRequired as exc:
+            raise _no_active_charter(exc, "recorded") from exc
+    try:
+        ok = resolve_effect(
+            db,
+            effect_id=effect_id,
+            target_state=target_state,
+            actor=actor,
+            resolution_source=str(body.resolution_source),
+            evidence=dict(body.evidence or {}),
+            expected_lease=int(body.expected_lease),
+            now=now,
+        )
+    except EffectTransitionRejected as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "effect_transition_rejected",
+                "reason": exc.reason,
+                "current_state": exc.current_state,
+                "target_state": exc.target_state,
+            },
+        ) from exc
+    if not ok:
+        db.rollback()
+        actual = db.execute(
+            text(
+                """
+                SELECT d.lease_generation
+                FROM directive_executions d
+                JOIN effect_journal e ON e.directive_id = d.directive_id
+                WHERE e.effect_id = :effect_id
+                """
+            ),
+            {"effect_id": effect_id},
+        ).scalar()
+        # G4 — ``actual_lease`` stays in the body, deliberately.  The lease is a FENCING token,
+        # not a secret: its job is to make a stale write lose, and guessing it is trivial anyway
+        # (it is a small monotonic counter, and GET /v1/takeover/execution/status hands the
+        # current value to any caller already inside this workspace, which this one is —
+        # _enforce_workspace_access and the actor derivation above both ran).  Knowing it buys a
+        # fenced-out worker nothing once G2 closed the transition table: the reap that bumped the
+        # lease also drove this effect to 'unknown', and validate_effect_transition refuses BOTH
+        # ways out of 'unknown' for a non-system actor ('system_only') and refuses either terminal
+        # state on an irreversible effect ('irreversible_actor').  So a correct lease still cannot
+        # launder the row closed; the one move left is '-> unknown', which is the pause.  What the
+        # field does buy is a caller that can tell "I am fenced" from "the row moved under me"
+        # without polling, which is why it is worth the disclosure.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "stale_lease",
+                "effect_id": str(effect_id),
+                "expected_lease": int(body.expected_lease),
+                "actual_lease": int(actual or 0),
+            },
+        )
+    db.commit()
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="effect_resolve",
+        query={"effect_id": str(effect_id), "target_state": target_state},
+        result_event_ids=[],
+        policy_decisions={"actor": actor, "resolution_source": body.resolution_source},
+        latency_ms=0,
+    )
+    updated = load_effect(db, effect_id=effect_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail={"error": "effect_not_found"})
+    return EffectResponse(**_effect_response_payload(updated, now=now))
+
+
+@app.get("/v1/effects/open", response_model=list[EffectResponse])
+def effects_open(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> list[EffectResponse]:
+    REQUEST_COUNT.labels(endpoint="effects_open", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    now = datetime.now(tz=UTC)
+    records = list_open_effects(
+        db, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id
+    )
+    paused, reason = pause_required(records)
+    out: list[EffectResponse] = []
+    for record in records:
+        payload = effect_record_to_json(record)
+        out.append(
+            EffectResponse(
+                effect_id=UUID(record.effect_id),
+                directive_id=UUID(record.directive_id),
+                seq=record.seq,
+                state=record.state,
+                intent_digest=record.intent_digest,
+                kind=record.intent.kind,
+                capability=record.intent.capability,
+                resource=record.intent.resource,
+                reversibility=record.intent.reversibility,
+                enforcement_tier=record.enforcement_tier,
+                action_tracing=record.action_tracing,
+                lease_generation=record.lease_generation,
+                claimed_executor=record.claimed_executor or None,
+                provider_run_id=record.provider_run_id,
+                opened_at=record.opened_at,
+                resolved_at=record.resolved_at,
+                resolution_source=record.resolution_source,
+                pause_required=bool(paused and record.state == "unknown"),
+                pause_reason=reason if record.state == "unknown" else "",
+                generated_at=now,
+                schema_version=str(payload.get("schema_version") or "v1"),
+            )
+        )
+    return out
+
+
+@app.post("/v1/verification/criteria", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_freeze(
+    body: AcceptanceCriteriaRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    """Freeze the criteria beyond the implementing agent's reach.
+
+    Refused when the caller is the identity that claimed the dispatch: an agent that can write its
+    own acceptance criteria is grading its own homework.
+    """
+    REQUEST_COUNT.labels(endpoint="verification_criteria_freeze", method="POST").inc()
+    _reject_advisor_writes(auth)
+    _enforce_workspace_access(auth, db)
+    # A freezer must be a server-bound principal. Reading the name off X-TCE-Consumer would let the
+    # agent rename itself and freeze its own goalposts, which is the same laundering the verification
+    # verdict routes already refuse.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "identity_unverified", "message": "freezing acceptance criteria requires a server-bound identity"},
+        )
+    # Two claim paths reach a directive: a dispatch record (the supervisor) and the ordinary
+    # claim_execution lease (an executor over MCP). Checking only the first left the second wide open --
+    # an agent could freeze `exit 0` as its own acceptance check and an honest verifier would grade it
+    # as passing.
+    claimed_by = db.execute(
+        text("SELECT claimed_by FROM dispatch_records WHERE directive_id = :directive_id ORDER BY attempt DESC LIMIT 1"),
+        {"directive_id": body.directive_id},
+    ).scalar()
+    # The freeze is ONE-SHOT: UNIQUE(directive_id), no UPDATE path, no DELETE path. So an unscoped
+    # freeze is not a harmless no-op -- whoever gets there first owns that directive's goalposts
+    # permanently. Measured over HTTP before this check, on both backends: an ordinary bound
+    # executor froze `/bin/sh -c "exit 0"` against a directive_id it had invented, for a directive
+    # that did not exist in any workspace, and got 200. That buys two things it should not:
+    # criteria for work someone else will do, and a pre-emptive 409 against the supervisor's own
+    # honest freeze. The directive must exist and it must be in the caller's workspace.
+    directive_row = db.execute(
+        text(
+            "SELECT claimed_executor FROM directive_executions "
+            "WHERE directive_id = :directive_id AND workspace_id = :workspace_id LIMIT 1"
+        ),
+        {"directive_id": body.directive_id, "workspace_id": auth.workspace_id},
+    ).mappings().first()
+    if directive_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_directive",
+                "message": "acceptance criteria may only be frozen for a directive in this workspace",
+                "directive_id": str(body.directive_id),
+            },
+        )
+    claimed_executor = directive_row["claimed_executor"]
+    consumer = str(auth.consumer)
+    if (claimed_by is not None and str(claimed_by) == consumer) or (
+        claimed_executor is not None and str(claimed_executor) == consumer
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "freezer_is_executor", "message": "the identity executing a directive may not freeze its acceptance criteria"},
+        )
+    checks = tuple(
+        AcceptanceCheck(
+            check_id=str(item.check_id),
+            argv=tuple(str(arg) for arg in item.argv),
+            cwd_rel=str(item.cwd_rel),
+            expect_exit_code=int(item.expect_exit_code),
+            timeout_seconds=int(item.timeout_seconds),
+        )
+        for item in body.checks
+    )
+    manifest = [(str(row[0]), str(row[1])) for row in body.corpus_manifest if len(row) >= 2]
+    try:
+        criteria = freeze_acceptance_criteria(
+            db,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            task_id=body.task_id,
+            directive_id=body.directive_id,
+            charter_id=body.charter_id,
+            checks=checks,
+            corpus_manifest=manifest,
+            frozen_by=auth.consumer,
+            settings=settings,
+            now=datetime.now(tz=UTC),
+        )
+    except CriteriaFrozen as exc:
+        raise HTTPException(
+            status_code=409, detail={"error": "criteria_frozen", "directive_id": str(body.directive_id)}
+        ) from exc
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="criteria_freeze",
+        query={"directive_id": str(body.directive_id), "criteria_id": criteria.criteria_id},
+        result_event_ids=[],
+        policy_decisions={"criteria_digest": criteria.criteria_digest, "checks": len(criteria.checks)},
+        latency_ms=0,
+    )
+    return AcceptanceCriteriaResponse(
+        criteria_id=UUID(criteria.criteria_id),
+        directive_id=UUID(criteria.directive_id),
+        criteria_digest=criteria.criteria_digest,
+        corpus_digest=criteria.corpus_digest,
+        checks=[AcceptanceCheckPayload(**acceptance_check_to_json(check)) for check in criteria.checks],
+        corpus_manifest=[list(item) for item in criteria.corpus_manifest],
+        frozen_at=criteria.frozen_at,
+        frozen_by=criteria.frozen_by,
+        policy_revision=criteria.policy_revision,
+    )
+
+
+@app.get("/v1/verification/criteria/{directive_id}", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_get(
+    directive_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    REQUEST_COUNT.labels(endpoint="verification_criteria_get", method="GET").inc()
+    _enforce_workspace_access(auth, db)
+    criteria = load_acceptance_criteria(db, directive_id=directive_id)
+    if criteria is None:
+        raise HTTPException(status_code=404, detail={"error": "criteria_not_frozen"})
+    return AcceptanceCriteriaResponse(
+        criteria_id=UUID(criteria.criteria_id),
+        directive_id=UUID(criteria.directive_id),
+        criteria_digest=criteria.criteria_digest,
+        corpus_digest=criteria.corpus_digest,
+        checks=[AcceptanceCheckPayload(**acceptance_check_to_json(check)) for check in criteria.checks],
+        corpus_manifest=[list(item) for item in criteria.corpus_manifest],
+        frozen_at=criteria.frozen_at,
+        frozen_by=criteria.frozen_by,
+        policy_revision=criteria.policy_revision,
+    )
+
+
+@app.post("/v1/verification/results", response_model=VerificationResultResponse)
+def verification_results_record(
+    body: VerificationResultRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> VerificationResultResponse:
+    """EVIDENCE IN, VERDICT OUT.  The body carries no verdict and no runner_principal; both are
+    produced here.  Allowed on a revoked charter — recording, not doing."""
+    REQUEST_COUNT.labels(endpoint="verification_results_record", method="POST").inc()
+    _enforce_workspace_access(auth, db)
+    if auth.role == AgentRole.EXECUTOR:
+        raise HTTPException(status_code=403, detail={"error": "unknown_runner", "reason": "executor_role"})
+    # F1 — the runner principal is DERIVED FROM AUTH (_runner_principal_for), and in compat mode
+    # `auth.consumer` is just whatever X-TCE-Consumer said.  Without this the implementing agent
+    # sends `X-TCE-Consumer: system:verifier` on its own bearer, clears the role check by saying
+    # `user`, and writes verification_state='passed' on its own directive.  Same idiom the charter
+    # routes use in _require_verified_human: the identity must come from a server-bound claim or
+    # the host-capture credential.  The role half is deliberately NOT required — the verifier is a
+    # system principal, not a human.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(status_code=403, detail={"error": "unknown_runner", "reason": "identity_unverified"})
+    evidence = VerificationEvidence(
+        directive_id=str(body.directive_id),
+        results=tuple(
+            CheckResult(
+                check_id=str(item.check_id),
+                argv=tuple(str(arg) for arg in item.argv),
+                exit_code=int(item.exit_code),
+                duration_ms=int(item.duration_ms),
+                stdout_sha256=str(item.stdout_sha256),
+                stderr_sha256=str(item.stderr_sha256),
+                excerpt=str(item.excerpt or ""),
+            )
+            for item in body.results
+        ),
+        observed_corpus_digest=str(body.observed_corpus_digest),
+        observed_corpus_manifest=tuple((str(row[0]), str(row[1])) for row in body.observed_corpus_manifest if len(row) >= 2),
+        platform=str(body.platform or ""),
+        commit_sha=body.commit_sha,
+        tree_sha=body.tree_sha,
+        reviewer_model=body.reviewer_model,
+    )
+    _outcome, response = record_verification(
+        db,
+        workspace_id=auth.workspace_id,
+        user_id=auth.user_id,
+        directive_id=body.directive_id,
+        evidence=evidence,
+        runner_principal=_runner_principal_for(auth),
+        settings=settings,
+        now=datetime.now(tz=UTC),
+    )
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="verification_record",
+        query={"directive_id": str(body.directive_id), "verification_id": str(response["verification_id"])},
+        result_event_ids=[],
+        policy_decisions={"verdict": response["verdict"], "reason": response["reason"]},
+        latency_ms=0,
+    )
+    return VerificationResultResponse(**response)
+
+
+@app.post("/v1/handoffs/outbox/{outbox_id}/requeue", response_model=dict)
+def handoff_outbox_requeue(
+    outbox_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The operator escape hatch.  A dead outbox row is never retried and never clears the
+    completion obligation, which otherwise blocks every future mutating grant in that session."""
+    REQUEST_COUNT.labels(endpoint="handoff_outbox_requeue", method="POST").inc()
+    _require_verified_human(auth, action="requeue a dead handoff")
+    _enforce_workspace_access(auth, db)
+    try:
+        result = requeue_dead_handoff(db, auth=auth, outbox_id=outbox_id, now=datetime.now(tz=UTC))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": "handoff_not_found"}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": "handoff_not_dead"}) from exc
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="outbox_requeue",
+        query={"outbox_id": str(outbox_id)},
+        result_event_ids=[],
+        policy_decisions={"status": result["status"]},
+        latency_ms=0,
+    )
+    return result
+
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "dashboard-static"
 if not _DASHBOARD_DIR.exists():

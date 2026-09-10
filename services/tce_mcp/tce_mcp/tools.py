@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
 from datetime import UTC, datetime
@@ -367,8 +368,25 @@ def _persona_standdown_ack(persona_mode: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Hard constraints — machine-readable locks sent in every takeover result.
-# Executors MUST treat directive_type="hard_constraint" as non-overridable
-# unless the user explicitly says "override constraint <rule_id>".
+#
+# Executors MUST treat directive_type="hard_constraint" as non-overridable.
+# There is NO override mechanism.  Earlier revisions of this comment, of
+# CLAUDE.md and of AGENTS.md told executors that the user could say
+# "override constraint <rule_id>"; no code anywhere in this repository ever
+# parsed that phrase, in this process or in either backend.  The claim was
+# documentation with no implementation and it has been deleted rather than
+# implemented (P3 §0.6).  An executor that needs a rule relaxed must ask the
+# user to change the active authority charter.
+#
+# Every rule carries a mandatory ``polarity`` field:
+#   "deny"       -- scope.path_prefixes is a DENY list: do NOT perform the
+#                   scoped actions on paths under those prefixes.
+#   "allow_only" -- scope.path_prefixes is an ALLOW list: perform the scoped
+#                   actions ONLY on paths under those prefixes.
+# A rule that arrives without the key is read as "deny" for backwards
+# compatibility.  The flag exists because ``charter-roots-only`` puts an
+# allow-list into the same field every pre-P3 rule used as a deny-list, and
+# without it a conforming executor reads the charter as its exact inverse.
 # ---------------------------------------------------------------------------
 PROTECTED_PATH_PREFIXES = [
     "shared/tce_shared/",
@@ -386,6 +404,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "no-edit-protected-dirs",
+        "polarity": "deny",
         "scope": {
             "path_prefixes": PROTECTED_PATH_PREFIXES,
             "actions": ["edit", "write", "delete"],
@@ -399,6 +418,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "no-edit-firewall-null-response",
+        "polarity": "deny",
         "scope": {
             "path_prefixes": ["services/tce_mcp/"],
             "actions": ["edit"],
@@ -413,6 +433,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "must-check-context-before-edit",
+        "polarity": "deny",
         "scope": {
             "actions": ["edit", "write"],
         },
@@ -425,6 +446,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "pause-when-capture-channel-down",
+        "polarity": "deny",
         "scope": {
             "actions": ["edit", "write", "delete", "execute"],
         },
@@ -445,6 +467,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
 PLANNING_PENDING_CONSTRAINT: dict[str, Any] = {
     "directive_type": "hard_constraint",
     "rule_id": "no-execute-while-planning-pending",
+    "polarity": "deny",
     "scope": {"actions": ["edit", "write", "delete", "execute"]},
     "enforcement": "block_and_escalate",
     "reason": (
@@ -453,6 +476,113 @@ PLANNING_PENDING_CONSTRAINT: dict[str, Any] = {
         "Wait for the next tce.takeover_step to return a directive."
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# The constraint floor (P3 §9.3, §0.9I).
+#
+# From P3 onward the backend may supply its own ``constraints`` array, projected
+# from the active authority charter.  The charter may only ADD to the floor; it
+# may never remove it.  These two rule ids are the floor: one protects the
+# enforcement code itself, the other protects THIS module — the firewall that
+# strips directive text out of the tool result.  A charter that could delete
+# them would let the first approved charter remove the protection on the very
+# channel the constraints travel through.
+#
+# WHAT THIS DOES AND DOES NOT ENFORCE.  These rules are a cooperative protocol.
+# Nothing in this process, in either backend, or in the operating system stops
+# an executor that ignores them.  The one structural property that does hold is
+# narrow and worth stating exactly: this module is loaded into the MCP server at
+# process start, so an executor editing ``tools.py`` on disk does not change the
+# constraints its own running session receives.  That is a reload boundary, not
+# a sandbox.  OS-level enforcement of paths and egress exists only for a process
+# tree the supervisor started under an enforcement tier (docs/charter.md).
+# ---------------------------------------------------------------------------
+FLOOR_CONSTRAINT_RULE_IDS: frozenset[str] = frozenset(
+    {"no-edit-protected-dirs", "no-edit-firewall-null-response"}
+)
+
+# Verbatim prefix of the unresolved-effect pause (P3 §9.3).  Scoped to effect rows in
+# state "unknown" ONLY: "prepared" and "running" rows are non-empty for the whole of a
+# healthy dispatch, so triggering on those would prepend a pause on every step of a run
+# that is working correctly.
+UNRESOLVED_EFFECT_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved"
+
+
+def _constraint_polarity(value: Any) -> str:
+    """Normalise a rule's polarity.  A rule without the key is read as ``deny``."""
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"deny", "allow_only"} else "deny"
+
+
+def _normalize_constraint(rule: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy one rule and guarantee it carries a polarity.
+
+    The copy matters: ``HARD_CONSTRAINTS`` and ``PROTECTED_PATH_PREFIXES`` are module-level
+    objects shared by reference on every active turn, so a consumer that mutated a returned
+    rule in place would change what every later session in this process receives.
+    """
+    normalized = copy.deepcopy(rule)
+    normalized["polarity"] = _constraint_polarity(normalized.get("polarity"))
+    return normalized
+
+
+def _merge_constraints(backend: Any) -> list[dict[str, Any]]:
+    """Compose the constraint array for one turn: the floor first, then the backend's rules.
+
+    ``backend`` is whatever the API returned in ``constraints`` — normally
+    ``tce_shared.charter.charter_constraints(...)`` projected from the active charter, and
+    ``None`` (or an empty list) when no charter is active.
+
+    * ``backend`` empty/absent/not-a-list  -> the local ``HARD_CONSTRAINTS`` fallback, which
+      keeps every pre-P3 rule including ``must-check-context-before-edit``.
+    * ``backend`` non-empty -> the two floor rules, taken from ``HARD_CONSTRAINTS`` so their
+      text cannot be rewritten from the wire, followed by every backend rule whose ``rule_id``
+      is not already present.  A backend copy of a floor rule is dropped, not merged: the
+      local text wins.
+
+    Every returned rule carries ``polarity``.  Nothing here mutates a module-level object.
+    """
+    if not isinstance(backend, list) or not backend:
+        return [_normalize_constraint(rule) for rule in HARD_CONSTRAINTS]
+
+    merged: list[dict[str, Any]] = [
+        _normalize_constraint(rule)
+        for rule in HARD_CONSTRAINTS
+        if str(rule.get("rule_id") or "") in FLOOR_CONSTRAINT_RULE_IDS
+    ]
+    seen: set[str] = {str(rule["rule_id"]) for rule in merged}
+    for item in backend:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("rule_id") or "").strip()
+        if not rule_id or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        merged.append(_normalize_constraint(item))
+    return merged
+
+
+def _unknown_effect_ids(unresolved_effects: Any) -> list[str]:
+    """Return the ids of effect rows whose state is ``unknown``.
+
+    A row without an explicit state is NOT treated as unknown.  That direction is
+    deliberate: the API's own ``final_response`` carries the authoritative pause, and
+    over-triggering here would prepend a pause to every step of a healthy dispatch
+    (P3 §9.3 / G15).
+    """
+    if not isinstance(unresolved_effects, list):
+        return []
+    ids: list[str] = []
+    for item in unresolved_effects:
+        if not isinstance(item, dict):
+            continue
+        state = str(item.get("state") or item.get("effect_state") or "").strip().lower()
+        if state != "unknown":
+            continue
+        ids.append(str(item.get("effect_id") or item.get("id") or "").strip())
+    return ids
+
 
 
 def with_schema(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1844,15 +1974,45 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
 
     # Attach hard constraints when takeover is active so the executor
     # sees them every turn — machine-readable, not prose.
-    # HARD_CONSTRAINTS is process-global and must never be mutated: it is assigned by
-    # reference on every active turn, so a single append would forbid all mutation for
-    # every session in this process for the life of the process.  Compose a fresh list.
+    #
+    # The SOURCE changed in P3, the shape did not: when the backend projects the active
+    # authority charter into ``constraints`` we merge it onto the floor; when it does not,
+    # _merge_constraints returns the local HARD_CONSTRAINTS fallback unchanged.  Either way
+    # the two floor rules survive and every rule carries a polarity.
+    #
+    # HARD_CONSTRAINTS is process-global and must never be mutated: it is read on every
+    # active turn, so a single append would forbid all mutation for every session in this
+    # process for the life of the process.  _merge_constraints composes a fresh, deep-copied
+    # list per turn; the planning rule is appended to that copy, never to the global.
     is_active = slim_state.get("active", False)
     if is_active:
-        constraints: list[dict[str, Any]] = list(HARD_CONSTRAINTS)
+        constraints: list[dict[str, Any]] = _merge_constraints(result.get("constraints"))
         if planning_pending:
-            constraints.append(PLANNING_PENDING_CONSTRAINT)
+            constraints.append(_normalize_constraint(PLANNING_PENDING_CONSTRAINT))
         slim["constraints"] = constraints
+
+        # Charter provenance, forwarded only while takeover is active.  These say WHICH
+        # authority is in force and under WHICH enforcement tier; docs/charter.md states
+        # what each tier does and does not enforce.
+        slim["charter_active"] = bool(result.get("charter_active", False))
+        slim["charter_version"] = str(result.get("charter_version") or "")
+        slim["enforcement_tier"] = result.get("enforcement_tier")
+        unresolved_effects = result.get("unresolved_effects")
+        slim["unresolved_effects"] = unresolved_effects if isinstance(unresolved_effects, list) else []
+
+        # The pause is scoped to effect rows in state "unknown" — an effect that may have
+        # landed and may be irreversible, and that nothing has resolved.  "prepared" and
+        # "running" rows are the normal state of a live dispatch and must not pause it.
+        unknown_ids = _unknown_effect_ids(unresolved_effects)
+        if unknown_ids:
+            pause_text = (
+                f"{UNRESOLVED_EFFECT_PAUSE_PREFIX} and may be irreversible. "
+                f"Resolve effect {unknown_ids[0]} before continuing."
+            )
+            existing_next_step = slim.get("next_step")
+            slim["next_step"] = (
+                f"{pause_text} {existing_next_step}" if existing_next_step else pause_text
+            )
 
     # Include persona acknowledgement on activation so the executor
     # greets the user in-character. Bake it into final_response AND

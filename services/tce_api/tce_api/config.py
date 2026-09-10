@@ -373,6 +373,35 @@ class Settings(BaseSettings):
     retrieval_advisor_min_ms: int = 250
     sqlite_progress_instructions: int = 1000
 
+    # --- P3 charter, effect journal, verification, dispatch (design 0.7) ---
+    # The documented off switch: TCE_CHARTER_ENFORCEMENT_ENABLED=0 restores pre-P3 behaviour.
+    charter_enforcement_enabled: bool = True
+    charter_default_ttl_seconds: int = 43200
+    charter_max_ttl_seconds: int = 604800
+    charter_min_ttl_seconds: int = 300
+    effect_journal_enabled: bool = True
+    effect_unknown_pause_enabled: bool = True
+    effect_journal_retention_days: int = 365
+    verification_enabled: bool = True
+    verification_runner_principal: str = "system:verifier"
+    verification_reviewer_model_enabled: bool = False
+    verification_max_checks: int = 8
+    verification_check_timeout_seconds: int = 900
+    dispatch_startup_reconcile_enabled: bool = True
+    dispatch_startup_reconcile_batch: int = 200
+    budget_default_minor_units: int = 200
+    budget_currency: str = "USD"
+    permit_scope_digest_enforced: bool = True
+    sandbox_self_test_max_age_seconds: int = 3600
+    # Repo paths the git change summary may be computed against.  Empty means "no repo is
+    # reachable", which is the honest state inside the service containers (git is not installed
+    # and no repo is bind-mounted).
+    git_change_summary_repo_allowlist: str = ""
+
+    @property
+    def git_change_summary_repos(self) -> list[str]:
+        return [item.strip() for item in self.git_change_summary_repo_allowlist.split(",") if item.strip()]
+
     @property
     def token_set(self) -> set[str]:
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}

@@ -425,3 +425,61 @@ def test_unknown_current_state_is_invalid_transition() -> None:
 
     assert decision.allowed is False
     assert decision.reason is TransitionReason.INVALID_TRANSITION
+
+
+# --- P3: scope-digest and charter binding, both additive ------------------------------------------------------------
+
+
+def _permit_check(**overrides: object) -> tuple[bool, str]:
+    now = datetime(2026, 9, 9, 12, 0, tzinfo=UTC)
+    kwargs: dict[str, object] = {
+        "permit_decision": "allow",
+        "permit_expires_at": now + timedelta(minutes=10),
+        "permit_user_id": "user-1",
+        "permit_directive_id": "d-1",
+        "permit_objective_hash": "obj-1",
+        "directive_id": "d-1",
+        "directive_user_id": "user-1",
+        "directive_objective_hash": "obj-1",
+        "started_at": None,
+        "now": now,
+        "phase": "claim",
+    }
+    kwargs.update(overrides)
+    return permit_binding_ok(**kwargs)  # type: ignore[arg-type]
+
+
+def test_scope_digest_is_optional_and_backwards_compatible() -> None:
+    digest = permit_scope_digest(action_kind="edit", target_paths=["services/a.py"], command_preview=None)
+    other = permit_scope_digest(action_kind="edit", target_paths=["services/b.py"], command_preview=None)
+
+    # Every pre-P3 call form still passes: the new arguments all default.
+    assert _permit_check() == (True, "ok")
+    assert _permit_check(permit_scope_digest=digest) == (True, "ok")
+    assert _permit_check(expected_scope_digest=digest) == (True, "ok")
+    assert _permit_check(permit_scope_digest=digest, expected_scope_digest=digest) == (True, "ok")
+
+    # Only a mismatched pair of non-None digests refuses.
+    assert _permit_check(permit_scope_digest=digest, expected_scope_digest=other) == (False, "permit_scope_digest_mismatch")
+
+
+def test_an_absent_scope_digest_under_enforcement_refuses_rather_than_skipping() -> None:
+    """A NULL that silently skips the check is how a written-but-never-read column stays unread."""
+    digest = permit_scope_digest(action_kind="edit", target_paths=["services/a.py"], command_preview=None)
+    assert _permit_check(scope_digest_enforced=True, expected_scope_digest=digest) == (False, "permit_scope_digest_missing")
+    assert _permit_check(scope_digest_enforced=True, permit_scope_digest=digest) == (False, "permit_scope_digest_missing")
+    assert _permit_check(scope_digest_enforced=True) == (False, "permit_scope_digest_missing")
+    assert _permit_check(scope_digest_enforced=True, permit_scope_digest=digest, expected_scope_digest=digest) == (True, "ok")
+
+
+def test_a_permit_from_a_superseded_charter_no_longer_authorises() -> None:
+    assert _permit_check(permit_charter_id="c-1", active_charter_id="c-1") == (True, "ok")
+    assert _permit_check(permit_charter_id="c-1", active_charter_id="c-2") == (False, "permit_charter_superseded")
+    # Either side absent is a legacy permit and stays a wildcard, exactly like the other bindings.
+    assert _permit_check(permit_charter_id="c-1") == (True, "ok")
+    assert _permit_check(active_charter_id="c-2") == (True, "ok")
+
+
+def test_the_new_refusals_are_ordered_after_the_allow_check() -> None:
+    """A permit that was never granted refuses for THAT reason, not for a missing digest."""
+    assert _permit_check(permit_decision="blocked", scope_digest_enforced=True) == (False, "permit_not_allowed")

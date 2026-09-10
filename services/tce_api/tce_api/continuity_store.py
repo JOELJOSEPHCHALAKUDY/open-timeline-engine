@@ -340,6 +340,75 @@ def deliver_handoff_safely(
         return row
 
 
+def drain_pending_handoffs(
+    db: Session,
+    *,
+    retention_days: int,
+    limit: int = 100,
+) -> dict[str, int]:
+    """Full's counterpart to the Lite function of the same name.
+
+    Until P3 the FULL backend had no drain at all: outbox rows whose inline enqueue_job was
+    swallowed by a bare except (Redis down) stayed pending forever, and a pending completion row
+    permanently blocks the session's next mutating capability grant.  Same key set as Lite's so
+    the two can be compared directly.  Sole caller: reconcile.startup_reconcile.
+    """
+    now = datetime.now(tz=UTC)
+    rows = db.execute(
+        text(
+            """
+            SELECT id FROM handoff_outbox
+            WHERE status = 'pending' AND next_attempt_at <= :now
+            ORDER BY created_at ASC
+            LIMIT :limit
+            """
+        ),
+        {"now": now, "limit": max(1, min(500, int(limit)))},
+    ).mappings().all()
+    counts = {"processed": 0, "delivered": 0, "pending": 0, "dead": 0}
+    for row in rows:
+        result = deliver_handoff_safely(db, outbox_id=row["id"], retention_days=retention_days)
+        status = str(result.status)
+        counts["processed"] += 1
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def requeue_dead_handoff(
+    db: Session,
+    *,
+    auth: Any,
+    outbox_id: uuid.UUID,
+    now: datetime,
+) -> dict[str, Any]:
+    """The operator escape hatch for a dead outbox row.
+
+    A row that reaches status='dead' after ten failed attempts is never retried and never clears
+    the completion obligation, which permanently blocks every future mutating grant in that
+    session with no path out.  Route auth is _require_verified_human; refuses 409 handoff_not_dead
+    for a row that is not actually dead, so this cannot be used to replay a live delivery.
+    """
+    row = db.get(HandoffOutbox, outbox_id)
+    if row is None:
+        raise LookupError("handoff_not_found")
+    if str(row.status) != "dead":
+        raise ValueError("handoff_not_dead")
+    row.status = "pending"
+    row.attempts = 0
+    row.last_error = ""
+    row.next_attempt_at = now
+    row.updated_at = now
+    db.commit()
+    return {
+        "outbox_id": str(row.id),
+        "status": row.status,
+        "attempts": int(row.attempts or 0),
+        "next_attempt_at": row.next_attempt_at,
+        "requeued_by": str(getattr(auth, "user_id", "") or ""),
+    }
+
+
 def record_resume_attempt(
     db: Session,
     *,

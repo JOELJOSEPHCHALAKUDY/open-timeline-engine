@@ -27,6 +27,8 @@ def issue_capability_grant(
     workspace_id: str,
     owner_id: str,
     body: dict[str, Any],
+    charter_id: UUID | None = None,
+    effect_journal_enabled: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(tz=UTC)
     operation = normalize_capability_operation(
@@ -58,6 +60,32 @@ def issue_capability_grant(
         ).scalar_one_or_none()
         if open_obligation is not None:
             decision, reason = "blocked", "previous mutating action requires completion capture"
+        elif effect_journal_enabled:
+            # The completion obligation widened to the effect journal, with the caller's OWN
+            # directive excluded.  A dispatch opens its root effect and holds it at 'running' for
+            # the whole run — exactly the window in which the agent asks for its grants — so
+            # without the exclusion every healthy dispatch deadlocks on itself.
+            open_effect = db.execute(
+                text(
+                    """
+                    SELECT 1 FROM effect_journal ej
+                     WHERE ej.workspace_id = :workspace_id
+                       AND ej.owner_id = :owner_id
+                       AND ej.session_id = :session_id
+                       AND ej.state IN ('prepared', 'running', 'unknown')
+                       AND (:current_directive_id IS NULL OR ej.directive_id <> :current_directive_id)
+                     LIMIT 1
+                    """
+                ),
+                {
+                    "workspace_id": workspace_id,
+                    "owner_id": owner_id,
+                    "session_id": session_id,
+                    "current_directive_id": directive_id,
+                },
+            ).scalar_one_or_none()
+            if open_effect is not None:
+                decision, reason = "blocked", "an effect from another directive in this session is unresolved"
         permit = db.execute(
             text(
                 """
@@ -101,12 +129,12 @@ def issue_capability_grant(
                 id, workspace_id, owner_id, session_id, directive_id, permit_id,
                 capability, action, resource, action_digest, token_hash, status,
                 decision, reason, risk_tier, mutating, redaction_applied,
-                created_at, expires_at, consumed_at, completion_required
+                created_at, expires_at, consumed_at, completion_required, charter_id
             ) VALUES (
                 :id, :workspace_id, :owner_id, :session_id, :directive_id, :permit_id,
                 :capability, :action, :resource, :action_digest, :token_hash, :status,
                 :decision, :reason, :risk_tier, :mutating, :redaction_applied,
-                :created_at, :expires_at, NULL, :completion_required
+                :created_at, :expires_at, NULL, :completion_required, :charter_id
             )
             """
         ),
@@ -125,6 +153,7 @@ def issue_capability_grant(
             "risk_tier": policy["risk_tier"],
             "mutating": bool(policy["mutating"]),
             "completion_required": bool(policy["mutating"]),
+            "charter_id": charter_id,
             "created_at": now,
             "expires_at": expires_at,
         },

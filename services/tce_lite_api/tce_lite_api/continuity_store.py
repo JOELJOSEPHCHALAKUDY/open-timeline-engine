@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from fastapi import HTTPException
 from tce_shared.autonomy_context import SUMMARY_VERSION, summarize_event_record
 from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
@@ -548,4 +549,49 @@ def pilot_metrics(conn: sqlite3.Connection, *, workspace_id: str, days: int) -> 
         "outbox_pending_count": int(outbox["pending"] or 0) if outbox else 0,
         "outbox_dead_count": int(outbox["dead"] or 0) if outbox else 0,
         **attempt_metrics,
+    }
+
+
+def requeue_dead_handoff(
+    conn: sqlite3.Connection,
+    *,
+    auth: Any,
+    outbox_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """The §6.4 operator escape hatch behind ``POST /v1/handoffs/outbox/{id}/requeue``.
+
+    A ``handoff_outbox`` row that reaches ``status='dead'`` after ten failed attempts is never
+    retried and never clears the completion obligation, which permanently blocks every future
+    mutating capability grant in that session with no path out.  Without this hatch the widened
+    obligation of §6.4 would be a new way to brick a session rather than a safety property.
+
+    Refuses ``409 handoff_not_dead`` unless the row really is dead; the route restricts it to a
+    server-verified human, never a bare ``X-TCE-Role: user`` header.
+    """
+    row = conn.execute(
+        "SELECT id, workspace_id, owner_id, status, attempts FROM handoff_outbox WHERE id = ? LIMIT 1",
+        (str(outbox_id),),
+    ).fetchone()
+    if row is None or str(row["workspace_id"]) != str(getattr(auth, "workspace_id", "")):
+        raise HTTPException(status_code=404, detail={"error": "handoff_not_found"})
+    if str(row["status"]) != "dead":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "handoff_not_dead", "status": str(row["status"])},
+        )
+    conn.execute(
+        """
+        UPDATE handoff_outbox
+           SET status = 'pending', attempts = 0, next_attempt_at = ?, last_error = '', updated_at = ?
+         WHERE id = ? AND status = 'dead'
+        """,
+        (now.isoformat(), now.isoformat(), str(outbox_id)),
+    )
+    conn.commit()
+    return {
+        "outbox_id": str(outbox_id),
+        "status": "pending",
+        "attempts": 0,
+        "next_attempt_at": now.isoformat(),
     }

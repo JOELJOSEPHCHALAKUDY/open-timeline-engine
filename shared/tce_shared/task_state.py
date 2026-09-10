@@ -63,6 +63,7 @@ __all__ = [
     "TASK_STATE_POLICY_REVISION",
     "TASK_STATE_SCHEMA_VERSION",
     "TASK_STATE_URI_SCHEME",
+    "UNKNOWN_CONTRACT_REVISION",
     "VERIFICATION_PASS_STATES",
     "VERIFICATION_STATES",
     "ApprovedConstraint",
@@ -85,6 +86,7 @@ __all__ = [
     "UnresolvedEffect",
     "VerificationRef",
     "approved_plan_from_json",
+    "approved_plan_id",
     "approved_plan_to_json",
     "canonical_json",
     "charter_for_task",
@@ -115,6 +117,7 @@ __all__ = [
     "render_task_state_markdown",
     "root_status",
     "short_objective",
+    "stamp_verification_provenance",
     "task_scope_digest",
     "task_state_summary_fields",
     "verification_from_json",
@@ -201,6 +204,12 @@ PLANNING_JOB_STATES: frozenset[str] = frozenset(
     {"pending", "leased", "succeeded", "failed", "discarded", "cancelled"}
 )
 PLANNING_JOB_REVIVABLE_STATES: frozenset[str] = frozenset({"cancelled", "failed"})
+# The contract revision stamped on a verification whose directive left NO trace on the
+# projection -- so the contract its work happened under cannot be established.  Every real
+# projection revision is >= 0, so this value can never equal one and
+# ``verification_is_current`` refuses it.  Fail-closed is the only safe reading: a
+# verification we cannot tie to a contract is not evidence FOR a contract.
+UNKNOWN_CONTRACT_REVISION: int = -1
 VERIFICATION_PASS_STATES: frozenset[str] = frozenset({"passed"})
 VERIFICATION_STATES: frozenset[str] = frozenset({"unverified", "passed", "failed", "skipped"})
 _TASK_STATE_NAMESPACE: uuid.UUID = uuid.UUID("8f2c0b6e-9d41-4a2f-9b73-2a51f0c7c1d2")
@@ -1175,6 +1184,52 @@ def verification_is_current(parts: StatusInputs) -> bool:
         return False
     plan = parts.plan
     return plan is not None and ref.plan_id == plan.plan_id
+
+
+def stamp_verification_provenance(
+    verification: dict[str, Any],
+    *,
+    projection: TaskStateProjection,
+    directive_id: str | None,
+    work_contract_revision: int | None = None,
+) -> dict[str, Any]:
+    """S5 provenance, stamped in ONE place for every writer of a verification, in both backends.
+
+    ``verification_is_current`` -- R9's first positive -- reads exactly the two fields this
+    function writes, so what they are read FROM decides whether the predicate can ever fail.
+
+    **The stamp is a claim about what the evidence is evidence OF, and it must not come from the
+    clock.**  Reading ``projection.contract_revision`` at grading time makes both sides of the
+    comparison the same value read from the same row at the same instant: the ref then asserts
+    "I am about whatever the contract is now", whichever contract that happens to be.  A
+    verification still in flight when the owner restates the objective would be re-badged as
+    evidence for the NEW contract, and R9 would release a wholly unverified objective to ``DONE``
+    on the strength of the previous one's checks -- the same defect as accepting an answer that
+    predates its question.
+
+    So ``work_contract_revision`` is the contract the WORK happened under, supplied by the caller
+    from the directive's own recorded history rather than from the projection.  Passing ``None``
+    keeps the legacy reading -- the projection's current revision -- and is correct only for a
+    writer whose verification is being recorded AS the work ends (the execution report, whose
+    state is pinned to ``'unverified'`` and can never satisfy R9 anyway).
+
+    ``plan_id`` follows from the revision, because §S3.6's plan id is
+    ``uuid5(task_id | contract_revision)`` and nothing else.  When the work's revision is the
+    current one the live plan's id is used verbatim (``None`` when there is no plan, which R9
+    already refuses); when it is older, the deterministic id for THAT revision is stamped, so the
+    ref stays readable as history and still cannot match the live plan.
+    """
+    current = int(projection.contract_revision)
+    revision = current if work_contract_revision is None else int(work_contract_revision)
+    verification["contract_revision"] = revision
+    if revision == current:
+        verification["plan_id"] = projection.plan.plan_id if projection.plan is not None else None
+    elif revision >= 0:
+        verification["plan_id"] = approved_plan_id(projection.task_id, revision)
+    else:
+        verification["plan_id"] = None
+    verification["directive_id"] = directive_id
+    return verification
 
 
 def derive_status(parts: StatusInputs) -> tuple[TaskStatus, NextPermittedAction]:

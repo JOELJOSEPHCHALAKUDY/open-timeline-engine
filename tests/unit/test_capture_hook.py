@@ -25,6 +25,12 @@ from typing import Any
 
 import pytest
 
+# Every test below either drives the hook through ``_run_hook`` (a real ``subprocess.run``
+# of scripts/tce_capture_input.py) or runs the generator CLI the same way. The marker is
+# module-level because the spawn is the point of the file, not an incidental detail —
+# see tests/conftest.py::_no_subprocess.
+pytestmark = pytest.mark.subprocess
+
 ROOT = Path(__file__).parents[2]
 HOOK = ROOT / "scripts" / "tce_capture_input.py"
 GENERATOR = ROOT / "scripts" / "generate_client_hooks.py"

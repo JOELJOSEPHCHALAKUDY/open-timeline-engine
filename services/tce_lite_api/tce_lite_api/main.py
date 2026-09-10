@@ -17,7 +17,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import httpx
@@ -66,9 +66,26 @@ from tce_shared.behavior_pilot import (
     sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.charter import (
+    CHARTER_POLICY_REVISION,
+    CharterInvalid,
+    CharterRequired,
+    resolved_charter_to_json,
+)
 from tce_shared.dashboard import timeline_dashboard_html
 from tce_shared.decision_capture import HOST_CAPTURE_CAPABILITY, HOST_CAPTURE_SOURCE, HUMAN_INPUT_TASK_TYPE, TRUSTED_ORIGINS
+from tce_shared.effect_journal import (
+    EFFECT_ACTOR_OWNER,
+    EFFECT_REOPENABLE_TRANSITIONS,
+    EffectIntent,
+    EffectRecord,
+    EffectTransitionRejected,
+    pause_required,
+)
 from tce_shared.events import (
+    AcceptanceCheckPayload,
+    AcceptanceCriteriaRequest,
+    AcceptanceCriteriaResponse,
     AgentRole,
     AutonomyGoalStatus,
     AutonomyNotice,
@@ -95,6 +112,9 @@ from tce_shared.events import (
     CapabilityGrantRequest,
     CapabilityGrantResponse,
     CaptureDeliveryState,
+    CharterCreateRequest,
+    CharterNarrowingRequest,
+    CharterResponse,
     CloneAdviceRequest,
     CloneAdviceResponse,
     CompletionCaptureRequest,
@@ -105,6 +125,12 @@ from tce_shared.events import (
     CounterfactualListResponse,
     CounterfactualResolveRequest,
     DirectiveExecution,
+    DispatchOpenRequest,
+    DispatchReconcileRequest,
+    DispatchResponse,
+    EffectOpenRequest,
+    EffectResolveRequest,
+    EffectResponse,
     EventEnvelope,
     EventSearchRequest,
     EventType,
@@ -127,6 +153,8 @@ from tce_shared.events import (
     ResumeFeedbackResponse,
     ResumePacketRequest,
     ResumePacketResponse,
+    SandboxSelfTestRequest,
+    SandboxSelfTestResponse,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
     TakeoverAutonomyTickResponse,
@@ -153,6 +181,8 @@ from tce_shared.events import (
     TrustedInputCapture,
     TrustedInputOriginKind,
     TrustedInputReceipt,
+    VerificationResultRequest,
+    VerificationResultResponse,
     to_lifecycle_status,
     to_next_permitted_action,
 )
@@ -171,7 +201,16 @@ from tce_shared.task_state import (
     render_task_state_markdown,
     task_state_summary_fields,
 )
+from tce_shared.verification import (
+    AcceptanceCheck,
+    AcceptanceCriteria,
+    CheckResult,
+    CriteriaFrozen,
+    CriteriaInvalid,
+    VerificationEvidence,
+)
 
+from . import charter_store, dispatch_store, effect_store, reconcile, verification_store
 from .auth import AuthContext, get_auth_context
 from .behavior_control_store import (
     consume_capability_grant,
@@ -222,6 +261,7 @@ from .continuity_store import (
     enqueue_handoff,
     pilot_metrics,
     record_resume_progress,
+    requeue_dead_handoff,
 )
 from .db import get_db, init_db
 from .planning_store import get_planning_job, sweep_stale_planning_jobs
@@ -460,6 +500,21 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             conn.commit()
         except Exception:
             _LOGGER.warning("startup planning job sweep failed", exc_info=True)
+        if bool(settings.dispatch_startup_reconcile_enabled):
+            try:
+                summary = reconcile.startup_reconcile(conn, settings=settings)
+                # Durable, regardless of audit_write_mode: the reconcile summary is evidence about
+                # what a crash left behind, not a debug line.
+                write_audit(conn, "system", "startup_reconcile", dict(summary), [], {"runtime": "lite"}, 0)
+            except Exception:
+                # Never blocks boot. The refusal is at POST /v1/dispatch, which returns
+                # 409 reconcile_pending while reconcile_complete() is False.
+                _LOGGER.exception("startup reconcile failed")
+        else:
+            _LOGGER.warning(
+                "dispatch_startup_reconcile_enabled=0: no reconcile ran, so POST /v1/dispatch will "
+                "refuse with 409 reconcile_pending"
+            )
     finally:
         connection_scope.close()
     yield
@@ -3284,7 +3339,15 @@ def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]
 @app.get("/v1/governance/status", response_model=GovernanceStatusResponse)
 def governance_status(
     _auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
 ) -> GovernanceStatusResponse:
+    now = now_utc()
+    charter = charter_store.load_active_charter(
+        conn, workspace_id=_auth.workspace_id, owner_id=_auth.user_id, session_id="default", now=now
+    )
+    self_test = dispatch_store.latest_self_test(
+        conn, workspace_id=_auth.workspace_id, sandbox_provider="seatbelt"
+    )
     return GovernanceStatusResponse(
         **build_governance_status(
             runtime="lite",
@@ -3300,6 +3363,11 @@ def governance_status(
             requested_execution_enforcement=settings.execution_enforcement_level,
             execution_interception_attested=settings.execution_interception_attested,
             execution_interception_provider=settings.execution_interception_provider,
+            charter=charter,
+            sandbox_self_test=self_test,
+            # D-3: per-command tracing needs an adapter that saw each command. Lite has none, so
+            # this is False here and the limitation line says so rather than being omitted.
+            action_tracing_available=False,
         )
     )
 
@@ -7296,6 +7364,670 @@ def get_planning_job_status(
 
 # ---------------------------------------------------------------------------
 # Static file mount for Angular dashboard (MUST be last — catch-all)
+# ---------------------------------------------------------------------------
+# P3 — authority charters, dispatch, effect journal, verification (§9.1)
+# ---------------------------------------------------------------------------
+
+
+# Mirrors Full's `_CREDENTIAL_KIND_PREFIXES` / `_runner_principal_for` (tce_api/main.py) exactly, so
+# the two backends agree about who the verifier is. Lite's compat bearer path yields a BARE consumer
+# while its host-capture path yields "host:<name>", and Full prefixes every path with the credential
+# kind; `verification_runner_principal` names an IDENTITY, not a transport, so the kind prefix is
+# stripped before the comparison. A bare "system:verifier" carries no such prefix and is unchanged.
+_CREDENTIAL_KIND_PREFIXES: tuple[str, ...] = ("bearer:", "mtls:", "host:")
+
+
+def _runner_principal_for(auth: AuthContext) -> str:
+    """The verification runner's identity, DERIVED FROM AUTH and never from the request body."""
+    consumer = str(auth.consumer or "")
+    for prefix in _CREDENTIAL_KIND_PREFIXES:
+        if consumer.startswith(prefix):
+            return consumer[len(prefix) :]
+    return consumer
+
+
+def _require_verified_human(auth: AuthContext, *, action: str) -> None:
+    """U1 — the ONE gate for every route below that is marked "role ``user`` only".
+
+    ``identity_claims_mode`` defaults to ``compat``, so ``X-TCE-Role: user`` on the caller's own
+    bearer is a header assertion, not authentication.  P1 closed that laundering for the execution
+    permit; nothing here may reopen it for the charter that sits above the permit.
+    """
+    is_human = auth.role == AgentRole.USER
+    identity_verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and identity_verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "charter_authority_required",
+                "message": "only a server-verified human may " + action,
+                "reasons": ["human_review_required", "non_human_caller" if not is_human else "identity_unverified"],
+            },
+        )
+
+
+def _charter_refusal(exc: CharterRequired) -> HTTPException:
+    """The U2 refusal body, byte-identical to Full's.
+
+    The ``"AUTONOMOUS MODE PAUSED: "`` prefix is deliberate: ``_slim_takeover_result`` already
+    surfaces that shape verbatim, so an executor sees the refusal with no MCP change.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "no_active_charter",
+            "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be created and "
+            "approved by the owner before mutating work may be claimed. Ask the owner to approve "
+            "one, then retry.",
+            "action_kind": exc.action_kind,
+            "reason": exc.reason,
+        },
+    )
+
+
+def _charter_audit(conn: sqlite3.Connection, *, auth: AuthContext, action: str, query: dict[str, Any]) -> None:
+    write_audit(conn, auth.consumer, action, query, [], {"policy_revision": CHARTER_POLICY_REVISION}, 0)
+
+
+@app.post("/v1/charters", response_model=CharterResponse)
+def charter_create(
+    body: CharterCreateRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="create an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_create", method="POST").inc()
+    try:
+        payload = charter_store.create_charter(conn, auth=auth, body=body, now=now_utc())
+    except CharterInvalid as exc:
+        raise HTTPException(status_code=422, detail={"error": "charter_invalid", "field": exc.field, "message": str(exc)}) from exc
+    _charter_audit(conn, auth=auth, action="charter_create", query={"charter_id": payload["charter_id"]})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/charters/narrowings", response_model=CharterResponse)
+def charter_narrow(
+    body: CharterNarrowingRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="narrow an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_narrow", method="POST").inc()
+    payload = charter_store.apply_narrowing(conn, auth=auth, body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_narrow", query={"charter_id": str(body.charter_id)})
+    return CharterResponse(**payload)
+
+
+@app.get("/v1/charters/active", response_model=CharterResponse)
+def charter_active(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="charter_active", method="GET").inc()
+    now = now_utc()
+    charter = charter_store.load_active_charter(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id, now=now
+    )
+    if charter is None:
+        return CharterResponse(charter=None, status="none", generated_at=now)
+    return CharterResponse(
+        charter=resolved_charter_to_json(charter),
+        charter_id=UUID(charter.charter_id),
+        status=charter.status,
+        charter_digest=charter.charter_digest,
+        charter_version=charter.charter_version,
+        policy_revision=charter.policy_revision,
+        enforcement_tier=charter.enforcement_tier,
+        credential_risk_acknowledged=charter.credential_risk_acknowledged,
+        approved_by=charter.approved_by,
+        approved_at=charter.approved_at,
+        expires_at=charter.expires_at,
+        revoked_at=charter.revoked_at,
+        narrowing_ids=list(charter.narrowing_ids),
+        generated_at=now,
+    )
+
+
+@app.post("/v1/charters/{charter_id}/approve", response_model=CharterResponse)
+def charter_approve(
+    charter_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="approve an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_approve", method="POST").inc()
+    payload = charter_store.approve_charter(conn, auth=auth, charter_id=str(charter_id), now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_approve", query={"charter_id": str(charter_id)})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/charters/{charter_id}/revoke", response_model=CharterResponse)
+def charter_revoke(
+    charter_id: UUID,
+    body: dict[str, Any] | None = None,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="revoke an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_revoke", method="POST").inc()
+    reason = str((body or {}).get("reason") or "")
+    payload = charter_store.revoke_charter(conn, auth=auth, charter_id=str(charter_id), reason=reason, now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_revoke", query={"charter_id": str(charter_id), "reason": reason})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/dispatch", response_model=DispatchResponse)
+def dispatch_open(
+    body: DispatchOpenRequest,
+    request: Request,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_open", method="POST").inc()
+    # Read from the raw headers rather than declaring a Header parameter: Full does the same, and
+    # a declared parameter would put an extra entry in Lite's OpenAPI document that Full's lacks.
+    idempotency_key = str(request.headers.get("Idempotency-Key") or body.idempotency_key or "").strip()
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail={"error": "idempotency_key_required"})
+    now = now_utc()
+    try:
+        charter = charter_store.resolve_charter_or_refuse(
+            conn, auth=auth, session_id=str(body.session_id), action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _charter_refusal(exc) from exc
+    if charter is None:
+        # Enforcement is off. A dispatch still needs a charter to name its scope, so this is a
+        # refusal either way -- but the reason is different and is reported as such.
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "no_active_charter", "reason": "no_active_charter", "action_kind": "execute",
+                    "message": "no active authority charter; dispatch has no scope to run under"},
+        )
+    payload = dispatch_store.open_dispatch(
+        conn, auth=auth, charter=charter, body=body, idempotency_key=idempotency_key, settings=settings, now=now
+    )
+    _charter_audit(conn, auth=auth, action="dispatch_open", query={"dispatch_id": payload["dispatch_id"]})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/dispatch/{dispatch_id}/provider", response_model=DispatchResponse)
+def dispatch_bind_provider(
+    dispatch_id: UUID,
+    body: dict[str, Any],
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_bind_provider", method="POST").inc()
+    dispatch_store.bind_provider_run(
+        conn,
+        dispatch_id=str(dispatch_id),
+        provider_run_id=str(body.get("provider_run_id") or ""),
+        provider_turn_id=(str(body["provider_turn_id"]) if body.get("provider_turn_id") else None),
+        now=now_utc(),
+    )
+    payload = dispatch_store.load_dispatch(conn, dispatch_id=str(dispatch_id), workspace_id=auth.workspace_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/dispatch/{dispatch_id}/reconcile", response_model=DispatchResponse)
+def dispatch_reconcile(
+    dispatch_id: UUID,
+    body: DispatchReconcileRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    # U3: allowed on a revoked charter. Recording what happened is not doing more.
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_reconcile", method="POST").inc()
+    payload = dispatch_store.reconcile_dispatch(conn, dispatch_id=str(dispatch_id), body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="dispatch_reconcile", query={"dispatch_id": str(dispatch_id)})
+    return DispatchResponse(**payload)
+
+
+@app.get("/v1/dispatch/{dispatch_id}", response_model=DispatchResponse)
+def dispatch_get(
+    dispatch_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dispatch_get", method="GET").inc()
+    payload = dispatch_store.load_dispatch(conn, dispatch_id=str(dispatch_id), workspace_id=auth.workspace_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/sandbox/self-test", response_model=SandboxSelfTestResponse)
+def sandbox_self_test(
+    body: SandboxSelfTestRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SandboxSelfTestResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="sandbox_self_test", method="POST").inc()
+    payload = dispatch_store.record_self_test(conn, auth=auth, body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="sandbox_self_test", query={"self_test_id": payload["self_test_id"], "passed": payload["passed"]})
+    return SandboxSelfTestResponse(**payload)
+
+
+def _effect_kind(value: str) -> Literal["directive", "write", "command", "commit", "external"]:
+    """Coerce the wire string to the closed kind set.  An unknown kind is "external": the most
+    conservative reading, because an effect we cannot classify is one we cannot claim to have
+    observed the boundary of."""
+    raw = str(value or "").strip()
+    if raw in ("directive", "write", "command", "commit", "external"):
+        return cast(Literal["directive", "write", "command", "commit", "external"], raw)
+    return "external"
+
+
+def _effect_reversibility(value: str) -> Literal["reversible", "irreversible", "unknown"]:
+    """An unrecognised reversibility is "unknown", never "reversible" -- a shell one-liner may be
+    `git push`, and defaulting to reversible is what would silently retry it."""
+    raw = str(value or "").strip()
+    if raw in ("reversible", "irreversible", "unknown"):
+        return cast(Literal["reversible", "irreversible", "unknown"], raw)
+    return "unknown"
+
+
+def _effect_response(record: EffectRecord, *, now: datetime, paused: bool = False, pause_reason: str = "") -> EffectResponse:
+    return EffectResponse(
+        effect_id=UUID(record.effect_id),
+        directive_id=UUID(record.directive_id),
+        seq=record.seq,
+        state=record.state,
+        intent_digest=record.intent_digest,
+        kind=record.intent.kind,
+        capability=record.intent.capability,
+        resource=record.intent.resource,
+        reversibility=record.intent.reversibility,
+        enforcement_tier=record.enforcement_tier,
+        action_tracing=record.action_tracing,
+        lease_generation=record.lease_generation,
+        claimed_executor=record.claimed_executor,
+        provider_run_id=record.provider_run_id,
+        opened_at=record.opened_at,
+        resolved_at=record.resolved_at,
+        resolution_source=record.resolution_source,
+        pause_required=paused,
+        pause_reason=pause_reason,
+        generated_at=now,
+    )
+
+
+@app.post("/v1/effects", response_model=EffectResponse)
+def effect_open(
+    body: EffectOpenRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> EffectResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="effect_open", method="POST").inc()
+    if not bool(settings.effect_journal_enabled):
+        raise HTTPException(status_code=503, detail={"error": "effect_journal_disabled"})
+    now = now_utc()
+    try:
+        charter_store.resolve_charter_or_refuse(
+            conn, auth=auth, session_id=str(body.session_id), action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _charter_refusal(exc) from exc
+    intent = EffectIntent(
+        kind=_effect_kind(body.kind),
+        capability=str(body.capability),
+        resource=str(body.resource or ""),
+        argv=tuple(str(item) for item in body.argv),
+        reversibility=_effect_reversibility(body.reversibility),
+        description=str(body.description or ""),
+    )
+    try:
+        effect_id = effect_store.open_effect(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=str(body.session_id),
+            task_id=body.task_id,
+            directive_id=str(body.directive_id),
+            dispatch_id=(str(body.dispatch_id) if body.dispatch_id else None),
+            intent=intent,
+            enforcement_tier=str(body.enforcement_tier),
+            action_tracing=str(body.action_tracing),
+            lease_generation=int(body.lease_generation),
+            claimed_executor=auth.consumer,
+            provider_run_id=body.provider_run_id,
+            provider_turn_id=body.provider_turn_id,
+            runtime_id=str(body.runtime_id or ""),
+            runtime_version=str(body.runtime_version or ""),
+            model_id=str(body.model_id or ""),
+            now=now,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_lease", "directive_id": str(body.directive_id), "expected_lease": int(body.lease_generation)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "effect_invalid", "message": str(exc)}) from exc
+    conn.commit()
+    _charter_audit(conn, auth=auth, action="effect_open", query={"effect_id": effect_id, "directive_id": str(body.directive_id)})
+    records = [r for r in effect_store.load_effects_for_directive(conn, directive_id=str(body.directive_id)) if r.effect_id == effect_id]
+    return _effect_response(records[0], now=now)
+
+
+@app.get("/v1/effects/open", response_model=list[EffectResponse])
+def effects_open(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> list[EffectResponse]:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="effects_open", method="GET").inc()
+    now = now_utc()
+    records = effect_store.list_open_effects(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id
+    )
+    paused, reason = pause_required(records)
+    return [_effect_response(record, now=now, paused=paused, pause_reason=reason) for record in records]
+
+
+@app.post("/v1/effects/{effect_id}/resolve", response_model=EffectResponse)
+def effect_resolve(
+    effect_id: UUID,
+    body: EffectResolveRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> EffectResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="effect_resolve", method="POST").inc()
+    now = now_utc()
+    row = conn.execute(
+        "SELECT state, session_id, directive_id, reversibility FROM effect_journal WHERE effect_id = ? AND workspace_id = ? LIMIT 1",
+        (str(effect_id), auth.workspace_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"error": "effect_not_found"})
+    current_state = str(row["state"])
+    pair = (current_state, str(body.target_state))
+    # S17: the actor is derived here, server-side. EffectResolveRequest deliberately has no actor
+    # field -- a caller that could name itself "system:reconciler" would defeat the whole rule.
+    is_owner = auth.role == AgentRole.USER and (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities)
+    needs_human = current_state == "unknown" or pair in EFFECT_REOPENABLE_TRANSITIONS
+    if needs_human:
+        _require_verified_human(auth, action="resolve an effect whose outcome is unknown")
+    actor = EFFECT_ACTOR_OWNER if is_owner else f"executor:{auth.consumer}"
+    # U3: a revoked charter must not stop the system from RECORDING what happened -- only from
+    # doing more. Recording sources stay open; anything else needs a live charter.
+    if str(body.resolution_source) not in ("reaper", "provider_read", "owner"):
+        try:
+            charter_store.resolve_charter_or_refuse(
+                conn, auth=auth, session_id=str(row["session_id"]), action_kind="execute", settings=settings, now=now
+            )
+        except CharterRequired as exc:
+            raise _charter_refusal(exc) from exc
+    try:
+        ok = effect_store.resolve_effect(
+            conn,
+            effect_id=str(effect_id),
+            target_state=str(body.target_state),
+            actor=actor,
+            resolution_source=str(body.resolution_source),
+            evidence=dict(body.evidence or {}),
+            expected_lease=int(body.expected_lease),
+            now=now,
+        )
+    except EffectTransitionRejected as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "effect_transition_rejected", "reason": exc.reason,
+                    "current_state": exc.current_state, "target_state": exc.target_state},
+        ) from exc
+    if not ok:
+        conn.rollback()
+        actual = conn.execute(
+            "SELECT lease_generation FROM directive_executions WHERE directive_id = ? LIMIT 1",
+            (str(row["directive_id"]),),
+        ).fetchone()
+        # G4 — ``actual_lease`` stays in the body, for the same reason it stays in Full's twin
+        # (tce_api/main.py, same route): the lease is a FENCING token, not a secret. It is a small
+        # monotonic counter, GET /v1/takeover/execution/status already hands the current value to
+        # any caller inside this workspace — which this one is — and once G2 closed the transition
+        # table, knowing it buys a fenced-out worker nothing. The reap that bumped the lease also
+        # drove this effect to 'unknown', and validate_effect_transition refuses both ways out of
+        # 'unknown' for a non-system actor ('system_only') and refuses either terminal state on an
+        # irreversible effect ('irreversible_actor'). What the field buys is a caller that can tell
+        # "I am fenced" from "the row moved under me" without polling. Parity matters here too:
+        # tests/integration/test_effect_reconcile_lite.py asserts on this field.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "stale_lease",
+                "effect_id": str(effect_id),
+                "expected_lease": int(body.expected_lease),
+                "actual_lease": int(actual["lease_generation"]) if actual is not None else None,
+            },
+        )
+    conn.commit()
+    _charter_audit(conn, auth=auth, action="effect_resolve", query={"effect_id": str(effect_id), "target_state": str(body.target_state), "actor": actor})
+    records = [r for r in effect_store.load_effects_for_directive(conn, directive_id=str(row["directive_id"])) if r.effect_id == str(effect_id)]
+    paused, reason = pause_required(records)
+    return _effect_response(records[0], now=now, paused=paused, pause_reason=reason)
+
+
+@app.post("/v1/verification/criteria", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_freeze(
+    body: AcceptanceCriteriaRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="verification_criteria_freeze", method="POST").inc()
+    # A freezer must be a server-bound principal. Reading the name off X-TCE-Consumer would let the
+    # agent rename itself and freeze its own goalposts, which is the same laundering the verification
+    # verdict routes already refuse.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "identity_unverified", "message": "freezing acceptance criteria requires a server-bound identity"},
+        )
+    # Two claim paths reach a directive: a dispatch record (the supervisor) and the ordinary
+    # claim_execution lease (an executor over MCP). Checking only the first left the second wide open --
+    # an agent could freeze `exit 0` as its own acceptance check and an honest verifier would grade it
+    # as passing.
+    claimed = conn.execute(
+        "SELECT claimed_by FROM dispatch_records WHERE directive_id = ? ORDER BY created_at DESC LIMIT 1",
+        (str(body.directive_id),),
+    ).fetchone()
+    # The freeze is ONE-SHOT: UNIQUE(directive_id), no UPDATE path, no DELETE path. So an
+    # unscoped freeze is not a harmless no-op -- whoever gets there first owns that directive's
+    # goalposts permanently. Measured over HTTP before this check, on both backends: an ordinary
+    # bound executor froze `/bin/sh -c "exit 0"` against a directive_id it had invented, for a
+    # directive that did not exist in any workspace, and got 200. That buys two things it should
+    # not: criteria for work someone else will do, and a pre-emptive 409 against the supervisor's
+    # own honest freeze. The directive must exist and it must be in the caller's workspace.
+    claimed_executor_row = conn.execute(
+        "SELECT claimed_executor FROM directive_executions WHERE directive_id = ? AND workspace_id = ? LIMIT 1",
+        (str(body.directive_id), auth.workspace_id),
+    ).fetchone()
+    if claimed_executor_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_directive",
+                "message": "acceptance criteria may only be frozen for a directive in this workspace",
+                "directive_id": str(body.directive_id),
+            },
+        )
+    consumer = str(auth.consumer)
+    if (claimed is not None and str(claimed["claimed_by"]) == consumer) or (
+        claimed_executor_row is not None and str(claimed_executor_row["claimed_executor"] or "") == consumer
+    ):
+        raise HTTPException(status_code=403, detail={"error": "criteria_frozen_by_executor"})
+    if not bool(settings.verification_enabled):
+        raise HTTPException(status_code=503, detail={"error": "verification_disabled"})
+    now = now_utc()
+    checks = [
+        AcceptanceCheck(
+            check_id=str(item.check_id),
+            argv=tuple(str(part) for part in item.argv),
+            cwd_rel=str(item.cwd_rel),
+            expect_exit_code=int(item.expect_exit_code),
+            timeout_seconds=int(item.timeout_seconds),
+        )
+        for item in body.checks
+    ]
+    manifest = [(str(entry[0]), str(entry[1])) for entry in body.corpus_manifest if len(entry) >= 2]
+    try:
+        criteria = verification_store.freeze_acceptance_criteria(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            task_id=body.task_id,
+            directive_id=str(body.directive_id),
+            charter_id=(str(body.charter_id) if body.charter_id else None),
+            checks=checks,
+            corpus_manifest=manifest,
+            frozen_by=auth.consumer,
+            settings=settings,
+            now=now,
+        )
+    except CriteriaFrozen as exc:
+        raise HTTPException(status_code=409, detail={"error": "criteria_frozen", "directive_id": str(body.directive_id)}) from exc
+    except CriteriaInvalid as exc:
+        raise HTTPException(status_code=422, detail={"error": "criteria_invalid", "field": exc.field, "message": str(exc)}) from exc
+    _charter_audit(conn, auth=auth, action="criteria_freeze", query={"directive_id": str(body.directive_id), "criteria_id": criteria.criteria_id})
+    return _criteria_response(criteria)
+
+
+def _criteria_response(criteria: AcceptanceCriteria) -> AcceptanceCriteriaResponse:
+    return AcceptanceCriteriaResponse(
+        criteria_id=UUID(criteria.criteria_id),
+        directive_id=UUID(criteria.directive_id),
+        criteria_digest=criteria.criteria_digest,
+        corpus_digest=criteria.corpus_digest,
+        checks=[
+            AcceptanceCheckPayload(
+                check_id=check.check_id,
+                argv=list(check.argv),
+                cwd_rel=check.cwd_rel,
+                expect_exit_code=check.expect_exit_code,
+                timeout_seconds=check.timeout_seconds,
+            )
+            for check in criteria.checks
+        ],
+        corpus_manifest=[list(entry) for entry in criteria.corpus_manifest],
+        frozen_at=criteria.frozen_at,
+        frozen_by=criteria.frozen_by,
+        policy_revision=criteria.policy_revision,
+    )
+
+
+@app.get("/v1/verification/criteria/{directive_id}", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_get(
+    directive_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="verification_criteria_get", method="GET").inc()
+    criteria = verification_store.load_acceptance_criteria(conn, directive_id=str(directive_id))
+    if criteria is None:
+        raise HTTPException(status_code=404, detail={"error": "criteria_not_frozen"})
+    return _criteria_response(criteria)
+
+
+@app.post("/v1/verification/results", response_model=VerificationResultResponse)
+def verification_results_record(
+    body: VerificationResultRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> VerificationResultResponse:
+    # U3: allowed on a revoked charter -- recording, not doing.
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="verification_results_record", method="POST").inc()
+    if auth.role == AgentRole.EXECUTOR:
+        raise HTTPException(status_code=403, detail={"error": "unknown_runner", "message": "an executor may not grade its own work"})
+    # F1 -- the role above is a HEADER under the default `identity_claims_mode="compat"`, so the
+    # executor check alone is not authentication: the implementing agent need only drop
+    # `X-TCE-Role: executor` from its own token to grade its own directive `passed`. The runner
+    # principal must come from a server-bound claim. This is the same laundering P1 closed for
+    # evidence and P3 closed for charters; the third door is this one.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "unknown_runner",
+                "message": "verification results require a server-verified runner identity",
+                "reasons": ["identity_unverified"],
+            },
+        )
+    evidence = VerificationEvidence(
+        directive_id=str(body.directive_id),
+        results=tuple(
+            CheckResult(
+                check_id=str(item.check_id),
+                argv=tuple(str(part) for part in item.argv),
+                exit_code=int(item.exit_code),
+                duration_ms=int(item.duration_ms),
+                stdout_sha256=str(item.stdout_sha256),
+                stderr_sha256=str(item.stderr_sha256),
+                excerpt=str(item.excerpt or ""),
+            )
+            for item in body.results
+        ),
+        observed_corpus_digest=str(body.observed_corpus_digest),
+        observed_corpus_manifest=tuple((str(e[0]), str(e[1])) for e in body.observed_corpus_manifest if len(e) >= 2),
+        platform=str(body.platform or ""),
+        commit_sha=body.commit_sha,
+        tree_sha=body.tree_sha,
+        reviewer_model=body.reviewer_model,
+    )
+    _outcome, payload = verification_store.record_verification(
+        conn,
+        workspace_id=auth.workspace_id,
+        user_id=auth.user_id,
+        directive_id=str(body.directive_id),
+        evidence=evidence,
+        # Derived from the authenticated identity, NEVER from the body.
+        runner_principal=_runner_principal_for(auth),
+        settings=settings,
+        now=now_utc(),
+    )
+    _charter_audit(conn, auth=auth, action="verification_record", query={"directive_id": str(body.directive_id), "verdict": payload["verdict"]})
+    return VerificationResultResponse(**payload)
+
+
+@app.post("/v1/handoffs/outbox/{outbox_id}/requeue", response_model=dict)
+def handoff_outbox_requeue(
+    outbox_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="requeue a dead completion handoff")
+    REQUEST_COUNT.labels(endpoint="handoff_outbox_requeue", method="POST").inc()
+    payload = requeue_dead_handoff(conn, auth=auth, outbox_id=str(outbox_id), now=now_utc())
+    _charter_audit(conn, auth=auth, action="outbox_requeue", query={"outbox_id": str(outbox_id)})
+    return payload
+
+
 # ---------------------------------------------------------------------------
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "dashboard-static"

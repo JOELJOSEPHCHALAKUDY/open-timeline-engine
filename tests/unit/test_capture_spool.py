@@ -82,6 +82,7 @@ def test_module_only_imports_allowed_stdlib_modules() -> None:
     assert seen <= _ALLOWED_IMPORTS, f"unexpected imports: {sorted(seen - _ALLOWED_IMPORTS)}"
 
 
+@pytest.mark.subprocess  # spawns a child interpreter; see tests/conftest.py::_no_subprocess
 def test_module_loads_standalone_without_pydantic_or_package_init() -> None:
     script = (
         "import sys, importlib.util\n"

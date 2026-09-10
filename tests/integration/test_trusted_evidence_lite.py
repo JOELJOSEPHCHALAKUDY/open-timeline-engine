@@ -139,6 +139,11 @@ def _apply_common_settings(db_path: Path) -> None:
     settings = get_settings()
     settings.lite_db_path = str(db_path)
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     settings.workspace_access_mode = "compat"
     settings.behavior_storage_gate_mode = "shadow"
     settings.behavior_autonomy_gate_enabled = False

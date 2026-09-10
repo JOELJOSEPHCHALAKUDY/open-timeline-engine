@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +37,7 @@ from tce_shared.task_state import (
     PINNED_KINDS,
     TASK_STATE_POLICY_REVISION,
     TASK_STATE_SCHEMA_VERSION,
+    UNKNOWN_CONTRACT_REVISION,
     FoldResult,
     InvalidationPlan,
     NextPermittedAction,
@@ -630,6 +631,96 @@ def _cas_update(
 
 
 # --------------------------------------------------------------------------------------
+# task_verifications
+# --------------------------------------------------------------------------------------
+
+
+def directive_contract_revision(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    task_id: str,
+    directive_id: str,
+) -> int:
+    """The contract revision the DIRECTIVE's work happened under -- the twin of
+    ``tce_api.task_state_store.directive_contract_revision``, and the same ruling.
+
+    ``task_state_events`` stamps every row with the ``contract_revision`` in force when it was
+    appended and with the ``directive_id`` that caused it, so the earliest such row for a directive
+    is the contract its work was done for.  A verification's provenance has to be read from THAT,
+    not from the projection at grading time: the projection's current revision is true of every
+    verification whenever it is asked, so a stamp taken from it excludes nothing.
+
+    A directive with no rows -- cancelled by an objective-change invalidation before it touched the
+    projection, or reported while task state was off -- returns :data:`UNKNOWN_CONTRACT_REVISION`,
+    which no real revision equals.
+    """
+    row = conn.execute(
+        """
+        SELECT MIN(e.contract_revision) AS contract_revision
+        FROM task_state_events e
+        JOIN task_states t ON t.id = e.task_state_id
+        WHERE t.workspace_id = ?
+          AND t.owner_id = ?
+          AND t.task_id = ?
+          AND e.directive_id = ?
+        """,
+        (workspace_id, owner_id, task_id, str(directive_id)),
+    ).fetchone()
+    if row is None or row["contract_revision"] is None:
+        return UNKNOWN_CONTRACT_REVISION
+    return int(row["contract_revision"])
+
+
+def insert_task_verification(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    task_id: str,
+    recorded_by: str,
+    ref: Mapping[str, Any],
+    now: datetime,
+) -> None:
+    """The ONE ``task_verifications`` INSERT in Lite, shared by both producers of a
+    ``VERIFICATION_RECORDED`` event.
+
+    Two call sites write this table -- ``store._record_execution_task_state_lite`` (the report
+    path, whose ``state`` is pinned to ``'unverified'``) and
+    ``verification_store.record_verification`` (the evidence-graded path, which carries the
+    ``decide_verdict`` outcome). They must agree column-for-column, because the resume packet
+    reads these rows as the durable history behind the projection's ``latest_verification``.
+    Keeping the statement here rather than duplicating it is what makes that agreement structural.
+    """
+    conn.execute(
+        """
+        INSERT INTO task_verifications(
+            id, workspace_id, owner_id, task_id, directive_id, state, method, summary,
+            evidence_event_ids_json, recorded_by, recorded_at, schema_version,
+            contract_revision, plan_id
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            workspace_id,
+            owner_id,
+            task_id,
+            ref.get("directive_id"),
+            ref.get("state"),
+            ref.get("method"),
+            ref.get("summary"),
+            canonical_json(list(ref.get("evidence_event_ids") or [])),
+            recorded_by,
+            now.isoformat(),
+            int(ref.get("contract_revision") or 0),
+            ref.get("plan_id"),
+        ),
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Cancellation
 # --------------------------------------------------------------------------------------
 
@@ -771,6 +862,7 @@ __all__ = [
     "apply_task_state_events",
     "begin_immediate_cas",
     "cancel_task",
+    "directive_contract_revision",
     "end_immediate_cas",
     "ensure_task_state",
     "load_task_state",

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from .charter import (
+    ResolvedCharter,
+    capability_for_action_kind,
+    charter_scope_narrowing,
+)
 from .events import (
     AutonomyPolicyProfile,
     AutonomyRiskTier,
@@ -95,7 +101,59 @@ def evaluate_execution_permit(
     estimated_change_size: int,
     role: str,
     sensitive_path_hit: bool,
+    charter: ResolvedCharter | None = None,
+    action_kind: str = "",
+    target_paths: Sequence[str] = (),
 ) -> tuple[ExecutionPermitDecision, str]:
+    """Decide whether an action may proceed, and say why.
+
+    The charter can only make the answer STRICTER, never looser.  That is a property, not a
+    convention, and the ordering below exists to preserve it:
+
+    * a scope violation blocks outright, and BLOCKED is already the strictest answer, so it may
+      short-circuit;
+    * a confirm-required capability is applied AFTER the base ladder, because applying it first
+      would let a charter turn a BLOCKED action (an advisor, or a critical-risk action) into a mere
+      CONFIRM_REQUIRED — the charter widening authority instead of narrowing it.
+
+    With ``charter=None`` the function is byte-for-byte the pre-charter ladder, which is what keeps
+    every existing call site and every existing test unaffected.
+    """
+    charter_confirm: tuple[ExecutionPermitDecision, str] | None = None
+    if charter is not None:
+        blocked, reason = charter_scope_narrowing(charter, action_kind, target_paths)
+        if blocked:
+            return (ExecutionPermitDecision.BLOCKED, reason)
+        capability = capability_for_action_kind(action_kind)
+        if capability in charter.confirm_required_capabilities:
+            charter_confirm = (ExecutionPermitDecision.CONFIRM_REQUIRED, f"charter: confirmation required for {capability}")
+    if charter_confirm is not None:
+        base = _evaluate_execution_permit_base(
+            policy_profile=policy_profile,
+            risk_tier=risk_tier,
+            estimated_change_size=estimated_change_size,
+            role=role,
+            sensitive_path_hit=sensitive_path_hit,
+        )
+        return base if base[0] != ExecutionPermitDecision.ALLOW else charter_confirm
+    return _evaluate_execution_permit_base(
+        policy_profile=policy_profile,
+        risk_tier=risk_tier,
+        estimated_change_size=estimated_change_size,
+        role=role,
+        sensitive_path_hit=sensitive_path_hit,
+    )
+
+
+def _evaluate_execution_permit_base(
+    *,
+    policy_profile: AutonomyPolicyProfile,
+    risk_tier: AutonomyRiskTier,
+    estimated_change_size: int,
+    role: str,
+    sensitive_path_hit: bool,
+) -> tuple[ExecutionPermitDecision, str]:
+    """The pre-charter ladder, unchanged and byte-for-byte."""
     normalized_role = role.strip().lower()
     if normalized_role == "advisor":
         return (ExecutionPermitDecision.BLOCKED, "advisor role is read-only")

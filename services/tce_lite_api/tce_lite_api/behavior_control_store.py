@@ -33,7 +33,14 @@ def issue_capability_grant(
     workspace_id: str,
     owner_id: str,
     body: dict[str, Any],
+    charter_id: str | None = None,
 ) -> dict[str, Any]:
+    """Issue (or refuse) one capability grant.
+
+    ``charter_id`` is stamped on the row and is what scopes the widened completion obligation below
+    to the charter in force, rather than to a session that may span two of them.  It defaults to
+    None so every existing caller and test is unaffected.
+    """
     now = _now()
     operation = normalize_capability_operation(
         capability=str(body.get("capability") or ""),
@@ -55,12 +62,30 @@ def issue_capability_grant(
             WHERE workspace_id = ? AND owner_id = ? AND session_id = ?
               AND status = 'consumed' AND completion_required = 1
               AND completion_recorded_at IS NULL
+              AND (? IS NULL OR charter_id IS NULL OR charter_id = ?)
             LIMIT 1
             """,
-            (workspace_id, owner_id, session_id),
+            (workspace_id, owner_id, session_id, charter_id, charter_id),
         ).fetchone()
         if open_obligation is not None:
             decision, reason = "blocked", "previous mutating action requires completion capture"
+        else:
+            # P3 §6.4: an unresolved material effect from ANOTHER directive in this session is also
+            # an open obligation. The `directive_id <> :current` exclusion is mandatory, not an
+            # optimisation: the dispatch's own root effect is `running` for the whole of a healthy
+            # run, and without the exclusion every working dispatch would deadlock on its own grants.
+            open_effect = conn.execute(
+                """
+                SELECT effect_id FROM effect_journal ej
+                WHERE ej.workspace_id = ? AND ej.owner_id = ? AND ej.session_id = ?
+                  AND ej.state IN ('prepared', 'running', 'unknown')
+                  AND (? IS NULL OR ej.directive_id <> ?)
+                LIMIT 1
+                """,
+                (workspace_id, owner_id, session_id, directive_id, directive_id),
+            ).fetchone()
+            if open_effect is not None:
+                decision, reason = "blocked", "an effect from another directive in this session is unresolved"
         permit = conn.execute(
             """
             SELECT p.decision, p.expires_at, d.state, d.permit_id
@@ -94,8 +119,8 @@ def issue_capability_grant(
             id, workspace_id, owner_id, session_id, directive_id, permit_id,
             capability, action, resource, action_digest, token_hash, status,
             decision, reason, risk_tier, mutating, redaction_applied,
-            created_at, expires_at, consumed_at, completion_required
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            created_at, expires_at, consumed_at, completion_required, charter_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         """,
         (
             grant_id,
@@ -118,6 +143,7 @@ def issue_capability_grant(
             now.isoformat(),
             expires_at.isoformat(),
             1 if policy["mutating"] else 0,
+            charter_id,
         ),
     )
     conn.commit()

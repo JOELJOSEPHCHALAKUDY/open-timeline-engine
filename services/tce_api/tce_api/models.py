@@ -248,6 +248,9 @@ class HandoffRecord(Base):
     executor_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     task_state_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A MIRROR of directive_executions.verification_state for the packet response.  Never a decision
+    # input: the verifier writes the directive row, and this column follows it.
+    verification_state: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     contract_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     verification_refs_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     unresolved_effects_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -438,6 +441,8 @@ class DirectiveExecution(Base):
     report_payload_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancel_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    dispatch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    charter_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
 class ExecutionPermit(Base):
@@ -464,6 +469,10 @@ class ExecutionPermit(Base):
     policy_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     scope_digest: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     resolved_by: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    # The charter the permit was granted under.  Compared against the charter active at claim time
+    # so a permit issued under a superseded authority stops authorising anything.
+    charter_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    charter_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class EventIdentity(Base):
@@ -713,6 +722,231 @@ class CapabilityGrant(Base):
     completion_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     completion_outbox_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     completion_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    charter_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+class AuthorityCharter(Base):
+    __tablename__ = "authority_charters"
+    __table_args__ = (Index("idx_authority_charters_scope_status", "workspace_id", "owner_id", "status", "expires_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    charter_version: Mapped[str] = mapped_column(TEXT, nullable=False)
+    policy_revision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="draft")
+    enforcement_tier: Mapped[str] = mapped_column(TEXT, nullable=False)
+    credential_risk_acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    source_receipt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    permitted_roots_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    protected_write_prefixes_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    denied_read_paths_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    permitted_capabilities_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    confirm_required_capabilities_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    egress_mode: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="deny_all")
+    runtime_allowlist_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    task_families_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="3")
+    max_concurrent_dispatches: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    max_wall_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1800")
+    budget_minor_units: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    budget_currency: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="USD")
+    spend_enforcement: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="unsupported")
+    charter_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class CharterNarrowing(Base):
+    __tablename__ = "charter_narrowings"
+    __table_args__ = (
+        Index("idx_charter_narrowings_session", "workspace_id", "session_id", "created_at"),
+        Index("idx_charter_narrowings_charter", "charter_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    charter_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    # NOT NULL is the whole control: a narrowing must trace to a trusted-capture receipt, never to
+    # client-supplied policy on the turn.
+    source_receipt_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    narrowing_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class DispatchRecord(Base):
+    __tablename__ = "dispatch_records"
+    __table_args__ = (
+        Index("uq_dispatch_records_directive_attempt", "directive_id", "attempt", unique=True),
+        Index("idx_dispatch_records_open", "workspace_id", "outcome", "started_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    directive_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    charter_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    charter_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    claimed_by: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    enforcement_tier: Mapped[str] = mapped_column(TEXT, nullable=False)
+    sandbox_provider: Mapped[str] = mapped_column(TEXT, nullable=False)
+    sandbox_profile_digest: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    sandbox_self_test_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    runtime_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    runtime_version: Mapped[str] = mapped_column(TEXT, nullable=False)
+    surface: Mapped[str] = mapped_column(TEXT, nullable=False)
+    model_id: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    contract_digest: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    capability_matrix_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    provider_run_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    provider_turn_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_family: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="unspecified")
+    budget_reserved_minor_units: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    budget_currency: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="USD")
+    spend_enforcement: Mapped[str] = mapped_column(TEXT, nullable=False)
+    cap_applied_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    cost_minor_units: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_source: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    tokens_input: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    tokens_output: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    tokens_cached_input: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    tokens_reasoning: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    human_intervention_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    outcome: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    terminal_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    wall_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class EffectJournalRow(Base):
+    __tablename__ = "effect_journal"
+    __table_args__ = (
+        Index("uq_effect_journal_intent", "directive_id", "intent_digest", unique=True),
+        Index("uq_effect_journal_seq", "directive_id", "seq", unique=True),
+        Index("idx_effect_journal_open", "workspace_id", "state", "opened_at"),
+        Index("idx_effect_journal_session_open", "workspace_id", "owner_id", "session_id", "state"),
+    )
+
+    effect_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    directive_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    dispatch_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(TEXT, nullable=False)
+    kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    reversibility: Mapped[str] = mapped_column(TEXT, nullable=False)
+    capability: Mapped[str] = mapped_column(TEXT, nullable=False)
+    resource: Mapped[str] = mapped_column(TEXT, nullable=False)
+    argv_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    description: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    intent_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    enforcement_tier: Mapped[str] = mapped_column(TEXT, nullable=False)
+    action_tracing: Mapped[str] = mapped_column(TEXT, nullable=False)
+    # EVIDENCE of what the worker believed at open time, not the fence.  The fence is a JOIN against
+    # directive_executions.lease_generation / claimed_executor at both open and resolve.
+    lease_generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    claimed_executor: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    provider_run_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    provider_turn_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    runtime_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    runtime_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    model_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolution_source: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    # Server-derived from the authenticated identity; never client-supplied.
+    resolved_by_actor: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    evidence_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class AcceptanceCriteriaRow(Base):
+    __tablename__ = "acceptance_criteria"
+    __table_args__ = (Index("uq_acceptance_criteria_directive", "directive_id", unique=True),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    directive_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    charter_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    checks_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    criteria_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    corpus_digest: Mapped[str] = mapped_column(TEXT, nullable=False)
+    corpus_manifest_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    frozen_by: Mapped[str] = mapped_column(TEXT, nullable=False)
+    policy_revision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class VerificationResult(Base):
+    __tablename__ = "verification_results"
+    __table_args__ = (Index("idx_verification_results_directive", "directive_id", "recorded_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    directive_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    criteria_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    criteria_digest_at_run: Mapped[str] = mapped_column(TEXT, nullable=False)
+    corpus_digest_at_run: Mapped[str] = mapped_column(TEXT, nullable=False)
+    criteria_digest_match: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    corpus_digest_match: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    verdict: Mapped[str] = mapped_column(TEXT, nullable=False)
+    reason: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    runner_principal: Mapped[str] = mapped_column(TEXT, nullable=False)
+    executing_identity: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    platform: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    commit_sha: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    tree_sha: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    checks_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Advisory only.  Recorded beside the verdict; it is never an input to it.
+    reviewer_model_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
+
+
+class SandboxSelfTest(Base):
+    __tablename__ = "sandbox_self_tests"
+    __table_args__ = (Index("idx_sandbox_self_tests_recent", "workspace_id", "sandbox_provider", "ran_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False, index=True)
+    host_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    sandbox_provider: Mapped[str] = mapped_column(TEXT, nullable=False)
+    provider_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    profile_digest: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="")
+    assertions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    passed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # False on this host: the supervisor runs as the same uid as the manager.  Recorded, not claimed.
+    uid_separation: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, server_default="v1")
 
 
 class BehaviorProcessModel(Base):

@@ -237,6 +237,11 @@ def permit_binding_ok(
     permit_user_id: str | None,  # NULL on legacy permits => wildcard
     permit_directive_id: str | None,  # NULL => wildcard
     permit_objective_hash: str | None,  # NULL => wildcard
+    permit_scope_digest: str | None = None,  # row.scope_digest
+    expected_scope_digest: str | None = None,  # recomputed from the declared paths
+    scope_digest_enforced: bool = False,  # a NULL row under enforcement must REFUSE, not skip
+    permit_charter_id: str | None = None,  # the charter the permit was issued under
+    active_charter_id: str | None = None,  # the charter active NOW
     directive_id: str,
     directive_user_id: str,
     directive_objective_hash: str | None,
@@ -249,11 +254,26 @@ def permit_binding_ok(
     At report time an expired permit is still honoured when execution demonstrably began under the
     valid grant (``started_at <= permit_expires_at``); authorisation is judged when the effect was
     attempted, not when the receipt arrives.
+
+    Two later bindings, both defaulted so every pre-existing call form is unchanged:
+
+    * **scope** — ``permit_scope_digest`` is the digest stored on the permit row and
+      ``expected_scope_digest`` the one recomputed from the action being attempted.  When
+      ``scope_digest_enforced`` is True a missing digest on either side REFUSES: a NULL that
+      silently skips the check is how a written-but-never-read column stays unread.
+    * **charter** — when both charter ids are present and differ, the permit was granted under an
+      authority that is no longer the active one, so it no longer authorises anything.
     """
     if phase not in ("claim", "report"):
         raise ValueError(f"unknown permit phase: {phase!r}")
     if permit_decision != "allow":
         return False, "permit_not_allowed"
+    if scope_digest_enforced and (permit_scope_digest is None or expected_scope_digest is None):
+        return False, "permit_scope_digest_missing"
+    if permit_scope_digest is not None and expected_scope_digest is not None and permit_scope_digest != expected_scope_digest:
+        return False, "permit_scope_digest_mismatch"
+    if permit_charter_id is not None and active_charter_id is not None and permit_charter_id != active_charter_id:
+        return False, "permit_charter_superseded"
     if permit_user_id is not None and permit_user_id != directive_user_id:
         return False, "permit_scope_mismatch"
     if permit_directive_id is not None and permit_directive_id != directive_id:

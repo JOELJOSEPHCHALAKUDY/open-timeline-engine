@@ -837,6 +837,11 @@ class TakeoverStepResponse(BaseModel):
     planning_pending_hint_ms: int = 0
     task_state: TaskStateSummary = Field(default_factory=TaskStateSummary)
     task_state_revision: int = 0
+    charter_active: bool = False
+    charter_version: str = ""
+    enforcement_tier: str | None = None
+    unresolved_effects: list[dict[str, Any]] = Field(default_factory=list)
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -1125,6 +1130,17 @@ class GovernanceStatusResponse(BaseModel):
     server_boundary_secure: bool
     production_autonomy_ready: bool
     limitations: list[str] = Field(default_factory=list)
+    charter_active: bool = False
+    charter_id: str | None = None
+    charter_version: str | None = None
+    charter_expires_at: str | None = None
+    enforcement_tier: str | None = None
+    sandbox_self_test_passed: bool = False
+    sandbox_self_test_at: str | None = None
+    sandbox_provider: str = ""
+    action_tracing_available: bool = False
+    spend_enforcement: str = "unsupported"
+    uid_separation: bool = False
     schema_version: str = "v1"
 
 
@@ -1136,6 +1152,9 @@ class ExecutionStatusResponse(BaseModel):
     capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
     task_state_revision: int = 0
     next_permitted_action: TaskNextPermittedAction = TaskNextPermittedAction.NONE
+    verification_state: str = "unverified"
+    unresolved_effects: list[dict[str, Any]] = Field(default_factory=list)
+    enforcement_tier: str | None = None
 
 
 class TakeoverPreloadRequest(BaseModel):
@@ -1676,4 +1695,304 @@ class TrustedInputReceipt(BaseModel):
     extraction_state: str = "pending"
     queue_state: str = "inline"
     capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    schema_version: str = "v1"
+
+
+# ---------------------------------------------------------------------------------------------
+# Charter, dispatch, effect journal, verification and sandbox self-test wire models.
+#
+# Two shapes here are deliberately missing a field, and the absence is the control:
+#
+#   * EffectResolveRequest has no `actor`.  The actor is derived server-side from the authenticated
+#     identity, so a caller cannot claim to be the reconciler and reopen a terminal effect.
+#   * VerificationResultRequest has no `verdict`, no `reason`, no digest-match flags and no
+#     `runner_principal`.  Evidence goes in, the API grades it, and a self-report cannot become a
+#     verification by asserting one.
+# ---------------------------------------------------------------------------------------------
+
+
+class CharterCapsPayload(BaseModel):
+    max_attempts: int = Field(default=3, ge=1, le=20)
+    max_concurrent_dispatches: int = Field(default=1, ge=1, le=8)
+    max_wall_seconds: int = Field(default=1800, ge=60, le=86400)
+    budget_minor_units: int = Field(default=0, ge=0)
+    budget_currency: str = "USD"
+    spend_enforcement: str = "unsupported"
+
+
+class CharterCreateRequest(BaseModel):
+    project_id: str | None = None
+    enforcement_tier: str = "container"
+    permitted_roots: list[str] = Field(default_factory=list)
+    protected_write_prefixes: list[str] = Field(default_factory=lambda: ["tests/", ".github/", ".local/"])
+    denied_read_paths: list[str] = Field(
+        default_factory=lambda: ["~/.ssh", "~/Library/Keychains", "~/.aws", "~/.claude", "~/.codex"]
+    )
+    permitted_capabilities: list[str] = Field(default_factory=list)
+    confirm_required_capabilities: list[str] = Field(default_factory=list)
+    egress_mode: str = "deny_all"
+    runtime_allowlist: list[list[str]] = Field(default_factory=list)
+    caps: CharterCapsPayload = Field(default_factory=CharterCapsPayload)
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    task_families: list[str] = Field(default_factory=list)
+    charter_version: str = "v1"
+    credential_risk_acknowledged: bool = False
+    source_receipt_id: UUID
+    session_id: str = "default"
+
+
+class CharterResponse(BaseModel):
+    charter: dict[str, Any] | None = None
+    charter_id: UUID | None = None
+    status: str = "draft"
+    charter_digest: str = ""
+    charter_version: str = "v1"
+    policy_revision: str = ""
+    enforcement_tier: str | None = None
+    credential_risk_acknowledged: bool = False
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    superseded_by: UUID | None = None
+    narrowing_ids: list[str] = Field(default_factory=list)
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class CharterNarrowingRequest(BaseModel):
+    charter_id: UUID
+    session_id: str = "default"
+    source_receipt_id: UUID
+    remove_roots: list[str] = Field(default_factory=list)
+    remove_capabilities: list[str] = Field(default_factory=list)
+    add_protected_write_prefixes: list[str] = Field(default_factory=list)
+    add_denied_read_paths: list[str] = Field(default_factory=list)
+    enforcement_tier: str | None = None
+    egress_mode: str | None = None
+    budget_minor_units: int | None = Field(default=None, ge=0)
+    max_attempts: int | None = Field(default=None, ge=1)
+    max_wall_seconds: int | None = Field(default=None, ge=1)
+    max_concurrent_dispatches: int | None = Field(default=None, ge=1)
+    expires_at: datetime | None = None
+    reason: str = ""
+
+
+class DispatchOpenRequest(BaseModel):
+    session_id: str = "default"
+    directive_id: UUID
+    task_id: str | None = None
+    attempt: int = Field(default=1, ge=1)
+    runtime_id: str
+    runtime_version: str
+    surface: str
+    model_id: str = ""
+    contract_digest: str = ""
+    task_family: str = "unspecified"
+    enforcement_tier: str
+    sandbox_provider: str
+    sandbox_profile_digest: str | None = None
+    sandbox_self_test_id: UUID | None = None
+    provider_run_id: str
+    provider_turn_id: str | None = None
+    request_minor_units: int | None = Field(default=None, ge=0)
+    idempotency_key: str = ""
+
+
+class DispatchResponse(BaseModel):
+    dispatch_id: UUID
+    directive_id: UUID
+    attempt: int = 1
+    charter_id: UUID
+    charter_digest: str = ""
+    enforcement_tier: str
+    sandbox_provider: str = ""
+    sandbox_profile_digest: str | None = None
+    sandbox_self_test_id: UUID | None = None
+    runtime_id: str = ""
+    runtime_version: str = ""
+    surface: str = ""
+    model_id: str = ""
+    contract_digest: str = ""
+    capability_matrix: dict[str, str] = Field(default_factory=dict)
+    provider_run_id: str | None = None
+    provider_turn_id: str | None = None
+    task_family: str = "unspecified"
+    budget_reserved_minor_units: int = 0
+    budget_currency: str = "USD"
+    spend_enforcement: str = "unsupported"
+    cap_applied: dict[str, float] | None = None
+    cost_minor_units: int | None = None
+    cost_source: str | None = None
+    tokens_input: int = 0
+    tokens_output: int = 0
+    tokens_cached_input: int = 0
+    tokens_reasoning: int = 0
+    human_intervention_count: int = 0
+    outcome: str | None = None
+    terminal_reason: str | None = None
+    wall_ms: int | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    reconciled_at: datetime | None = None
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class DispatchReconcileRequest(BaseModel):
+    outcome: str
+    terminal_reason: str = ""
+    wall_ms: int = Field(default=0, ge=0)
+    human_intervention_count: int = Field(default=0, ge=0)
+    reconciliation: dict[str, Any] = Field(default_factory=dict)
+
+
+class EffectOpenRequest(BaseModel):
+    session_id: str = "default"
+    directive_id: UUID
+    dispatch_id: UUID | None = None
+    task_id: str | None = None
+    kind: str
+    capability: str
+    resource: str = ""
+    argv: list[str] = Field(default_factory=list)
+    reversibility: str
+    description: str = ""
+    enforcement_tier: str
+    action_tracing: str
+    lease_generation: int = Field(default=0, ge=0)
+    provider_run_id: str | None = None
+    provider_turn_id: str | None = None
+    runtime_id: str | None = None
+    runtime_version: str | None = None
+    model_id: str | None = None
+
+
+class EffectResolveRequest(BaseModel):
+    target_state: str
+    resolution_source: str
+    expected_lease: int = Field(ge=0)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+
+
+class EffectResponse(BaseModel):
+    effect_id: UUID
+    directive_id: UUID
+    seq: int = 0
+    state: str = "prepared"
+    intent_digest: str = ""
+    kind: str = ""
+    capability: str = ""
+    resource: str = ""
+    reversibility: str = "unknown"
+    enforcement_tier: str = ""
+    action_tracing: str = ""
+    lease_generation: int = 0
+    claimed_executor: str | None = None
+    provider_run_id: str | None = None
+    opened_at: datetime | None = None
+    resolved_at: datetime | None = None
+    resolution_source: str | None = None
+    pause_required: bool = False
+    pause_reason: str = ""
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class AcceptanceCheckPayload(BaseModel):
+    check_id: str
+    argv: list[str] = Field(min_length=1)
+    cwd_rel: str = "."
+    expect_exit_code: int = 0
+    timeout_seconds: int = Field(default=900, ge=1, le=3600)
+
+
+class AcceptanceCriteriaRequest(BaseModel):
+    directive_id: UUID
+    task_id: str | None = None
+    charter_id: UUID | None = None
+    checks: list[AcceptanceCheckPayload] = Field(min_length=1)
+    corpus_manifest: list[list[str]] = Field(default_factory=list)
+
+
+class AcceptanceCriteriaResponse(BaseModel):
+    criteria_id: UUID
+    directive_id: UUID
+    criteria_digest: str
+    corpus_digest: str
+    checks: list[AcceptanceCheckPayload] = Field(default_factory=list)
+    corpus_manifest: list[list[str]] = Field(default_factory=list)
+    frozen_at: datetime
+    frozen_by: str
+    policy_revision: str = ""
+    schema_version: str = "v1"
+
+
+class CheckResultPayload(BaseModel):
+    check_id: str
+    argv: list[str] = Field(default_factory=list)
+    exit_code: int
+    duration_ms: int = Field(default=0, ge=0)
+    stdout_sha256: str
+    stderr_sha256: str
+    excerpt: str = Field(default="", max_length=2000)
+
+
+class VerificationResultRequest(BaseModel):
+    directive_id: UUID
+    results: list[CheckResultPayload] = Field(default_factory=list)
+    observed_corpus_digest: str
+    observed_corpus_manifest: list[list[str]] = Field(default_factory=list)
+    platform: str = ""
+    commit_sha: str | None = None
+    tree_sha: str | None = None
+    reviewer_model: dict[str, Any] | None = None
+
+
+class VerificationResultResponse(BaseModel):
+    verification_id: UUID
+    directive_id: UUID
+    verdict: str
+    reason: str = ""
+    verification_state: str = "unverified"
+    criteria_digest_at_run: str = ""
+    corpus_digest_at_run: str = ""
+    criteria_digest_match: bool = False
+    corpus_digest_match: bool = False
+    runner_principal: str = ""
+    executing_identity: str = ""
+    platform: str = ""
+    commit_sha: str | None = None
+    tree_sha: str | None = None
+    advisory: bool = True
+    recorded_at: datetime
+    schema_version: str = "v1"
+
+
+class SandboxAssertionPayload(BaseModel):
+    name: str
+    expected: str = ""
+    observed: str = ""
+    passed: bool = False
+
+
+class SandboxSelfTestRequest(BaseModel):
+    host_id: str = ""
+    sandbox_provider: str
+    provider_version: str = ""
+    profile_digest: str = ""
+    assertions: list[SandboxAssertionPayload] = Field(default_factory=list)
+    passed: bool = False
+    uid_separation: bool = False
+
+
+class SandboxSelfTestResponse(BaseModel):
+    self_test_id: UUID
+    sandbox_provider: str
+    profile_digest: str = ""
+    passed: bool = False
+    uid_separation: bool = False
+    assertions: list[SandboxAssertionPayload] = Field(default_factory=list)
+    ran_at: datetime
     schema_version: str = "v1"

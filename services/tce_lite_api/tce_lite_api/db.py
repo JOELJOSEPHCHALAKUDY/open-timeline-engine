@@ -731,6 +731,278 @@ def _ensure_task_state_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE handoff_records ADD COLUMN {name} {ddl}")
 
 
+def _ensure_charter_effects_schema(conn: sqlite3.Connection) -> None:
+    """P3 authority charter, effect journal, dispatch records, acceptance criteria and verification.
+
+    Mirrors alembic revision 20260909_0039 (Full).  Additive and idempotent only; no ``commit()``
+    here — ``init_db`` commits once at the end.
+
+    Lite parity note: ``effect_journal`` is new in this revision, so there are no pre-existing rows
+    and ``NOT NULL`` on ``enforcement_tier``/``action_tracing`` is declared directly rather than
+    backfilled.  G4's live assertion therefore holds in both backends for the same reason.
+
+    The two UNIQUE indexes on ``effect_journal`` are load-bearing, not decoration:
+    ``uq_effect_journal_intent`` is what makes "exactly one row per intent" a database guarantee
+    (the idempotent re-POST of ``/v1/effects``), and ``uq_effect_journal_seq`` is what stops two
+    workers minting the same ``seq`` under one directive.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS authority_charters (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            project_id TEXT,
+            charter_version TEXT NOT NULL,
+            policy_revision TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            enforcement_tier TEXT NOT NULL,
+            credential_risk_acknowledged INTEGER NOT NULL DEFAULT 0,
+            source_receipt_id TEXT NOT NULL,
+            permitted_roots_json TEXT NOT NULL DEFAULT '[]',
+            protected_write_prefixes_json TEXT NOT NULL DEFAULT '[]',
+            denied_read_paths_json TEXT NOT NULL DEFAULT '[]',
+            permitted_capabilities_json TEXT NOT NULL DEFAULT '[]',
+            confirm_required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+            egress_mode TEXT NOT NULL DEFAULT 'deny_all',
+            runtime_allowlist_json TEXT NOT NULL DEFAULT '[]',
+            task_families_json TEXT NOT NULL DEFAULT '[]',
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            max_concurrent_dispatches INTEGER NOT NULL DEFAULT 1,
+            max_wall_seconds INTEGER NOT NULL DEFAULT 1800,
+            budget_minor_units INTEGER NOT NULL DEFAULT 0,
+            budget_currency TEXT NOT NULL DEFAULT 'USD',
+            spend_enforcement TEXT NOT NULL DEFAULT 'unsupported',
+            charter_digest TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            revoke_reason TEXT,
+            superseded_by TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_authority_charters_scope_status "
+        "ON authority_charters (workspace_id, owner_id, status, expires_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS charter_narrowings (
+            id TEXT PRIMARY KEY,
+            charter_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            source_receipt_id TEXT NOT NULL,
+            narrowing_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_charter_narrowings_session "
+        "ON charter_narrowings (workspace_id, session_id, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_charter_narrowings_charter ON charter_narrowings (charter_id, created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dispatch_records (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            directive_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            charter_id TEXT NOT NULL,
+            charter_digest TEXT NOT NULL,
+            claimed_by TEXT NOT NULL DEFAULT '',
+            enforcement_tier TEXT NOT NULL,
+            sandbox_provider TEXT NOT NULL,
+            sandbox_profile_digest TEXT,
+            sandbox_self_test_id TEXT,
+            runtime_id TEXT NOT NULL,
+            runtime_version TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            model_id TEXT NOT NULL DEFAULT '',
+            contract_digest TEXT NOT NULL DEFAULT '',
+            capability_matrix_json TEXT NOT NULL DEFAULT '{}',
+            provider_run_id TEXT,
+            provider_turn_id TEXT,
+            task_family TEXT NOT NULL DEFAULT 'unspecified',
+            budget_reserved_minor_units INTEGER NOT NULL DEFAULT 0,
+            budget_currency TEXT NOT NULL DEFAULT 'USD',
+            spend_enforcement TEXT NOT NULL,
+            cap_applied_json TEXT,
+            cost_minor_units INTEGER,
+            cost_source TEXT,
+            tokens_input INTEGER NOT NULL DEFAULT 0,
+            tokens_output INTEGER NOT NULL DEFAULT 0,
+            tokens_cached_input INTEGER NOT NULL DEFAULT 0,
+            tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+            human_intervention_count INTEGER NOT NULL DEFAULT 0,
+            outcome TEXT,
+            terminal_reason TEXT,
+            wall_ms INTEGER,
+            started_at TEXT,
+            finished_at TEXT,
+            reconciled_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_records_directive_attempt "
+        "ON dispatch_records (directive_id, attempt)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dispatch_records_open ON dispatch_records (workspace_id, outcome, started_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS effect_journal (
+            effect_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            directive_id TEXT NOT NULL,
+            dispatch_id TEXT,
+            seq INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            reversibility TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            argv_json TEXT NOT NULL DEFAULT '[]',
+            description TEXT NOT NULL DEFAULT '',
+            intent_digest TEXT NOT NULL,
+            enforcement_tier TEXT NOT NULL,
+            action_tracing TEXT NOT NULL,
+            lease_generation INTEGER NOT NULL DEFAULT 0,
+            claimed_executor TEXT,
+            provider_run_id TEXT,
+            provider_turn_id TEXT,
+            runtime_id TEXT,
+            runtime_version TEXT,
+            model_id TEXT,
+            opened_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution_source TEXT,
+            resolved_by_actor TEXT,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_effect_journal_intent ON effect_journal (directive_id, intent_digest)"
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_effect_journal_seq ON effect_journal (directive_id, seq)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_effect_journal_open ON effect_journal (workspace_id, state, opened_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_effect_journal_session_open "
+        "ON effect_journal (workspace_id, owner_id, session_id, state)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS acceptance_criteria (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            task_id TEXT,
+            directive_id TEXT NOT NULL,
+            charter_id TEXT,
+            checks_json TEXT NOT NULL DEFAULT '[]',
+            criteria_digest TEXT NOT NULL,
+            corpus_digest TEXT NOT NULL,
+            corpus_manifest_json TEXT NOT NULL DEFAULT '[]',
+            frozen_at TEXT NOT NULL,
+            frozen_by TEXT NOT NULL,
+            policy_revision TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_acceptance_criteria_directive ON acceptance_criteria (directive_id)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verification_results (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            task_id TEXT,
+            directive_id TEXT NOT NULL,
+            criteria_id TEXT,
+            criteria_digest_at_run TEXT NOT NULL,
+            corpus_digest_at_run TEXT NOT NULL,
+            criteria_digest_match INTEGER NOT NULL DEFAULT 0,
+            corpus_digest_match INTEGER NOT NULL DEFAULT 0,
+            verdict TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            runner_principal TEXT NOT NULL,
+            executing_identity TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT,
+            tree_sha TEXT,
+            checks_json TEXT NOT NULL DEFAULT '[]',
+            reviewer_model_json TEXT,
+            recorded_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_verification_results_directive "
+        "ON verification_results (directive_id, recorded_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sandbox_self_tests (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            sandbox_provider TEXT NOT NULL,
+            provider_version TEXT NOT NULL DEFAULT '',
+            profile_digest TEXT NOT NULL DEFAULT '',
+            assertions_json TEXT NOT NULL DEFAULT '[]',
+            passed INTEGER NOT NULL DEFAULT 0,
+            uid_separation INTEGER NOT NULL DEFAULT 0,
+            ran_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sandbox_self_tests_recent "
+        "ON sandbox_self_tests (workspace_id, sandbox_provider, ran_at DESC)"
+    )
+    added_columns = {
+        ("directive_executions", "dispatch_id"): "TEXT",
+        ("directive_executions", "charter_id"): "TEXT",
+        ("execution_permits", "charter_id"): "TEXT",
+        ("execution_permits", "charter_version"): "TEXT",
+        ("capability_grants", "charter_id"): "TEXT",
+        ("handoff_records", "verification_state"): "TEXT",
+    }
+    for (table, column), ddl in added_columns.items():
+        if not _column_exists(conn, table, column):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -1912,6 +2184,7 @@ def init_db() -> None:
         _ensure_continuity_v05_schema(conn)
         _ensure_trusted_capture_schema(conn)
         _ensure_task_state_schema(conn)
+        _ensure_charter_effects_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

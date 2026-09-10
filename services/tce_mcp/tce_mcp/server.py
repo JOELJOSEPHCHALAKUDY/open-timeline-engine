@@ -761,7 +761,14 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "unknown) reports the trusted human-input capture channel: when it is gap or unavailable under an unattended "
         "autonomy profile the API pauses ('AUTONOMOUS MODE PAUSED: capture channel'); show that text and do not mutate. "
         "open_decision_opportunity_id, when set, is the pending human choice awaiting host-captured input. "
-        "planning_pending=true means there is no executable directive yet; follow next_step and poll, never start work."
+        "planning_pending=true means there is no executable directive yet; follow next_step and poll, never start work. "
+        "The constraints array is non-overridable and has no override phrase: every rule carries polarity, where "
+        "'deny' means scope.path_prefixes are forbidden and 'allow_only' means they are the ONLY permitted paths for "
+        "the scoped actions (a rule with no polarity key is read as 'deny'). charter_active/charter_version/"
+        "enforcement_tier name the authority in force; enforcement_tier is what the operating system enforces for a "
+        "supervisor-dispatched process tree only, never for this session (see docs/charter.md). unresolved_effects "
+        "lists effects from earlier runs; when one is in state 'unknown', next_step is prefixed with 'AUTONOMOUS MODE "
+        "PAUSED: an effect from a previous run is unresolved' — show it and do not start new work."
     ),
 )
 def takeover_step(
