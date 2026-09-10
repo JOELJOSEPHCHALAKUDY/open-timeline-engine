@@ -17,7 +17,8 @@ Run the four-arm prospective comparison without treating generated memory as evi
 1. Before an agent decides, call `tce.assign_behavior_projection_pilot` with a unique stable `trial_key`, situation, objective, and candidate choices.
 2. Give the returned `context_payload` to the agent unchanged. Do not fetch behavioral memory separately for that trial.
 3. After the independent human decision or observed outcome is known, call `tce.report_behavior_projection_pilot_outcome` once.
-4. Include the agent top choice, top three choices, confidence, actual choice, action/workflow similarity, corrections, regret, personalization errors, malicious activation, and evidence IDs actually used.
+4. Include the agent top choice, top three choices, actual choice, corrections, regret, personalization errors, malicious activation, and evidence IDs actually used. There is no confidence field and no similarity field: the party under test does not score itself, and the calibration figure those fed scored a perfect 0.0 for a perfectly inverted reporter.
+   The safety clause is three-valued. Over zero completed trials it reads `not_computable`, not `true` — an empty pilot is not a safe one.
 5. Read `tce.get_behavior_projection_pilot_status` for aggregate progress. Do not infer success while it reports `collecting`.
 
 Assignment and outcome retries are safe when the payload is identical. Reusing a trial key or assignment with a different payload returns HTTP `409` and must be investigated rather than overwritten.

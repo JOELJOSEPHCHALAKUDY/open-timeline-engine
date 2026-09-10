@@ -507,17 +507,14 @@ def assign_behavior_projection_pilot(
 
 @mcp.tool(
     name="tce.report_behavior_projection_pilot_outcome",
-    description="Report held-out choice, quality, correction, safety, and evidence-use outcomes for a pilot assignment",
+    description="Report held-out choice, correction, safety, and evidence-use outcomes for a pilot assignment. There is no confidence or similarity field: the party under test does not score itself.",
 )
 def report_behavior_projection_pilot_outcome(
     assignment_id: str,
     actual_choice: str,
     agent_choice: str | None = None,
     top3_choices: list[str] | None = None,
-    agent_confidence: float = 0.0,
     abstained: bool = False,
-    action_similarity: float = 0.0,
-    workflow_similarity: float = 0.0,
     correction_required: bool = False,
     outcome_regret: bool = False,
     irrelevant_personalization: bool = False,
@@ -530,10 +527,7 @@ def report_behavior_projection_pilot_outcome(
         actual_choice=actual_choice,
         agent_choice=agent_choice,
         top3_choices=top3_choices,
-        agent_confidence=agent_confidence,
         abstained=abstained,
-        action_similarity=action_similarity,
-        workflow_similarity=workflow_similarity,
         correction_required=correction_required,
         outcome_regret=outcome_regret,
         irrelevant_personalization=irrelevant_personalization,

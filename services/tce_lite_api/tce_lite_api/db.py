@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import get_settings
+from .dream_adjudication_store import ensure_dream_adjudication_tables
 
 
 def _connect() -> sqlite3.Connection:
@@ -1340,6 +1341,179 @@ def _ensure_dream_proposal_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_pilot_enrolment_schema(conn: sqlite3.Connection) -> None:
+    """P6 operational proof: an arm frozen before the work starts, and an adjudication only a
+    verified human writes.
+
+    Mirrors alembic revision ``20260909_0043`` (Full) column for column and index name for index
+    name, so the two schemas can be diffed rather than reasoned about.  Type mapping is the house
+    one: ``UUID`` -> ``TEXT``, ``TIMESTAMPTZ`` -> ``TEXT`` (ISO-8601 UTC), ``JSONB`` -> ``TEXT``
+    with a ``'[]'`` default, ``BOOLEAN`` -> ``INTEGER``.
+
+    ``pilot_strata`` exists to make a permuted block *exact* rather than balanced-in-expectation.
+    Its slot is taken by a single ``INSERT ... ON CONFLICT(stratum_id) DO UPDATE SET next_slot =
+    next_slot + 1 RETURNING next_slot - 1`` — supported from SQLite 3.35 — inside the
+    ``BEGIN IMMEDIATE`` pattern, so two concurrent enrolments cannot take the same slot.
+
+    Additive and idempotent only.  Nothing here drops or recreates a table: ``pilot_episodes``
+    holds allocations frozen before the work began and ``pilot_episode_closes`` and
+    ``dream_relevance_adjudications`` hold nothing but the owner's own answers, and Lite has no
+    downgrade path that could put any of it back.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pilot_strata (
+            stratum_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,
+            decision_family TEXT NOT NULL,
+            arm_set_sha TEXT NOT NULL DEFAULT '',
+            allocation_salt_sha256 TEXT NOT NULL DEFAULT '',
+            next_slot INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pilot_strata_scope "
+        "ON pilot_strata (workspace_id, subject_user_id, project_id, decision_family)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pilot_episodes (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,
+            decision_family TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            objective_hash TEXT NOT NULL DEFAULT '',
+            cancel_epoch INTEGER NOT NULL DEFAULT 0,
+            episode_key TEXT NOT NULL,
+            task_id TEXT,
+            stratum_id TEXT NOT NULL,
+            slot INTEGER NOT NULL DEFAULT -1,
+            block_ordinal INTEGER NOT NULL DEFAULT -1,
+            block_position INTEGER NOT NULL DEFAULT -1,
+            arm_id TEXT NOT NULL,
+            arm_class TEXT NOT NULL DEFAULT 'runtime',
+            allocation_kind TEXT NOT NULL DEFAULT 'randomized',
+            arm_set_sha TEXT NOT NULL DEFAULT '',
+            allocation_salt_sha256 TEXT NOT NULL DEFAULT '',
+            agent_principal TEXT NOT NULL DEFAULT '',
+            allocated_at TEXT NOT NULL,
+            revealed_at TEXT,
+            enrolled_before_execution INTEGER NOT NULL DEFAULT 1,
+            thresholds_sha TEXT NOT NULL DEFAULT '',
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    # The uniqueness that makes the arm un-shoppable: the same work re-enrolled collides here and
+    # the store returns the ORIGINAL row with reused=true instead of drawing a second arm.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pilot_episodes_episode "
+        "ON pilot_episodes (workspace_id, subject_user_id, episode_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pilot_episodes_cell "
+        "ON pilot_episodes (workspace_id, subject_user_id, project_id, decision_family, arm_id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pilot_episodes_block ON pilot_episodes (stratum_id, block_ordinal)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pilot_episodes_allocated_at ON pilot_episodes (allocated_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pilot_episodes_session ON pilot_episodes (workspace_id, session_id)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pilot_episode_closes (
+            id TEXT PRIMARY KEY,
+            episode_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            adjudicator_id TEXT NOT NULL DEFAULT '',
+            adjudicator_verified INTEGER NOT NULL DEFAULT 0,
+            adjudication_independent INTEGER NOT NULL DEFAULT 0,
+            executed_arm TEXT NOT NULL,
+            deviated INTEGER NOT NULL DEFAULT 0,
+            deviation_reason TEXT NOT NULL DEFAULT '',
+            rescue_level TEXT NOT NULL DEFAULT 'none',
+            finished INTEGER NOT NULL DEFAULT 0,
+            completion_basis TEXT NOT NULL DEFAULT 'unfinished',
+            review_minutes INTEGER NOT NULL DEFAULT 0,
+            review_verdict TEXT NOT NULL DEFAULT 'accepted_as_is',
+            unfinished_reason TEXT NOT NULL DEFAULT '',
+            late_close INTEGER NOT NULL DEFAULT 0,
+            closed_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pilot_episode_closes_episode ON pilot_episode_closes (episode_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pilot_episode_closes_closed_at "
+        "ON pilot_episode_closes (workspace_id, closed_at)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pilot_episode_observations (
+            id TEXT PRIMARY KEY,
+            episode_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            principal TEXT NOT NULL DEFAULT '',
+            producer_class TEXT NOT NULL DEFAULT 'agent_asserted',
+            agent_notes TEXT NOT NULL DEFAULT '',
+            agent_declared_steps_json TEXT NOT NULL DEFAULT '[]',
+            agent_self_rated_difficulty INTEGER,
+            observed_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pilot_episode_observations_episode "
+        "ON pilot_episode_observations (episode_id, observed_at)"
+    )
+
+    # The fifth table's schema is written twice on purpose, and the duplication is policed rather
+    # than tolerated: ``db.py`` owns Lite's bootstrap and ``dream_adjudication_store`` owns the
+    # table's contract, and ``test_dream_adjudication.py::test_the_lite_ddl_is_the_same_text_in_db_py
+    # _and_in_the_store`` compares the two CREATE blocks column for column.  Both are executed —
+    # both are IF NOT EXISTS — so a drift cannot hide behind whichever one happened to run first.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dream_relevance_adjudications (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,
+            adjudicator_id TEXT NOT NULL DEFAULT '',
+            adjudicator_verified INTEGER NOT NULL DEFAULT 0,
+            relevance TEXT NOT NULL,
+            rationale TEXT NOT NULL DEFAULT '',
+            blind_claimed INTEGER NOT NULL DEFAULT 0,
+            blind_verified INTEGER NOT NULL DEFAULT 0,
+            delivery_useful TEXT NOT NULL DEFAULT '',
+            counted_for_delivery INTEGER NOT NULL DEFAULT 0,
+            adjudicated_at TEXT NOT NULL,
+            supersedes_adjudication_id TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    ensure_dream_adjudication_tables(conn)
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -2524,6 +2698,7 @@ def init_db() -> None:
         _ensure_charter_effects_schema(conn)
         _ensure_decision_policy_schema(conn)
         _ensure_dream_proposal_schema(conn)
+        _ensure_pilot_enrolment_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

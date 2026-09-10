@@ -1310,6 +1310,11 @@ class BehaviorProjectionPilotOutcome(Base):
     agent_choice: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     top3_choices_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     actual_choice: Mapped[str] = mapped_column(TEXT, nullable=False)
+    # DEAD COLUMNS, kept only so the ORM matches the table.  No code reads or writes
+    # ``agent_confidence``, ``action_similarity`` or ``workflow_similarity``: all three were the
+    # party under test scoring its own answer, and the calibration figure they fed returned a
+    # perfect 0.0 for a perfectly inverted reporter.  The columns stay because a migration that
+    # drops a column holding a human answer is refused; a unit test asserts nothing reads them.
     agent_confidence: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
     abstained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     action_similarity: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
@@ -1773,4 +1778,207 @@ class DreamGenerationRunRow(Base):
     prompt_hash: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class PilotStratum(Base):
+    """The allocator's counter, and the only reason a permuted block is *exact*.
+
+    ``next_slot`` is bumped by a single ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING``, so a
+    block contains each arm exactly once and is therefore also a matched set.  Nothing else
+    writes this table, and ``pilot_strata`` is always locked before ``pilot_episodes`` and never
+    after — the lock order P2 and P3 established, extended by one table.
+    """
+
+    __tablename__ = "pilot_strata"
+    __table_args__ = (
+        Index(
+            "idx_pilot_strata_scope",
+            "workspace_id",
+            "subject_user_id",
+            "project_id",
+            "decision_family",
+        ),
+    )
+
+    stratum_id: Mapped[str] = mapped_column(TEXT, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    decision_family: Mapped[str] = mapped_column(TEXT, nullable=False)
+    arm_set_sha: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    allocation_salt_sha256: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    next_slot: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class PilotEpisode(Base):
+    """One enrolled piece of work and the arm it was frozen to before it started.
+
+    ``episode_key`` is P4's six-component digest, computed server-side and never accepted from a
+    caller; the unique index on ``(workspace_id, subject_user_id, episode_key)`` is what turns a
+    repeat enrolment into a reuse rather than a second draw.  ``arm_id`` is written once: there
+    is no ``UPDATE pilot_episodes SET arm_id`` anywhere in this repository, and a unit test scans
+    every SQL literal for one.
+
+    This is deliberately not ``behavior_projection_pilot_assignments.variant``.  That column
+    selects a memory-context format inside one runtime; this one allocates a runtime or a
+    workflow.  Two different comparisons, two different tables, two different vocabularies.
+    """
+
+    __tablename__ = "pilot_episodes"
+    __table_args__ = (
+        Index(
+            "uq_pilot_episodes_episode",
+            "workspace_id",
+            "subject_user_id",
+            "episode_key",
+            unique=True,
+        ),
+        Index(
+            "idx_pilot_episodes_cell",
+            "workspace_id",
+            "subject_user_id",
+            "project_id",
+            "decision_family",
+            "arm_id",
+        ),
+        Index("idx_pilot_episodes_block", "stratum_id", "block_ordinal"),
+        Index("idx_pilot_episodes_allocated_at", "allocated_at"),
+        Index("idx_pilot_episodes_session", "workspace_id", "session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    decision_family: Mapped[str] = mapped_column(TEXT, nullable=False)
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    objective_hash: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    cancel_epoch: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    episode_key: Mapped[str] = mapped_column(TEXT, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    stratum_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    slot: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    block_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    block_position: Mapped[int] = mapped_column(Integer, nullable=False, default=-1)
+    arm_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    arm_class: Mapped[str] = mapped_column(TEXT, nullable=False, default="runtime")
+    allocation_kind: Mapped[str] = mapped_column(TEXT, nullable=False, default="randomized")
+    arm_set_sha: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    allocation_salt_sha256: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    agent_principal: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    allocated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enrolled_before_execution: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    thresholds_sha: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class PilotEpisodeClose(Base):
+    """The adjudication: what actually happened, written only by a verified human.
+
+    ``adjudication_independent`` is computed by the server from ``adjudicator_id`` against the
+    enrolling ``agent_principal``, so independence is a property of the row rather than a promise
+    in a runbook, and a self-adjudicated close is excluded from every numerator under a named
+    counter instead of being silently counted.
+
+    There is no ``success`` column.  The composite is recomputed from these components at every
+    report run, so a later change to the definition cannot quietly disagree with history — and
+    every component here is ``server_derived`` or ``human_attested``.  None is agent-asserted.
+    """
+
+    __tablename__ = "pilot_episode_closes"
+    __table_args__ = (
+        Index("uq_pilot_episode_closes_episode", "episode_id", unique=True),
+        Index("idx_pilot_episode_closes_closed_at", "workspace_id", "closed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    adjudicator_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    adjudicator_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    adjudication_independent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    executed_arm: Mapped[str] = mapped_column(TEXT, nullable=False)
+    deviated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deviation_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    rescue_level: Mapped[str] = mapped_column(TEXT, nullable=False, default="none")
+    finished: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    completion_basis: Mapped[str] = mapped_column(TEXT, nullable=False, default="unfinished")
+    review_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    review_verdict: Mapped[str] = mapped_column(TEXT, nullable=False, default="accepted_as_is")
+    unfinished_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    late_close: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class PilotEpisodeObservation(Base):
+    """The executor's own account of its run.  Diagnostics, and no gate clause reads it.
+
+    These fields are useful when a cell reads oddly, which is why they exist and have a named
+    reader — the report's diagnostics block.  They live in their own table so that the separation
+    is structural: the clause functions in ``tce_shared.pilot_enrollment`` take a type that has
+    nowhere to put them.  ``producer_class`` restates it on every row.
+    """
+
+    __tablename__ = "pilot_episode_observations"
+    __table_args__ = (Index("idx_pilot_episode_observations_episode", "episode_id", "observed_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    episode_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    principal: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    producer_class: Mapped[str] = mapped_column(TEXT, nullable=False, default="agent_asserted")
+    agent_notes: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    agent_declared_steps_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    agent_self_rated_difficulty: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class DreamRelevanceAdjudication(Base):
+    """Whether a proposal was *relevant*, judged independently of whether it was accepted.
+
+    A rejection is a preference; a ``not_relevant`` adjudication is a claim about the proposal's
+    fit, and the false-positive rate is computed only from the second.  ``blind_verified`` is the
+    load-bearing column and is why ``blind_claimed`` alone is not trusted: blindness is checked
+    by the server against P5's append-only ``dream_proposal_events``, not taken on the caller's
+    word.  Append-only — a later judgement supersedes an earlier one by id, never in place.
+    """
+
+    __tablename__ = "dream_relevance_adjudications"
+    __table_args__ = (
+        Index("idx_dream_relevance_adjudications_proposal", "proposal_id", "adjudicated_at"),
+        Index(
+            "idx_dream_relevance_adjudications_scope",
+            "workspace_id",
+            "owner_id",
+            "project_id",
+            "adjudicated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    adjudicator_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    adjudicator_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    relevance: Mapped[str] = mapped_column(TEXT, nullable=False)
+    rationale: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    blind_claimed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    blind_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    delivery_useful: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    counted_for_delivery: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    adjudicated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    supersedes_adjudication_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")

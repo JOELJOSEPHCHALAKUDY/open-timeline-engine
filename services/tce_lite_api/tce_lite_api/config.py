@@ -413,6 +413,16 @@ class Settings(BaseSettings):
     dream_run_stale_minutes: int = 30
     dream_list_limit: int = 10
 
+    # ---- P6: operational-proof pilot ---------------------------------------------------
+    # Same four names and same four defaults as services/tce_api/tce_api/config.py.  Every
+    # number that can move a verdict lives in tce_shared.pilot_thresholds, not here.
+    pilot_enrollment_enabled: bool = False
+    pilot_allocation_salt: str = "tce-pilot-p6-v1"
+    pilot_human_baseline_enabled: bool = False
+    # NOT an expiry: a late close is recorded as late_close=true and counted, because refusing
+    # it would convert a finished episode into a coverage deficit that can never be repaired.
+    pilot_close_grace_days: int = 90
+
     @property
     def token_set(self) -> set[str]:
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}

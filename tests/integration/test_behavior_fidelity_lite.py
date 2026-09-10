@@ -913,9 +913,6 @@ def test_behavior_projection_pilot_is_idempotent_redacted_and_collecting(client:
         "agent_choice": "minimal verified fix",
         "top3_choices": ["minimal verified fix", "broad refactor"],
         "actual_choice": "minimal verified fix",
-        "agent_confidence": 0.9,
-        "action_similarity": 0.9,
-        "workflow_similarity": 0.8,
         "used_evidence_ids": citations,
         "notes": "token=plain-outcome-secret",
     }

@@ -221,7 +221,6 @@ def test_full_projection_pilot_assignment_outcome_and_status_contract() -> None:
                     "agent_choice": "minimal patch",
                     "top3_choices": ["minimal patch"],
                     "actual_choice": "minimal patch",
-                    "agent_confidence": 0.9,
                     "used_evidence_ids": [str(observation_id)],
                 },
             )

@@ -272,9 +272,6 @@ def test_real_stdio_mcp_behavior_projection_pilot_and_html_review() -> None:
                 "agent_choice": "minimal verified change",
                 "top3_choices": ["minimal verified change", "broad rewrite"],
                 "actual_choice": "minimal verified change",
-                "agent_confidence": 0.9,
-                "action_similarity": 1.0,
-                "workflow_similarity": 1.0,
                 "used_evidence_ids": assignment_result["citations"],
             },
         )

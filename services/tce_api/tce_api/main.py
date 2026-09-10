@@ -144,6 +144,7 @@ from tce_shared.decision_policy import (
     evidence_strength_label,
     failed_advisor_contribution,
 )
+from tce_shared.dream_adjudication import dream_block, dream_block_unavailable
 from tce_shared.effect_journal import (
     DEFAULT_REVERSIBILITY_BY_KIND,
     EFFECT_ACTOR_OWNER,
@@ -210,6 +211,8 @@ from tce_shared.events import (
     DreamProposalTransitionRequest,
     DreamRefreshRequest,
     DreamRefreshResponse,
+    DreamRelevanceAdjudicationRequest,
+    DreamRelevanceAdjudicationResponse,
     EffectOpenRequest,
     EffectResolveRequest,
     EffectResponse,
@@ -235,6 +238,15 @@ from tce_shared.events import (
     MemoryReviewResolveRequest,
     OperationMode,
     PatternFeedbackRequest,
+    PilotEnrolmentRequest,
+    PilotEnrolmentResponse,
+    PilotEpisodeCloseRequest,
+    PilotEpisodeCloseResponse,
+    PilotEpisodeListResponse,
+    PilotEpisodeSummary,
+    PilotObservationRequest,
+    PilotObservationResponse,
+    PilotReportResponse,
     PlanningJobStatusResponse,
     PolicyDecisionBlock,
     ProcessMiningRequest,
@@ -335,6 +347,14 @@ from tce_shared.handoff import (
     normalize_objective_text,
     rank_resume_candidates,
 )
+from tce_shared.pilot_enrollment import (
+    AllocationKind,
+    CompletionBasis,
+    PilotArm,
+    RescueLevel,
+    ReviewVerdict,
+)
+from tce_shared.pilot_thresholds import P6_THRESHOLDS_SHA
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.scope import PROJECT_BOUND, PROJECT_UNBOUND, SCOPE_POLICY_REVISION, ResolvedScope
@@ -509,6 +529,12 @@ from .dispatch_store import (
     reconcile_dispatch,
     record_self_test,
 )
+from .dream_adjudication_store import (
+    DreamTablesMissing,
+    ProposalNotInScope,
+    dream_counts_for_scope,
+)
+from .dream_adjudication_store import record_adjudication as record_dream_adjudication
 from .dream_store import (
     DreamRunInFlight,
     append_surfaced,
@@ -562,6 +588,18 @@ from .models import (
     WorkflowTemplate,
 )
 from .otel import setup_otel
+from .pilot_store import (
+    PilotEpisodeConflict,
+    PilotEpisodeNotFound,
+    build_pilot_report,
+)
+from .pilot_store import close_episode as pilot_close_episode
+from .pilot_store import enroll_episode as pilot_enroll_episode
+from .pilot_store import list_episodes as pilot_list_episodes
+from .pilot_store import load_episode as pilot_load_episode
+from .pilot_store import load_report_corpus as pilot_load_report_corpus
+from .pilot_store import mark_revealed as pilot_mark_revealed
+from .pilot_store import record_observation as pilot_record_observation
 from .plan_rows import write_plan_rows
 from .planning_store import (
     enqueue_planning_job,
@@ -20935,6 +20973,450 @@ def handoff_outbox_requeue(
         latency_ms=0,
     )
     return result
+
+
+
+# ---------------------------------------------------------------------------
+# P6 — the operational-proof pilot.  Six routes: one enrolment, one diagnostic
+# write, one adjudication, two reads and the dream relevance judgement.
+#
+# The rule that shapes all six: THE PARTY UNDER TEST DOES NOT GRADE ITSELF.
+# Enrolling and posting observations are open to any authenticated principal in
+# scope — an executor may attest *what it did*.  Closing an episode and
+# adjudicating a dream require a verified human, because those attest *what
+# happened*.  The owner's own review minutes are adjudication; the executor's own
+# confidence is not, and P6 stores no such field anywhere.
+# ---------------------------------------------------------------------------
+
+
+def _require_pilot_enrollment() -> None:
+    """The master switch.  404, not 503: an unenabled pilot has no surface at all.
+
+    All six P6 routes call this.  A 404 is the honest answer because the pilot is
+    instrumentation the owner opts into per deployment, and a 503 would imply the
+    route exists and is merely unwell.
+    """
+    if not bool(getattr(settings, "pilot_enrollment_enabled", False)):
+        raise HTTPException(status_code=404, detail="pilot enrolment is not enabled")
+
+
+def _require_pilot_adjudicator(auth: AuthContext, *, action: str) -> None:
+    """C6 — copied from ``_require_dream_verdict_human``, and deliberately not generalised.
+
+    ``auth.py`` reads the role straight off ``X-TCE-Role`` in compat mode, so "role user" is not
+    authentication; the second half of the predicate is what makes it one.  The MCP executor is
+    structurally barred from the host-capture credential
+    (``client.py::assert_executor_credential_is_not_host_capture``), so an executor cannot close
+    the episode whose work it performed.
+
+    Enrolment and observations are NOT gated here.  An executor saying "I ran this, here is my
+    account of it" is a diagnostic; an executor saying "it worked" would be the system grading
+    its own work, and that is the one thing this predicate exists to stop.
+    """
+    is_human = auth.role == AgentRole.USER
+    verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "pilot_adjudicator_required",
+                "message": f"a pilot adjudication requires a verified human identity ({action})",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
+
+
+def _pilot_scope_for(auth: AuthContext, *, db: Session, session_id: str) -> ResolvedScope:
+    """Scope comes from the credential, never from the body.  Same resolver P5's dreams use."""
+    return _dream_scope_for(auth, db=db, session_id=session_id, app_context=None)
+
+
+def _pilot_episode_response(row: dict[str, Any], *, reused: bool) -> PilotEnrolmentResponse:
+    """One producer for the enrolment wire model, so the two branches cannot disagree."""
+    return PilotEnrolmentResponse(
+        episode_id=UUID(str(row["id"])),
+        episode_key=str(row["episode_key"]),
+        arm_id=PilotArm(str(row["arm_id"])),
+        arm_class=str(row["arm_class"]),
+        allocation_kind=AllocationKind(str(row["allocation_kind"])),
+        stratum_id=str(row["stratum_id"]),
+        slot=int(row["slot"]),
+        block_ordinal=int(row["block_ordinal"]),
+        allocated_at=row["allocated_at"],
+        revealed_at=row.get("revealed_at"),
+        reused=reused,
+        enrolled_before_execution=bool(row.get("enrolled_before_execution", True)),
+        arm_set_sha=str(row["arm_set_sha"] or ""),
+        allocation_salt_sha256=str(row["allocation_salt_sha256"] or ""),
+    )
+
+
+@app.post("/v1/pilot/episodes", response_model=PilotEnrolmentResponse)
+def enrol_pilot_episode(
+    body: PilotEnrolmentRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PilotEnrolmentResponse:
+    """Freeze an arm to a piece of work, BEFORE the work starts.
+
+    The caller sends ``session_id``, ``objective_text``, ``project_id`` and ``decision_family``.
+    It does not send an ``episode_key`` and it does not send an ``arm_id``: the server hashes the
+    objective with the existing producer, reads ``cancel_epoch`` from P2's ``task_states`` **for
+    this session's own task**, and derives P4's six-component key itself.  Re-enrolling the same
+    work therefore returns the ORIGINAL arm with ``reused=true`` rather than drawing again, and
+    ``body.task_id`` reaches neither the key nor the allocator: a caller-varied field inside the
+    key is an allocator a caller can shop.
+
+    What this does NOT do, stated because an earlier version of this docstring claimed otherwise:
+    it does not make redrawing impossible.  ``session_id`` and ``project_id`` are caller-supplied
+    components of the key, and ``session_id`` is absent from ``stratum_id`` — so a caller who mints
+    a new session id draws again inside the same ``(project, decision_family)`` cell.  That is
+    deliberate: a new session genuinely is a different piece of work, and the allocator cannot tell
+    an honest new task from a discarded one.  The containment is visibility, not prevention.  An
+    abandoned draw leaves an enrolled, never-closed episode, so the per-cell ``close_coverage``
+    clause (>= 0.80) turns repeated shopping into a SHORTFALL the report names, in the cell where
+    it happened.  A relabelled ``project_id`` is contained differently: it forms its own cell, and
+    POOLING REFUSED stops it borrowing another cell's rows.
+
+    ``revealed_at`` comes back NULL on a fresh enrolment.  It is stamped by the ledger read, so
+    ``allocated_at`` strictly before ``revealed_at`` is an auditable fact rather than a promise.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_enrol", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, db)
+    _reject_advisor_writes(auth)
+    # The body's ``project_id`` is a HINT, never an identity: it goes through the same
+    # ``resolve_scope`` canonicaliser every other project-scoped route uses, and
+    # ``scope.project_id`` — not the body — is what lands on the row.  MEASURED, and not softened
+    # here: that resolver canonicalises, it does not entitle.  A project the subject has never
+    # spoken into is accepted and becomes its OWN report cell, holding only the episodes enrolled
+    # under it.  Relabelling therefore moves an episode to the cell it named; it cannot move a
+    # foreign episode INTO a cell, because the report refuses to pool cells (C10).  The
+    # entitlement predicate ``subject_has_project_receipts`` guards generation, not enrolment.
+    hint = {"project_id": body.project_id} if body.project_id else None
+    scope = _dream_scope_for(auth, db=db, session_id=body.session_id, app_context=hint)
+    now = datetime.now(tz=UTC)
+    try:
+        row, reused = pilot_enroll_episode(
+            db,
+            workspace_id=scope.workspace_id,
+            owner_id=scope.owner_id,
+            owner_ids=scope.sql_owner_ids(),
+            subject_user_id=scope.subject_user_id,
+            agent_principal=auth.consumer,
+            project_id=scope.project_id,
+            decision_family=body.decision_family,
+            session_id=body.session_id,
+            objective_hash=objective_hash(body.objective_text),
+            task_id=body.task_id,
+            elect_arm=body.elect_arm,
+            allocation_salt=str(getattr(settings, "pilot_allocation_salt", "tce-pilot-p6-v1")),
+            human_baseline_enabled=bool(getattr(settings, "pilot_human_baseline_enabled", False)),
+            thresholds_sha=P6_THRESHOLDS_SHA,
+            now=now,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "pilot_enrolment_refused", "message": str(exc)}) from exc
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="pilot_enrol",
+        query={"session_id": body.session_id, "decision_family": body.decision_family},
+        result_event_ids=[],
+        policy_decisions={"arm_id": str(row["arm_id"]), "allocation_kind": str(row["allocation_kind"]), "reused": reused},
+        latency_ms=0,
+    )
+    return _pilot_episode_response(row, reused=reused)
+
+
+@app.post("/v1/pilot/episodes/{episode_id}/observations", response_model=PilotObservationResponse)
+def record_pilot_observation(
+    episode_id: UUID,
+    body: PilotObservationRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PilotObservationResponse:
+    """The executor's own account of its run.  ``agent_asserted``, and no gate clause reads it.
+
+    Its own table, its own response key, and ``read_by_any_gate=false`` on the wire.  These
+    exist because the executor's account is genuinely useful when a cell reads oddly — that is
+    its named reader, the report's diagnostics block — and they are never evidence.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_observation", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, db)
+    _reject_advisor_writes(auth)
+    scope = _pilot_scope_for(auth, db=db, session_id=str(episode_id))
+    try:
+        episode = pilot_load_episode(
+            db,
+            workspace_id=scope.workspace_id,
+            owner_ids=scope.sql_owner_ids(),
+            episode_id=str(episode_id),
+        )
+    except PilotEpisodeNotFound as exc:
+        raise HTTPException(status_code=404, detail="pilot episode not found") from exc
+    notes, _ = redact_text(body.agent_notes)
+    steps = [redact_text(str(step))[0] for step in body.agent_declared_steps]
+    result = pilot_record_observation(
+        db,
+        episode=episode,
+        principal=auth.consumer,
+        agent_notes=notes,
+        agent_declared_steps=steps,
+        agent_self_rated_difficulty=body.agent_self_rated_difficulty,
+        now=datetime.now(tz=UTC),
+    )
+    return PilotObservationResponse(
+        observation_id=result["observation_id"],
+        episode_id=result["episode_id"],
+        recorded=True,
+        producer_class="agent_asserted",
+        read_by_any_gate=False,
+        observed_at=result["observed_at"],
+    )
+
+
+@app.post("/v1/pilot/episodes/{episode_id}/close", response_model=PilotEpisodeCloseResponse)
+def close_pilot_episode(
+    episode_id: UUID,
+    body: PilotEpisodeCloseRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PilotEpisodeCloseResponse:
+    """The adjudication.  403 for an executor, one per episode, and four derived fields.
+
+    ``deviated`` is computed from ``executed_arm`` against the assigned arm and is never accepted
+    on the wire.  ``completion_basis`` is P3's verification first, P2's task state second, and
+    the human's ``finished`` only third.  ``adjudication_independent`` compares the adjudicator
+    with the enrolling principal.  ``late_close`` is a diagnostic and never a refusal.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_close", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, db)
+    _require_pilot_adjudicator(auth, action="close a pilot episode")
+    scope = _pilot_scope_for(auth, db=db, session_id=str(episode_id))
+    try:
+        episode = pilot_load_episode(
+            db,
+            workspace_id=scope.workspace_id,
+            owner_ids=scope.sql_owner_ids(),
+            episode_id=str(episode_id),
+        )
+    except PilotEpisodeNotFound as exc:
+        raise HTTPException(status_code=404, detail="pilot episode not found") from exc
+    reason, _ = redact_text(body.deviation_reason)
+    unfinished, _ = redact_text(body.unfinished_reason)
+    try:
+        result = pilot_close_episode(
+            db,
+            episode=episode,
+            owner_ids=scope.sql_owner_ids(),
+            adjudicator_id=auth.consumer,
+            adjudicator_verified=bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities,
+            executed_arm=body.executed_arm,
+            rescue_level=body.rescue_level,
+            finished=body.finished,
+            review_verdict=body.review_verdict,
+            review_minutes=body.review_minutes,
+            deviation_reason=reason,
+            unfinished_reason=unfinished,
+            grace_days=int(getattr(settings, "pilot_close_grace_days", 90)),
+            now=datetime.now(tz=UTC),
+        )
+    except PilotEpisodeConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "pilot_episode_already_closed", "episode_id": str(episode_id)},
+        ) from exc
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="pilot_close",
+        query={"episode_id": str(episode_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "deviated": bool(result["deviated"]),
+            "adjudication_independent": bool(result["adjudication_independent"]),
+            "completion_basis": result["completion_basis"].value,
+        },
+        latency_ms=0,
+    )
+    return PilotEpisodeCloseResponse(
+        episode_id=result["episode_id"],
+        close_id=result["close_id"],
+        deviated=bool(result["deviated"]),
+        adjudication_independent=bool(result["adjudication_independent"]),
+        adjudicator_verified=bool(result["adjudicator_verified"]),
+        completion_basis=result["completion_basis"],
+        late_close=bool(result["late_close"]),
+        closed_at=result["closed_at"],
+    )
+
+
+@app.get("/v1/pilot/episodes", response_model=PilotEpisodeListResponse)
+def list_pilot_episodes(
+    session_id: str = "default",
+    limit: int = 200,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PilotEpisodeListResponse:
+    """The enrolment ledger.  This is the read that stamps ``revealed_at``.
+
+    It is the one write a GET on this surface performs, and it is deliberate: an arm that was
+    frozen and then read has ``allocated_at < revealed_at``, and an arm that was never read has
+    ``revealed_at IS NULL``.  It only ever moves NULL -> now and it touches no other column, so
+    it cannot rewrite an allocation.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_episodes", method="GET").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, db)
+    scope = _pilot_scope_for(auth, db=db, session_id=session_id)
+    rows = pilot_list_episodes(
+        db,
+        workspace_id=scope.workspace_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+        limit=limit,
+    )
+    now = datetime.now(tz=UTC)
+    pilot_mark_revealed(db, episode_ids=[row["id"] for row in rows if row.get("revealed_at") is None], now=now)
+    episodes = [
+        PilotEpisodeSummary(
+            episode_id=UUID(str(row["id"])),
+            episode_key=str(row["episode_key"]),
+            project_id=(str(row["project_id"]) if row.get("project_id") else None),
+            decision_family=str(row["decision_family"]),
+            arm_id=PilotArm(str(row["arm_id"])),
+            arm_class=str(row["arm_class"]),
+            allocation_kind=AllocationKind(str(row["allocation_kind"])),
+            block_ordinal=int(row["block_ordinal"]),
+            slot=int(row["slot"]),
+            allocated_at=row["allocated_at"],
+            revealed_at=row.get("revealed_at") or now,
+            closed_at=row.get("closed_at"),
+            executed_arm=(PilotArm(str(row["executed_arm"])) if row.get("executed_arm") else None),
+            deviated=bool(row.get("deviated")),
+            rescue_level=(RescueLevel(str(row["rescue_level"])) if row.get("rescue_level") else None),
+            completion_basis=(CompletionBasis(str(row["completion_basis"])) if row.get("completion_basis") else None),
+            review_verdict=(ReviewVerdict(str(row["review_verdict"])) if row.get("review_verdict") else None),
+            late_close=bool(row.get("late_close")),
+        )
+        for row in rows
+    ]
+    return PilotEpisodeListResponse(episodes=episodes, total=len(episodes))
+
+
+@app.get("/v1/pilot/report", response_model=PilotReportResponse)
+def pilot_report(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> PilotReportResponse:
+    """The read-only report.  It never pools, never grants and never reports a zero as a result.
+
+    C12: this route writes no qualification record and no promotion, exposure or personalization
+    path reads it.  ``scripts/p6_pilot_report.py`` renders the SAME computation — both call
+    ``pilot_store.build_pilot_report``, which calls the clause functions in
+    ``tce_shared.pilot_enrollment`` — so the two cannot drift into disagreeing about a verdict.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_report", method="GET").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, db)
+    scope = _pilot_scope_for(auth, db=db, session_id=session_id)
+    corpus = pilot_load_report_corpus(
+        db,
+        workspace_id=scope.workspace_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+    )
+    try:
+        block = dream_block(dream_counts_for_scope(db, scope=scope))
+    except DreamTablesMissing as exc:
+        # A database still at 20260909_0041 has the whole dream surface on disk and none of it in
+        # the schema.  That reads as NOT_COMPUTABLE with the reason, never as "no proposals".
+        block = dream_block_unavailable(project_id=scope.project_id, detail=str(exc))
+    return build_pilot_report(corpus, dreams=block.to_payload(), now=datetime.now(tz=UTC))
+
+
+@app.post("/v1/dreams/{proposal_id}/adjudicate", response_model=DreamRelevanceAdjudicationResponse)
+def adjudicate_dream_relevance(
+    proposal_id: UUID,
+    body: DreamRelevanceAdjudicationRequest,
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DreamRelevanceAdjudicationResponse:
+    """Whether a proposal was RELEVANT, judged independently of whether it was accepted.
+
+    P6 adds no ``dream_proposals`` column, status value or nonresponse value; P5 already ships
+    that vocabulary and this composes with it.  What it adds is the one thing P5 correctly did
+    not: an adjudication of fit.  A rejection is a preference and is never counted as a false
+    positive; ``ignored`` is nonresponse and moves neither number.
+
+    ``blind_claimed`` is the client's word.  ``blind_verified`` is the server's, checked against
+    P5's own append-only ``dream_proposal_events``: the adjudication must predate every verdict
+    event and the adjudicator must not be the actor on one.
+    """
+    REQUEST_COUNT.labels(endpoint="dream_adjudicate", method="POST").inc()
+    _require_pilot_enrollment()
+    _require_dreams_enabled()
+    _enforce_workspace_access(auth, db)
+    _require_pilot_adjudicator(auth, action="adjudicate a dream proposal")
+    scope = _dream_scope_for(auth, db=db, session_id=session_id, app_context=None)
+    try:
+        write = record_dream_adjudication(
+            db,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            adjudicator_id=auth.consumer,
+            adjudicator_verified=bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities,
+            relevance=body.relevance,
+            rationale=body.rationale,
+            blind_claimed=body.blind_claimed,
+            delivery_useful=body.delivery_useful,
+            supersedes_adjudication_id=(
+                str(body.supersedes_adjudication_id) if body.supersedes_adjudication_id else None
+            ),
+            now=datetime.now(tz=UTC),
+        )
+    except DreamTablesMissing as exc:
+        raise HTTPException(status_code=503, detail="dream tables are not present in this database") from exc
+    except ProposalNotInScope as exc:
+        raise HTTPException(status_code=404, detail="dream proposal not found") from exc
+    db.commit()
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="dream_adjudicate",
+        query={"proposal_id": str(proposal_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "relevance": body.relevance.value,
+            "blind_claimed": bool(body.blind_claimed),
+            "blind_verified": bool(write.blind_verified),
+            "blind_reason": write.blind_reason,
+            "counted_for_delivery": bool(write.counted_for_delivery),
+            "delivery_reason": write.delivery_reason,
+        },
+        latency_ms=0,
+    )
+    return DreamRelevanceAdjudicationResponse(
+        adjudication_id=UUID(str(write.adjudication_id)),
+        proposal_id=UUID(str(write.proposal_id)),
+        relevance=write.relevance,
+        blind_claimed=bool(write.blind_claimed),
+        blind_verified=bool(write.blind_verified),
+        blind_reason=write.blind_reason,
+        delivery_useful=write.delivery_useful,
+        counted_for_delivery=bool(write.counted_for_delivery),
+        delivery_reason=write.delivery_reason,
+        adjudicated_at=write.adjudicated_at,
+        supersedes_adjudication_id=(UUID(str(write.supersedes_adjudication_id)) if write.supersedes_adjudication_id else None),
+    )
 
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "dashboard-static"

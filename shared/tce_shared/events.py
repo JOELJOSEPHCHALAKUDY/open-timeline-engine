@@ -27,6 +27,20 @@ from .decision_policy import (
     OodStatus,
 )
 from .decision_policy import QualificationState as QualificationState
+
+# The P6 pilot vocabulary is declared in ``tce_shared.pilot_enrollment`` and imported here,
+# never mirrored.  That module must stay pydantic-free — the report script and the worker both
+# import it — so the dependency only runs one way, exactly as it does for ``decision_policy``.
+from .pilot_enrollment import (
+    AllocationKind,
+    ClauseState,
+    CompletionBasis,
+    DeliveryUsefulness,
+    PilotArm,
+    RelevanceVerdict,
+    RescueLevel,
+    ReviewVerdict,
+)
 from .task_state import NextPermittedAction, TaskStatus
 from .version import SCHEMA_VERSION
 
@@ -1340,10 +1354,12 @@ class BehaviorPilotOutcomeRequest(BaseModel):
     agent_choice: str | None = Field(default=None, max_length=500)
     top3_choices: list[str] = Field(default_factory=list, max_length=3)
     actual_choice: str = Field(min_length=1, max_length=500)
-    agent_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     abstained: bool = False
-    action_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
-    workflow_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    # There is no ``agent_confidence``, no ``action_similarity`` and no ``workflow_similarity``
+    # here, and there must not be.  All three were the party under test scoring its own answer,
+    # and the gate that read them computed a *perfect* calibration score for a perfectly inverted
+    # reporter.  The columns remain in the two pilot tables — dropping a column that held a human
+    # answer is refused — but no code reads or writes them.
     correction_required: bool = False
     outcome_regret: bool = False
     irrelevant_personalization: bool = False
@@ -1375,9 +1391,6 @@ class BehaviorPilotArmMetrics(BaseModel):
     top1_agreement: float | None = None
     top3_agreement: float | None = None
     non_abstained_precision: float | None = None
-    calibration_brier: float | None = None
-    mean_action_similarity: float | None = None
-    mean_workflow_similarity: float | None = None
     stale_memory_use_rate: float | None = None
     irrelevant_personalization_rate: float | None = None
     correction_rate: float | None = None
@@ -1401,7 +1414,9 @@ class BehaviorPilotGate(BaseModel):
     coverage_complete: bool = False
     latency_passed: bool = False
     quality_passed: bool = False
-    safety_passed: bool = True
+    # Three-valued: ``"not_computable"`` when no completed trial has been reported.  A boolean
+    # that defaulted to ``True`` made an empty corpus read as a safety pass.
+    safety_passed: bool | str = "not_computable"
     evaluation_ready: bool = False
     reasons: list[str] = Field(default_factory=list)
 
@@ -2207,3 +2222,244 @@ class DreamRefreshResponse(BaseModel):
     swept: dict[str, int] = Field(default_factory=dict)
     reconciled: dict[str, int] = Field(default_factory=dict)
     schema_version: str = "v1"
+
+
+# ======================================================================================
+# P6 — the operational-proof pilot.  Enrolment, adjudication and the read-only report.
+#
+# Two shapes carry the honesty of this surface.  ``PilotEnrolmentRequest`` has no
+# ``episode_key`` and no ``arm_id``: both are server-derived, so re-enrolling the same work reuses
+# its arm. A new session id still draws again in the same cell -- see pilot_enrollment.episode_key --
+# and that residual is surfaced by close_coverage rather than prevented; arm shopping
+# with no analogue here.  ``PilotClaimBReport`` has no ``supported`` field, and must never
+# acquire one — a caller cannot render Claim B as a supported claim because the type has
+# nowhere to put one.
+# ======================================================================================
+
+
+class PilotEnrolmentRequest(BaseModel):
+    """Enrol a piece of work BEFORE it starts.  The server computes the episode and the arm.
+
+    ``objective_text`` is hashed server-side with the existing producer; the caller never sends
+    an ``objective_hash`` and never sends an ``episode_key``.  ``elect_arm`` is the human-baseline
+    election branch and is refused unless ``pilot_human_baseline_enabled`` is on.
+    """
+
+    session_id: str = Field(min_length=1, max_length=200)
+    project_id: str | None = Field(default=None, max_length=200)
+    decision_family: str = Field(min_length=1, max_length=80)
+    objective_text: str = Field(min_length=1, max_length=2000)
+    task_id: str | None = Field(default=None, max_length=200)
+    elect_arm: PilotArm | None = None
+
+
+class PilotEnrolmentResponse(BaseModel):
+    """``reused=true`` means this work was already enrolled and kept its original arm."""
+
+    episode_id: UUID
+    episode_key: str
+    arm_id: PilotArm
+    arm_class: str
+    allocation_kind: AllocationKind
+    stratum_id: str
+    slot: int
+    block_ordinal: int
+    allocated_at: datetime
+    revealed_at: datetime | None = None
+    reused: bool = False
+    enrolled_before_execution: bool = True
+    arm_set_sha: str = ""
+    allocation_salt_sha256: str = ""
+    schema_version: str = "v1"
+
+
+class PilotObservationRequest(BaseModel):
+    """``agent_asserted`` diagnostics.  No gate clause may read any field on this model.
+
+    These exist because the executor's account of a run is genuinely useful when reading a
+    surprising cell, and they have a named reader — the report's diagnostics block.  They are
+    stored in their own table and returned under their own ``self_reported`` key so that no
+    renderer can mistake them for evidence.
+    """
+
+    agent_notes: str = Field(default="", max_length=2000)
+    agent_declared_steps: list[str] = Field(default_factory=list, max_length=40)
+    agent_self_rated_difficulty: int | None = Field(default=None, ge=0, le=10)
+
+
+class PilotObservationResponse(BaseModel):
+    observation_id: UUID
+    episode_id: UUID
+    recorded: bool = True
+    producer_class: str = "agent_asserted"
+    read_by_any_gate: bool = False
+    observed_at: datetime
+    schema_version: str = "v1"
+
+
+class PilotEpisodeCloseRequest(BaseModel):
+    """The adjudication.  Only a verified human may post it.
+
+    ``deviated`` is deliberately absent: the server computes it from ``executed_arm`` against the
+    assigned arm and never accepts it.  ``completion_basis`` is absent for the same reason — it
+    is derived from P3 verification, then P2 task state, and only then falls back to ``finished``.
+    """
+
+    executed_arm: PilotArm
+    rescue_level: RescueLevel
+    finished: bool
+    review_verdict: ReviewVerdict
+    review_minutes: int = Field(default=0, ge=0, le=600)
+    deviation_reason: str = Field(default="", max_length=500)
+    unfinished_reason: str = Field(default="", max_length=500)
+
+
+class PilotEpisodeCloseResponse(BaseModel):
+    episode_id: UUID
+    close_id: UUID
+    deviated: bool = False
+    adjudication_independent: bool = True
+    adjudicator_verified: bool = True
+    completion_basis: CompletionBasis = CompletionBasis.UNFINISHED
+    late_close: bool = False
+    closed_at: datetime
+    schema_version: str = "v1"
+
+
+class PilotEpisodeSummary(BaseModel):
+    episode_id: UUID
+    episode_key: str
+    project_id: str | None = None
+    decision_family: str
+    arm_id: PilotArm
+    arm_class: str
+    allocation_kind: AllocationKind
+    block_ordinal: int = 0
+    slot: int = 0
+    allocated_at: datetime
+    revealed_at: datetime | None = None
+    closed_at: datetime | None = None
+    executed_arm: PilotArm | None = None
+    deviated: bool = False
+    rescue_level: RescueLevel | None = None
+    completion_basis: CompletionBasis | None = None
+    review_verdict: ReviewVerdict | None = None
+    late_close: bool = False
+    schema_version: str = "v1"
+
+
+class PilotEpisodeListResponse(BaseModel):
+    episodes: list[PilotEpisodeSummary] = Field(default_factory=list)
+    total: int = 0
+    schema_version: str = "v1"
+
+
+class DreamRelevanceAdjudicationRequest(BaseModel):
+    """A judgement about a proposal's FIT, independent of whether it was accepted.
+
+    ``blind_claimed`` is the client's word.  ``blind_verified`` on the response is the server's,
+    checked against P5's append-only event log.  A rejection is a preference; a ``not_relevant``
+    adjudication is a claim about the proposal, and the second is never derived from the first.
+    """
+
+    relevance: RelevanceVerdict
+    rationale: str = Field(default="", max_length=500)
+    blind_claimed: bool = False
+    delivery_useful: DeliveryUsefulness | None = None
+    supersedes_adjudication_id: UUID | None = None
+
+
+class DreamRelevanceAdjudicationResponse(BaseModel):
+    """``blind_claimed`` is what the caller said; ``blind_verified`` is what the server found.
+
+    ``blind_reason`` and ``delivery_reason`` come from the closed lists in
+    ``tce_shared.dream_adjudication`` (``BLIND_REASONS``, ``DELIVERY_REASONS``).  They are here so
+    a ``false`` is never a bare ``false``: an owner who is told his blindness claim was refused
+    can see that it was refused because he gave the verdict himself, and a usefulness answer that
+    does not count says it was answered inside the 30-day lookback rather than silently vanishing
+    from the metric.
+    """
+
+    adjudication_id: UUID
+    proposal_id: UUID
+    relevance: RelevanceVerdict
+    blind_claimed: bool = False
+    blind_verified: bool = False
+    blind_reason: str = ""
+    delivery_useful: DeliveryUsefulness | None = None
+    counted_for_delivery: bool = False
+    delivery_reason: str = ""
+    adjudicated_at: datetime
+    supersedes_adjudication_id: UUID | None = None
+    schema_version: str = "v1"
+
+
+class PilotClause(BaseModel):
+    """PASS, SHORTFALL(measured, floor) or NOT_COMPUTABLE(reason).  There is no fourth state."""
+
+    name: str
+    state: ClauseState
+    measured: float | None = None
+    floor: float | None = None
+    comparison: str = "<"
+    reason: str = ""
+    detail: str = ""
+    rendered: str = ""
+
+
+class PilotCellReport(BaseModel):
+    """One ``(project_id, decision_family)`` cell.  Nothing here is averaged with anything else."""
+
+    project_id: str | None = None
+    decision_family: str
+    supported: bool = False
+    clauses: list[PilotClause] = Field(default_factory=list)
+    shortfalls: list[str] = Field(default_factory=list)
+    exclusions: dict[str, int] = Field(default_factory=dict)
+    enrolled: int = 0
+    closed: int = 0
+    closed_by_arm: dict[str, int] = Field(default_factory=dict)
+    success_by_arm: dict[str, int] = Field(default_factory=dict)
+    as_treated_by_arm: dict[str, int] = Field(default_factory=dict)
+    complete_blocks: int = 0
+    active_days: int = 0
+    calendar_days: int = 0
+    comparisons: dict[str, Any] = Field(default_factory=dict)
+    cost: PilotClause | None = None
+    human_intervention: PilotClause | None = None
+
+
+class PilotClaimBReport(BaseModel):
+    """**No ``supported`` field, ever.**  See ``pilot_enrollment.ClaimBVerdict``."""
+
+    state: str = "not_computable"
+    clause: PilotClause | None = None
+    closed: int = 0
+    randomized: int = 0
+    elected: int = 0
+    sentence: str = ""
+
+
+class PilotReportResponse(BaseModel):
+    """The read-only report.  It grants nothing and no promotion path reads it."""
+
+    generated_at: datetime
+    thresholds_version: str = ""
+    thresholds_sha: str = ""
+    thresholds_effective_at: datetime | None = None
+    single_participant_notice: str = ""
+    pooling_refused: str = ""
+    success_definition: str = ""
+    enrolled_total: int = 0
+    strata_total: int = 0
+    arms_enabled: list[str] = Field(default_factory=list)
+    arm_availability: dict[str, str] = Field(default_factory=dict)
+    cells: list[PilotCellReport] = Field(default_factory=list)
+    worst_cell: PilotCellReport | None = None
+    claim_b: PilotClaimBReport = Field(default_factory=PilotClaimBReport)
+    cost: PilotClause | None = None
+    human_intervention: PilotClause | None = None
+    dreams: dict[str, Any] = Field(default_factory=dict)
+    notices: list[str] = Field(default_factory=list)
+    schema_version: str = "v1"
+

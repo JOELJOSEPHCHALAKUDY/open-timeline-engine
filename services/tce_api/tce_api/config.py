@@ -475,6 +475,28 @@ class Settings(BaseSettings):
     ``running`` rows older than this to ``failed``/``run_abandoned`` before taking the slot."""
     dream_list_limit: int = 10
 
+    # ---- P6 operational-proof pilot ----
+    # Four settings, each with a named reader, and that is the whole list.  EVERY number that
+    # can move a verdict lives in ``tce_shared.pilot_thresholds`` instead, where it is frozen and
+    # hashed: a threshold a caller can sweep is not a threshold.
+    pilot_enrollment_enabled: bool = False
+    """Master switch for the six P6 routes.  Reader: ``main._require_pilot_enrollment`` -> 404."""
+
+    pilot_allocation_salt: str = "tce-pilot-p6-v1"
+    """HMAC key for the permuted-block permutation.  Readers: ``pilot_store.enroll_episode`` ->
+    ``pilot_enrollment.allocate_arm``; its sha256 is copied onto every stratum and episode row so
+    that a mid-pilot change is visible to the report rather than silently pooled."""
+
+    pilot_human_baseline_enabled: bool = False
+    """Gate on the ``elect_arm='owner_unassisted'`` branch of ``POST /v1/pilot/episodes``.
+    Reader: ``pilot_store.enroll_episode`` -> ``pilot_enrollment.resolve_enrolment``."""
+
+    pilot_close_grace_days: int = 90
+    """Reader: ``pilot_store.close_episode`` -> the ``late_close`` flag.  Deliberately NOT an
+    expiry.  ``behavior_pilot_assignment_ttl_days`` rejects a late outcome with a 409, which over
+    a four-to-six week MINIMUM window converts a finished episode into a permanent coverage
+    deficit that can never be repaired.  P6 records ``late_close=true`` and counts the episode."""
+
     @property
     def git_change_summary_repos(self) -> list[str]:
         return [item.strip() for item in self.git_change_summary_repo_allowlist.split(",") if item.strip()]

@@ -1573,6 +1573,14 @@
         "title": "AdvisorVerifyResponse",
         "type": "object"
       },
+      "AllocationKind": {
+        "enum": [
+          "randomized",
+          "elected"
+        ],
+        "title": "AllocationKind",
+        "type": "string"
+      },
       "ApiStatusInfo": {
         "properties": {
           "status": {
@@ -2230,17 +2238,6 @@
             "title": "Assignment Count",
             "type": "integer"
           },
-          "calibration_brier": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Calibration Brier"
-          },
           "completed_count": {
             "default": 0,
             "title": "Completed Count",
@@ -2283,28 +2280,6 @@
               }
             ],
             "title": "Malicious Activation Rate"
-          },
-          "mean_action_similarity": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mean Action Similarity"
-          },
-          "mean_workflow_similarity": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Mean Workflow Similarity"
           },
           "median_injected_tokens": {
             "anyOf": [
@@ -2604,9 +2579,16 @@
             "type": "array"
           },
           "safety_passed": {
-            "default": true,
-            "title": "Safety Passed",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "default": "not_computable",
+            "title": "Safety Passed"
           },
           "sample_complete": {
             "default": false,
@@ -2629,13 +2611,6 @@
             "title": "Abstained",
             "type": "boolean"
           },
-          "action_similarity": {
-            "default": 0.0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Action Similarity",
-            "type": "number"
-          },
           "actual_choice": {
             "maxLength": 500,
             "minLength": 1,
@@ -2653,13 +2628,6 @@
               }
             ],
             "title": "Agent Choice"
-          },
-          "agent_confidence": {
-            "default": 0.0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Agent Confidence",
-            "type": "number"
           },
           "assignment_id": {
             "format": "uuid",
@@ -2708,13 +2676,6 @@
             "maxItems": 40,
             "title": "Used Evidence Ids",
             "type": "array"
-          },
-          "workflow_similarity": {
-            "default": 0.0,
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Workflow Similarity",
-            "type": "number"
           }
         },
         "required": [
@@ -4158,6 +4119,15 @@
         "title": "CheckResultPayload",
         "type": "object"
       },
+      "ClauseState": {
+        "enum": [
+          "pass",
+          "shortfall",
+          "not_computable"
+        ],
+        "title": "ClauseState",
+        "type": "string"
+      },
       "CloneAdviceRequest": {
         "properties": {
           "allow_fallback": {
@@ -4460,6 +4430,16 @@
         ],
         "title": "CloneScoreResponse",
         "type": "object"
+      },
+      "CompletionBasis": {
+        "enum": [
+          "verified",
+          "task_state_done",
+          "owner_attested",
+          "unfinished"
+        ],
+        "title": "CompletionBasis",
+        "type": "string"
       },
       "CompletionCaptureRequest": {
         "properties": {
@@ -6116,6 +6096,15 @@
         "title": "DecisionStatus",
         "type": "string"
       },
+      "DeliveryUsefulness": {
+        "enum": [
+          "useful",
+          "not_useful",
+          "too_early"
+        ],
+        "title": "DeliveryUsefulness",
+        "type": "string"
+      },
       "DirectiveExecution": {
         "properties": {
           "action_kind": {
@@ -7253,6 +7242,135 @@
           }
         },
         "title": "DreamRefreshResponse",
+        "type": "object"
+      },
+      "DreamRelevanceAdjudicationRequest": {
+        "description": "A judgement about a proposal's FIT, independent of whether it was accepted.\n\n``blind_claimed`` is the client's word.  ``blind_verified`` on the response is the server's,\nchecked against P5's append-only event log.  A rejection is a preference; a ``not_relevant``\nadjudication is a claim about the proposal, and the second is never derived from the first.",
+        "properties": {
+          "blind_claimed": {
+            "default": false,
+            "title": "Blind Claimed",
+            "type": "boolean"
+          },
+          "delivery_useful": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryUsefulness"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rationale": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Rationale",
+            "type": "string"
+          },
+          "relevance": {
+            "$ref": "#/components/schemas/RelevanceVerdict"
+          },
+          "supersedes_adjudication_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Adjudication Id"
+          }
+        },
+        "required": [
+          "relevance"
+        ],
+        "title": "DreamRelevanceAdjudicationRequest",
+        "type": "object"
+      },
+      "DreamRelevanceAdjudicationResponse": {
+        "description": "``blind_claimed`` is what the caller said; ``blind_verified`` is what the server found.\n\n``blind_reason`` and ``delivery_reason`` come from the closed lists in\n``tce_shared.dream_adjudication`` (``BLIND_REASONS``, ``DELIVERY_REASONS``).  They are here so\na ``false`` is never a bare ``false``: an owner who is told his blindness claim was refused\ncan see that it was refused because he gave the verdict himself, and a usefulness answer that\ndoes not count says it was answered inside the 30-day lookback rather than silently vanishing\nfrom the metric.",
+        "properties": {
+          "adjudicated_at": {
+            "format": "date-time",
+            "title": "Adjudicated At",
+            "type": "string"
+          },
+          "adjudication_id": {
+            "format": "uuid",
+            "title": "Adjudication Id",
+            "type": "string"
+          },
+          "blind_claimed": {
+            "default": false,
+            "title": "Blind Claimed",
+            "type": "boolean"
+          },
+          "blind_reason": {
+            "default": "",
+            "title": "Blind Reason",
+            "type": "string"
+          },
+          "blind_verified": {
+            "default": false,
+            "title": "Blind Verified",
+            "type": "boolean"
+          },
+          "counted_for_delivery": {
+            "default": false,
+            "title": "Counted For Delivery",
+            "type": "boolean"
+          },
+          "delivery_reason": {
+            "default": "",
+            "title": "Delivery Reason",
+            "type": "string"
+          },
+          "delivery_useful": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DeliveryUsefulness"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "title": "Proposal Id",
+            "type": "string"
+          },
+          "relevance": {
+            "$ref": "#/components/schemas/RelevanceVerdict"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "supersedes_adjudication_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Adjudication Id"
+          }
+        },
+        "required": [
+          "adjudication_id",
+          "proposal_id",
+          "relevance",
+          "adjudicated_at"
+        ],
+        "title": "DreamRelevanceAdjudicationResponse",
         "type": "object"
       },
       "EffectOpenRequest": {
@@ -9922,6 +10040,875 @@
         "title": "PatternItem",
         "type": "object"
       },
+      "PilotArm": {
+        "description": "What the executing party is handed.  A *runtime/workflow* allocation, never a format.",
+        "enum": [
+          "existing_runtime",
+          "markdown_handoff",
+          "tce_assisted",
+          "owner_unassisted"
+        ],
+        "title": "PilotArm",
+        "type": "string"
+      },
+      "PilotCellReport": {
+        "description": "One ``(project_id, decision_family)`` cell.  Nothing here is averaged with anything else.",
+        "properties": {
+          "active_days": {
+            "default": 0,
+            "title": "Active Days",
+            "type": "integer"
+          },
+          "as_treated_by_arm": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "As Treated By Arm",
+            "type": "object"
+          },
+          "calendar_days": {
+            "default": 0,
+            "title": "Calendar Days",
+            "type": "integer"
+          },
+          "clauses": {
+            "items": {
+              "$ref": "#/components/schemas/PilotClause"
+            },
+            "title": "Clauses",
+            "type": "array"
+          },
+          "closed": {
+            "default": 0,
+            "title": "Closed",
+            "type": "integer"
+          },
+          "closed_by_arm": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Closed By Arm",
+            "type": "object"
+          },
+          "comparisons": {
+            "additionalProperties": true,
+            "title": "Comparisons",
+            "type": "object"
+          },
+          "complete_blocks": {
+            "default": 0,
+            "title": "Complete Blocks",
+            "type": "integer"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotClause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "decision_family": {
+            "title": "Decision Family",
+            "type": "string"
+          },
+          "enrolled": {
+            "default": 0,
+            "title": "Enrolled",
+            "type": "integer"
+          },
+          "exclusions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Exclusions",
+            "type": "object"
+          },
+          "human_intervention": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotClause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "shortfalls": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Shortfalls",
+            "type": "array"
+          },
+          "success_by_arm": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Success By Arm",
+            "type": "object"
+          },
+          "supported": {
+            "default": false,
+            "title": "Supported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "decision_family"
+        ],
+        "title": "PilotCellReport",
+        "type": "object"
+      },
+      "PilotClaimBReport": {
+        "description": "**No ``supported`` field, ever.**  See ``pilot_enrollment.ClaimBVerdict``.",
+        "properties": {
+          "clause": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotClause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "closed": {
+            "default": 0,
+            "title": "Closed",
+            "type": "integer"
+          },
+          "elected": {
+            "default": 0,
+            "title": "Elected",
+            "type": "integer"
+          },
+          "randomized": {
+            "default": 0,
+            "title": "Randomized",
+            "type": "integer"
+          },
+          "sentence": {
+            "default": "",
+            "title": "Sentence",
+            "type": "string"
+          },
+          "state": {
+            "default": "not_computable",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "title": "PilotClaimBReport",
+        "type": "object"
+      },
+      "PilotClause": {
+        "description": "PASS, SHORTFALL(measured, floor) or NOT_COMPUTABLE(reason).  There is no fourth state.",
+        "properties": {
+          "comparison": {
+            "default": "<",
+            "title": "Comparison",
+            "type": "string"
+          },
+          "detail": {
+            "default": "",
+            "title": "Detail",
+            "type": "string"
+          },
+          "floor": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Floor"
+          },
+          "measured": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measured"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "rendered": {
+            "default": "",
+            "title": "Rendered",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ClauseState"
+          }
+        },
+        "required": [
+          "name",
+          "state"
+        ],
+        "title": "PilotClause",
+        "type": "object"
+      },
+      "PilotEnrolmentRequest": {
+        "description": "Enrol a piece of work BEFORE it starts.  The server computes the episode and the arm.\n\n``objective_text`` is hashed server-side with the existing producer; the caller never sends\nan ``objective_hash`` and never sends an ``episode_key``.  ``elect_arm`` is the human-baseline\nelection branch and is refused unless ``pilot_human_baseline_enabled`` is on.",
+        "properties": {
+          "decision_family": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Decision Family",
+            "type": "string"
+          },
+          "elect_arm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotArm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "objective_text": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Objective Text",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "session_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "required": [
+          "session_id",
+          "decision_family",
+          "objective_text"
+        ],
+        "title": "PilotEnrolmentRequest",
+        "type": "object"
+      },
+      "PilotEnrolmentResponse": {
+        "description": "``reused=true`` means this work was already enrolled and kept its original arm.",
+        "properties": {
+          "allocated_at": {
+            "format": "date-time",
+            "title": "Allocated At",
+            "type": "string"
+          },
+          "allocation_kind": {
+            "$ref": "#/components/schemas/AllocationKind"
+          },
+          "allocation_salt_sha256": {
+            "default": "",
+            "title": "Allocation Salt Sha256",
+            "type": "string"
+          },
+          "arm_class": {
+            "title": "Arm Class",
+            "type": "string"
+          },
+          "arm_id": {
+            "$ref": "#/components/schemas/PilotArm"
+          },
+          "arm_set_sha": {
+            "default": "",
+            "title": "Arm Set Sha",
+            "type": "string"
+          },
+          "block_ordinal": {
+            "title": "Block Ordinal",
+            "type": "integer"
+          },
+          "enrolled_before_execution": {
+            "default": true,
+            "title": "Enrolled Before Execution",
+            "type": "boolean"
+          },
+          "episode_id": {
+            "format": "uuid",
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "episode_key": {
+            "title": "Episode Key",
+            "type": "string"
+          },
+          "reused": {
+            "default": false,
+            "title": "Reused",
+            "type": "boolean"
+          },
+          "revealed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revealed At"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "slot": {
+            "title": "Slot",
+            "type": "integer"
+          },
+          "stratum_id": {
+            "title": "Stratum Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "episode_id",
+          "episode_key",
+          "arm_id",
+          "arm_class",
+          "allocation_kind",
+          "stratum_id",
+          "slot",
+          "block_ordinal",
+          "allocated_at"
+        ],
+        "title": "PilotEnrolmentResponse",
+        "type": "object"
+      },
+      "PilotEpisodeCloseRequest": {
+        "description": "The adjudication.  Only a verified human may post it.\n\n``deviated`` is deliberately absent: the server computes it from ``executed_arm`` against the\nassigned arm and never accepts it.  ``completion_basis`` is absent for the same reason \u2014 it\nis derived from P3 verification, then P2 task state, and only then falls back to ``finished``.",
+        "properties": {
+          "deviation_reason": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Deviation Reason",
+            "type": "string"
+          },
+          "executed_arm": {
+            "$ref": "#/components/schemas/PilotArm"
+          },
+          "finished": {
+            "title": "Finished",
+            "type": "boolean"
+          },
+          "rescue_level": {
+            "$ref": "#/components/schemas/RescueLevel"
+          },
+          "review_minutes": {
+            "default": 0,
+            "maximum": 600.0,
+            "minimum": 0.0,
+            "title": "Review Minutes",
+            "type": "integer"
+          },
+          "review_verdict": {
+            "$ref": "#/components/schemas/ReviewVerdict"
+          },
+          "unfinished_reason": {
+            "default": "",
+            "maxLength": 500,
+            "title": "Unfinished Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "executed_arm",
+          "rescue_level",
+          "finished",
+          "review_verdict"
+        ],
+        "title": "PilotEpisodeCloseRequest",
+        "type": "object"
+      },
+      "PilotEpisodeCloseResponse": {
+        "properties": {
+          "adjudication_independent": {
+            "default": true,
+            "title": "Adjudication Independent",
+            "type": "boolean"
+          },
+          "adjudicator_verified": {
+            "default": true,
+            "title": "Adjudicator Verified",
+            "type": "boolean"
+          },
+          "close_id": {
+            "format": "uuid",
+            "title": "Close Id",
+            "type": "string"
+          },
+          "closed_at": {
+            "format": "date-time",
+            "title": "Closed At",
+            "type": "string"
+          },
+          "completion_basis": {
+            "$ref": "#/components/schemas/CompletionBasis",
+            "default": "unfinished"
+          },
+          "deviated": {
+            "default": false,
+            "title": "Deviated",
+            "type": "boolean"
+          },
+          "episode_id": {
+            "format": "uuid",
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "late_close": {
+            "default": false,
+            "title": "Late Close",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "episode_id",
+          "close_id",
+          "closed_at"
+        ],
+        "title": "PilotEpisodeCloseResponse",
+        "type": "object"
+      },
+      "PilotEpisodeListResponse": {
+        "properties": {
+          "episodes": {
+            "items": {
+              "$ref": "#/components/schemas/PilotEpisodeSummary"
+            },
+            "title": "Episodes",
+            "type": "array"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "PilotEpisodeListResponse",
+        "type": "object"
+      },
+      "PilotEpisodeSummary": {
+        "properties": {
+          "allocated_at": {
+            "format": "date-time",
+            "title": "Allocated At",
+            "type": "string"
+          },
+          "allocation_kind": {
+            "$ref": "#/components/schemas/AllocationKind"
+          },
+          "arm_class": {
+            "title": "Arm Class",
+            "type": "string"
+          },
+          "arm_id": {
+            "$ref": "#/components/schemas/PilotArm"
+          },
+          "block_ordinal": {
+            "default": 0,
+            "title": "Block Ordinal",
+            "type": "integer"
+          },
+          "closed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Closed At"
+          },
+          "completion_basis": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompletionBasis"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "decision_family": {
+            "title": "Decision Family",
+            "type": "string"
+          },
+          "deviated": {
+            "default": false,
+            "title": "Deviated",
+            "type": "boolean"
+          },
+          "episode_id": {
+            "format": "uuid",
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "episode_key": {
+            "title": "Episode Key",
+            "type": "string"
+          },
+          "executed_arm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotArm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "late_close": {
+            "default": false,
+            "title": "Late Close",
+            "type": "boolean"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "rescue_level": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RescueLevel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revealed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revealed At"
+          },
+          "review_verdict": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewVerdict"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "slot": {
+            "default": 0,
+            "title": "Slot",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "episode_id",
+          "episode_key",
+          "decision_family",
+          "arm_id",
+          "arm_class",
+          "allocation_kind",
+          "allocated_at"
+        ],
+        "title": "PilotEpisodeSummary",
+        "type": "object"
+      },
+      "PilotObservationRequest": {
+        "description": "``agent_asserted`` diagnostics.  No gate clause may read any field on this model.\n\nThese exist because the executor's account of a run is genuinely useful when reading a\nsurprising cell, and they have a named reader \u2014 the report's diagnostics block.  They are\nstored in their own table and returned under their own ``self_reported`` key so that no\nrenderer can mistake them for evidence.",
+        "properties": {
+          "agent_declared_steps": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Agent Declared Steps",
+            "type": "array"
+          },
+          "agent_notes": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Agent Notes",
+            "type": "string"
+          },
+          "agent_self_rated_difficulty": {
+            "anyOf": [
+              {
+                "maximum": 10.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Self Rated Difficulty"
+          }
+        },
+        "title": "PilotObservationRequest",
+        "type": "object"
+      },
+      "PilotObservationResponse": {
+        "properties": {
+          "episode_id": {
+            "format": "uuid",
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "observation_id": {
+            "format": "uuid",
+            "title": "Observation Id",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "producer_class": {
+            "default": "agent_asserted",
+            "title": "Producer Class",
+            "type": "string"
+          },
+          "read_by_any_gate": {
+            "default": false,
+            "title": "Read By Any Gate",
+            "type": "boolean"
+          },
+          "recorded": {
+            "default": true,
+            "title": "Recorded",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation_id",
+          "episode_id",
+          "observed_at"
+        ],
+        "title": "PilotObservationResponse",
+        "type": "object"
+      },
+      "PilotReportResponse": {
+        "description": "The read-only report.  It grants nothing and no promotion path reads it.",
+        "properties": {
+          "arm_availability": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Arm Availability",
+            "type": "object"
+          },
+          "arms_enabled": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Arms Enabled",
+            "type": "array"
+          },
+          "cells": {
+            "items": {
+              "$ref": "#/components/schemas/PilotCellReport"
+            },
+            "title": "Cells",
+            "type": "array"
+          },
+          "claim_b": {
+            "$ref": "#/components/schemas/PilotClaimBReport"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotClause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dreams": {
+            "additionalProperties": true,
+            "title": "Dreams",
+            "type": "object"
+          },
+          "enrolled_total": {
+            "default": 0,
+            "title": "Enrolled Total",
+            "type": "integer"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "human_intervention": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotClause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notices": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Notices",
+            "type": "array"
+          },
+          "pooling_refused": {
+            "default": "",
+            "title": "Pooling Refused",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "single_participant_notice": {
+            "default": "",
+            "title": "Single Participant Notice",
+            "type": "string"
+          },
+          "strata_total": {
+            "default": 0,
+            "title": "Strata Total",
+            "type": "integer"
+          },
+          "success_definition": {
+            "default": "",
+            "title": "Success Definition",
+            "type": "string"
+          },
+          "thresholds_effective_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thresholds Effective At"
+          },
+          "thresholds_sha": {
+            "default": "",
+            "title": "Thresholds Sha",
+            "type": "string"
+          },
+          "thresholds_version": {
+            "default": "",
+            "title": "Thresholds Version",
+            "type": "string"
+          },
+          "worst_cell": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PilotCellReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "generated_at"
+        ],
+        "title": "PilotReportResponse",
+        "type": "object"
+      },
       "PlanningJobStatusResponse": {
         "properties": {
           "attempts": {
@@ -10274,6 +11261,27 @@
         ],
         "title": "ProcessModelItem",
         "type": "object"
+      },
+      "RelevanceVerdict": {
+        "description": "A judgement about a dream proposal's fit, independent of whether it was accepted.",
+        "enum": [
+          "relevant",
+          "not_relevant",
+          "cannot_judge"
+        ],
+        "title": "RelevanceVerdict",
+        "type": "string"
+      },
+      "RescueLevel": {
+        "description": "Four-valued rather than boolean: *approved a diff* and *took over and finished it myself*\nare different events, and the plan asks for the second.",
+        "enum": [
+          "none",
+          "steered",
+          "took_over",
+          "abandoned_to_owner"
+        ],
+        "title": "RescueLevel",
+        "type": "string"
       },
       "ResumeFeedbackRequest": {
         "properties": {
@@ -10912,6 +11920,15 @@
           "escalate"
         ],
         "title": "RetryStrategy",
+        "type": "string"
+      },
+      "ReviewVerdict": {
+        "enum": [
+          "accepted_as_is",
+          "accepted_with_edits",
+          "rejected"
+        ],
+        "title": "ReviewVerdict",
         "type": "string"
       },
       "RuntimeModeConfig": {
@@ -22986,6 +24003,179 @@
         "summary": "Get Dream"
       }
     },
+    "/v1/dreams/{proposal_id}/adjudicate": {
+      "post": {
+        "description": "Whether a proposal was RELEVANT, judged independently of whether it was accepted.\n\nP6 adds no ``dream_proposals`` column, status value or nonresponse value; P5 already ships\nthat vocabulary and this composes with it.  What it adds is the one thing P5 correctly did\nnot: an adjudication of fit.  A rejection is a preference and is never counted as a false\npositive; ``ignored`` is nonresponse and moves neither number.\n\n``blind_claimed`` is the client's word.  ``blind_verified`` is the server's, checked against\nP5's own append-only ``dream_proposal_events``: the adjudication must predate every verdict\nevent and the adjudicator must not be the actor on one.",
+        "operationId": "adjudicate_dream_relevance_v1_dreams__proposal_id__adjudicate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DreamRelevanceAdjudicationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DreamRelevanceAdjudicationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Adjudicate Dream Relevance"
+      }
+    },
     "/v1/dreams/{proposal_id}/transition": {
       "post": {
         "description": "One route, one closed vocabulary.\n\n``accepted`` does not mint anything.  It writes one event and returns.  If accept minted a\nplan root, accepting while a task was in flight would have to either clobber the owner's\ncurrent objective or 409 \u2014 and a 409 loses the owner's answer, which is the exact class of\nloss this phase exists to prevent.  The answer is recorded first; the machinery catches up\non the next reconcile.",
@@ -27071,6 +28261,799 @@
           }
         },
         "summary": "Submit Pattern Feedback"
+      }
+    },
+    "/v1/pilot/episodes": {
+      "get": {
+        "description": "The enrolment ledger.  This is the read that stamps ``revealed_at``.\n\nIt is the one write a GET on this surface performs, and it is deliberate: an arm that was\nfrozen and then read has ``allocated_at < revealed_at``, and an arm that was never read has\n``revealed_at IS NULL``.  It only ever moves NULL -> now and it touches no other column, so\nit cannot rewrite an allocation.",
+        "operationId": "list_pilot_episodes_v1_pilot_episodes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 200,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotEpisodeListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Pilot Episodes"
+      },
+      "post": {
+        "description": "Freeze an arm to a piece of work, BEFORE the work starts.\n\nThe caller sends ``session_id``, ``objective_text``, ``project_id`` and ``decision_family``.\nIt does not send an ``episode_key`` and it does not send an ``arm_id``: the server hashes the\nobjective with the existing producer, reads ``cancel_epoch`` from P2's ``task_states`` **for\nthis session's own task**, and derives P4's six-component key itself.  Re-enrolling the same\nwork therefore returns the ORIGINAL arm with ``reused=true`` rather than drawing again, and\n``body.task_id`` reaches neither the key nor the allocator: a caller-varied field inside the\nkey is an allocator a caller can shop.\n\nWhat this does NOT do, stated because an earlier version of this docstring claimed otherwise:\nit does not make redrawing impossible.  ``session_id`` and ``project_id`` are caller-supplied\ncomponents of the key, and ``session_id`` is absent from ``stratum_id`` \u2014 so a caller who mints\na new session id draws again inside the same ``(project, decision_family)`` cell.  That is\ndeliberate: a new session genuinely is a different piece of work, and the allocator cannot tell\nan honest new task from a discarded one.  The containment is visibility, not prevention.  An\nabandoned draw leaves an enrolled, never-closed episode, so the per-cell ``close_coverage``\nclause (>= 0.80) turns repeated shopping into a SHORTFALL the report names, in the cell where\nit happened.  A relabelled ``project_id`` is contained differently: it forms its own cell, and\nPOOLING REFUSED stops it borrowing another cell's rows.\n\n``revealed_at`` comes back NULL on a fresh enrolment.  It is stamped by the ledger read, so\n``allocated_at`` strictly before ``revealed_at`` is an auditable fact rather than a promise.",
+        "operationId": "enrol_pilot_episode_v1_pilot_episodes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PilotEnrolmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotEnrolmentResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enrol Pilot Episode"
+      }
+    },
+    "/v1/pilot/episodes/{episode_id}/close": {
+      "post": {
+        "description": "The adjudication.  403 for an executor, one per episode, and four derived fields.\n\n``deviated`` is computed from ``executed_arm`` against the assigned arm and is never accepted\non the wire.  ``completion_basis`` is P3's verification first, P2's task state second, and\nthe human's ``finished`` only third.  ``adjudication_independent`` compares the adjudicator\nwith the enrolling principal.  ``late_close`` is a diagnostic and never a refusal.",
+        "operationId": "close_pilot_episode_v1_pilot_episodes__episode_id__close_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "episode_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Episode Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PilotEpisodeCloseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotEpisodeCloseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close Pilot Episode"
+      }
+    },
+    "/v1/pilot/episodes/{episode_id}/observations": {
+      "post": {
+        "description": "The executor's own account of its run.  ``agent_asserted``, and no gate clause reads it.\n\nIts own table, its own response key, and ``read_by_any_gate=false`` on the wire.  These\nexist because the executor's account is genuinely useful when a cell reads oddly \u2014 that is\nits named reader, the report's diagnostics block \u2014 and they are never evidence.",
+        "operationId": "record_pilot_observation_v1_pilot_episodes__episode_id__observations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "episode_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Episode Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PilotObservationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotObservationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Pilot Observation"
+      }
+    },
+    "/v1/pilot/report": {
+      "get": {
+        "description": "The read-only report.  It never pools, never grants and never reports a zero as a result.\n\nC12: this route writes no qualification record and no promotion, exposure or personalization\npath reads it.  ``scripts/p6_pilot_report.py`` renders the SAME computation \u2014 both call\n``pilot_store.build_pilot_report``, which calls the clause functions in\n``tce_shared.pilot_enrollment`` \u2014 so the two cannot drift into disagreeing about a verdict.",
+        "operationId": "pilot_report_v1_pilot_report_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PilotReportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pilot Report"
       }
     },
     "/v1/planning/jobs/{job_id}": {

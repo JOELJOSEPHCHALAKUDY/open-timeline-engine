@@ -9,7 +9,7 @@ from tce_shared.behavior_pilot import (
     prepare_behavior_pilot_context,
     sanitize_behavior_pilot_payload,
 )
-from tce_shared.events import BehaviorPilotVariant
+from tce_shared.events import BehaviorPilotArmMetrics, BehaviorPilotOutcomeRequest, BehaviorPilotVariant
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
 
@@ -126,10 +126,7 @@ def _completed_rows(*, malicious: bool = False) -> list[dict]:
                     "agent_choice": "minimal patch",
                     "top3_choices": ["minimal patch"],
                     "actual_choice": "minimal patch",
-                    "agent_confidence": 0.9,
                     "abstained": False,
-                    "action_similarity": 0.9,
-                    "workflow_similarity": 0.9,
                     "correction_required": False,
                     "outcome_regret": False,
                     "irrelevant_personalization": False,
@@ -154,3 +151,40 @@ def test_pilot_gate_requires_real_window_samples_latency_and_safety() -> None:
     unsafe = behavior_pilot_status(_completed_rows(malicious=True), now=NOW)
     assert unsafe["status"] == "failed_safety"
     assert unsafe["gate"]["safety_passed"] is False
+
+
+
+def test_no_self_reported_metric_survives() -> None:
+    """G6.  The three metrics the system computed about itself are gone, and the safety clause
+    no longer passes on an empty corpus.
+
+    ``calibration_brier`` read ``agent_confidence``, a number the party under test posted about
+    its own answer, and it scored **0.0 — a perfect Brier score — for a reporter that posts 1.0
+    when it is right and 0.0 when it is wrong**: perfectly inverted, perfectly rewarded.  The two
+    similarity means came from the same self-report.  ``safety_passed`` read ``True`` over zero
+    rows, so an empty pilot looked like a safe one.
+    """
+
+    outcome_fields = set(BehaviorPilotOutcomeRequest.model_fields)
+    metric_fields = set(BehaviorPilotArmMetrics.model_fields)
+    for gone in ("agent_confidence", "action_similarity", "workflow_similarity"):
+        assert gone not in outcome_fields, gone
+    for gone in ("calibration_brier", "mean_action_similarity", "mean_workflow_similarity"):
+        assert gone not in metric_fields, gone
+
+    empty = behavior_pilot_status([], now=NOW)
+    assert empty["gate"]["safety_passed"] == "not_computable"
+    assert empty["gate"]["evaluation_ready"] is False
+    assert empty["status"] != "failed_safety"
+    assert any("not computable" in reason for reason in empty["gate"]["reasons"])
+    for arm in empty["arms"]:
+        for gone in ("calibration_brier", "mean_action_similarity", "mean_workflow_similarity"):
+            assert gone not in arm, gone
+
+
+def test_a_populated_safe_corpus_still_reports_a_real_boolean() -> None:
+    """Three-valued does not mean never-true: with completed rows the clause is a boolean again."""
+
+    populated = behavior_pilot_status(_completed_rows(), now=NOW)
+    assert populated["gate"]["safety_passed"] is True
+
