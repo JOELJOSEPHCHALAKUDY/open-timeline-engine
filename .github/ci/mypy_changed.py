@@ -82,11 +82,23 @@ def main() -> int:
     print("Running mypy on changed Python files:")
     for target in targets:
         print(f" - {target}")
+    # Same MYPYPATH the repository baseline uses (`MYPYPATH=shared mypy shared services scripts
+    # tests`). Without it every `import tce_shared.*` / `import tce_api.*` on a changed line reports
+    # import-not-found -- errors the baseline does not have and that no edit to the changed file can
+    # fix, because the problem is the invocation rather than the code.
+    env = dict(os.environ)
+    existing = env.get("MYPYPATH", "")
+    roots = [Path("shared"), *sorted(Path("services").glob("tce_*"))]
+    resolved = [str(root.resolve()) for root in roots if root.is_dir()]
+    if existing:
+        resolved.append(existing)
+    env["MYPYPATH"] = os.pathsep.join(resolved)
     completed = subprocess.run(
         [sys.executable, "-m", "mypy", "--show-error-codes", "--no-error-summary", *targets],
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     changed_by_file = {str(Path(path).resolve()): _changed_lines(path, diff_ref) for path in targets}
     relevant: list[str] = []
