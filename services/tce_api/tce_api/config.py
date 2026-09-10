@@ -374,8 +374,19 @@ class Settings(BaseSettings):
     sqlite_progress_instructions: int = 1000
 
     # --- P3 charter, effect journal, verification, dispatch (design 0.7) ---
-    # The documented off switch: TCE_CHARTER_ENFORCEMENT_ENABLED=0 restores pre-P3 behaviour.
-    charter_enforcement_enabled: bool = True
+    # OFF by default, and that is deliberate. When this is on, claim_execution refuses a mutating
+    # action kind without an active charter -- and every auto-generated takeover directive is
+    # action_kind="takeover_step", which maps to the mutating capability process.execute. Creating a
+    # charter needs a verified human AND a source_receipt_id from trusted_input_receipts, which only
+    # the host-capture credential can write, and nothing in scripts/ mints one. Shipping this on by
+    # default therefore bricked takeover on a fresh install: step, claim, 409 no_active_charter, with
+    # no path out that the installer provides.
+    #
+    # A new control must not disable the product it is protecting. Enforcement is opt-in until the
+    # bootstrap path exists: set TCE_CHARTER_ENFORCEMENT_ENABLED=1 once you have created a charter
+    # (docs/charter.md walks through it). With it on and no charter, the refusal is correct and
+    # intended -- that is the operator's choice, not a default they never made.
+    charter_enforcement_enabled: bool = False
     charter_default_ttl_seconds: int = 43200
     charter_max_ttl_seconds: int = 604800
     charter_min_ttl_seconds: int = 300

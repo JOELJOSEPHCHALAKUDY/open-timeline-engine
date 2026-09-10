@@ -279,7 +279,15 @@ class Settings(BaseSettings):
     # protocol gate, not an OS one -- GET /v1/governance/status reports
     # effective_execution_enforcement, which is "sandbox_enforced" only when a passing sandbox
     # self-test backs it and "protocol_only" otherwise.
-    charter_enforcement_enabled: bool = True
+    #
+    # OFF by default, matching Full. With this on, claim_execution refuses a mutating action kind
+    # without an active charter, and every auto-generated takeover directive is
+    # action_kind="takeover_step" -> the mutating capability process.execute. A charter needs a
+    # verified human and a source_receipt_id only the host-capture credential can write, and nothing
+    # in scripts/ mints one -- so on by default bricked takeover on a fresh install. Enforcement is
+    # opt-in until that bootstrap exists: TCE_CHARTER_ENFORCEMENT_ENABLED=1 once a charter is created
+    # (docs/charter.md). On, with no charter, the refusal is correct -- it is a choice the operator made.
+    charter_enforcement_enabled: bool = False
     charter_default_ttl_seconds: int = 43200
     charter_max_ttl_seconds: int = 604800
     charter_min_ttl_seconds: int = 300

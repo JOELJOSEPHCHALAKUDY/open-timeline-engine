@@ -47,14 +47,22 @@ This is the canonical documentation index for Open Timeline Engine.
 - Git capture plugin: [../plugins/tce_git_capture/README.md](../plugins/tce_git_capture/README.md)
 - VSCode extension: [../plugins/tce_vscode/README.md](../plugins/tce_vscode/README.md)
 - Browser extension: [../plugins/tce_browser/README.md](../plugins/tce_browser/README.md)
+- Host capture hook (trusted human input, separate credential, the only source of receipted human evidence): [plugin-setup.md §4](plugin-setup.md#4-host-capture-hook-trusted-human-input)
+
+## Autonomy and governance
+
+Read [charter.md](charter.md) first — the other documents in this group assume it.
+
+- **Authority charters**: what an autonomous run is permitted to do, the three enforcement tiers, and a control-by-control table of what the operating system enforces, what TCE refuses, what is merely cooperative, and what is not enforced at all — including the eleven stated deviations this host cannot close. [charter.md](charter.md)
+- **The supervisor**: how to run the separate host process that dispatches, watches, verifies and reconciles an autonomous runtime; why it is deliberately not a compose service; the two distinct credentials it needs; and the operator escape hatches for a stuck effect or a dead handoff. [supervisor.md](supervisor.md)
+- **Task state, planning and retrieval deadlines**: the append-only log and the projection folded from it, why a 409 under concurrency is expected, what an executor must do while planning is pending, and what the new deadline labels mean on a dashboard. [task-state.md](task-state.md)
+- **The decision policy**: how one turn's answer is selected, when it abstains, how a decision family earns (and loses) permission to use personalization, and why nothing in this system is calibrated. [decision-policy.md](decision-policy.md)
+- **Aspiration proposals**: what a proposal is, why every word in one must be quoted from a message the owner is receipted as having typed, the accept/reject/snooze vocabulary, and why the system refuses to generate any on the current corpus. [dreams.md](dreams.md)
 
 ## Clone and advisor operations
 
 - Dual-AI behavior, setup, and troubleshooting: [clone-advisor.md](clone-advisor.md)
 - Takeover behavior notes: [takeover-scenarios.md](takeover-scenarios.md)
-- Durable task state, planning jobs and turn deadlines: [task-state.md](task-state.md)
-- Aspiration proposals, the accept/reject/snooze vocabulary and why the system currently refuses to generate: [dreams.md](dreams.md)
-- How a decision is selected, when it abstains, and what is never calibrated: [decision-policy.md](decision-policy.md)
 - Retrieval status endpoint: `GET /v1/context/retrieval/status`
 - Retrieval policy visibility:
   - default: `policy_profile=user-only`
@@ -87,6 +95,7 @@ This is the canonical documentation index for Open Timeline Engine.
 
 - Backup and restore: [runbooks/backup-restore.md](runbooks/backup-restore.md)
 - Disaster recovery: [runbooks/disaster-recovery.md](runbooks/disaster-recovery.md)
+- Operational proof pilot: enrolling and closing episodes, adjudicating proposals, and reading a report that says `NOT ENOUGH EVIDENCE` honestly rather than rounding up: [runbooks/operational-proof-pilot.md](runbooks/operational-proof-pilot.md)
 
 ## API and OpenAPI
 
@@ -96,6 +105,10 @@ This is the canonical documentation index for Open Timeline Engine.
 ## Security
 
 - Threat model and security notes: [threat-model/README.md](threat-model/README.md)
+- Enforcement tiers, the eleven stated deviations, and the credential a mutating sandbox holds (D-10): [charter.md](charter.md)
+- Supervisor credential separation — two distinct tokens, why a verifier that grades its own work returns `inconclusive`: [supervisor.md](supervisor.md)
+- Trusted human-input capture and its separate host credential: [plugin-setup.md §4](plugin-setup.md#4-host-capture-hook-trusted-human-input)
+- Measured rather than claimed, for your own installation: `GET /v1/governance/status`
 
 ## Historical and internal plans
 
