@@ -47,6 +47,7 @@ import re
 import tempfile
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -521,11 +522,334 @@ def _request_from_row(row: dict[str, Any], evidence: list[dict[str, Any]]) -> An
     return replay_request_from_row(row, evidence)
 
 
-def test_the_live_corpus_never_produces_an_exposed_abstention() -> None:
+# --------------------------------------------------------------------------------------
+# The seeded corpus the three arms below read
+# --------------------------------------------------------------------------------------
+
+# Every arm below drives P4 from the **live corpus**: the newest ``behavior_shadow_predictions``,
+# the decision families those rows carry, and the ``decision_opportunities`` they join to.  Each
+# one opens with a non-vacuity assertion -- ``assert rows``, ``assert families``, ``assert
+# non_empty`` -- because an arm that reads an empty table cannot tell a working reconstruction
+# from a broken one, and this file says so in as many words.
+#
+# On a developer's machine those rows are simply there.  A CI database is created, migrated to
+# head, downgraded and upgraded again, and is EMPTY, so the non-vacuity assertions are the first
+# thing that fires.  The answer is not a skip and not a softened assertion: both reintroduce
+# exactly the vacuous pass those assertions exist to prevent.  It is to make the corpus a
+# *fixture* -- one prospective decision seeded through the same six calls
+# ``tce_api.main._freeze_decision_opportunity`` makes on a real turn -- and leave every assertion
+# as it stands.  Where the live corpus already carries rows, the seeded one simply joins them.
+#
+# Seeding through the real writers is the point, not ceremony.  ``build_decision_request`` is
+# what fixes ``evidence_revision``, ``retrieval_version``, ``episode_key`` and the qualification
+# lookup; ``freeze_shadow_prediction`` is what stamps ``prediction_stage='prospective'`` and
+# ``resolution_state='pending'``; ``persist_policy_decision`` is what writes
+# ``request_fingerprint``, ``candidate_option_count`` and the four ``20260909_0041`` replay
+# inputs; ``insert_opportunity`` is what puts the option list on ``alternatives_json``, which is
+# the single column the candidate-set arm exists to prove replay reads.  A hand-rolled ``INSERT``
+# would produce a row shaped like this file's idea of production rather than like production.
+#
+# Everything is written under one dedicated workspace and deleted in a ``finally``.
+
+# One dedicated workspace, owned by this file and nobody else, so the cleanup can be a
+# `DELETE ... WHERE workspace_id = ...` that cannot reach a developer's real rows.
+POLICY_CORPUS_WORKSPACE = "p4-seeded-corpus-ws"
+POLICY_CORPUS_SUBJECT = "p4-seeded-corpus-subject"
+POLICY_CORPUS_SESSION = "p4-seeded-corpus-session"
+POLICY_CORPUS_FAMILY = "needs_human"
+POLICY_CORPUS_ALTERNATIVES: tuple[str, ...] = ("minimal verified fix", "broad refactor")
+
+_OBJECTIVE_HASH = "p4seededcorpus000000000000000001"
+_SITUATION_TYPE = "prioritization_needed"
+_OBJECTIVE = "ship the stripe webhook fix"
+# Deliberately does NOT name either candidate option: `advice_names_a_candidate` is the real
+# derivation of `decision_advice_shown`, and a question that named an option would make the
+# seeded row contaminated evidence rather than a plain unanswered one.
+_QUESTION = "the stripe webhook retries are failing in production; how should we proceed"
+_CONSTRAINTS: dict[str, Any] = {"risk": "production"}
+_SNAPSHOT: dict[str, Any] = {"component": "api", "objective_hash": _OBJECTIVE_HASH}
+
+
+@dataclass(frozen=True)
+class SeededPolicyCorpus:
+    """What the fixture put in the database, for a test that wants to name it."""
+
+    workspace_id: str
+    subject_user_id: str
+    session_id: str
+    decision_family: str
+    candidate_options: tuple[str, ...]
+    opportunity_id: uuid.UUID
+    prediction_id: uuid.UUID
+    observation_ids: tuple[str, ...]
+
+
+def _observation_payloads() -> list[dict[str, Any]]:
+    """Four decisions by the same subject over the same option pair.
+
+    Real evidence rather than an empty set: the exposure gate is reached on every exit of
+    ``decide``, but a request with no evidence terminates before it has scored anything, and a
+    corpus arm whose policy result is always the same early abstention is a weaker instrument
+    than one whose policy actually ranked the options it was offered.
+    """
+
+    return [
+        {
+            "situation_type": _SITUATION_TYPE,
+            "situation_summary": "stripe webhook failing in production",
+            "context_snapshot": {"component": "api"},
+            "objective_text": _OBJECTIVE,
+            "constraints": dict(_CONSTRAINTS),
+            "available_choices": list(POLICY_CORPUS_ALTERNATIVES),
+            "selected_choice": POLICY_CORPUS_ALTERNATIVES[index % 2],
+            "action_taken": "patch the handler and run scoped tests",
+            "memory_class": "preference",
+            "evidence_source": "explicit",
+            "confidence": 0.9,
+            "decision_family": POLICY_CORPUS_FAMILY,
+        }
+        for index in range(4)
+    ]
+
+
+def _purge(db: Any) -> None:
+    import sqlalchemy as sa
+
+    for statement in (
+        "DELETE FROM behavior_shadow_predictions WHERE workspace_id = :ws",
+        "DELETE FROM decision_opportunities WHERE workspace_id = :ws",
+        "DELETE FROM decision_observations WHERE workspace_id = :ws",
+    ):
+        db.execute(sa.text(statement), {"ws": POLICY_CORPUS_WORKSPACE})
+    db.commit()
+
+
+@pytest.fixture()
+def seeded_policy_corpus() -> Iterator[SeededPolicyCorpus]:
+    """One prospective decision, written by the real writers, removed afterwards.
+
+    Asserts rather than skips on a missing ``TCE_DATABASE_URL``: every consumer of this fixture
+    already treats an unset URL as a failure, because running those gates against nothing is
+    the vacuous pass they exist to prevent.
+    """
+
+    url = os.environ.get("TCE_DATABASE_URL", "").strip()
+    assert url, (
+        "TCE_DATABASE_URL is unset, so there is no corpus to seed and the arms that use this "
+        "fixture would read an empty database and pass vacuously."
+    )
+
+    import sqlalchemy as sa
+    from sqlalchemy.orm import Session
+    from tce_api.behavior_control_store import freeze_shadow_prediction
+    from tce_api.behavior_store import save_behavior_evidence
+    from tce_api.capture_store import insert_opportunity
+    from tce_api.policy_store import (
+        build_decision_request,
+        persist_policy_decision,
+        prediction_payload,
+        reset_policy_column_cache,
+    )
+    from tce_shared.decision_policy import advice_names_a_candidate, decide
+    from tce_shared.scope import PROJECT_UNBOUND, ResolvedScope
+
+    # The migration probes are cached per engine URL for the life of the process, and a
+    # negative answer sticks for a minute.  A suite that ran against a database mid-migration
+    # would otherwise seed a row with none of the P4 columns filled in.
+    reset_policy_column_cache()
+
+    engine = sa.create_engine(url, future=True)
+    scope = ResolvedScope(
+        workspace_id=POLICY_CORPUS_WORKSPACE,
+        executor_id="p4-seeded-corpus",
+        owner_id=POLICY_CORPUS_SUBJECT,
+        subject_user_id=POLICY_CORPUS_SUBJECT,
+        project_id=None,
+        project_binding=PROJECT_UNBOUND,
+        task_id=None,
+        owner_ids=frozenset({POLICY_CORPUS_SUBJECT}),
+    )
+    opportunity_id = uuid.uuid4()
+    observation_ids: list[str] = []
+
+    try:
+        with Session(engine) as db:
+            # Left over from a run that died before its `finally`; seeding on top of it would
+            # double the corpus and make `candidate_option_count` assertions order-dependent.
+            _purge(db)
+
+            for payload in _observation_payloads():
+                observation_ids.append(
+                    str(
+                        save_behavior_evidence(
+                            db,
+                            consumer_id="p4-seeded-corpus",
+                            workspace_id=POLICY_CORPUS_WORKSPACE,
+                            subject_user_id=POLICY_CORPUS_SUBJECT,
+                            evidence=payload,
+                            storage_gate={
+                                "learning_eligible": True,
+                                "score": 0.8,
+                                "decision": "eligible",
+                            },
+                        )
+                    )
+                )
+
+            # From here down this mirrors `main._freeze_decision_opportunity`, call for call and
+            # in its order: one request, one decision, the shadow row, the decision on that row,
+            # then the opportunity that carries the option list.
+            decision_at = datetime.now(tz=UTC)
+            request = build_decision_request(
+                db,
+                scope=scope,
+                decision_family=POLICY_CORPUS_FAMILY,
+                situation_type=_SITUATION_TYPE,
+                situation_summary=_QUESTION[:500],
+                objective_text=_OBJECTIVE,
+                constraints=dict(_CONSTRAINTS),
+                context_snapshot=dict(_SNAPSHOT),
+                candidate_options=list(POLICY_CORPUS_ALTERNATIVES),
+                decision_at=decision_at,
+                session_id=POLICY_CORPUS_SESSION,
+                objective_hash=_OBJECTIVE_HASH,
+                model_id="p4-seeded-corpus-model",
+                runtime_version="p4-seeded-corpus-runtime",
+            )
+            assert request.evidence_rows, (
+                "the seeded observations did not come back through `load_policy_evidence`, so "
+                "the seeded decision would be made over an empty corpus"
+            )
+            assert request.candidate_options == POLICY_CORPUS_ALTERNATIVES
+            result = decide(request)
+
+            # The write site builds `query` from the situation, the objective, the constraints
+            # and the snapshot, and never from the options.  Keeping that literally true here is
+            # what preserves the regression pin in the candidate-set arm.
+            query = {
+                "situation_type": _SITUATION_TYPE,
+                "situation_summary": _QUESTION[:500],
+                "objective_text": _OBJECTIVE,
+                "constraints": dict(_CONSTRAINTS),
+                "context_snapshot": dict(_SNAPSHOT),
+            }
+            # Strictly later than `decision_at`, exactly as the write path's second
+            # `datetime.now()` is.
+            frozen_at = datetime.now(tz=UTC) + timedelta(milliseconds=1)
+            prediction_id = freeze_shadow_prediction(
+                db,
+                workspace_id=POLICY_CORPUS_WORKSPACE,
+                subject_user_id=POLICY_CORPUS_SUBJECT,
+                opportunity_id=opportunity_id,
+                session_id=POLICY_CORPUS_SESSION,
+                turn=1,
+                decision_family=POLICY_CORPUS_FAMILY,
+                query=query,
+                prediction=prediction_payload(result),
+                evidence_count=len(request.evidence_rows),
+                latency_ms=7,
+                evidence_cutoff_at=request.evidence_cutoff_at,
+                evidence_revision=request.evidence_revision,
+                advice_visible=False,
+                frozen_at=frozen_at,
+            )
+            persist_policy_decision(
+                db,
+                prediction_id=prediction_id,
+                result=result,
+                request=request,
+                project_id=None,
+                episode_key=request.episode_key,
+                decision_advice_shown=advice_names_a_candidate(
+                    rendered_text=_QUESTION,
+                    candidate_options=POLICY_CORPUS_ALTERNATIVES,
+                ),
+                candidate_option_count=len(POLICY_CORPUS_ALTERNATIVES),
+            )
+            insert_opportunity(
+                db,
+                opportunity_id=opportunity_id,
+                workspace_id=POLICY_CORPUS_WORKSPACE,
+                subject_user_id=POLICY_CORPUS_SUBJECT,
+                owner_id=POLICY_CORPUS_SUBJECT,
+                session_id=POLICY_CORPUS_SESSION,
+                turn=1,
+                objective_hash=_OBJECTIVE_HASH,
+                task_id=None,
+                project_id=None,
+                decision_family=POLICY_CORPUS_FAMILY,
+                situation_type=_SITUATION_TYPE,
+                question_text=_QUESTION,
+                alternatives=list(POLICY_CORPUS_ALTERNATIVES),
+                pre_answer_snapshot={**_SNAPSHOT, "final_response": _QUESTION, "turn": 1},
+                evidence_cutoff_at=request.evidence_cutoff_at,
+                evidence_revision=request.evidence_revision,
+                advice_exposure={"advice_visible": False, "prediction_shown": result.exposed},
+                shadow_prediction_id=prediction_id,
+                source_event_id=None,
+                expires_at=frozen_at + timedelta(hours=1),
+                created_at=frozen_at,
+                frozen_at=frozen_at,
+                episode_key=request.episode_key,
+            )
+            db.commit()
+
+            # The three properties every consumer depends on, checked once here so a failure
+            # names the seeding rather than surfacing as a confusing assertion in a gate.
+            seeded = db.execute(
+                sa.text(
+                    """
+                    SELECT p.prediction_stage,
+                           p.resolution_state,
+                           p.request_fingerprint IS NOT NULL AS has_fingerprint,
+                           p.candidate_option_count,
+                           jsonb_array_length(COALESCE(o.alternatives_json, '[]'::jsonb)) AS options,
+                           (p.query_json ? 'available_choices') AS query_has_choices
+                      FROM behavior_shadow_predictions p
+                      JOIN decision_opportunities o ON o.id = p.opportunity_id
+                     WHERE p.id = :id
+                    """
+                ),
+                {"id": prediction_id},
+            ).mappings().one()
+            assert seeded["prediction_stage"] == "prospective"
+            assert seeded["resolution_state"] == "pending"
+            assert seeded["has_fingerprint"], (
+                "the seeded row carries no request_fingerprint: alembic 20260909_0040 is not "
+                "applied to this database, so no P4 column was written"
+            )
+            assert seeded["options"] == len(POLICY_CORPUS_ALTERNATIVES)
+            assert seeded["candidate_option_count"] == len(POLICY_CORPUS_ALTERNATIVES)
+            assert not seeded["query_has_choices"], (
+                "the seeded query_json carries available_choices, which would let a replay that "
+                "reads that key pass by coincidence"
+            )
+
+        yield SeededPolicyCorpus(
+            workspace_id=POLICY_CORPUS_WORKSPACE,
+            subject_user_id=POLICY_CORPUS_SUBJECT,
+            session_id=POLICY_CORPUS_SESSION,
+            decision_family=POLICY_CORPUS_FAMILY,
+            candidate_options=POLICY_CORPUS_ALTERNATIVES,
+            opportunity_id=opportunity_id,
+            prediction_id=prediction_id,
+            observation_ids=tuple(observation_ids),
+        )
+    finally:
+        with Session(engine) as db:
+            _purge(db)
+        engine.dispose()
+
+
+def test_the_live_corpus_never_produces_an_exposed_abstention(seeded_policy_corpus: Any) -> None:
     """Zero families are qualified, so ``exposed`` is ``False`` on every row of the real corpus.
 
     This is the assertion that goes red the instant ``_exposure()`` defaults open — which is one of
     the two routes by which the earlier draft turned every turn into an escalation.
+
+    ``seeded_policy_corpus`` (above) puts one prospective decision in
+    the corpus through the real writers, so "the real corpus" is non-empty on a freshly migrated
+    database too.  The assertion below is unchanged and still walks every row it finds.
     """
 
     from tce_shared.decision_policy import decide
@@ -549,11 +873,14 @@ def test_the_live_corpus_never_produces_an_exposed_abstention() -> None:
     assert statuses, statuses
 
 
-def test_an_unexposed_policy_result_changes_no_turn(subtests: object = None) -> None:
+def test_an_unexposed_policy_result_changes_no_turn(
+    seeded_policy_corpus: Any, subtests: object = None
+) -> None:
     """FN2/G14: ``policy=<unexposed>`` returns exactly what ``policy=None`` returns.
 
     Driven from the real corpus rather than from a hand-built result, so it covers whatever the
-    policy actually concludes about real evidence — abstention, selection or a rule.
+    policy actually concludes about real evidence — abstention, selection or a rule.  The seeded
+    row guarantees there is at least one such result to drive it with; see the fixture.
     """
 
     from tce_shared.decision_policy import decide
@@ -605,7 +932,9 @@ def _live_families() -> list[str]:
     return sorted(str(row["decision_family"]) for row in rows)
 
 
-def test_the_promotion_gate_reports_not_qualified_with_per_family_shortfalls() -> None:
+def test_the_promotion_gate_reports_not_qualified_with_per_family_shortfalls(
+    seeded_policy_corpus: Any,
+) -> None:
     """G12: absence of a qualification is a *recorded refusal*, not an error and not a zero.
 
     P4's promotion clause admits only prospective cases the human answered without having already
@@ -615,6 +944,12 @@ def test_the_promotion_gate_reports_not_qualified_with_per_family_shortfalls() -
     prospective rows are unresolved, so the admissible count is zero in every family.  That is the
     expected result and the report must say it in those words, per family, with the clause that
     fell short — not raise, and not quietly return nothing.
+
+    ``seeded_policy_corpus`` supplies one prospective, *unanswered* row in one family, which is
+    the live corpus in miniature: it is excluded as ``cases_excluded_unresolved``, the admissible
+    count stays zero, and the gate has a family to name.  Without it a freshly migrated database
+    reports on no families at all, and "NOT_QUALIFIED in every family" is trivially true of the
+    empty set.
     """
 
     from tce_shared.policy_evaluation import REQUIRED_BASELINES, PolicyCase, evaluate_policy
@@ -964,7 +1299,7 @@ def _live_prospective_with_options(
     )
 
 
-def test_replay_reconstructs_the_candidate_set_the_turn_offered() -> None:
+def test_replay_reconstructs_the_candidate_set_the_turn_offered(seeded_policy_corpus: Any) -> None:
     """The deployed route and the evaluated route decide over the *same option list*.
 
     Before this fix the replay assembly read ``query_json['available_choices']`` — a key the
@@ -980,6 +1315,13 @@ def test_replay_reconstructs_the_candidate_set_the_turn_offered() -> None:
     ``opportunity_id``, so the join is total for every prospective row.  This asserts the
     reconstruction three ways: non-empty, equal to what was offered, and consistent with the
     scalar the write site derived from the same list.
+
+    The non-vacuity assertion at the bottom — "no prospective row in the whole corpus joins to a
+    non-empty ``alternatives_json``" — is the whole instrument, so it is *seeded* rather than
+    hoped for: ``seeded_policy_corpus`` writes an opportunity carrying two alternatives and a
+    shadow row joined to it by ``opportunity_id``, through ``insert_opportunity`` and
+    ``freeze_shadow_prediction``.  Its ``query_json`` deliberately carries no
+    ``available_choices`` key, so the regression pin below still cannot pass by coincidence.
     """
 
     from tce_api.policy_store import replay_candidate_options

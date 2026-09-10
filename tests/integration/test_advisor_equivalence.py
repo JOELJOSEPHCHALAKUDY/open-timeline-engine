@@ -141,7 +141,49 @@ def _purge_advisor_eq_rows() -> Iterator[None]:
 
 
 @pytest.fixture()
-def full_app(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+def _clone_advisor_mode() -> Iterator[None]:
+    """Put the runtime mode in ``clone_advisor``, which is what makes the advisor reachable.
+
+    This is ambient database state, not configuration: ``mode.get_runtime_mode`` reads the
+    ``runtime_mode`` row of ``runtime_settings`` and only falls back to
+    ``Settings.default_operation_mode`` when that row does not exist yet, so pinning the setting
+    is not enough once anything in the run has materialised the row.  On a developer's database
+    the row has said ``clone_advisor`` since somebody ran ``PUT /v1/runtime/mode`` months ago.
+    On a database that CI creates, migrates and hands over, it says ``timeline_only``, and then
+    ``clone_advice`` raises ``409 clone_mode_disabled`` on **every** turn -- before
+    ``_advisor_runtime_reason_from_routes`` is ever called, so the healthy advisor these tests
+    monkeypatch in is never consulted at all.  What the three Full arms then measure is the
+    409: ``fast_path_reason='advisor_exception'``, a climbing ``advisor_fail_streak``,
+    ``advisor_unhealthy`` by turn 2, and ``advice_visible`` False on every frozen row.
+
+    So the mode is seeded here through ``set_runtime_mode`` -- the real writer behind that
+    route -- and restored to whatever it was, on both kinds of database.
+    """
+
+    url = os.environ.get("TCE_DATABASE_URL", "").strip()
+    if not url:  # the arms that need it are already skipped by `full_only`
+        yield
+        return
+
+    import sqlalchemy as sa
+    from sqlalchemy.orm import Session
+    from tce_api.mode import get_runtime_mode, set_runtime_mode
+    from tce_shared.events import OperationMode
+
+    engine = sa.create_engine(url, future=True)
+    try:
+        with Session(engine) as db:
+            previous = get_runtime_mode(db).mode
+            set_runtime_mode(db, OperationMode.CLONE_ADVISOR, "advisor-equivalence-test")
+        yield
+    finally:
+        with Session(engine) as db:
+            set_runtime_mode(db, previous, "advisor-equivalence-test-restore")
+        engine.dispose()
+
+
+@pytest.fixture()
+def full_app(monkeypatch: pytest.MonkeyPatch, _clone_advisor_mode: None) -> Iterator[Any]:
     import tce_api.bundle as bundle
     import tce_api.main as full_main
     from tce_api.config import get_settings
