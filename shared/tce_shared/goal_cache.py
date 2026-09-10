@@ -11,8 +11,28 @@ _L1_CACHE: dict[str, dict[str, Any]] = {}
 _L1_STATS = {"hits": 0, "misses": 0}
 
 
-def cache_key(*, workspace_id: str, user_id: str, session_id: str, objective_hash: str, state_version: str) -> str:
-    raw = f"{workspace_id}|{user_id}|{session_id}|{objective_hash}|{state_version}"
+def cache_key(
+    *,
+    workspace_id: str,
+    user_id: str,
+    session_id: str,
+    objective_hash: str,
+    state_version: str,
+    contract_revision: int,
+    scope_digest: str,
+    policy_revision: str,
+) -> str:
+    """Key a cached goal queue to the contract and the scope it was computed under.
+
+    The three P2 arguments are required and have no defaults on purpose: a cached queue
+    served across a contract bump or across a different resolved scope is a correctness
+    bug, and the compile break at every call site is the only reliable way to find them.
+    The ``goalq:`` prefix is unchanged so ``invalidate_l1("goalq:")`` keeps working.
+    """
+    raw = (
+        f"{workspace_id}|{user_id}|{session_id}|{objective_hash}|{state_version}"
+        f"|{contract_revision}|{scope_digest}|{policy_revision}"
+    )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
     return f"goalq:{digest}"
 
@@ -94,13 +114,20 @@ def goal_cache_key(
     session_id: str,
     objective_hash: str,
     state_version: str,
+    contract_revision: int,
+    scope_digest: str,
+    policy_revision: str,
 ) -> str:
+    """Thin re-export of :func:`cache_key`; this is the name both backends import."""
     return cache_key(
         workspace_id=workspace_id,
         user_id=user_id,
         session_id=session_id,
         objective_hash=objective_hash,
         state_version=state_version,
+        contract_revision=contract_revision,
+        scope_digest=scope_digest,
+        policy_revision=policy_revision,
     )
 
 

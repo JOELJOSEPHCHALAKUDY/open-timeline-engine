@@ -181,11 +181,11 @@ def record_outcome_lite(
         INSERT OR IGNORE INTO behavior_projection_pilot_outcomes (
             id, assignment_id, workspace_id, subject_user_id, reporter_id,
             outcome_digest, agent_choice, top3_choices_json, actual_choice,
-            agent_confidence, abstained, action_similarity, workflow_similarity,
+            abstained,
             correction_required, outcome_regret, irrelevant_personalization,
             malicious_memory_activated, stale_evidence_used, used_evidence_ids_json,
             notes, redaction_applied, reported_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1')
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1')
         """,
         (
             outcome_id,
@@ -197,10 +197,7 @@ def record_outcome_lite(
             outcome.get("agent_choice"),
             json.dumps(outcome.get("top3_choices") or []),
             outcome["actual_choice"],
-            float(outcome.get("agent_confidence") or 0.0),
             1 if outcome.get("abstained") else 0,
-            float(outcome.get("action_similarity") or 0.0),
-            float(outcome.get("workflow_similarity") or 0.0),
             1 if outcome.get("correction_required") else 0,
             1 if outcome.get("outcome_regret") else 0,
             1 if outcome.get("irrelevant_personalization") else 0,
@@ -246,8 +243,8 @@ def list_pilot_rows_lite(
         SELECT a.id AS assignment_id, a.variant, a.assigned_at, a.expires_at,
                a.injected_tokens, a.retrieval_latency_ms,
                o.id AS outcome_id, o.agent_choice, o.top3_choices_json,
-               o.actual_choice, o.agent_confidence, o.abstained,
-               o.action_similarity, o.workflow_similarity, o.correction_required,
+               o.actual_choice, o.abstained,
+               o.correction_required,
                o.outcome_regret, o.irrelevant_personalization,
                o.malicious_memory_activated, o.stale_evidence_used, o.reported_at
         FROM behavior_projection_pilot_assignments a

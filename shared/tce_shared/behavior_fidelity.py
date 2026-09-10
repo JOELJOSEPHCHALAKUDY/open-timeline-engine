@@ -4,10 +4,11 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from .policy_thresholds import OOD_OVERLAP_FLOOR
 from .redaction import redact_text
 
 BEHAVIOR_SCHEMA_VERSION = "v1"
@@ -197,7 +198,37 @@ def validate_behavior_evidence(payload: dict[str, Any]) -> list[str]:
 
 
 def behavior_storage_gate(payload: dict[str, Any], *, threshold: float = 0.55) -> dict[str, Any]:
-    """Score whether evidence may influence learned behavior; raw evidence remains auditable."""
+    """Score whether evidence may influence learned behavior; raw evidence remains auditable.
+
+    The score reads **provenance and auditable content only**.  It reads no number the writer
+    of the row attached to itself.  This is the same ruling as the one ``_similarity`` below
+    carries, applied one layer earlier, and this is the layer that mattered: the flag this
+    function returns is written to ``decision_observations.learning_eligible``, which is the
+    WHERE clause of both policy evidence loaders and, one hop later, a direct term in
+    ``decision_policy.evidence_strength_label`` via ``Adequacy.learning_eligible_count``.  A
+    ``0.10 * payload["confidence"]`` term therefore let a writer that claimed to be confident
+    make its own evidence eligible and then make that evidence look strong.
+
+    **Nothing replaced that term.**  The rule is that a replacement has to be computed from
+    stored evidence rows rather than from a field the writer controls, and this function sees
+    exactly one payload, before it is stored: corroboration count, agreement among
+    neighbours and human confirmation are all properties of a *corpus*, and none of them is
+    knowable here.  They are already measured where they can be — ``Adequacy`` carries
+    ``learning_eligible_count``, ``agreement_share`` and ``effective_sample_size`` at
+    retrieval time.  The one payload key that would qualify, ``confirmed_at``, is server-set
+    on the receipt-backed extraction path and forced to ``None`` on every HTTP path, so
+    weighting it here would score the writer's route rather than the evidence.
+
+    **The weights were re-derived so ``threshold`` still means what it meant.**  The freed
+    0.10 moved to ``rationale`` (0.12 -> 0.22) rather than to the constant floor.  Every live
+    caller scores its payload after ``normalize_behavior_evidence``, which defaults
+    ``confidence`` to 1.0, so the deleted term was in practice a flat +0.10 on a row that
+    stated why it was decided *and* on a row that did not.  Sending it to the floor would have
+    kept both; sending it to ``rationale`` keeps the score of the first identical to what it
+    scored before and drops the second below the line.  A row with no stated reason that
+    passed only because a model said it was sure is exactly the population this gate exists to
+    hold back, and it is the only population whose verdict changes.
+    """
 
     source = str(payload.get("evidence_source") or "explicit").strip().lower()
     memory_class = str(payload.get("memory_class") or "decision").strip().lower()
@@ -212,7 +243,7 @@ def behavior_storage_gate(payload: dict[str, Any], *, threshold: float = 0.55) -
     }
     score += source_weights.get(source, 0.05)
     if payload.get("rationale"):
-        score += 0.12
+        score += 0.22
     else:
         reasons.append("missing_rationale")
     if payload.get("outcome"):
@@ -221,8 +252,6 @@ def behavior_storage_gate(payload: dict[str, Any], *, threshold: float = 0.55) -
         score += 0.05
     if payload.get("action_taken"):
         score += 0.05
-    confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.0) or 0.0)))
-    score += 0.10 * confidence
     if memory_class in {"safety_constraint", "procedural_runbook"} and source in {"explicit", "correction"}:
         score += 0.10
     if payload.get("lifecycle_status") != "active":
@@ -266,7 +295,7 @@ def _choice_key(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
-def _evidence_text(item: dict[str, Any]) -> str:
+def _evidence_text(item: Mapping[str, Any]) -> str:
     return " ".join(
         [
             str(item.get("situation_type") or ""),
@@ -279,11 +308,11 @@ def _evidence_text(item: dict[str, Any]) -> str:
 
 
 def _active_evidence(
-    item: dict[str, Any],
+    item: Mapping[str, Any],
     *,
     at: datetime | None = None,
     historical: bool = False,
-    rows_by_id: dict[str, dict[str, Any]] | None = None,
+    rows_by_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> bool:
     lifecycle_status = str(item.get("lifecycle_status") or "active")
     if lifecycle_status == "rejected":
@@ -310,11 +339,11 @@ def _active_evidence(
 
 
 def _eligible_evidence_rows(
-    evidence_rows: Iterable[dict[str, Any]],
+    evidence_rows: Iterable[Mapping[str, Any]],
     *,
     at: datetime | None = None,
     historical: bool = False,
-) -> list[dict[str, Any]]:
+) -> list[Mapping[str, Any]]:
     rows = [dict(row) for row in evidence_rows]
     rows_by_id = {str(row.get("id")): row for row in rows if row.get("id")}
     active = [
@@ -340,39 +369,63 @@ def _eligible_evidence_rows(
 
 
 def eligible_behavior_evidence(
-    evidence_rows: Iterable[dict[str, Any]],
+    evidence_rows: Iterable[Mapping[str, Any]],
     *,
     at: datetime | None = None,
     historical: bool = False,
-) -> list[dict[str, Any]]:
+) -> list[Mapping[str, Any]]:
     """Return evidence that is currently eligible to influence behavior."""
 
     return _eligible_evidence_rows(evidence_rows, at=at, historical=historical)
 
 
-def _similarity(query: dict[str, Any], evidence: dict[str, Any], *, newest_ts: datetime) -> float:
+def _topical_overlap(query: Mapping[str, Any], evidence: Mapping[str, Any]) -> float:
+    """Raw Jaccard token overlap between a query and one evidence row.
+
+    This is the only input to ``ood_score``.  It reads no clock, no ``evidence_source`` and
+    no self-reported confidence, which is exactly what makes it a distribution test rather
+    than a freshness test: ``_similarity`` below is a *ranking* score, 40% of whose range
+    comes from terms that have nothing to do with the query, so a semantically unrelated but
+    fresh, explicit, same-``situation_type`` row out-scores the identical row aged a year.
+    Asking that number whether a query is in distribution gets you an answer about recency.
+    """
+
     query_tokens = _tokens(_evidence_text(query))
     evidence_tokens = _tokens(_evidence_text(evidence))
-    union = query_tokens | evidence_tokens
-    overlap = len(query_tokens & evidence_tokens) / max(1, len(union))
+    return len(query_tokens & evidence_tokens) / max(1, len(query_tokens | evidence_tokens))
+
+
+def _similarity(query: Mapping[str, Any], evidence: Mapping[str, Any], *, decision_at: datetime) -> float:
+    """Rank one evidence row against a query, with recency measured at decision time.
+
+    ``decision_at`` — not ``max(row.ts)``.  Anchoring recency on the newest row in the corpus
+    makes the decay a function of the corpus rather than of the decision: a 900-day-old
+    corpus and a 5-day-old corpus produced byte-identical predictions, because in both the
+    newest row was 0 days old *relative to itself*.  Live traffic and replay then measure
+    different things while claiming to run the same policy.
+
+    There is deliberately no ``evidence.get("confidence")`` term.  That column is fed from an
+    advisor's own number about itself; reading it here launders a model's self-report into an
+    evidence score one hop later.  The weight it carried moved to ``overlap``.
+    """
+
+    overlap = _topical_overlap(query, evidence)
     same_situation = str(query.get("situation_type") or "") == str(evidence.get("situation_type") or "")
     evidence_ts = _as_datetime(evidence.get("ts"))
-    age_days = max(0.0, (newest_ts - evidence_ts).total_seconds() / 86400.0)
+    age_days = max(0.0, (decision_at - evidence_ts).total_seconds() / 86400.0)
     recency = math.exp(-math.log(2) * age_days / 90.0)
     source = str(evidence.get("evidence_source") or "inferred")
     source_quality = {"correction": 1.0, "explicit": 0.95, "calibration": 0.85, "inferred": 0.65}.get(source, 0.55)
-    confidence = max(0.0, min(1.0, float(evidence.get("confidence", 0.5) or 0.5)))
     return round(
-        (0.55 * overlap)
+        (0.60 * overlap)
         + (0.18 if same_situation else 0.0)
         + (0.12 * recency)
-        + (0.10 * source_quality)
-        + (0.05 * confidence),
+        + (0.10 * source_quality),
         6,
     )
 
 
-def _map_choice(choice: str, allowed: list[str]) -> str:
+def _map_choice(choice: str, allowed: Sequence[str]) -> str:
     if not allowed:
         return choice
     choice_tokens = _tokens(choice)
@@ -399,7 +452,7 @@ def _effective_sample_size(weights: Iterable[float]) -> float:
     return (total * total) / squared
 
 
-def _context_group_key(item: dict[str, Any]) -> str:
+def _context_group_key(item: Mapping[str, Any]) -> str:
     normalized = _choice_key(_evidence_text(item))
     return _CONTEXT_NUMBER_RE.sub("<n>", normalized)
 
@@ -419,14 +472,22 @@ def _wilson_interval(successes: int, total: int, *, z: float = 1.96) -> tuple[fl
 
 
 def predict_behavior(
-    evidence_rows: Iterable[dict[str, Any]],
-    query: dict[str, Any],
+    evidence_rows: Iterable[Mapping[str, Any]],
+    query: Mapping[str, Any],
     *,
-    candidate_choices: list[str] | None = None,
+    decision_at: datetime,
+    candidate_choices: Sequence[str] | None = None,
     min_confidence: float = 0.55,
     max_neighbors: int = 12,
     historical_as_of: datetime | None = None,
 ) -> dict[str, Any]:
+    """The kNN stage of the decision policy.
+
+    ``decision_at`` is **required and keyword-only** on purpose.  A ``datetime | None = None``
+    default that falls back to ``datetime.now()`` reintroduces train/serve skew silently, in
+    replay, which is the one place nobody would look for it.
+    """
+
     rows = _eligible_evidence_rows(
         evidence_rows,
         at=historical_as_of,
@@ -449,14 +510,16 @@ def predict_behavior(
             "predicted_action": None,
         }
 
-    newest_ts = max((_as_datetime(row.get("ts")) for row in rows), default=datetime.now(tz=UTC))
     neighbors = sorted(
-        [(_similarity(query, row, newest_ts=newest_ts), row) for row in rows],
+        [(_similarity(query, row, decision_at=decision_at), row) for row in rows],
         key=lambda item: (-item[0], -_as_datetime(item[1].get("ts")).timestamp(), str(item[1].get("id") or "")),
     )[: max(1, max_neighbors)]
     votes: dict[str, float] = defaultdict(float)
     labels: dict[str, str] = {}
-    action_votes: dict[str, float] = defaultdict(float)
+    # Action votes are accumulated PER MAPPED CHOICE and the winner is read off the winning
+    # choice afterwards.  Summing them across every neighbour is how the predictor came to
+    # answer "pause and verify" while handing the executor "force push to prod".
+    action_votes_by_choice: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     citations: list[str] = []
     voting_weights: list[float] = []
     for similarity, row in neighbors:
@@ -473,24 +536,28 @@ def predict_behavior(
         voting_weights.append(weight)
         action = str(row.get("action_taken") or "").strip()
         if action:
-            action_votes[action] += max(0.001, similarity)
+            action_votes_by_choice[key][action] += weight
         if row.get("id"):
             citations.append(str(row["id"]))
 
     ranked = sorted(votes.items(), key=lambda item: (-item[1], item[0]))
     total = sum(weight for _, weight in ranked)
     top_similarity = neighbors[0][0] if neighbors else 0.0
+    top_overlap = max((_topical_overlap(query, row) for _, row in neighbors), default=0.0)
     vote_share = ranked[0][1] / total if ranked and total else 0.0
     confidence = round(min(1.0, vote_share * (0.45 + (0.55 * min(1.0, top_similarity)))), 4)
-    ood_score = round(max(0.0, min(1.0, 1.0 - top_similarity)), 4)
-    out_of_distribution = bool(neighbors and top_similarity < 0.45)
+    # Distribution is measured on raw topical overlap, never on the ranking score.
+    ood_score = round(max(0.0, min(1.0, 1.0 - top_overlap)), 4)
+    out_of_distribution = bool(neighbors and top_overlap < OOD_OVERLAP_FLOOR)
     ranked_choices = [
         {"choice": labels[key], "score": round(weight / max(total, 1e-9), 4)} for key, weight in ranked[:5]
     ]
     abstained = not ranked_choices or confidence < max(0.0, min(1.0, min_confidence))
     predicted_action = None
-    if action_votes:
-        predicted_action = sorted(action_votes.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    if ranked:
+        winning_actions = action_votes_by_choice.get(ranked[0][0], {})
+        if winning_actions:
+            predicted_action = sorted(winning_actions.items(), key=lambda item: (-item[1], item[0]))[0][0]
     return {
         "predicted_choice": None if abstained else ranked_choices[0]["choice"],
         "ranked_choices": ranked_choices,
@@ -608,6 +675,7 @@ def evaluate_behavior_fidelity(
         prediction = predict_behavior(
             train,
             query,
+            decision_at=_as_datetime(test.get("ts")),
             candidate_choices=available,
             min_confidence=min_confidence,
             historical_as_of=_as_datetime(test.get("ts")),

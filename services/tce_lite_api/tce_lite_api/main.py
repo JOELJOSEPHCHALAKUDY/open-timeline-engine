@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import re
 import shlex
@@ -10,17 +11,17 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ote_advisor_providers import get_provider, list_provider_metadata, resolve_fallback_chain
 from ote_advisor_providers.base import ProviderAttemptResult, ProviderRequest
@@ -48,6 +49,19 @@ from ote_advisor_providers.router import (
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from tce_shared.aspirations import (
+    DISPLAY_ACTIONS,
+    HUMAN_VERDICT_ACTIONS,
+    SCOPE_KIND_PROJECT,
+    DreamCitation,
+    DreamProposalEvent,
+    DreamProposalEventKind,
+    DreamProposalProjection,
+    DreamRevisionConflict,
+    DreamTransitionRefused,
+    PoolMessage,
+    dream_proposal_summary_fields,
+)
 from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
@@ -55,7 +69,6 @@ from tce_shared.behavior_fidelity import (
     eligible_behavior_evidence,
     evaluate_behavior_fidelity,
     normalize_behavior_evidence,
-    predict_behavior,
 )
 from tce_shared.behavior_pilot import (
     assign_behavior_pilot_variant,
@@ -65,8 +78,40 @@ from tce_shared.behavior_pilot import (
     sanitize_behavior_pilot_payload,
 )
 from tce_shared.behavior_projection import BehaviorProjectionNotFound, build_behavior_projection
+from tce_shared.charter import (
+    CHARTER_POLICY_REVISION,
+    CharterInvalid,
+    CharterRequired,
+    resolved_charter_to_json,
+)
 from tce_shared.dashboard import timeline_dashboard_html
+from tce_shared.decision_capture import (
+    HOST_CAPTURE_CAPABILITY,
+    HOST_CAPTURE_SOURCE,
+    HUMAN_INPUT_TASK_TYPE,
+    TRUSTED_ORIGINS,
+    evidence_revision,
+)
+from tce_shared.decision_policy import (
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    OodStatus,
+    decide,
+)
+from tce_shared.dream_adjudication import dream_block, dream_block_unavailable
+from tce_shared.effect_journal import (
+    EFFECT_ACTOR_OWNER,
+    EFFECT_REOPENABLE_TRANSITIONS,
+    EffectIntent,
+    EffectRecord,
+    EffectTransitionRejected,
+    pause_required,
+)
 from tce_shared.events import (
+    AcceptanceCheckPayload,
+    AcceptanceCriteriaRequest,
+    AcceptanceCriteriaResponse,
     AgentRole,
     AutonomyGoalStatus,
     AutonomyNotice,
@@ -92,6 +137,10 @@ from tce_shared.events import (
     CapabilityConsumeResponse,
     CapabilityGrantRequest,
     CapabilityGrantResponse,
+    CaptureDeliveryState,
+    CharterCreateRequest,
+    CharterNarrowingRequest,
+    CharterResponse,
     CloneAdviceRequest,
     CloneAdviceResponse,
     CompletionCaptureRequest,
@@ -102,6 +151,20 @@ from tce_shared.events import (
     CounterfactualListResponse,
     CounterfactualResolveRequest,
     DirectiveExecution,
+    DispatchOpenRequest,
+    DispatchReconcileRequest,
+    DispatchResponse,
+    DreamProposal,
+    DreamProposalCitation,
+    DreamProposalListResponse,
+    DreamProposalTransitionRequest,
+    DreamRefreshRequest,
+    DreamRefreshResponse,
+    DreamRelevanceAdjudicationRequest,
+    DreamRelevanceAdjudicationResponse,
+    EffectOpenRequest,
+    EffectResolveRequest,
+    EffectResponse,
     EventEnvelope,
     EventSearchRequest,
     EventType,
@@ -116,6 +179,17 @@ from tce_shared.events import (
     MemoryReviewListResponse,
     MemoryReviewResolveRequest,
     PatternFeedbackRequest,
+    PilotEnrolmentRequest,
+    PilotEnrolmentResponse,
+    PilotEpisodeCloseRequest,
+    PilotEpisodeCloseResponse,
+    PilotEpisodeListResponse,
+    PilotEpisodeSummary,
+    PilotObservationRequest,
+    PilotObservationResponse,
+    PilotReportResponse,
+    PlanningJobStatusResponse,
+    PolicyDecisionBlock,
     ProcessMiningRequest,
     ProcessMiningResponse,
     ProcessModelItem,
@@ -123,6 +197,8 @@ from tce_shared.events import (
     ResumeFeedbackResponse,
     ResumePacketRequest,
     ResumePacketResponse,
+    SandboxSelfTestRequest,
+    SandboxSelfTestResponse,
     TakeoverAutonomyStatusResponse,
     TakeoverAutonomyTickRequest,
     TakeoverAutonomyTickResponse,
@@ -142,14 +218,52 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TaskCancelRequest,
+    TaskCancelResponse,
+    TaskStateProjectionResponse,
+    TaskStateSummary,
+    TrustedInputCapture,
+    TrustedInputOriginKind,
+    TrustedInputReceipt,
+    VerificationResultRequest,
+    VerificationResultResponse,
+    to_lifecycle_status,
+    to_next_permitted_action,
 )
+from tce_shared.execution_transitions import completion_payload_fingerprint
 from tce_shared.fingerprint import DEFAULT_FINGERPRINT, merge_observation_into_fingerprint
 from tce_shared.governance import build_governance_status
 from tce_shared.handoff import normalize_milestone_v1
+from tce_shared.pilot_enrollment import (
+    AllocationKind,
+    CompletionBasis,
+    PilotArm,
+    RescueLevel,
+    ReviewVerdict,
+)
+from tce_shared.pilot_thresholds import P6_THRESHOLDS_SHA
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
-from tce_shared.redaction import redact_text
+from tce_shared.redaction import redact_project_hint, redact_text
+from tce_shared.scope import PROJECT_BOUND, ResolvedScope
+from tce_shared.takeover import objective_hash
+from tce_shared.task_state import (
+    TaskStatePreconditionFailed,
+    TaskStateProjection,
+    TaskStateRevisionConflict,
+    render_task_state_markdown,
+    task_state_summary_fields,
+)
+from tce_shared.verification import (
+    AcceptanceCheck,
+    AcceptanceCriteria,
+    CheckResult,
+    CriteriaFrozen,
+    CriteriaInvalid,
+    VerificationEvidence,
+)
 
+from . import charter_store, dispatch_store, effect_store, reconcile, verification_store
 from .auth import AuthContext, get_auth_context
 from .behavior_control_store import (
     consume_capability_grant,
@@ -183,15 +297,63 @@ from .behavior_pilot_store import (
 from .behavior_pilot_store import (
     record_outcome_lite as record_behavior_pilot_outcome,
 )
+from .capture_store import (
+    capture_delivery_state,
+    extract_pending_inputs,
+    get_receipt,
+    get_receipt_by_delivery_key,
+    insert_receipt,
+    open_opportunities_for_subject,
+    validate_source_event_provenance,
+)
 from .config import get_settings
 from .continuity_store import (
+    CompletionConflictError,
     deliver_handoff_safely,
     drain_pending_handoffs,
     enqueue_handoff,
     pilot_metrics,
     record_resume_progress,
+    requeue_dead_handoff,
 )
 from .db import get_db, init_db
+from .dream_adjudication_store import (
+    DreamTablesMissing,
+    ProposalNotInScope,
+    dream_counts_for_scope,
+)
+from .dream_adjudication_store import record_adjudication as record_dream_adjudication
+from .dream_store import (
+    append_surfaced,
+    apply_dream_events,
+    dream_scope_kind,
+    finish_generation_run,
+    list_proposals,
+    load_live_proposals,
+    load_proposal,
+    load_proposal_stamps,
+    reconcile_dream_pursuit,
+    select_candidate_messages,
+    start_generation_run,
+    subject_has_project_receipts,
+    sweep_dream_proposals,
+    validate_citations_cheap,
+    validate_citations_deep,
+)
+from .pilot_store import (
+    PilotEpisodeConflict,
+    PilotEpisodeNotFound,
+    build_pilot_report,
+)
+from .pilot_store import close_episode as pilot_close_episode
+from .pilot_store import enroll_episode as pilot_enroll_episode
+from .pilot_store import list_episodes as pilot_list_episodes
+from .pilot_store import load_episode as pilot_load_episode
+from .pilot_store import load_report_corpus as pilot_load_report_corpus
+from .pilot_store import mark_revealed as pilot_mark_revealed
+from .pilot_store import record_observation as pilot_record_observation
+from .planning_store import get_planning_job, sweep_stale_planning_jobs
+from .policy_store import build_decision_request, persist_policy_decision
 from .store import (
     acknowledge_takeover_notice as store_acknowledge_takeover_notice,
 )
@@ -203,6 +365,7 @@ from .store import (
     discover_takeover_goals,
     get_event,
     get_resume_packet,
+    human_origin_verified,
     invalidate_takeover_goal_cache,
     json_dumps,
     json_loads,
@@ -213,6 +376,7 @@ from .store import (
     load_behavior_evidence_by_id_lite,
     load_behavior_evidence_lite,
     load_fingerprint_lite,
+    now_utc,
     request_execution_permit_lite,
     resolve_execution_permit_lite,
     run_lifecycle_maintenance,
@@ -316,6 +480,11 @@ from .store_graph import (
     upsert_team_membership,
     workspace_access_allowed,
 )
+from .task_state_store import (
+    cancel_task,
+    load_task_state,
+    rebuild_task_state,
+)
 from .types import (
     ActivitySummaryResponse,
     AdvisorConfigResponse,
@@ -400,6 +569,42 @@ from .types import (
 settings = get_settings()
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
+def _parse_evidence_ts(raw: Any) -> datetime | None:
+    """Decision time for a retrospective shadow: the observation's own timestamp.
+
+    Returns ``None`` rather than ``datetime.now()`` on a value it cannot read, so the caller
+    makes the substitution explicitly.  A silent now() fallback is exactly the train/serve skew
+    ``decision_at`` exists to remove, and it would be invisible in replay.
+    """
+
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _uuid_citations(values: Sequence[str]) -> list[UUID]:
+    """Observation ids that are real UUIDs, as UUIDs.  Anything else is dropped rather than
+    coerced: a citation that does not resolve is not a citation."""
+
+    output: list[UUID] = []
+    for value in values:
+        try:
+            output.append(UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return output
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     init_db()
@@ -407,6 +612,31 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     conn = next(connection_scope)
     try:
         drain_pending_handoffs(conn, retention_days=int(settings.handoff_retention_days))
+        if bool(getattr(settings, "capture_extraction_enabled", True)):
+            try:
+                extract_pending_inputs(conn, settings=settings, limit=int(getattr(settings, "decision_extraction_batch_size", 100)))
+            except Exception:
+                _LOGGER.warning("startup decision extraction sweep failed", exc_info=True)
+        try:
+            sweep_stale_planning_jobs(conn, settings=settings, now=now_utc())
+            conn.commit()
+        except Exception:
+            _LOGGER.warning("startup planning job sweep failed", exc_info=True)
+        if bool(settings.dispatch_startup_reconcile_enabled):
+            try:
+                summary = reconcile.startup_reconcile(conn, settings=settings)
+                # Durable, regardless of audit_write_mode: the reconcile summary is evidence about
+                # what a crash left behind, not a debug line.
+                write_audit(conn, "system", "startup_reconcile", dict(summary), [], {"runtime": "lite"}, 0)
+            except Exception:
+                # Never blocks boot. The refusal is at POST /v1/dispatch, which returns
+                # 409 reconcile_pending while reconcile_complete() is False.
+                _LOGGER.exception("startup reconcile failed")
+        else:
+            _LOGGER.warning(
+                "dispatch_startup_reconcile_enabled=0: no reconcile ran, so POST /v1/dispatch will "
+                "refuse with 409 reconcile_pending"
+            )
     finally:
         connection_scope.close()
     yield
@@ -2427,7 +2657,9 @@ def _behavior_subject_access_allowed(auth: AuthContext) -> bool:
 
 def _enforce_workspace_access(auth: AuthContext, conn: sqlite3.Connection) -> None:
     access_mode = str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower()
-    if access_mode != "strict" and auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR}:
+    if access_mode != "strict" and (auth.role in {AgentRole.EXECUTOR, AgentRole.ADVISOR} or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        # Compat mode: credential-bound principals (executors, the host-capture adapter) are not gated on
+        # team_memberships, which the first stored event auto-seeds with the executor. Strict mode gates everyone.
         return
     try:
         allowed = workspace_access_allowed(
@@ -2449,6 +2681,48 @@ def _enforce_workspace_access(auth: AuthContext, conn: sqlite3.Connection) -> No
 def _reject_advisor_writes(auth: AuthContext) -> None:
     if auth.role == AgentRole.ADVISOR:
         raise HTTPException(status_code=403, detail="advisor role is read-only")
+
+
+_INSECURE_API_TOKENS = {"", "changeme", "local-dev-token"}
+
+
+def _require_host_capture(auth: AuthContext) -> None:
+    """Only the host-capture capability (credential-bound, never header-derived) may attest human input."""
+    if HOST_CAPTURE_CAPABILITY not in auth.capabilities:
+        raise HTTPException(status_code=403, detail="host capture capability required")
+    cfg = get_settings()
+    if not bool(getattr(cfg, "allow_default_token", False)) and (cfg.host_capture_token_set & _INSECURE_API_TOKENS):
+        raise HTTPException(status_code=403, detail="host capture disabled: default token in use")
+
+
+def _capture_delivery_state_for_auth(auth: AuthContext, conn: sqlite3.Connection, *, now: datetime) -> str:
+    try:
+        return capture_delivery_state(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            stale_seconds=int(getattr(settings, "capture_delivery_stale_seconds", 21600)),
+            now=now,
+        )
+    except sqlite3.Error:
+        return "unknown"
+
+
+def _receipt_response(receipt: dict[str, Any], *, deduplicated: bool, capture_state: str) -> TrustedInputReceipt:
+    return TrustedInputReceipt(
+        receipt_id=UUID(str(receipt["id"])),
+        event_id=UUID(str(receipt["event_id"])) if receipt.get("event_id") else None,
+        delivery_key=str(receipt["delivery_key"]),
+        content_sha256=str(receipt["content_sha256"]),
+        origin_kind=TrustedInputOriginKind(str(receipt["origin_kind"])),
+        capture_principal=str(receipt["capture_principal"]),
+        observed_at=datetime.fromisoformat(str(receipt["observed_at"])),
+        ingested_at=datetime.fromisoformat(str(receipt["ingested_at"])),
+        deduplicated=deduplicated,
+        extraction_state=str(receipt.get("extraction_state") or "pending"),
+        queue_state=str(receipt.get("queue_state") or "inline"),
+        capture_delivery_state=CaptureDeliveryState(capture_state),
+    )
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
@@ -2771,6 +3045,160 @@ def read_event(
     return event
 
 
+@app.post("/v1/inputs", response_model=TrustedInputReceipt, status_code=201)
+def capture_input(
+    body: TrustedInputCapture,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TrustedInputReceipt:
+    """Trusted capture channel: the host adapter delivers the human's raw input BEFORE any executor rewrites it.
+
+    Restricted to the host-capture capability; the durable receipt is persisted before acknowledging.
+    Lite parity gap: payloads are stored redacted in plaintext (no AES-GCM at rest) and extraction runs inline."""
+    _require_host_capture(auth)
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="inputs", method="POST").inc()
+    start = time.perf_counter()
+    if body.origin_kind == TrustedInputOriginKind.HUMAN_INPUT and auth.behavior_subject_id != auth.user_id:
+        raise HTTPException(status_code=403, detail="host capture must authenticate as the human subject")
+    now = datetime.now(tz=UTC)
+    # Host clock clamp: `observed_at` is host-supplied. A clock running ahead would otherwise make a prediction
+    # frozen AFTER the answer look prospective (inflating the exit-gate denominator) and let a message promote as
+    # the answer to a question that did not exist yet.
+    host_observed_at = body.observed_at if body.observed_at.tzinfo else body.observed_at.replace(tzinfo=UTC)
+    observed_at = min(host_observed_at.astimezone(UTC), now)
+    existing = get_receipt_by_delivery_key(conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, delivery_key=body.delivery_key)
+    if existing is not None:
+        return _receipt_response(existing, deduplicated=True, capture_state=_capture_delivery_state_for_auth(auth, conn, now=now))
+
+    # Server-side re-redaction + cap: the hook's redaction is not trusted on its own.
+    max_chars = max(1, int(getattr(settings, "capture_max_chars", 2000)))
+    redacted, applied = redact_text(body.content)
+    content = redacted[:max_chars]
+    truncated = bool(body.content_truncated) or len(redacted) > max_chars
+    # project_hint is untrusted host input: the hook redacts client-side, but the server does not trust that.
+    # A credential URL hides in exactly the keys ('repo', 'project', 'branch') the content allowlist would spare,
+    # so it is sanitized before it reaches scope resolution or the event context.
+    project_hint, hint_redactions = redact_project_hint(dict(body.project_hint) if isinstance(body.project_hint, dict) else {})
+    scope = auth.resolved_scope(project_hint=project_hint or None)
+    project_id = scope.project_id if scope.project_binding == PROJECT_BOUND else None
+    redaction_applied = sorted(set(body.redaction_applied) | set(applied) | set(hint_redactions))
+    observed_iso = observed_at.isoformat()
+    ingested_iso = now.isoformat()
+    first_line = next((line.strip() for line in content.splitlines() if line.strip()), "") or "human input"
+    event = EventEnvelope(
+        schema_version=1,
+        ts=observed_at,
+        actor="user",
+        source=HOST_CAPTURE_SOURCE,
+        domain="coding",
+        task_type=HUMAN_INPUT_TASK_TYPE,
+        event_type=EventType.TASK_STEP,
+        title=first_line[:150],
+        sensitivity=2,
+        idempotency_key=body.delivery_key,
+        source_id=body.session_id,
+        source_seq=body.sequence,
+        tags=["human_input", str(body.host_client or "claude")],
+        context={
+            "input_origin": body.origin_kind.value,
+            "capture_principal": auth.consumer,
+            "host_session_id": body.session_id,
+            "prompt_id": body.prompt_id,
+            "cwd": body.cwd,
+            "hook_event_name": body.hook_event_name,
+            "host_client": body.host_client,
+            "project": project_hint.get("project"),
+            "project_root": project_hint.get("project_root"),
+            "git_remote": project_hint.get("git_remote"),
+            "branch": project_hint.get("branch"),
+            "project_id": project_id,
+            "observed_at": observed_iso,
+            "ingested_at": ingested_iso,
+        },
+        payload={
+            "input_excerpt": content,
+            "original_char_count": int(body.original_char_count),
+            "content_truncated": truncated,
+            "conversation_session_id": body.session_id,
+            "input_sha256": body.content_sha256,
+            "redaction_applied": redaction_applied,
+            "hook_event_name": body.hook_event_name,
+            "live_capture": True,
+        },
+    )
+    event_id = store_event(conn, event, settings, auth)
+    receipt_id = str(uuid.uuid4())
+    insert_receipt(
+        conn,
+        receipt_id=receipt_id,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        subject_user_id=auth.behavior_subject_id,
+        host_session_id=body.session_id,
+        sequence=body.sequence,
+        prompt_id=body.prompt_id,
+        delivery_key=body.delivery_key,
+        content_sha256=body.content_sha256,
+        origin_kind=body.origin_kind.value,
+        capture_principal=auth.consumer,
+        host_client=str(body.host_client or "claude"),
+        event_id=str(event_id),
+        project_id=project_id,
+        observed_at=observed_at,
+        ingested_at=now,
+        original_char_count=int(body.original_char_count),
+        content_truncated=truncated,
+        redaction_applied=redaction_applied,
+        spool_depth=int(body.spool_depth),
+        spool_failures=int(body.spool_failures),
+        gap_since=body.gap_since,
+        queue_state="inline" if bool(getattr(settings, "capture_extraction_enabled", True)) else "disabled",
+    )
+    conn.commit()
+    if bool(getattr(settings, "capture_extraction_enabled", True)):
+        # Lite has no worker: derive decision candidates inline, never failing the capture itself.
+        try:
+            extract_pending_inputs(conn, settings=settings, limit=1, receipt_id=receipt_id)
+        except Exception:
+            _LOGGER.warning("inline decision extraction failed for receipt %s", receipt_id, exc_info=True)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    REQUEST_LATENCY.labels(endpoint="inputs", method="POST").observe(latency_ms / 1000.0)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="capture_input",
+        query={
+            "receipt_id": receipt_id,
+            "delivery_key": body.delivery_key,
+            "origin_kind": body.origin_kind.value,
+            "host_client": str(body.host_client or "claude"),
+            "project_hint_redactions": hint_redactions,
+        },
+        result_event_ids=[event_id],
+        policy_decisions={"mode": "bearer", "role": auth.role.value, "capabilities": sorted(auth.capabilities)},
+        latency_ms=latency_ms,
+    )
+    stored = get_receipt(conn, receipt_id=receipt_id)
+    if stored is None:  # pragma: no cover - defensive: the row was just committed
+        raise HTTPException(status_code=500, detail="receipt persistence failed")
+    return _receipt_response(stored, deduplicated=False, capture_state=_capture_delivery_state_for_auth(auth, conn, now=now))
+
+
+@app.get("/v1/inputs/{receipt_id}", response_model=TrustedInputReceipt)
+def read_input_receipt(
+    receipt_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TrustedInputReceipt:
+    REQUEST_COUNT.labels(endpoint="inputs_get", method="GET").inc()
+    _enforce_workspace_access(auth, conn)
+    receipt = get_receipt(conn, receipt_id=str(receipt_id))
+    if receipt is None or str(receipt["workspace_id"]) != auth.workspace_id or str(receipt["subject_user_id"]) != auth.behavior_subject_id:
+        raise HTTPException(status_code=404, detail="receipt not found")
+    return _receipt_response(receipt, deduplicated=False, capture_state=_capture_delivery_state_for_auth(auth, conn, now=datetime.now(tz=UTC)))
+
+
 @app.post("/v1/search", response_model=dict)
 def search(
     body: EventSearchRequest,
@@ -2780,8 +3208,13 @@ def search(
     REQUEST_COUNT.labels(endpoint="search", method="POST").inc()
     _enforce_workspace_access(auth, conn)
     start = time.perf_counter()
+    scope = auth.resolved_scope(
+        project_hint=getattr(body, "app_context", None) if isinstance(getattr(body, "app_context", None), dict) else None,
+        target_owner=getattr(body, "target_owner", None),
+        continuity_intent=bool(getattr(body, "continuity_intent", False)),
+    )
     result, blocked, retrieval_meta = search_events(
-        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id
+        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=scope
     )
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="search", method="POST").observe(latency_ms / 1000.0)
@@ -2874,29 +3307,69 @@ def capture_completion(
         """,
         (body.session_id, auth.workspace_id, auth.user_id),
     ).fetchone()
+    session_project: dict[str, Any] | None = None
     if state_row is not None:
         try:
             takeover_context = json.loads(str(state_row["takeover_context"] or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             takeover_context = {}
-        project_context = canonical_project_context(takeover_context.get("project_context"))
+        session_project_raw = takeover_context.get("project_context") if isinstance(takeover_context, dict) else None
+        session_project = dict(session_project_raw) if isinstance(session_project_raw, dict) and session_project_raw else None
+    # Project binding for an ordinary completion (no takeover activation required): explicit
+    # app_context => bound, session-bound project => inherited, otherwise visibly unbound.
+    explicit_app_context = getattr(body, "app_context", None)
+    scope = auth.resolved_scope(
+        project_hint=explicit_app_context if isinstance(explicit_app_context, dict) and explicit_app_context else None,
+        session_project=session_project,
+        task_id=body.session_id,
+    )
+    if scope.is_bound():
+        project_context = canonical_project_context(
+            explicit_app_context if scope.project_binding == PROJECT_BOUND and isinstance(explicit_app_context, dict) else None,
+            session_project,
+        )
         if project_context:
             milestone["project_context"] = project_context
+    milestone["project_binding"] = scope.project_binding
     now = datetime.now(tz=UTC)
-    outbox = enqueue_handoff(
-        conn,
-        workspace_id=auth.workspace_id,
-        owner_id=auth.user_id,
-        behavior_subject_id=auth.behavior_subject_id,
-        session_id=body.session_id,
-        directive_id=None,
-        completion_key=body.completion_key,
-        terminal_state=body.state,
-        milestone=milestone,
-        source=body.source,
-        redaction_applied=bool(normalized["redaction_applied"]),
-        now=now,
-    )
+    try:
+        outbox = enqueue_handoff(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            behavior_subject_id=auth.behavior_subject_id,
+            session_id=body.session_id,
+            directive_id=None,
+            completion_key=body.completion_key,
+            terminal_state=body.state,
+            milestone=milestone,
+            source=body.source,
+            redaction_applied=bool(normalized["redaction_applied"]),
+            now=now,
+            executor_id=auth.consumer,
+            payload_hash=completion_payload_fingerprint(milestone),
+        )
+    except CompletionConflictError as exc:
+        conn.rollback()
+        write_audit(
+            conn,
+            consumer=auth.consumer,
+            action="completion_conflict",
+            query={"completion_key": body.completion_key, "session_id": body.session_id, "outbox_id": str(exc.outbox_id)},
+            result_event_ids=[],
+            policy_decisions={"reason": "idempotency_conflict"},
+            latency_ms=0,
+        )
+        conn.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "idempotency_conflict",
+                "completion_key": body.completion_key,
+                "outbox_id": str(exc.outbox_id),
+                "message": "same completion_key with a different payload",
+            },
+        ) from exc
     conn.commit()
     delivered = deliver_handoff_safely(
         conn,
@@ -2919,6 +3392,7 @@ def capture_completion(
         handoff_record_id=UUID(str(delivered["handoff_record_id"])),
         contract_valid=True,
         captured_at=datetime.fromisoformat(str(delivered["created_at"])),
+        project_binding=scope.project_binding,
     )
 
 
@@ -2987,7 +3461,15 @@ def auth_whoami(auth: AuthContext = Depends(get_auth_context)) -> dict[str, Any]
 @app.get("/v1/governance/status", response_model=GovernanceStatusResponse)
 def governance_status(
     _auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
 ) -> GovernanceStatusResponse:
+    now = now_utc()
+    charter = charter_store.load_active_charter(
+        conn, workspace_id=_auth.workspace_id, owner_id=_auth.user_id, session_id="default", now=now
+    )
+    self_test = dispatch_store.latest_self_test(
+        conn, workspace_id=_auth.workspace_id, sandbox_provider="seatbelt"
+    )
     return GovernanceStatusResponse(
         **build_governance_status(
             runtime="lite",
@@ -3003,6 +3485,11 @@ def governance_status(
             requested_execution_enforcement=settings.execution_enforcement_level,
             execution_interception_attested=settings.execution_interception_attested,
             execution_interception_provider=settings.execution_interception_provider,
+            charter=charter,
+            sandbox_self_test=self_test,
+            # D-3: per-command tracing needs an adapter that saw each command. Lite has none, so
+            # this is False here and the limitation line says so rather than being omitted.
+            action_tracing_available=False,
         )
     )
 
@@ -3859,8 +4346,13 @@ def get_context_bundle(
     REQUEST_COUNT.labels(endpoint="context_bundle", method="POST").inc()
     _enforce_workspace_access(auth, conn)
     start = time.perf_counter()
+    scope = auth.resolved_scope(
+        project_hint=body.app_context if isinstance(body.app_context, dict) else None,
+        target_owner=getattr(body, "target_owner", None),
+        continuity_intent=bool(getattr(body, "continuity_intent", False)),
+    )
     bundle, blocked = context_bundle(
-        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id
+        conn, body, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=scope
     )
     latency_ms = int((time.perf_counter() - start) * 1000)
     REQUEST_LATENCY.labels(endpoint="context_bundle", method="POST").observe(latency_ms / 1000.0)
@@ -3968,6 +4460,10 @@ def context_brief(
 ) -> ContextBriefResponse:
     REQUEST_COUNT.labels(endpoint="context_brief", method="POST").inc()
     _enforce_workspace_access(auth, conn)
+    scope = auth.resolved_scope(
+        project_hint=body.app_context if isinstance(body.app_context, dict) else None,
+        task_id=body.session_id,
+    )
     result = store_context_brief(
         conn,
         settings=settings,
@@ -3978,6 +4474,7 @@ def context_brief(
         app_context=body.app_context,
         constraints=body.constraints,
         max_items=body.max_items,
+        scope=scope,
     )
     return ContextBriefResponse.model_validate(result)
 
@@ -4127,6 +4624,7 @@ def get_activity_summary(
         period=period,
         domain=domain,
         max_events=max_events,
+        scope=auth.resolved_scope(),
     )
     write_audit(
         conn,
@@ -4190,6 +4688,7 @@ def get_patterns(
         workspace_id=auth.workspace_id,
         owner_id=auth.user_id,
         limit=100,
+        scope=auth.resolved_scope(),
     )
 
 
@@ -4662,7 +5161,7 @@ def takeover_execution_status(
 ) -> ExecutionStatusResponse:
     _enforce_workspace_access(auth, conn)
     REQUEST_COUNT.labels(endpoint="takeover_execution_status", method="GET").inc()
-    return store_execution_status(conn, auth=auth, session_id=session_id)
+    return store_execution_status(conn, auth=auth, session_id=session_id, settings=settings)
 
 
 @app.get("/v1/workflow/templates")
@@ -4904,37 +5403,115 @@ def _store_behavior_evidence_lite_api(
     if not bool(getattr(settings, "behavior_evidence_enabled", True)):
         raise HTTPException(status_code=404, detail="behavior evidence capture is disabled")
     raw = body.model_dump(mode="python")
-    if body.evidence_source.value in {"explicit", "correction", "calibration"} and not raw.get("confirmed_at"):
-        raw["confirmed_at"] = datetime.now(tz=UTC)
+    # P0: confirmation is never caller-asserted; a verified source-event path (P1) is the only writer.
+    raw["confirmed_at"] = None
+    # P0: only a human operator can author human-origin evidence. A non-human caller (executor/advisor)
+    # is downgraded to inferred, may not supersede prior observations, and is held out of learning as
+    # pending_review below regardless of score.
+    is_human = auth.role == AgentRole.USER
+    # P1: only a server-established human identity (bound claim, mTLS, or the host-capture credential) mints
+    # learning-eligible human evidence. In compat mode `X-TCE-Role: user` is caller-asserted on the executor's
+    # own bearer, so a header-asserted USER stores for audit but stays pending review.
+    identity_verified = human_origin_verified(auth)
+    human_verified = is_human and identity_verified
+    if not is_human:
+        raw["evidence_source"] = BehaviorEvidenceSource.INFERRED.value
+        raw["supersedes_observation_id"] = None
     normalized = normalize_behavior_evidence(raw)
+    # P1: a source-event id is meaningful only when the server validates its ownership, origin and scope.
+    identity_unverified_link = False
+    source_event_ids = [str(value) for value in (body.source_event_ids or [])]
+    if source_event_ids:
+        provenance = validate_source_event_provenance(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            event_ids=source_event_ids,
+        )
+        if any(not bool(info.get("owned")) for info in provenance.values()):
+            raise HTTPException(status_code=403, detail="source_event_ids outside caller scope")
+        # Binding manual evidence to a receipt/opportunity as human-origin is a human-origin promotion:
+        # it needs a server-established identity, not an X-TCE-Role header on the executor's own bearer.
+        verified_human = human_verified
+        if is_human and provenance and all(str(info.get("origin_kind") or "") in TRUSTED_ORIGINS for info in provenance.values()):
+            now = datetime.now(tz=UTC)
+            since = now - timedelta(seconds=max(0, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600))))
+            selected = str(normalized.get("selected_choice") or "").strip().casefold()
+            matching = [
+                item
+                for item in open_opportunities_for_subject(
+                    conn,
+                    workspace_id=auth.workspace_id,
+                    subject_user_id=auth.behavior_subject_id,
+                    project_id=None,
+                    since=since,
+                )
+                if str(item.get("situation_type")) == str(normalized.get("situation_type"))
+                and (not item.get("alternatives") or selected in {str(alt).strip().casefold() for alt in item.get("alternatives") or []})
+            ]
+            if len(matching) == 1 and verified_human:
+                normalized["opportunity_id"] = str(matching[0]["id"])
+                normalized["capture_receipt_id"] = next((info.get("receipt_id") for info in provenance.values() if info.get("receipt_id")), None)
+                normalized["origin_kind"] = "human_input"
+            elif len(matching) == 1:
+                # Stored for audit, but a header-asserted human never mints receipt-bound human-origin evidence.
+                identity_unverified_link = True
+    # The HTTP evidence path never confirms: only the receipt-backed extraction path sets confirmed_at.
+    normalized["confirmed_at"] = None
     storage_gate = behavior_storage_gate(
         normalized,
         threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
     )
+    if identity_unverified_link and storage_gate["learning_eligible"]:
+        storage_gate = {
+            **storage_gate,
+            "learning_eligible": False,
+            "decision": "pending_review",
+            "reasons": [*list(storage_gate.get("reasons") or []), "identity_unverified"],
+        }
     prior_evidence: list[dict[str, Any]] = []
     shadow_prediction: dict[str, Any] | None = None
     shadow_latency_ms = 0
+    shadow_result: DecisionResult | None = None
+    shadow_request: DecisionRequest | None = None
     if bool(getattr(settings, "behavior_shadow_evaluation_enabled", True)):
-        prior_evidence = load_behavior_evidence_lite(
-            conn,
-            workspace_id=auth.workspace_id,
-            subject_user_id=auth.behavior_subject_id,
-            limit=500,
-            eligible_only=True,
-        )
+        # R6: the retrospective shadow decides at the OBSERVATION's time, not at now(). The
+        # recency term used to be anchored on the newest row in the corpus, which made a
+        # 900-day-old corpus and a 5-day-old corpus produce byte-identical predictions -- a
+        # replay could not tell them apart, so nothing the harness measured was about time.
+        shadow_scope = auth.resolved_scope()
+        observation_at = _parse_evidence_ts(normalized.get("ts")) or datetime.now(tz=UTC)
         shadow_started = time.perf_counter()
-        shadow_prediction = predict_behavior(
-            prior_evidence,
-            {
-                "situation_type": normalized["situation_type"],
-                "situation_summary": normalized["situation_summary"],
-                "objective_text": normalized["objective_text"],
-                "constraints": normalized["constraints"],
-                "context_snapshot": normalized["context_snapshot"],
-            },
-            candidate_choices=list(normalized.get("available_choices") or []),
-            min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        )
+        try:
+            shadow_request = build_decision_request(
+                conn,
+                scope=shadow_scope,
+                settings=settings,
+                decision_family=str(normalized.get("decision_family") or "behavior_evidence"),
+                situation_type=str(normalized["situation_type"]),
+                situation_summary=str(normalized["situation_summary"]),
+                objective_text=str(normalized["objective_text"]),
+                constraints=normalized["constraints"] if isinstance(normalized.get("constraints"), dict) else {},
+                context_snapshot=normalized["context_snapshot"] if isinstance(normalized.get("context_snapshot"), dict) else {},
+                candidate_options=[str(item) for item in (normalized.get("available_choices") or [])],
+                decision_at=observation_at,
+                session_id=str(normalized.get("session_id") or ""),
+                objective_hash=None,
+            )
+            shadow_result = decide(shadow_request)
+            prior_evidence = [dict(row) for row in shadow_request.evidence_rows]
+            shadow_prediction = {
+                "predicted_choice": shadow_result.selected_option,
+                "abstained": shadow_result.status is DecisionStatus.ABSTAINED,
+                "confidence": float(shadow_result.policy_score),
+                "citations": list(shadow_result.evidence_observation_ids),
+            }
+        except Exception:
+            # A shadow that cannot be computed is recorded as absent. It must never fail the
+            # write of the human's own evidence, which is the thing this endpoint exists for.
+            _LOGGER.warning("retrospective shadow decision failed", exc_info=True)
+            shadow_result = None
+            shadow_prediction = None
         shadow_latency_ms = max(0, int((time.perf_counter() - shadow_started) * 1000))
     mode = str(getattr(settings, "behavior_storage_gate_mode", "shadow") or "shadow").strip().lower()
     if mode not in {"shadow", "warn", "enforce"}:
@@ -4954,16 +5531,26 @@ def _store_behavior_evidence_lite_api(
         if mode == "warn":
             warnings.append(message)
     review_pending = bool(
-        getattr(settings, "behavior_memory_review_enabled", True)
-        and storage_gate["learning_eligible"]
-        and normalized.get("evidence_source") in {"inferred", "backfill"}
+        storage_gate["learning_eligible"]
+        and (
+            not human_verified
+            or (
+                getattr(settings, "behavior_memory_review_enabled", True)
+                and normalized.get("evidence_source") in {"inferred", "backfill"}
+            )
+        )
     )
     if review_pending:
+        review_reasons = [*list(storage_gate.get("reasons") or []), "human_review_required"]
+        if not is_human:
+            review_reasons.append("non_human_caller")
+        elif not identity_verified:
+            review_reasons.append("identity_unverified")
         storage_gate = {
             **storage_gate,
             "learning_eligible": False,
             "decision": "pending_review",
-            "reasons": [*list(storage_gate.get("reasons") or []), "human_review_required"],
+            "reasons": review_reasons,
         }
         warnings.append("evidence is pending memory review and cannot influence behavior yet")
     supersedes = normalized.get("supersedes_observation_id")
@@ -5017,6 +5604,22 @@ def _store_behavior_evidence_lite_api(
             evidence_count=len(prior_evidence),
             latency_ms=shadow_latency_ms,
         )
+        if shadow_result is not None and shadow_request is not None:
+            persist_policy_decision(
+                conn,
+                prediction_id=shadow_prediction_id,
+                result=shadow_result,
+                request=shadow_request,
+                project_id=auth.resolved_scope().project_id,
+                episode_key="",
+                # A retrospective row is scored after the fact and never gates anything, but it
+                # is still marked contaminated rather than clean: the answer already existed
+                # when the decision was computed, which is a stronger contamination than any the
+                # promotion gate is testing for.
+                decision_advice_shown=True,
+                candidate_option_count=len([str(item) for item in (normalized.get("available_choices") or [])]),
+            )
+            conn.commit()
     if storage_gate["learning_eligible"]:
         fingerprint_data = load_fingerprint_lite(
             conn,
@@ -5466,33 +6069,54 @@ def predict_behavior_choice(
     _enforce_workspace_access(auth, conn)
     if not bool(getattr(settings, "behavior_prediction_enabled", True)):
         raise HTTPException(status_code=404, detail="behavior prediction is disabled")
-    evidence = load_behavior_evidence_lite(
+    # R4: this route no longer calls the kNN primitive directly. `decide()` is the only
+    # function in this repo that may select a decision option or abstain from selecting one,
+    # and this route is one of its deployed callers -- which is the whole point of P4: before
+    # it, every route marked "deployed" was marked "not evaluated" and vice versa.
+    now = datetime.now(tz=UTC)
+    request = build_decision_request(
         conn,
-        workspace_id=auth.workspace_id,
-        subject_user_id=auth.behavior_subject_id,
-        limit=2000,
-        eligible_only=True,
+        scope=auth.resolved_scope(),
+        settings=settings,
+        decision_family=str(getattr(body, "decision_family", "") or "behavior_predict"),
+        situation_type=body.situation_type,
+        situation_summary=body.situation_summary,
+        objective_text=body.objective,
+        constraints=body.constraints if isinstance(body.constraints, dict) else {},
+        context_snapshot=body.context_snapshot if isinstance(body.context_snapshot, dict) else {},
+        candidate_options=[str(item) for item in (body.candidate_choices or [])],
+        decision_at=now,
+        session_id="",
+        objective_hash=None,
     )
-    prediction = predict_behavior(
-        evidence,
-        {
-            "situation_type": body.situation_type,
-            "situation_summary": body.situation_summary,
-            "objective_text": body.objective,
-            "constraints": body.constraints,
-            "context_snapshot": body.context_snapshot,
-        },
-        candidate_choices=body.candidate_choices,
-        min_confidence=max(
-            body.min_confidence,
-            float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        ),
-    )
+    result = decide(request)
+    abstained = result.status is DecisionStatus.ABSTAINED
+    prediction: dict[str, Any] = {
+        "predicted_choice": result.selected_option,
+        "ranked_choices": [
+            {"choice": item.option, "share": item.share} for item in result.ranked_options
+        ],
+        # UNCALIBRATED, and the field description on the model now says so. Nothing in this
+        # system has ever been fit to or checked against an outcome.
+        "confidence": float(result.policy_score),
+        "abstained": abstained,
+        "needs_clarification": abstained,
+        "clarification_question": result.reason_for_asking if abstained else None,
+        "citations": _uuid_citations(result.evidence_observation_ids),
+        "neighbor_count": result.adequacy.neighbour_count,
+        "effective_neighbor_count": result.adequacy.effective_sample_size,
+        "out_of_distribution": result.ood_status is OodStatus.OUT_OF_DISTRIBUTION,
+        "ood_score": result.ood_score,
+        "predicted_action": result.suggested_action,
+    }
     gate = latest_fidelity_gate_lite(
         conn,
         workspace_id=auth.workspace_id,
         subject_user_id=auth.behavior_subject_id,
     )
+    # FN4: this guard and its False default are untouched by P4. Removing it is one of the two
+    # routes by which an earlier draft escalated every turn on a corpus where no family is
+    # qualified. With the default off, nothing reads `gate` at all.
     if bool(getattr(settings, "behavior_autonomy_gate_enabled", False)) and not bool(gate.get("passed", False)):
         prediction.update(
             {
@@ -5502,7 +6126,11 @@ def predict_behavior_choice(
                 "clarification_question": "Behavior fidelity is not validated yet. What choice should be made?",
             }
         )
-    return BehaviorPredictionResponse(**prediction, fidelity_gate=gate)
+    return BehaviorPredictionResponse(
+        **prediction,
+        fidelity_gate=gate,
+        policy_decision=PolicyDecisionBlock.model_validate(result.block_payload()),
+    )
 
 
 @app.post("/v1/behavior/evaluate", response_model=BehaviorEvaluationResponse)
@@ -5851,6 +6479,22 @@ def behavior_memory_review_resolve(
     _reject_advisor_writes(auth)
     REQUEST_COUNT.labels(endpoint="behavior_memory_review_resolve", method="POST").inc()
     _enforce_workspace_access(auth, conn)
+    # Promotion turns a pending_review row into learning-eligible evidence, so it is the same gate as
+    # minting that evidence directly: a header-asserted USER (compat mode) must not be able to round-trip
+    # its own pending row past the identity gate. Rejection needs no such proof.
+    is_human = auth.role == AgentRole.USER
+    if body.decision == "promote" and not human_origin_verified(auth):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "behavior_review_promotion_rejected",
+                "message": "only a server-verified human may promote a pending review",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
     note, _ = redact_control_text(body.note, limit=1000)
     row = resolve_memory_review(
         conn,
@@ -6734,7 +7378,1745 @@ def dashboard_human_score_recompute(
 
 
 # ---------------------------------------------------------------------------
+# P2 durable task state (§4.6 / §0.7 S11.12) — the same four routes, the same
+# response models and the same two exception handlers as Full.
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(TaskStateRevisionConflict)
+def _task_state_conflict(request: Request, exc: TaskStateRevisionConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_revision_conflict",
+            "task_id": exc.task_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(TaskStatePreconditionFailed)
+def _task_state_precondition(request: Request, exc: TaskStatePreconditionFailed) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "task_state_precondition_failed",
+            "task_id": exc.task_id,
+            "detail": exc.reason,
+        },
+    )
+
+
+def _parse_optional_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _task_state_summary(projection: TaskStateProjection, *, source_revision: str) -> TaskStateSummary:
+    fields = dict(task_state_summary_fields(projection, source_revision=source_revision))
+    fields["status"] = to_lifecycle_status(fields["status"])
+    fields["next_permitted_action"] = to_next_permitted_action(fields["next_permitted_action"])
+    return TaskStateSummary(**fields)
+
+
+@app.get("/v1/tasks/{task_id}/state", response_model=TaskStateSummary)
+def get_task_state(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskStateSummary:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="task_state", method="GET").inc()
+    loaded = load_task_state(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="task state was not found")
+    projection, _highest_seq, source_revision = loaded
+    return _task_state_summary(projection, source_revision=source_revision)
+
+
+@app.get("/v1/tasks/{task_id}/state.md", response_model=TaskStateProjectionResponse)
+def get_task_state_markdown(
+    task_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskStateProjectionResponse:
+    if not bool(getattr(settings, "task_state_markdown_enabled", True)):
+        raise HTTPException(status_code=404, detail="task state projections are disabled")
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="task_state_markdown", method="GET").inc()
+    started = time.perf_counter()
+    folded = rebuild_task_state(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, task_id=task_id
+    )
+    if folded is None:
+        raise HTTPException(status_code=404, detail="task state was not found")
+    rendered = render_task_state_markdown(
+        folded.projection,
+        source_revision=folded.source_revision,
+        generated_at=now_utc(),
+        max_steps=int(getattr(settings, "task_state_markdown_max_steps", 24)),
+    )
+    response = TaskStateProjectionResponse(**rendered)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="task_state_projection_read",
+        query={
+            "workspace_id": auth.workspace_id,
+            "task_id": task_id,
+            "projection_id": str(response.projection_id),
+            "uri": response.uri,
+            "source_revision": response.source_revision,
+            "content_sha256": response.content_sha256,
+        },
+        result_event_ids=[],
+        policy_decisions={
+            "role": auth.role.value,
+            "trust_level": response.trust_level,
+            "read_only": response.read_only,
+            "projection_learning_eligible": response.projection_learning_eligible,
+        },
+        latency_ms=latency_ms,
+    )
+    return response
+
+
+@app.post("/v1/tasks/{task_id}/cancel", response_model=TaskCancelResponse)
+def cancel_task_endpoint(
+    task_id: str,
+    body: TaskCancelRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> TaskCancelResponse:
+    _enforce_workspace_access(auth, conn)
+    if auth.role == AgentRole.ADVISOR:
+        raise HTTPException(status_code=403, detail="advisor role is read-only")
+    REQUEST_COUNT.labels(endpoint="task_cancel", method="POST").inc()
+    # D4: the task identity for a takeover turn IS the session, so the path parameter is
+    # authoritative and doubles as the session the cancel fences.
+    return cancel_task(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=task_id,
+        task_id=task_id,
+        reason=body.reason,
+        actor=auth.consumer,
+        now=now_utc(),
+    )
+
+
+@app.get("/v1/planning/jobs/{job_id}", response_model=PlanningJobStatusResponse)
+def get_planning_job_status(
+    job_id: str,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PlanningJobStatusResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="planning_job_status", method="GET").inc()
+    row = get_planning_job(conn, workspace_id=auth.workspace_id, job_id=job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="planning job was not found")
+    return PlanningJobStatusResponse(
+        job_id=UUID(str(row["id"])),
+        task_id=str(row["task_id"] or ""),
+        job_kind=str(row["job_kind"] or ""),
+        state=str(row["state"] or "pending"),
+        producer=(str(row["producer"]) if row["producer"] else None),
+        attempts=int(row["attempts"] or 0),
+        max_attempts=int(row["max_attempts"] or 0),
+        last_error=(str(row["last_error"]) if row["last_error"] else None),
+        contract_revision=int(row["contract_revision"] or 0),
+        input_revision=str(row["input_revision"] or ""),
+        queue_state=str(row["queue_state"] or "inline"),
+        cancel_requested=bool(row["cancel_requested"]),
+        created_at=_parse_optional_dt(row["created_at"]),
+        updated_at=_parse_optional_dt(row["updated_at"]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Static file mount for Angular dashboard (MUST be last — catch-all)
+# ---------------------------------------------------------------------------
+# P3 — authority charters, dispatch, effect journal, verification (§9.1)
+# ---------------------------------------------------------------------------
+
+
+# Mirrors Full's `_CREDENTIAL_KIND_PREFIXES` / `_runner_principal_for` (tce_api/main.py) exactly, so
+# the two backends agree about who the verifier is. Lite's compat bearer path yields a BARE consumer
+# while its host-capture path yields "host:<name>", and Full prefixes every path with the credential
+# kind; `verification_runner_principal` names an IDENTITY, not a transport, so the kind prefix is
+# stripped before the comparison. A bare "system:verifier" carries no such prefix and is unchanged.
+_CREDENTIAL_KIND_PREFIXES: tuple[str, ...] = ("bearer:", "mtls:", "host:")
+
+
+def _runner_principal_for(auth: AuthContext) -> str:
+    """The verification runner's identity, DERIVED FROM AUTH and never from the request body."""
+    consumer = str(auth.consumer or "")
+    for prefix in _CREDENTIAL_KIND_PREFIXES:
+        if consumer.startswith(prefix):
+            return consumer[len(prefix) :]
+    return consumer
+
+
+def _require_verified_human(auth: AuthContext, *, action: str) -> None:
+    """U1 — the ONE gate for every route below that is marked "role ``user`` only".
+
+    ``identity_claims_mode`` defaults to ``compat``, so ``X-TCE-Role: user`` on the caller's own
+    bearer is a header assertion, not authentication.  P1 closed that laundering for the execution
+    permit; nothing here may reopen it for the charter that sits above the permit.
+    """
+    is_human = auth.role == AgentRole.USER
+    identity_verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and identity_verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "charter_authority_required",
+                "message": "only a server-verified human may " + action,
+                "reasons": ["human_review_required", "non_human_caller" if not is_human else "identity_unverified"],
+            },
+        )
+
+
+def _charter_refusal(exc: CharterRequired) -> HTTPException:
+    """The U2 refusal body, byte-identical to Full's.
+
+    The ``"AUTONOMOUS MODE PAUSED: "`` prefix is deliberate: ``_slim_takeover_result`` already
+    surfaces that shape verbatim, so an executor sees the refusal with no MCP change.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "no_active_charter",
+            "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be created and "
+            "approved by the owner before mutating work may be claimed. Ask the owner to approve "
+            "one, then retry.",
+            "action_kind": exc.action_kind,
+            "reason": exc.reason,
+        },
+    )
+
+
+def _charter_audit(conn: sqlite3.Connection, *, auth: AuthContext, action: str, query: dict[str, Any]) -> None:
+    write_audit(conn, auth.consumer, action, query, [], {"policy_revision": CHARTER_POLICY_REVISION}, 0)
+
+
+@app.post("/v1/charters", response_model=CharterResponse)
+def charter_create(
+    body: CharterCreateRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="create an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_create", method="POST").inc()
+    try:
+        payload = charter_store.create_charter(conn, auth=auth, body=body, now=now_utc())
+    except CharterInvalid as exc:
+        raise HTTPException(status_code=422, detail={"error": "charter_invalid", "field": exc.field, "message": str(exc)}) from exc
+    _charter_audit(conn, auth=auth, action="charter_create", query={"charter_id": payload["charter_id"]})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/charters/narrowings", response_model=CharterResponse)
+def charter_narrow(
+    body: CharterNarrowingRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="narrow an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_narrow", method="POST").inc()
+    payload = charter_store.apply_narrowing(conn, auth=auth, body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_narrow", query={"charter_id": str(body.charter_id)})
+    return CharterResponse(**payload)
+
+
+@app.get("/v1/charters/active", response_model=CharterResponse)
+def charter_active(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="charter_active", method="GET").inc()
+    now = now_utc()
+    charter = charter_store.load_active_charter(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id, now=now
+    )
+    if charter is None:
+        return CharterResponse(charter=None, status="none", generated_at=now)
+    return CharterResponse(
+        charter=resolved_charter_to_json(charter),
+        charter_id=UUID(charter.charter_id),
+        status=charter.status,
+        charter_digest=charter.charter_digest,
+        charter_version=charter.charter_version,
+        policy_revision=charter.policy_revision,
+        enforcement_tier=charter.enforcement_tier,
+        credential_risk_acknowledged=charter.credential_risk_acknowledged,
+        approved_by=charter.approved_by,
+        approved_at=charter.approved_at,
+        expires_at=charter.expires_at,
+        revoked_at=charter.revoked_at,
+        narrowing_ids=list(charter.narrowing_ids),
+        generated_at=now,
+    )
+
+
+@app.post("/v1/charters/{charter_id}/approve", response_model=CharterResponse)
+def charter_approve(
+    charter_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="approve an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_approve", method="POST").inc()
+    payload = charter_store.approve_charter(conn, auth=auth, charter_id=str(charter_id), now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_approve", query={"charter_id": str(charter_id)})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/charters/{charter_id}/revoke", response_model=CharterResponse)
+def charter_revoke(
+    charter_id: UUID,
+    body: dict[str, Any] | None = None,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CharterResponse:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="revoke an authority charter")
+    REQUEST_COUNT.labels(endpoint="charter_revoke", method="POST").inc()
+    reason = str((body or {}).get("reason") or "")
+    payload = charter_store.revoke_charter(conn, auth=auth, charter_id=str(charter_id), reason=reason, now=now_utc())
+    _charter_audit(conn, auth=auth, action="charter_revoke", query={"charter_id": str(charter_id), "reason": reason})
+    return CharterResponse(**payload)
+
+
+@app.post("/v1/dispatch", response_model=DispatchResponse)
+def dispatch_open(
+    body: DispatchOpenRequest,
+    request: Request,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_open", method="POST").inc()
+    # Read from the raw headers rather than declaring a Header parameter: Full does the same, and
+    # a declared parameter would put an extra entry in Lite's OpenAPI document that Full's lacks.
+    idempotency_key = str(request.headers.get("Idempotency-Key") or body.idempotency_key or "").strip()
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail={"error": "idempotency_key_required"})
+    now = now_utc()
+    try:
+        charter = charter_store.resolve_charter_or_refuse(
+            conn, auth=auth, session_id=str(body.session_id), action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _charter_refusal(exc) from exc
+    if charter is None:
+        # Enforcement is off. A dispatch still needs a charter to name its scope, so this is a
+        # refusal either way -- but the reason is different and is reported as such.
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "no_active_charter", "reason": "no_active_charter", "action_kind": "execute",
+                    "message": "no active authority charter; dispatch has no scope to run under"},
+        )
+    payload = dispatch_store.open_dispatch(
+        conn, auth=auth, charter=charter, body=body, idempotency_key=idempotency_key, settings=settings, now=now
+    )
+    _charter_audit(conn, auth=auth, action="dispatch_open", query={"dispatch_id": payload["dispatch_id"]})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/dispatch/{dispatch_id}/provider", response_model=DispatchResponse)
+def dispatch_bind_provider(
+    dispatch_id: UUID,
+    body: dict[str, Any],
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_bind_provider", method="POST").inc()
+    dispatch_store.bind_provider_run(
+        conn,
+        dispatch_id=str(dispatch_id),
+        provider_run_id=str(body.get("provider_run_id") or ""),
+        provider_turn_id=(str(body["provider_turn_id"]) if body.get("provider_turn_id") else None),
+        now=now_utc(),
+    )
+    payload = dispatch_store.load_dispatch(conn, dispatch_id=str(dispatch_id), workspace_id=auth.workspace_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/dispatch/{dispatch_id}/reconcile", response_model=DispatchResponse)
+def dispatch_reconcile(
+    dispatch_id: UUID,
+    body: DispatchReconcileRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    # U3: allowed on a revoked charter. Recording what happened is not doing more.
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dispatch_reconcile", method="POST").inc()
+    payload = dispatch_store.reconcile_dispatch(conn, dispatch_id=str(dispatch_id), body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="dispatch_reconcile", query={"dispatch_id": str(dispatch_id)})
+    return DispatchResponse(**payload)
+
+
+@app.get("/v1/dispatch/{dispatch_id}", response_model=DispatchResponse)
+def dispatch_get(
+    dispatch_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DispatchResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dispatch_get", method="GET").inc()
+    payload = dispatch_store.load_dispatch(conn, dispatch_id=str(dispatch_id), workspace_id=auth.workspace_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail={"error": "dispatch_not_found"})
+    return DispatchResponse(**payload)
+
+
+@app.post("/v1/sandbox/self-test", response_model=SandboxSelfTestResponse)
+def sandbox_self_test(
+    body: SandboxSelfTestRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SandboxSelfTestResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="sandbox_self_test", method="POST").inc()
+    payload = dispatch_store.record_self_test(conn, auth=auth, body=body, now=now_utc())
+    _charter_audit(conn, auth=auth, action="sandbox_self_test", query={"self_test_id": payload["self_test_id"], "passed": payload["passed"]})
+    return SandboxSelfTestResponse(**payload)
+
+
+def _effect_kind(value: str) -> Literal["directive", "write", "command", "commit", "external"]:
+    """Coerce the wire string to the closed kind set.  An unknown kind is "external": the most
+    conservative reading, because an effect we cannot classify is one we cannot claim to have
+    observed the boundary of."""
+    raw = str(value or "").strip()
+    if raw in ("directive", "write", "command", "commit", "external"):
+        return cast(Literal["directive", "write", "command", "commit", "external"], raw)
+    return "external"
+
+
+def _effect_reversibility(value: str) -> Literal["reversible", "irreversible", "unknown"]:
+    """An unrecognised reversibility is "unknown", never "reversible" -- a shell one-liner may be
+    `git push`, and defaulting to reversible is what would silently retry it."""
+    raw = str(value or "").strip()
+    if raw in ("reversible", "irreversible", "unknown"):
+        return cast(Literal["reversible", "irreversible", "unknown"], raw)
+    return "unknown"
+
+
+def _effect_response(record: EffectRecord, *, now: datetime, paused: bool = False, pause_reason: str = "") -> EffectResponse:
+    return EffectResponse(
+        effect_id=UUID(record.effect_id),
+        directive_id=UUID(record.directive_id),
+        seq=record.seq,
+        state=record.state,
+        intent_digest=record.intent_digest,
+        kind=record.intent.kind,
+        capability=record.intent.capability,
+        resource=record.intent.resource,
+        reversibility=record.intent.reversibility,
+        enforcement_tier=record.enforcement_tier,
+        action_tracing=record.action_tracing,
+        lease_generation=record.lease_generation,
+        claimed_executor=record.claimed_executor,
+        provider_run_id=record.provider_run_id,
+        opened_at=record.opened_at,
+        resolved_at=record.resolved_at,
+        resolution_source=record.resolution_source,
+        pause_required=paused,
+        pause_reason=pause_reason,
+        generated_at=now,
+    )
+
+
+@app.post("/v1/effects", response_model=EffectResponse)
+def effect_open(
+    body: EffectOpenRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> EffectResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="effect_open", method="POST").inc()
+    if not bool(settings.effect_journal_enabled):
+        raise HTTPException(status_code=503, detail={"error": "effect_journal_disabled"})
+    now = now_utc()
+    try:
+        charter_store.resolve_charter_or_refuse(
+            conn, auth=auth, session_id=str(body.session_id), action_kind="execute", settings=settings, now=now
+        )
+    except CharterRequired as exc:
+        raise _charter_refusal(exc) from exc
+    intent = EffectIntent(
+        kind=_effect_kind(body.kind),
+        capability=str(body.capability),
+        resource=str(body.resource or ""),
+        argv=tuple(str(item) for item in body.argv),
+        reversibility=_effect_reversibility(body.reversibility),
+        description=str(body.description or ""),
+    )
+    try:
+        effect_id = effect_store.open_effect(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=str(body.session_id),
+            task_id=body.task_id,
+            directive_id=str(body.directive_id),
+            dispatch_id=(str(body.dispatch_id) if body.dispatch_id else None),
+            intent=intent,
+            enforcement_tier=str(body.enforcement_tier),
+            action_tracing=str(body.action_tracing),
+            lease_generation=int(body.lease_generation),
+            claimed_executor=auth.consumer,
+            provider_run_id=body.provider_run_id,
+            provider_turn_id=body.provider_turn_id,
+            runtime_id=str(body.runtime_id or ""),
+            runtime_version=str(body.runtime_version or ""),
+            model_id=str(body.model_id or ""),
+            now=now,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "stale_lease", "directive_id": str(body.directive_id), "expected_lease": int(body.lease_generation)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "effect_invalid", "message": str(exc)}) from exc
+    conn.commit()
+    _charter_audit(conn, auth=auth, action="effect_open", query={"effect_id": effect_id, "directive_id": str(body.directive_id)})
+    records = [r for r in effect_store.load_effects_for_directive(conn, directive_id=str(body.directive_id)) if r.effect_id == effect_id]
+    return _effect_response(records[0], now=now)
+
+
+@app.get("/v1/effects/open", response_model=list[EffectResponse])
+def effects_open(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> list[EffectResponse]:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="effects_open", method="GET").inc()
+    now = now_utc()
+    records = effect_store.list_open_effects(
+        conn, workspace_id=auth.workspace_id, owner_id=auth.user_id, session_id=session_id
+    )
+    paused, reason = pause_required(records)
+    return [_effect_response(record, now=now, paused=paused, pause_reason=reason) for record in records]
+
+
+@app.post("/v1/effects/{effect_id}/resolve", response_model=EffectResponse)
+def effect_resolve(
+    effect_id: UUID,
+    body: EffectResolveRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> EffectResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="effect_resolve", method="POST").inc()
+    now = now_utc()
+    row = conn.execute(
+        "SELECT state, session_id, directive_id, reversibility FROM effect_journal WHERE effect_id = ? AND workspace_id = ? LIMIT 1",
+        (str(effect_id), auth.workspace_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail={"error": "effect_not_found"})
+    current_state = str(row["state"])
+    pair = (current_state, str(body.target_state))
+    # S17: the actor is derived here, server-side. EffectResolveRequest deliberately has no actor
+    # field -- a caller that could name itself "system:reconciler" would defeat the whole rule.
+    is_owner = auth.role == AgentRole.USER and (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities)
+    needs_human = current_state == "unknown" or pair in EFFECT_REOPENABLE_TRANSITIONS
+    if needs_human:
+        _require_verified_human(auth, action="resolve an effect whose outcome is unknown")
+    actor = EFFECT_ACTOR_OWNER if is_owner else f"executor:{auth.consumer}"
+    # U3: a revoked charter must not stop the system from RECORDING what happened -- only from
+    # doing more. Recording sources stay open; anything else needs a live charter.
+    if str(body.resolution_source) not in ("reaper", "provider_read", "owner"):
+        try:
+            charter_store.resolve_charter_or_refuse(
+                conn, auth=auth, session_id=str(row["session_id"]), action_kind="execute", settings=settings, now=now
+            )
+        except CharterRequired as exc:
+            raise _charter_refusal(exc) from exc
+    try:
+        ok = effect_store.resolve_effect(
+            conn,
+            effect_id=str(effect_id),
+            target_state=str(body.target_state),
+            actor=actor,
+            resolution_source=str(body.resolution_source),
+            evidence=dict(body.evidence or {}),
+            expected_lease=int(body.expected_lease),
+            now=now,
+        )
+    except EffectTransitionRejected as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "effect_transition_rejected", "reason": exc.reason,
+                    "current_state": exc.current_state, "target_state": exc.target_state},
+        ) from exc
+    if not ok:
+        conn.rollback()
+        actual = conn.execute(
+            "SELECT lease_generation FROM directive_executions WHERE directive_id = ? LIMIT 1",
+            (str(row["directive_id"]),),
+        ).fetchone()
+        # G4 — ``actual_lease`` stays in the body, for the same reason it stays in Full's twin
+        # (tce_api/main.py, same route): the lease is a FENCING token, not a secret. It is a small
+        # monotonic counter, GET /v1/takeover/execution/status already hands the current value to
+        # any caller inside this workspace — which this one is — and once G2 closed the transition
+        # table, knowing it buys a fenced-out worker nothing. The reap that bumped the lease also
+        # drove this effect to 'unknown', and validate_effect_transition refuses both ways out of
+        # 'unknown' for a non-system actor ('system_only') and refuses either terminal state on an
+        # irreversible effect ('irreversible_actor'). What the field buys is a caller that can tell
+        # "I am fenced" from "the row moved under me" without polling. Parity matters here too:
+        # tests/integration/test_effect_reconcile_lite.py asserts on this field.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "stale_lease",
+                "effect_id": str(effect_id),
+                "expected_lease": int(body.expected_lease),
+                "actual_lease": int(actual["lease_generation"]) if actual is not None else None,
+            },
+        )
+    conn.commit()
+    _charter_audit(conn, auth=auth, action="effect_resolve", query={"effect_id": str(effect_id), "target_state": str(body.target_state), "actor": actor})
+    records = [r for r in effect_store.load_effects_for_directive(conn, directive_id=str(row["directive_id"])) if r.effect_id == str(effect_id)]
+    paused, reason = pause_required(records)
+    return _effect_response(records[0], now=now, paused=paused, pause_reason=reason)
+
+
+@app.post("/v1/verification/criteria", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_freeze(
+    body: AcceptanceCriteriaRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="verification_criteria_freeze", method="POST").inc()
+    # A freezer must be a server-bound principal. Reading the name off X-TCE-Consumer would let the
+    # agent rename itself and freeze its own goalposts, which is the same laundering the verification
+    # verdict routes already refuse.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "identity_unverified", "message": "freezing acceptance criteria requires a server-bound identity"},
+        )
+    # Two claim paths reach a directive: a dispatch record (the supervisor) and the ordinary
+    # claim_execution lease (an executor over MCP). Checking only the first left the second wide open --
+    # an agent could freeze `exit 0` as its own acceptance check and an honest verifier would grade it
+    # as passing.
+    claimed = conn.execute(
+        "SELECT claimed_by FROM dispatch_records WHERE directive_id = ? ORDER BY created_at DESC LIMIT 1",
+        (str(body.directive_id),),
+    ).fetchone()
+    # The freeze is ONE-SHOT: UNIQUE(directive_id), no UPDATE path, no DELETE path. So an
+    # unscoped freeze is not a harmless no-op -- whoever gets there first owns that directive's
+    # goalposts permanently. Measured over HTTP before this check, on both backends: an ordinary
+    # bound executor froze `/bin/sh -c "exit 0"` against a directive_id it had invented, for a
+    # directive that did not exist in any workspace, and got 200. That buys two things it should
+    # not: criteria for work someone else will do, and a pre-emptive 409 against the supervisor's
+    # own honest freeze. The directive must exist and it must be in the caller's workspace.
+    claimed_executor_row = conn.execute(
+        "SELECT claimed_executor FROM directive_executions WHERE directive_id = ? AND workspace_id = ? LIMIT 1",
+        (str(body.directive_id), auth.workspace_id),
+    ).fetchone()
+    if claimed_executor_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "unknown_directive",
+                "message": "acceptance criteria may only be frozen for a directive in this workspace",
+                "directive_id": str(body.directive_id),
+            },
+        )
+    consumer = str(auth.consumer)
+    if (claimed is not None and str(claimed["claimed_by"]) == consumer) or (
+        claimed_executor_row is not None and str(claimed_executor_row["claimed_executor"] or "") == consumer
+    ):
+        raise HTTPException(status_code=403, detail={"error": "criteria_frozen_by_executor"})
+    if not bool(settings.verification_enabled):
+        raise HTTPException(status_code=503, detail={"error": "verification_disabled"})
+    now = now_utc()
+    checks = [
+        AcceptanceCheck(
+            check_id=str(item.check_id),
+            argv=tuple(str(part) for part in item.argv),
+            cwd_rel=str(item.cwd_rel),
+            expect_exit_code=int(item.expect_exit_code),
+            timeout_seconds=int(item.timeout_seconds),
+        )
+        for item in body.checks
+    ]
+    manifest = [(str(entry[0]), str(entry[1])) for entry in body.corpus_manifest if len(entry) >= 2]
+    try:
+        criteria = verification_store.freeze_acceptance_criteria(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            task_id=body.task_id,
+            directive_id=str(body.directive_id),
+            charter_id=(str(body.charter_id) if body.charter_id else None),
+            checks=checks,
+            corpus_manifest=manifest,
+            frozen_by=auth.consumer,
+            settings=settings,
+            now=now,
+        )
+    except CriteriaFrozen as exc:
+        raise HTTPException(status_code=409, detail={"error": "criteria_frozen", "directive_id": str(body.directive_id)}) from exc
+    except CriteriaInvalid as exc:
+        raise HTTPException(status_code=422, detail={"error": "criteria_invalid", "field": exc.field, "message": str(exc)}) from exc
+    _charter_audit(conn, auth=auth, action="criteria_freeze", query={"directive_id": str(body.directive_id), "criteria_id": criteria.criteria_id})
+    return _criteria_response(criteria)
+
+
+def _criteria_response(criteria: AcceptanceCriteria) -> AcceptanceCriteriaResponse:
+    return AcceptanceCriteriaResponse(
+        criteria_id=UUID(criteria.criteria_id),
+        directive_id=UUID(criteria.directive_id),
+        criteria_digest=criteria.criteria_digest,
+        corpus_digest=criteria.corpus_digest,
+        checks=[
+            AcceptanceCheckPayload(
+                check_id=check.check_id,
+                argv=list(check.argv),
+                cwd_rel=check.cwd_rel,
+                expect_exit_code=check.expect_exit_code,
+                timeout_seconds=check.timeout_seconds,
+            )
+            for check in criteria.checks
+        ],
+        corpus_manifest=[list(entry) for entry in criteria.corpus_manifest],
+        frozen_at=criteria.frozen_at,
+        frozen_by=criteria.frozen_by,
+        policy_revision=criteria.policy_revision,
+    )
+
+
+@app.get("/v1/verification/criteria/{directive_id}", response_model=AcceptanceCriteriaResponse)
+def verification_criteria_get(
+    directive_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AcceptanceCriteriaResponse:
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="verification_criteria_get", method="GET").inc()
+    criteria = verification_store.load_acceptance_criteria(conn, directive_id=str(directive_id))
+    if criteria is None:
+        raise HTTPException(status_code=404, detail={"error": "criteria_not_frozen"})
+    return _criteria_response(criteria)
+
+
+@app.post("/v1/verification/results", response_model=VerificationResultResponse)
+def verification_results_record(
+    body: VerificationResultRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> VerificationResultResponse:
+    # U3: allowed on a revoked charter -- recording, not doing.
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="verification_results_record", method="POST").inc()
+    if auth.role == AgentRole.EXECUTOR:
+        raise HTTPException(status_code=403, detail={"error": "unknown_runner", "message": "an executor may not grade its own work"})
+    # F1 -- the role above is a HEADER under the default `identity_claims_mode="compat"`, so the
+    # executor check alone is not authentication: the implementing agent need only drop
+    # `X-TCE-Role: executor` from its own token to grade its own directive `passed`. The runner
+    # principal must come from a server-bound claim. This is the same laundering P1 closed for
+    # evidence and P3 closed for charters; the third door is this one.
+    if not (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "unknown_runner",
+                "message": "verification results require a server-verified runner identity",
+                "reasons": ["identity_unverified"],
+            },
+        )
+    evidence = VerificationEvidence(
+        directive_id=str(body.directive_id),
+        results=tuple(
+            CheckResult(
+                check_id=str(item.check_id),
+                argv=tuple(str(part) for part in item.argv),
+                exit_code=int(item.exit_code),
+                duration_ms=int(item.duration_ms),
+                stdout_sha256=str(item.stdout_sha256),
+                stderr_sha256=str(item.stderr_sha256),
+                excerpt=str(item.excerpt or ""),
+            )
+            for item in body.results
+        ),
+        observed_corpus_digest=str(body.observed_corpus_digest),
+        observed_corpus_manifest=tuple((str(e[0]), str(e[1])) for e in body.observed_corpus_manifest if len(e) >= 2),
+        platform=str(body.platform or ""),
+        commit_sha=body.commit_sha,
+        tree_sha=body.tree_sha,
+        reviewer_model=body.reviewer_model,
+    )
+    _outcome, payload = verification_store.record_verification(
+        conn,
+        workspace_id=auth.workspace_id,
+        user_id=auth.user_id,
+        directive_id=str(body.directive_id),
+        evidence=evidence,
+        # Derived from the authenticated identity, NEVER from the body.
+        runner_principal=_runner_principal_for(auth),
+        settings=settings,
+        now=now_utc(),
+    )
+    _charter_audit(conn, auth=auth, action="verification_record", query={"directive_id": str(body.directive_id), "verdict": payload["verdict"]})
+    return VerificationResultResponse(**payload)
+
+
+@app.post("/v1/handoffs/outbox/{outbox_id}/requeue", response_model=dict)
+def handoff_outbox_requeue(
+    outbox_id: UUID,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    _enforce_workspace_access(auth, conn)
+    _require_verified_human(auth, action="requeue a dead completion handoff")
+    REQUEST_COUNT.labels(endpoint="handoff_outbox_requeue", method="POST").inc()
+    payload = requeue_dead_handoff(conn, auth=auth, outbox_id=str(outbox_id), now=now_utc())
+    _charter_audit(conn, auth=auth, action="outbox_requeue", query={"outbox_id": str(outbox_id)})
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# P5 — dream proposals (§4.1).  Four routes, the same four Full exposes, sharing the
+# request and response models declared once in ``tce_shared.events`` so wire parity is
+# mechanical rather than careful.
+#
+# What Lite cannot do is generate: there is no model gateway here, so
+# ``POST /v1/dreams/refresh`` runs every step that does not need a model and then refuses
+# ``model_unavailable`` in a real ``dream_generation_runs`` row.  Every other route —
+# storage, the fold, the transitions, both validators, the sweep and the pursuit
+# reconciler — is backend-neutral and fully functional.
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(DreamRevisionConflict)
+def _dream_revision_conflict(request: Request, exc: DreamRevisionConflict) -> JSONResponse:
+    """A lost compare-and-swap is a 409, not a 500.
+
+    Without this handler the exception escapes as an unhandled error and a retrying client
+    is told the server broke rather than that it lost a race it can simply repeat.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_revision_conflict",
+            "proposal_id": exc.proposal_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(DreamTransitionRefused)
+def _dream_transition_refused(request: Request, exc: DreamTransitionRefused) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_transition_refused",
+            "proposal_id": exc.proposal_id,
+            "detail": exc.reason,
+        },
+    )
+
+
+def _dreams_enabled() -> None:
+    if not bool(getattr(settings, "dream_proposals_enabled", True)):
+        raise HTTPException(status_code=503, detail="dream proposals are disabled")
+
+
+def _dream_verdict_gate(auth: AuthContext, action: str) -> None:
+    """D7 — a verdict requires a verified human; a display record does not.
+
+    ``surfaced`` is not a verdict.  It is the statement "this was put in front of the owner",
+    and the thing that puts it in front of him is the executor's renderer, so requiring a
+    human to attest that the executor displayed something would make the field unreachable.
+    The abuse ceiling is bounded and worth stating: an executor spamming ``surfaced`` can only
+    drive the nonresponse axis to ``ignored``, whose sole effect is a *longer* re-surface
+    interval.  It cannot reject, suppress, expire anything early, or appear as the owner's
+    answer.
+    """
+    if action not in HUMAN_VERDICT_ACTIONS:
+        return
+    is_human = auth.role == AgentRole.USER
+    verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and verified):
+        raise HTTPException(status_code=403, detail="a dream verdict requires a verified human identity")
+
+
+def _dream_actor_class(auth: AuthContext) -> str:
+    if auth.role == AgentRole.USER and (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        return "human"
+    return "executor"
+
+
+def _dream_proposal_model(
+    projection: DreamProposalProjection,
+    *,
+    source_revision: str,
+    citations_verified: str,
+    citations: Sequence[DreamCitation],
+    created_at: datetime | None,
+    updated_at: datetime | None,
+) -> DreamProposal:
+    """One projection -> one wire model, derived through the shared helper.
+
+    ``citations`` is passed in rather than read off the projection because what crosses the
+    wire is the set that just re-validated, not the set that was stored — a proposal is never
+    shown with evidence the request could not prove.  The hashes stay off the wire: they are
+    how the system checks a quote, not something a reader needs.
+    """
+    fields = dict(
+        dream_proposal_summary_fields(
+            projection, source_revision=source_revision, citations_verified=citations_verified
+        )
+    )
+    fields["citations"] = [
+        DreamProposalCitation(
+            event_id=UUID(citation.event_id),
+            receipt_id=UUID(citation.receipt_id),
+            origin_kind=citation.origin_kind,
+            observed_at=citation.observed_at,
+            quote=citation.quote,
+        )
+        for citation in citations
+        if _is_uuid_text(citation.event_id) and _is_uuid_text(citation.receipt_id)
+    ]
+    fields["citation_count"] = len(fields["citations"])
+    stamp = updated_at or created_at or now_utc()
+    fields["created_at"] = created_at or stamp
+    fields["updated_at"] = updated_at or stamp
+    return DreamProposal(**fields)
+
+
+def _is_uuid_text(value: str) -> bool:
+    try:
+        UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+def _dream_session_project(
+    conn: sqlite3.Connection, *, auth: AuthContext, session_id: str
+) -> dict[str, Any] | None:
+    """The project this session is already working in, read from the session row itself.
+
+    The lookup is keyed on ``(session_id, workspace_id, user_id)`` from the credential, so a
+    caller cannot borrow another principal's session to inherit their project binding.
+    """
+    if not session_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT takeover_context FROM takeover_sessions
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+        """,
+        (session_id, auth.workspace_id, auth.user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        takeover_context = json.loads(str(row["takeover_context"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(takeover_context, dict):
+        return None
+    candidate = takeover_context.get("project_context")
+    return dict(candidate) if isinstance(candidate, dict) and candidate else None
+
+
+def _dream_scope_for(
+    auth: AuthContext,
+    app_context: dict[str, Any] | None,
+    session_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> ResolvedScope:
+    """Scope comes from the authenticated caller.  ``app_context`` is a hint, never an identity.
+
+    The session's own project context is the second hint, and it is what makes the read and
+    transition routes able to reach a project-scoped proposal at all: those routes take no
+    ``app_context``, so without it every one of them resolved to workspace scope and a
+    proposal minted under a project could be written and then never read back.  Full resolves
+    scope the same way (``main.py::_session_project_context``); this keeps the two backends
+    answering the same question.
+    """
+    return auth.resolved_scope(
+        project_hint=app_context if isinstance(app_context, dict) else None,
+        session_project=(
+            _dream_session_project(conn, auth=auth, session_id=session_id)
+            if conn is not None
+            else None
+        ),
+        task_id=session_id or None,
+    )
+
+
+@app.get("/v1/dreams", response_model=DreamProposalListResponse)
+def list_dreams(
+    session_id: str = "default",
+    status: list[str] | None = Query(default=None),
+    include_history: bool = False,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposalListResponse:
+    """Read-only.  Writes nothing, ever.
+
+    A GET with a side effect is the kind of thing that gets "optimised" into a cache six
+    months later, and the surfaced record is the only thing standing between nonresponse and
+    rejection.  Proposals whose citations no longer clear the floor are FILTERED here and
+    withdrawn by the sweep, which is the named producer of ``withdrawn``.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dreams_list", method="GET").inc()
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    now = now_utc()
+    projections = list_proposals(
+        conn,
+        scope=scope,
+        statuses=[str(item) for item in (status or []) if str(item)],
+        include_history=bool(include_history),
+        now=now,
+        limit=int(getattr(settings, "dream_list_limit", 10)),
+    )
+    stamps = load_proposal_stamps(
+        conn, scope=scope, proposal_ids=[item.proposal_id for item in projections]
+    )
+    min_citations = int(getattr(settings, "dream_min_citations", 2))
+    out: list[DreamProposal] = []
+    for projection in projections:
+        surviving, _dropped = validate_citations_cheap(
+            conn, scope=scope, citations=projection.citations
+        )
+        if len(surviving) < min_citations:
+            continue
+        created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+        out.append(
+            _dream_proposal_model(
+                projection,
+                source_revision="",
+                citations_verified="cheap",
+                citations=surviving,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        )
+    return DreamProposalListResponse(proposals=out, total=len(out), citations_verified="cheap")
+
+
+@app.post("/v1/dreams/refresh", response_model=DreamRefreshResponse)
+def refresh_dreams(
+    body: DreamRefreshRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamRefreshResponse:
+    """Sweep, reconcile, take the run slot, then refuse for a named reason.
+
+    The route owns everything that does not need a model, so every refusal is observable in
+    the response body and in a real run row.  A generation path that is entirely broken must
+    not read as "no proposals today": that silence is the failure mode this whole surface
+    exists to remove.
+
+    Lite has no model gateway, so the last refusal is always ``model_unavailable`` and the
+    branches above it are the ones a caller can actually move.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dreams_refresh", method="POST").inc()
+    now = now_utc()
+    scope = _dream_scope_for(auth, body.app_context, body.session_id, conn)
+    scope_kind = dream_scope_kind(scope)
+
+    swept = sweep_dream_proposals(
+        conn,
+        scope=scope,
+        now=now,
+        ttl_days=int(getattr(settings, "dream_proposal_ttl_days", 45)),
+        min_citations=int(getattr(settings, "dream_min_citations", 2)),
+        quote_max_chars=int(getattr(settings, "dream_quote_max_chars", 200)),
+        after_surfaces=int(getattr(settings, "dream_nonresponse_after_surfaces", 3)),
+    )
+    reconciled = reconcile_dream_pursuit(
+        conn,
+        scope=scope,
+        session_id=body.session_id,
+        now=now,
+        after_surfaces=int(getattr(settings, "dream_nonresponse_after_surfaces", 3)),
+    )
+
+    try:
+        run_id = start_generation_run(
+            conn,
+            scope=scope,
+            session_id=body.session_id,
+            scope_kind=scope_kind,
+            stale_minutes=int(getattr(settings, "dream_run_stale_minutes", 30)),
+            now=now,
+        )
+    except sqlite3.IntegrityError:
+        # The unique partial index refused a second in-flight run for this scope.  That is the
+        # slot doing its job, not an error: two concurrent refreshes cannot both mint.
+        conn.commit()
+        return DreamRefreshResponse(
+            run_id=None,
+            state="refused",
+            refusal_reason="run_already_in_flight",
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    def _refuse(reason: str, *, pool: Sequence[PoolMessage] = (), pool_drops: dict[str, int] | None = None) -> DreamRefreshResponse:
+        revision, cutoff = evidence_revision(
+            [{"id": message.event_id, "ts": message.observed_at} for message in pool]
+        )
+        finish_generation_run(
+            conn,
+            run_id=run_id,
+            state="refused",
+            refusal_reason=reason,
+            pool=pool,
+            evidence_revision=revision,
+            evidence_cutoff_at=cutoff,
+            candidates_returned=0,
+            proposals_written=0,
+            refusals={},
+            pool_drops=pool_drops or {},
+            prompt_hash="",
+            model_provider="",
+            now=now,
+        )
+        conn.commit()
+        return DreamRefreshResponse(
+            run_id=UUID(run_id),
+            state="refused",
+            refusal_reason=reason,
+            proposals_written=0,
+            refusals={},
+            pool_size=len(pool),
+            pool_drops=pool_drops or {},
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    if scope_kind == SCOPE_KIND_PROJECT and not subject_has_project_receipts(conn, scope=scope):
+        # A project id is client-assertable, so a run may not bind to a project the subject has
+        # never spoken into.  Without this the attribution would be whatever the caller claimed.
+        return _refuse("unentitled_project")
+
+    live = load_live_proposals(
+        conn, scope=scope, limit=int(getattr(settings, "dream_max_live_proposals", 20))
+    )
+    if len(live) >= int(getattr(settings, "dream_max_live_proposals", 20)):
+        return _refuse("too_many_open_proposals")
+
+    pool, pool_drops = select_candidate_messages(
+        conn,
+        scope=scope,
+        scope_kind=scope_kind,
+        limit=int(getattr(settings, "dream_message_limit", 60)),
+        min_chars=int(getattr(settings, "dream_min_message_chars", 25)),
+        max_chars=int(getattr(settings, "dream_max_message_chars", 1200)),
+        max_sensitivity=int(getattr(settings, "block_sensitivity", 3)) - 1,
+    )
+    if len(pool) < int(getattr(settings, "dream_min_messages", 10)):
+        # The honest answer on a corpus that cannot support a proposal.  It is reported rather
+        # than hidden precisely because the failure it replaces looked identical to a quiet week.
+        return _refuse("insufficient_messages", pool=pool, pool_drops=pool_drops)
+
+    # D15: Lite has no worker, no Redis and no model gateway, so there is nothing to enqueue.
+    # The response model is identical to Full's and the run row is real; only the reason differs.
+    return _refuse("model_unavailable", pool=pool, pool_drops=pool_drops)
+
+
+@app.get("/v1/dreams/{proposal_id}", response_model=DreamProposal)
+def get_dream(
+    proposal_id: UUID,
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposal:
+    """Read-only, and the deep validation runs here: the body is read and the quote re-found.
+
+    ``410`` when the proposal has already been withdrawn because its citations stopped
+    verifying — a reader who followed a link deserves the reason, not a bare 404.  ``404``
+    when the one scope predicate does not match, which is also the answer for another
+    subject's or another project's proposal.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dreams_detail", method="GET").inc()
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    loaded = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    projection, _highest_seq, source_revision = loaded
+    if projection.withdrawn_reason == "citations_unverifiable":
+        raise HTTPException(status_code=410, detail="dream proposal was withdrawn: citations_unverifiable")
+    surviving, _dropped = validate_citations_deep(
+        conn,
+        scope=scope,
+        citations=projection.citations,
+        quote_max_chars=int(getattr(settings, "dream_quote_max_chars", 200)),
+    )
+    if len(surviving) < int(getattr(settings, "dream_min_citations", 2)):
+        raise HTTPException(status_code=410, detail="dream proposal was withdrawn: citations_unverifiable")
+    stamps = load_proposal_stamps(conn, scope=scope, proposal_ids=[projection.proposal_id])
+    created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+    return _dream_proposal_model(
+        projection,
+        source_revision=source_revision,
+        citations_verified="deep",
+        citations=surviving,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+@app.post("/v1/dreams/{proposal_id}/transition", response_model=DreamProposal)
+def dream_transition(
+    proposal_id: UUID,
+    body: DreamProposalTransitionRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposal:
+    """One route, one closed vocabulary: ``surfaced``, ``accepted``, ``rejected``, ``snoozed``,
+    ``unsnoozed``.
+
+    Accept mints nothing.  It writes one event and returns.  If accept minted a plan root then
+    accepting while a task was in flight would have to either clobber the owner's current
+    objective or 409 — and a 409 loses the owner's answer, which is the exact class of loss
+    this vocabulary exists to prevent.  The answer is recorded first; the machinery catches up
+    in ``reconcile_dream_pursuit``.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dreams_transition", method="POST").inc()
+    action = str(body.action or "").strip().lower()
+    if action not in HUMAN_VERDICT_ACTIONS | DISPLAY_ACTIONS:
+        raise HTTPException(status_code=422, detail=f"unknown dream transition action: {action}")
+    _dream_verdict_gate(auth, action)
+
+    scope = _dream_scope_for(auth, None, body.session_id, conn)
+    loaded = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    now = now_utc()
+    after_surfaces = int(getattr(settings, "dream_nonresponse_after_surfaces", 3))
+    actor_class = _dream_actor_class(auth)
+
+    if action == "surfaced":
+        append_surfaced(
+            conn,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            actor=auth.consumer,
+            actor_class=actor_class,
+            now=now,
+            min_hours=int(getattr(settings, "dream_resurface_min_hours", 24)),
+            ignored_hours=int(getattr(settings, "dream_resurface_ignored_hours", 168)),
+            after_surfaces=after_surfaces,
+        )
+    else:
+        payload: dict[str, Any] = {"reason": str(body.reason or "")[:400]}
+        if action == "accepted":
+            kind = DreamProposalEventKind.ACCEPTED
+            payload["accepted_at"] = now.isoformat()
+        elif action == "rejected":
+            kind = DreamProposalEventKind.REJECTED
+            payload["rejected_at"] = now.isoformat()
+        elif action == "snoozed":
+            kind = DreamProposalEventKind.SNOOZED
+            until = body.snooze_until or (
+                now + timedelta(days=int(getattr(settings, "dream_snooze_default_days", 7)))
+            )
+            payload["snooze_until"] = until.isoformat()
+        else:
+            kind = DreamProposalEventKind.UNSNOOZED
+            payload["expires_at"] = (
+                now + timedelta(days=int(getattr(settings, "dream_proposal_ttl_days", 45)))
+            ).isoformat()
+        apply_dream_events(
+            conn,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            new_events=[
+                DreamProposalEvent(
+                    seq=0,
+                    kind=kind,
+                    payload=payload,
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    actor_class=actor_class,
+                )
+            ],
+            now=now,
+            after_surfaces=after_surfaces,
+        )
+
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="dream_transition",
+        query={"proposal_id": str(proposal_id), "dream_action": action, "actor_class": actor_class},
+        result_event_ids=[],
+        policy_decisions={"role": auth.role.value, "identity_verified": bool(auth.identity_verified)},
+        latency_ms=0,
+    )
+
+    refreshed = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if refreshed is None:  # pragma: no cover - the row cannot vanish inside one request
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    projection, _highest_seq, source_revision = refreshed
+    stamps = load_proposal_stamps(conn, scope=scope, proposal_ids=[projection.proposal_id])
+    created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+    return _dream_proposal_model(
+        projection,
+        source_revision=source_revision,
+        citations_verified="cheap",
+        citations=projection.citations,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# P6 — the operational-proof pilot (§6.3).  The same six routes Full exposes,
+# sharing the request and response models declared once in ``tce_shared.events``
+# so wire parity is mechanical rather than careful, and sharing the clause
+# arithmetic in ``tce_shared.pilot_enrollment`` so a verdict cannot differ
+# between backends.
+#
+# The rule that shapes all six: THE PARTY UNDER TEST DOES NOT GRADE ITSELF.
+# Enrolling and posting observations are open to any authenticated principal in
+# scope — an executor may attest *what it did*.  Closing an episode and
+# adjudicating a dream require a verified human, because those attest *what
+# happened*.
+# ---------------------------------------------------------------------------
+
+
+def _require_pilot_enrollment() -> None:
+    """The master switch.  404, not 503: an unenabled pilot has no surface at all."""
+    if not bool(getattr(settings, "pilot_enrollment_enabled", False)):
+        raise HTTPException(status_code=404, detail="pilot enrolment is not enabled")
+
+
+def _require_pilot_adjudicator(auth: AuthContext, *, action: str) -> None:
+    """C6 — the same verified-human predicate a dream verdict uses, and not generalised.
+
+    ``auth.py`` reads the role straight off ``X-TCE-Role`` in compat mode, so "role user" is not
+    authentication; the second half of the predicate is what makes it one.  Enrolment and
+    observations are deliberately NOT gated here: an executor saying "I ran this" is a
+    diagnostic, and an executor saying "it worked" would be the system grading its own work.
+    """
+    is_human = auth.role == AgentRole.USER
+    verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "pilot_adjudicator_required",
+                "message": f"a pilot adjudication requires a verified human identity ({action})",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
+
+
+def _pilot_episode_response(row: dict[str, Any], *, reused: bool) -> PilotEnrolmentResponse:
+    """One producer for the enrolment wire model, so the two branches cannot disagree."""
+    return PilotEnrolmentResponse(
+        episode_id=UUID(str(row["id"])),
+        episode_key=str(row["episode_key"]),
+        arm_id=PilotArm(str(row["arm_id"])),
+        arm_class=str(row["arm_class"]),
+        allocation_kind=AllocationKind(str(row["allocation_kind"])),
+        stratum_id=str(row["stratum_id"]),
+        slot=int(row["slot"]),
+        block_ordinal=int(row["block_ordinal"]),
+        allocated_at=row["allocated_at"],
+        revealed_at=row.get("revealed_at"),
+        reused=reused,
+        enrolled_before_execution=bool(row.get("enrolled_before_execution", True)),
+        arm_set_sha=str(row["arm_set_sha"] or ""),
+        allocation_salt_sha256=str(row["allocation_salt_sha256"] or ""),
+    )
+
+
+@app.post("/v1/pilot/episodes", response_model=PilotEnrolmentResponse)
+def enrol_pilot_episode(
+    body: PilotEnrolmentRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PilotEnrolmentResponse:
+    """Freeze an arm to a piece of work, BEFORE the work starts.
+
+    The caller does not send an ``episode_key`` and does not send an ``arm_id``: the server
+    hashes the objective with the existing producer, reads ``cancel_epoch`` from P2's
+    ``task_states`` **for this session's own task**, and derives P4's six-component key itself.
+    Re-enrolling the same work returns the ORIGINAL arm with ``reused=true`` and consumes no
+    stratum slot.  ``body.task_id`` is recorded for the P2/P3 joins at close time and reaches
+    neither the key nor the allocator.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_enrol", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    # The body's ``project_id`` is a HINT, never an identity: it goes through the same
+    # ``resolve_scope`` canonicaliser every other project-scoped route uses, and
+    # ``scope.project_id`` — not the body — is what lands on the row.  MEASURED, and not softened
+    # here: that resolver canonicalises, it does not entitle.  A project the subject has never
+    # spoken into is accepted and becomes its OWN report cell, holding only the episodes enrolled
+    # under it.  Relabelling therefore moves an episode to the cell it named; it cannot move a
+    # foreign episode INTO a cell, because the report refuses to pool cells (C10).  The
+    # entitlement predicate ``subject_has_project_receipts`` guards generation, not enrolment.
+    hint = {"project_id": body.project_id} if body.project_id else None
+    scope = _dream_scope_for(auth, hint, body.session_id, conn)
+    try:
+        row, reused = pilot_enroll_episode(
+            conn,
+            workspace_id=scope.workspace_id,
+            owner_id=scope.owner_id,
+            owner_ids=scope.sql_owner_ids(),
+            subject_user_id=scope.subject_user_id,
+            agent_principal=auth.consumer,
+            project_id=scope.project_id,
+            decision_family=body.decision_family,
+            session_id=body.session_id,
+            objective_hash=objective_hash(body.objective_text),
+            task_id=body.task_id,
+            elect_arm=body.elect_arm,
+            allocation_salt=str(getattr(settings, "pilot_allocation_salt", "tce-pilot-p6-v1")),
+            human_baseline_enabled=bool(getattr(settings, "pilot_human_baseline_enabled", False)),
+            thresholds_sha=P6_THRESHOLDS_SHA,
+            now=now_utc(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "pilot_enrolment_refused", "message": str(exc)}) from exc
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="pilot_enrol",
+        query={"session_id": body.session_id, "decision_family": body.decision_family},
+        result_event_ids=[],
+        policy_decisions={"arm_id": str(row["arm_id"]), "allocation_kind": str(row["allocation_kind"]), "reused": reused},
+        latency_ms=0,
+    )
+    return _pilot_episode_response(row, reused=reused)
+
+
+@app.post("/v1/pilot/episodes/{episode_id}/observations", response_model=PilotObservationResponse)
+def record_pilot_observation(
+    episode_id: UUID,
+    body: PilotObservationRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PilotObservationResponse:
+    """The executor's own account of its run.  ``agent_asserted``, and no gate clause reads it."""
+    REQUEST_COUNT.labels(endpoint="pilot_observation", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    scope = _dream_scope_for(auth, None, str(episode_id), conn)
+    try:
+        episode = pilot_load_episode(
+            conn,
+            workspace_id=scope.workspace_id,
+            owner_ids=scope.sql_owner_ids(),
+            episode_id=str(episode_id),
+        )
+    except PilotEpisodeNotFound as exc:
+        raise HTTPException(status_code=404, detail="pilot episode not found") from exc
+    notes, _ = redact_text(body.agent_notes)
+    steps = [redact_text(str(step))[0] for step in body.agent_declared_steps]
+    result = pilot_record_observation(
+        conn,
+        episode=episode,
+        principal=auth.consumer,
+        agent_notes=notes,
+        agent_declared_steps=steps,
+        agent_self_rated_difficulty=body.agent_self_rated_difficulty,
+        now=now_utc(),
+    )
+    return PilotObservationResponse(
+        observation_id=result["observation_id"],
+        episode_id=result["episode_id"],
+        recorded=True,
+        producer_class="agent_asserted",
+        read_by_any_gate=False,
+        observed_at=result["observed_at"],
+    )
+
+
+@app.post("/v1/pilot/episodes/{episode_id}/close", response_model=PilotEpisodeCloseResponse)
+def close_pilot_episode(
+    episode_id: UUID,
+    body: PilotEpisodeCloseRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PilotEpisodeCloseResponse:
+    """The adjudication.  403 for an executor, one per episode, and four derived fields.
+
+    ``deviated``, ``completion_basis``, ``adjudication_independent`` and ``late_close`` are all
+    computed by the store and never accepted on the wire.  ``late_close`` is a diagnostic and
+    never a refusal.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_close", method="POST").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, conn)
+    _require_pilot_adjudicator(auth, action="close a pilot episode")
+    scope = _dream_scope_for(auth, None, str(episode_id), conn)
+    try:
+        episode = pilot_load_episode(
+            conn,
+            workspace_id=scope.workspace_id,
+            owner_ids=scope.sql_owner_ids(),
+            episode_id=str(episode_id),
+        )
+    except PilotEpisodeNotFound as exc:
+        raise HTTPException(status_code=404, detail="pilot episode not found") from exc
+    reason, _ = redact_text(body.deviation_reason)
+    unfinished, _ = redact_text(body.unfinished_reason)
+    try:
+        result = pilot_close_episode(
+            conn,
+            episode=episode,
+            owner_ids=scope.sql_owner_ids(),
+            adjudicator_id=auth.consumer,
+            adjudicator_verified=bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities,
+            executed_arm=body.executed_arm,
+            rescue_level=body.rescue_level,
+            finished=body.finished,
+            review_verdict=body.review_verdict,
+            review_minutes=body.review_minutes,
+            deviation_reason=reason,
+            unfinished_reason=unfinished,
+            grace_days=int(getattr(settings, "pilot_close_grace_days", 90)),
+            now=now_utc(),
+        )
+    except PilotEpisodeConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "pilot_episode_already_closed", "episode_id": str(episode_id)},
+        ) from exc
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="pilot_close",
+        query={"episode_id": str(episode_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "deviated": bool(result["deviated"]),
+            "adjudication_independent": bool(result["adjudication_independent"]),
+            "completion_basis": result["completion_basis"].value,
+        },
+        latency_ms=0,
+    )
+    return PilotEpisodeCloseResponse(
+        episode_id=result["episode_id"],
+        close_id=result["close_id"],
+        deviated=bool(result["deviated"]),
+        adjudication_independent=bool(result["adjudication_independent"]),
+        adjudicator_verified=bool(result["adjudicator_verified"]),
+        completion_basis=result["completion_basis"],
+        late_close=bool(result["late_close"]),
+        closed_at=result["closed_at"],
+    )
+
+
+@app.get("/v1/pilot/episodes", response_model=PilotEpisodeListResponse)
+def list_pilot_episodes(
+    session_id: str = "default",
+    limit: int = 200,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PilotEpisodeListResponse:
+    """The enrolment ledger.  This is the read that stamps ``revealed_at``.
+
+    It only ever moves NULL -> now and it touches no other column, so it cannot rewrite an
+    allocation — and ``allocated_at < revealed_at`` becomes an auditable fact rather than a
+    promise in a runbook.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_episodes", method="GET").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, conn)
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    rows = pilot_list_episodes(
+        conn,
+        workspace_id=scope.workspace_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+        limit=limit,
+    )
+    now = now_utc()
+    pilot_mark_revealed(conn, episode_ids=[row["id"] for row in rows if row.get("revealed_at") is None], now=now)
+    episodes = [
+        PilotEpisodeSummary(
+            episode_id=UUID(str(row["id"])),
+            episode_key=str(row["episode_key"]),
+            project_id=(str(row["project_id"]) if row.get("project_id") else None),
+            decision_family=str(row["decision_family"]),
+            arm_id=PilotArm(str(row["arm_id"])),
+            arm_class=str(row["arm_class"]),
+            allocation_kind=AllocationKind(str(row["allocation_kind"])),
+            block_ordinal=int(row["block_ordinal"]),
+            slot=int(row["slot"]),
+            allocated_at=row["allocated_at"],
+            revealed_at=row.get("revealed_at") or now,
+            closed_at=row.get("closed_at"),
+            executed_arm=(PilotArm(str(row["executed_arm"])) if row.get("executed_arm") else None),
+            deviated=bool(row.get("deviated")),
+            rescue_level=(RescueLevel(str(row["rescue_level"])) if row.get("rescue_level") else None),
+            completion_basis=(CompletionBasis(str(row["completion_basis"])) if row.get("completion_basis") else None),
+            review_verdict=(ReviewVerdict(str(row["review_verdict"])) if row.get("review_verdict") else None),
+            late_close=bool(row.get("late_close")),
+        )
+        for row in rows
+    ]
+    return PilotEpisodeListResponse(episodes=episodes, total=len(episodes))
+
+
+@app.get("/v1/pilot/report", response_model=PilotReportResponse)
+def pilot_report(
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PilotReportResponse:
+    """The read-only report.  It never pools, never grants and never reports a zero as a result.
+
+    C12: this route writes no qualification record and no promotion, exposure or personalization
+    path reads it.  ``scripts/p6_pilot_report.py`` renders the SAME computation.
+    """
+    REQUEST_COUNT.labels(endpoint="pilot_report", method="GET").inc()
+    _require_pilot_enrollment()
+    _enforce_workspace_access(auth, conn)
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    corpus = pilot_load_report_corpus(
+        conn,
+        workspace_id=scope.workspace_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+    )
+    try:
+        block = dream_block(dream_counts_for_scope(conn, scope=scope))
+    except DreamTablesMissing as exc:
+        # The dream surface can exist on disk and not in the schema.  That reads as
+        # NOT_COMPUTABLE with the reason, never as "no proposals were made".
+        block = dream_block_unavailable(project_id=scope.project_id, detail=str(exc))
+    return build_pilot_report(corpus, dreams=block.to_payload(), now=now_utc())
+
+
+@app.post("/v1/dreams/{proposal_id}/adjudicate", response_model=DreamRelevanceAdjudicationResponse)
+def adjudicate_dream_relevance(
+    proposal_id: UUID,
+    body: DreamRelevanceAdjudicationRequest,
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamRelevanceAdjudicationResponse:
+    """Whether a proposal was RELEVANT, judged independently of whether it was accepted.
+
+    P6 adds no ``dream_proposals`` column, status value or nonresponse value.  A rejection is a
+    preference and is never counted as a false positive; ``ignored`` is nonresponse and moves
+    neither number.  ``blind_verified`` is checked server-side against P5's own append-only
+    ``dream_proposal_events``, never taken from ``blind_claimed``.
+    """
+    REQUEST_COUNT.labels(endpoint="dream_adjudicate", method="POST").inc()
+    _require_pilot_enrollment()
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    _require_pilot_adjudicator(auth, action="adjudicate a dream proposal")
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    try:
+        write = record_dream_adjudication(
+            conn,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            adjudicator_id=auth.consumer,
+            adjudicator_verified=bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities,
+            relevance=body.relevance,
+            rationale=body.rationale,
+            blind_claimed=body.blind_claimed,
+            delivery_useful=body.delivery_useful,
+            supersedes_adjudication_id=(
+                str(body.supersedes_adjudication_id) if body.supersedes_adjudication_id else None
+            ),
+            now=now_utc(),
+        )
+    except DreamTablesMissing as exc:
+        raise HTTPException(status_code=503, detail="dream tables are not present in this database") from exc
+    except ProposalNotInScope as exc:
+        raise HTTPException(status_code=404, detail="dream proposal not found") from exc
+    conn.commit()
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="dream_adjudicate",
+        query={"proposal_id": str(proposal_id)},
+        result_event_ids=[],
+        policy_decisions={
+            "relevance": body.relevance.value,
+            "blind_claimed": bool(body.blind_claimed),
+            "blind_verified": bool(write.blind_verified),
+            "blind_reason": write.blind_reason,
+            "counted_for_delivery": bool(write.counted_for_delivery),
+            "delivery_reason": write.delivery_reason,
+        },
+        latency_ms=0,
+    )
+    return DreamRelevanceAdjudicationResponse(
+        adjudication_id=UUID(str(write.adjudication_id)),
+        proposal_id=UUID(str(write.proposal_id)),
+        relevance=write.relevance,
+        blind_claimed=bool(write.blind_claimed),
+        blind_verified=bool(write.blind_verified),
+        blind_reason=write.blind_reason,
+        delivery_useful=write.delivery_useful,
+        counted_for_delivery=bool(write.counted_for_delivery),
+        delivery_reason=write.delivery_reason,
+        adjudicated_at=write.adjudicated_at,
+        supersedes_adjudication_id=(UUID(str(write.supersedes_adjudication_id)) if write.supersedes_adjudication_id else None),
+    )
+
+
 # ---------------------------------------------------------------------------
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "dashboard-static"

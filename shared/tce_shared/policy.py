@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .scope import ResolvedScope
+
 
 @dataclass(slots=True)
 class PolicyDecision:
@@ -17,3 +19,4 @@ class ConsumerContext:
     max_sensitivity: int
     workspace_id: str = "personal"
     owner_id: str = "user"
+    scope: ResolvedScope | None = None

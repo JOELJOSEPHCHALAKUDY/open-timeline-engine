@@ -7,11 +7,20 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from fastapi import HTTPException
 from tce_shared.autonomy_context import SUMMARY_VERSION, summarize_event_record
 from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
-from tce_shared.project_context import canonical_project_context
+from tce_shared.project_context import canonical_project_context, sanitize_project_remote
 from tce_shared.redaction import redact_payload, redact_text
+
+
+class CompletionConflictError(ValueError):
+    """Same completion_key was already captured with a different payload (idempotency conflict)."""
+
+    def __init__(self, outbox_id: str) -> None:
+        super().__init__(f"completion_key already captured with a different payload (outbox {outbox_id})")
+        self.outbox_id = outbox_id
 
 
 def _dumps(value: Any) -> str:
@@ -63,6 +72,8 @@ def enqueue_handoff(
     source: str,
     redaction_applied: bool,
     now: datetime | None = None,
+    executor_id: str | None = None,
+    payload_hash: str | None = None,
 ) -> sqlite3.Row:
     created_at = (now or datetime.now(tz=UTC)).astimezone(UTC)
     conn.execute(
@@ -71,8 +82,8 @@ def enqueue_handoff(
             id, workspace_id, owner_id, behavior_subject_id, session_id, directive_id,
             completion_key, terminal_state, milestone_json, source, status, attempts,
             next_attempt_at, event_id, handoff_record_id, redaction_applied,
-            created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)
+            created_at, updated_at, executor_id, payload_hash
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid.uuid4()),
@@ -91,6 +102,8 @@ def enqueue_handoff(
             1 if redaction_applied else 0,
             created_at.isoformat(),
             created_at.isoformat(),
+            executor_id,
+            payload_hash,
         ),
     )
     row = conn.execute(
@@ -102,6 +115,10 @@ def enqueue_handoff(
     ).fetchone()
     if row is None:
         raise RuntimeError("handoff outbox insert failed")
+    # Same key + different payload is a conflict; an identical retry replays the original row.
+    existing_hash = row["payload_hash"] if "payload_hash" in row.keys() else None
+    if existing_hash is not None and payload_hash is not None and str(existing_hash) != str(payload_hash):
+        raise CompletionConflictError(str(row["id"]))
     return cast(sqlite3.Row, row)
 
 
@@ -208,13 +225,18 @@ def deliver_handoff(conn: sqlite3.Connection, *, outbox_id: str, retention_days:
     change_summary, summary_redacted = _safe_change_summary(
         milestone.get("change_summary_json") or milestone.get("change_summary")
     )
+    record_project = canonical_project_context(milestone.get("project_context"))
+    record_project_id = str(record_project.get("project_id") or "").strip() or None
+    record_git_remote = sanitize_project_remote(record_project.get("project_remote")) or None
+    record_executor_id = str(row["executor_id"]).strip() if "executor_id" in row.keys() and row["executor_id"] else None
     conn.execute(
         """
         INSERT OR IGNORE INTO handoff_records(
             id, workspace_id, owner_id, session_id, directive_id, ts, title, decision,
             next_step, status, files_json, anchors_json, git_json, change_summary_json,
-            objective_text, source, event_id, schema_version, redaction_applied, expires_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?)
+            objective_text, source, event_id, schema_version, redaction_applied, expires_at,
+            project_id, git_remote, executor_id
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'v1', ?, ?, ?, ?, ?)
         """,
         (
             row["handoff_record_id"],
@@ -238,6 +260,9 @@ def deliver_handoff(conn: sqlite3.Connection, *, outbox_id: str, retention_days:
             if bool(row["redaction_applied"] or payload_redacted or title_redacted or objective_redacted or summary_redacted)
             else 0,
             (created_at + timedelta(days=max(1, retention_days))).isoformat(),
+            record_project_id,
+            record_git_remote,
+            record_executor_id,
         ),
     )
     conn.execute(
@@ -336,14 +361,15 @@ def record_resume_attempt(
     requested_at: datetime,
     returned_at: datetime,
     handoff_ts: datetime,
+    source_session_id: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO continuity_resume_attempts(
             id, packet_id, workspace_id, requesting_owner_id, target_owner_id,
             session_id, selected_record_id, query_text, top_file, requested_at, returned_at,
-            latency_ms, time_since_handoff_ms, recommended_files_json
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            latency_ms, time_since_handoff_ms, recommended_files_json, source_session_id
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(uuid.uuid4()),
@@ -360,6 +386,7 @@ def record_resume_attempt(
             max(0, int((returned_at - requested_at).total_seconds() * 1000)),
             max(0, int((requested_at - handoff_ts).total_seconds() * 1000)),
             _dumps([str(value)[:240] for value in recommended_files[:40]]),
+            (str(source_session_id)[:160] if source_session_id else None),
         ),
     )
     conn.commit()
@@ -522,4 +549,49 @@ def pilot_metrics(conn: sqlite3.Connection, *, workspace_id: str, days: int) -> 
         "outbox_pending_count": int(outbox["pending"] or 0) if outbox else 0,
         "outbox_dead_count": int(outbox["dead"] or 0) if outbox else 0,
         **attempt_metrics,
+    }
+
+
+def requeue_dead_handoff(
+    conn: sqlite3.Connection,
+    *,
+    auth: Any,
+    outbox_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """The §6.4 operator escape hatch behind ``POST /v1/handoffs/outbox/{id}/requeue``.
+
+    A ``handoff_outbox`` row that reaches ``status='dead'`` after ten failed attempts is never
+    retried and never clears the completion obligation, which permanently blocks every future
+    mutating capability grant in that session with no path out.  Without this hatch the widened
+    obligation of §6.4 would be a new way to brick a session rather than a safety property.
+
+    Refuses ``409 handoff_not_dead`` unless the row really is dead; the route restricts it to a
+    server-verified human, never a bare ``X-TCE-Role: user`` header.
+    """
+    row = conn.execute(
+        "SELECT id, workspace_id, owner_id, status, attempts FROM handoff_outbox WHERE id = ? LIMIT 1",
+        (str(outbox_id),),
+    ).fetchone()
+    if row is None or str(row["workspace_id"]) != str(getattr(auth, "workspace_id", "")):
+        raise HTTPException(status_code=404, detail={"error": "handoff_not_found"})
+    if str(row["status"]) != "dead":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "handoff_not_dead", "status": str(row["status"])},
+        )
+    conn.execute(
+        """
+        UPDATE handoff_outbox
+           SET status = 'pending', attempts = 0, next_attempt_at = ?, last_error = '', updated_at = ?
+         WHERE id = ? AND status = 'dead'
+        """,
+        (now.isoformat(), now.isoformat(), str(outbox_id)),
+    )
+    conn.commit()
+    return {
+        "outbox_id": str(outbox_id),
+        "status": "pending",
+        "attempts": 0,
+        "next_attempt_at": now.isoformat(),
     }

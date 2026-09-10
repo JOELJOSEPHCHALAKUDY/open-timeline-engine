@@ -29,3 +29,19 @@ def test_hashed_credential_resolves_server_bound_identity() -> None:
 
 def test_invalid_claim_document_fails_closed_to_no_bindings() -> None:
     assert parse_identity_claims("not-json") == {}
+
+
+def test_capabilities_are_read_from_the_claim_and_filtered_to_the_known_set() -> None:
+    claims = parse_identity_claims(
+        {
+            "bearer:host": {"consumer": "host-capture-claude", "role": "user", "capabilities": ["host_capture", "admin", "host_capture"]},
+            "bearer:exec": {"consumer": "codex", "role": "executor", "capabilities": ["admin", "write_events"]},
+            "bearer:plain": {"consumer": "codex", "role": "executor"},
+            "bearer:notalist": {"consumer": "codex", "role": "executor", "capabilities": "host_capture"},
+        }
+    )
+    assert claims["bearer:host"].capabilities == ("host_capture",)
+    assert claims["bearer:exec"].capabilities == ()
+    assert claims["bearer:plain"].capabilities == ()
+    # a string is not a capability list: fail closed rather than granting one character at a time
+    assert claims["bearer:notalist"].capabilities == ()

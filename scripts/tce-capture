@@ -7,6 +7,8 @@ if [ -f "$ROOT/.env" ]; then
   . "$ROOT/.env"
   set +a
 fi
+# The host capture credential is server-side only; the executor CLI must never present it.
+unset TCE_HOST_CAPTURE_TOKENS TCE_HOST_CAPTURE_TOKEN
 : "${TCE_USER_CONSUMER_ID:=${TCE_MCP_EXECUTOR_CONSUMER_ID:-codex-executor}}"
 : "${TCE_USER_ID:=${TCE_MCP_EXECUTOR_USER_ID:-${TCE_USER_CONSUMER_ID}}}"
 : "${TCE_USER_WORKSPACE_ID:=${TCE_MCP_WORKSPACE_ID:-personal}}"

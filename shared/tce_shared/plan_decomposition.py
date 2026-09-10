@@ -161,6 +161,10 @@ def parse_plan_steps(payload: Any, *, max_steps: int = MAX_PLAN_STEPS) -> list[P
 def fallback_plan_steps(objective: str) -> list[PlanStep]:
     """A deterministic plan, used whenever no model plan is available.
 
+    No P2 consumer: the durable-task-state path routes through
+    ``task_state.deterministic_plan`` / ``task_state.plan_steps_from_model`` instead. Kept
+    because existing tests reference it.
+
     This exists so that decomposition has no failure mode: a takeover turn must
     never break because a model was slow, absent, or incoherent. The shape is the
     generic engineering loop — understand, do, verify — which is weak as a plan but

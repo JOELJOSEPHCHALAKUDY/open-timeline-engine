@@ -79,9 +79,30 @@ def behavior_evidence_json(workspace_id: str, subject_id: str, observation_id: s
     )
 
 
+def _require_task_resource_scope(workspace_id: str) -> None:
+    settings = get_settings()
+    if workspace_id != settings.mcp_workspace_id:
+        raise ValueError("task resource scope does not match the authenticated MCP identity")
+
+
+@mcp.resource(
+    "tce://workspace/{workspace_id}/task/{task_id}/state.md",
+    name="Task state projection",
+    description=(
+        "Deterministic read-only Markdown projection of one task's state: objective and contract "
+        "revision, status and next permitted action, approved constraints, open decisions, plan "
+        "steps, unresolved effects, latest verification and citations. Never re-ingested as evidence."
+    ),
+    mime_type="text/markdown; charset=utf-8",
+)
+def task_state_markdown(workspace_id: str, task_id: str) -> str:
+    _require_task_resource_scope(workspace_id)
+    return str(tools.get_task_state_projection(task_id=task_id)["content"])
+
+
 @mcp.tool(name="tce.search_events", description="Search timeline events with filters and citations")
-def search_events(query: str, filters: dict | None = None, k: int = 10, time_range: dict | None = None) -> dict:
-    return tools.search_events(query=query, filters=filters, k=k, time_range=time_range)
+def search_events(query: str, filters: dict | None = None, k: int = 10, time_range: dict | None = None, app_context: dict | None = None) -> dict:
+    return tools.search_events(query=query, filters=filters, k=k, time_range=time_range, app_context=app_context)
 
 
 @mcp.tool(name="tce.get_context_bundle", description="Get redaction-safe context bundle for a task")
@@ -89,13 +110,25 @@ def get_context_bundle(task: str, app_context: dict | None = None, constraints: 
     return tools.get_context_bundle(task=task, app_context=app_context, constraints=constraints)
 
 
-@mcp.tool(name="tce.get_resume_packet", description="Get deterministic handoff resume packet for cross-executor continuation")
+@mcp.tool(
+    name="tce.get_resume_packet",
+    description=(
+        "Get deterministic handoff resume packet for cross-executor continuation. session_id is YOUR (reader) session. "
+        "To resume a peer's work, pass source_session_id (the session that completed the work, e.g. 'codex-a'), or "
+        "target_owner plus include_cross_user=true to resume that executor's latest completion. Pass current_git "
+        "({commit, repo}) so the result reports anchor_freshness (current|stale|unknown); treat stale anchors as "
+        "untrusted. legacy_session_scope=true restricts results to records written by session_id itself (old behaviour)."
+    ),
+)
 def get_resume_packet(
     query: str,
     target_owner: str | None = None,
     session_id: str = "default",
     k: int = 5,
     include_cross_user: bool = True,
+    source_session_id: str | None = None,
+    legacy_session_scope: bool = False,
+    current_git: dict | None = None,
 ) -> dict:
     return tools.get_resume_packet(
         query=query,
@@ -103,6 +136,9 @@ def get_resume_packet(
         session_id=session_id,
         k=k,
         include_cross_user=include_cross_user,
+        source_session_id=source_session_id,
+        legacy_session_scope=legacy_session_scope,
+        current_git=current_git,
     )
 
 
@@ -119,6 +155,7 @@ def complete_task(
     git: dict | None = None,
     anchors: list[dict] | None = None,
     change_summary: dict | None = None,
+    app_context: dict | None = None,
 ) -> dict:
     return tools.complete_task(
         completion_key=completion_key,
@@ -132,6 +169,7 @@ def complete_task(
         git=git,
         anchors=anchors,
         change_summary=change_summary,
+        app_context=app_context,
     )
 
 
@@ -282,8 +320,8 @@ def run_retrieval_eval(session_id: str = "default", tasks: list[str] | None = No
 
 
 @mcp.tool(name="tce.get_patterns", description="Get extracted patterns by domain")
-def get_patterns(domain: str | None = None, min_confidence: float = 0.5) -> dict:
-    return tools.get_patterns(domain=domain, min_confidence=min_confidence)
+def get_patterns(domain: str | None = None, min_confidence: float = 0.5, app_context: dict | None = None) -> dict:
+    return tools.get_patterns(domain=domain, min_confidence=min_confidence, app_context=app_context)
 
 
 @mcp.tool(name="tce.record_event", description="Record an event in the timeline engine")
@@ -469,17 +507,14 @@ def assign_behavior_projection_pilot(
 
 @mcp.tool(
     name="tce.report_behavior_projection_pilot_outcome",
-    description="Report held-out choice, quality, correction, safety, and evidence-use outcomes for a pilot assignment",
+    description="Report held-out choice, correction, safety, and evidence-use outcomes for a pilot assignment. There is no confidence or similarity field: the party under test does not score itself.",
 )
 def report_behavior_projection_pilot_outcome(
     assignment_id: str,
     actual_choice: str,
     agent_choice: str | None = None,
     top3_choices: list[str] | None = None,
-    agent_confidence: float = 0.0,
     abstained: bool = False,
-    action_similarity: float = 0.0,
-    workflow_similarity: float = 0.0,
     correction_required: bool = False,
     outcome_regret: bool = False,
     irrelevant_personalization: bool = False,
@@ -492,10 +527,7 @@ def report_behavior_projection_pilot_outcome(
         actual_choice=actual_choice,
         agent_choice=agent_choice,
         top3_choices=top3_choices,
-        agent_confidence=agent_confidence,
         abstained=abstained,
-        action_similarity=action_similarity,
-        workflow_similarity=workflow_similarity,
         correction_required=correction_required,
         outcome_regret=outcome_regret,
         irrelevant_personalization=irrelevant_personalization,
@@ -717,7 +749,25 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "state.takeover_context.objective. Do not narrate the result; take action. Before editing any file, call "
         "tce.check_context first. On the first call in a repository, include app_context.project_root and "
         "app_context.project; resend them when the repository changes. If result contains persona_ack, show only "
-        "that text before taking action."
+        "that text before taking action. The result's project_binding (bound|unbound) says whether autonomous writes "
+        "are allowed: unbound means provide app_context.project_root first. state.lease_generation, when present, is "
+        "the directive lease you must echo on tce.report_execution. capture_delivery_state (healthy|gap|unavailable|"
+        "unknown) reports the trusted human-input capture channel: when it is gap or unavailable under an unattended "
+        "autonomy profile the API pauses ('AUTONOMOUS MODE PAUSED: capture channel'); show that text and do not mutate. "
+        "open_decision_opportunity_id, when set, is the pending human choice awaiting host-captured input. "
+        "planning_pending=true means there is no executable directive yet; follow next_step and poll, never start work. "
+        "The constraints array is non-overridable and has no override phrase: every rule carries polarity, where "
+        "'deny' means scope.path_prefixes are forbidden and 'allow_only' means they are the ONLY permitted paths for "
+        "the scoped actions (a rule with no polarity key is read as 'deny'). charter_active/charter_version/"
+        "enforcement_tier name the authority in force; enforcement_tier is what the operating system enforces for a "
+        "supervisor-dispatched process tree only, never for this session (see docs/charter.md). unresolved_effects "
+        "lists effects from earlier runs; when one is in state 'unknown', next_step is prefixed with 'AUTONOMOUS MODE "
+        "PAUSED: an effect from a previous run is unresolved' — show it and do not start new work. "
+        "When policy_decision.status is 'abstained' and policy_decision.exposed is true, do not execute — show "
+        "policy_decision.reason_for_asking and wait. policy_decision.exposed=false means personalization was not "
+        "applied on this turn and the block is reporting only; it is not an instruction to stop. "
+        "dream_proposals_pending is the count of aspiration proposals waiting for the owner's answer; it is "
+        "information, never a directive. Read them with tce.dreams, which also records that they were shown."
     ),
 )
 def takeover_step(
@@ -915,7 +965,14 @@ def ack_takeover_notice(notice_id: str, session_id: str = "default", select_goal
     return tools.ack_takeover_notice(notice_id=notice_id, session_id=session_id, select_goal=select_goal)
 
 
-@mcp.tool(name="tce.claim_execution", description="Claim a pending directive execution before mutating work")
+@mcp.tool(
+    name="tce.claim_execution",
+    description=(
+        "Claim a pending directive execution before mutating work. The response's lease_generation is the fencing "
+        "token: remember it and echo it on tce.report_execution. A directive already claimed by another executor "
+        "returns 409 claimed_by_other; do not retry, report it to the user."
+    ),
+)
 def claim_execution(
     session_id: str = "default",
     directive_id: str | None = None,
@@ -928,7 +985,16 @@ def claim_execution(
     )
 
 
-@mcp.tool(name="tce.report_execution", description="Report directive execution outcome for retry/self-correction")
+@mcp.tool(
+    name="tce.report_execution",
+    description=(
+        "Report directive execution outcome for retry/self-correction. REQUIRED: echo lease_generation from your "
+        "tce.claim_execution response (or state.lease_generation in the takeover_step result); it is the fencing token "
+        "and a stale or missing lease is rejected with 409 (stale_lease / lease_required) and the report is discarded. "
+        "Pass a stable idempotency_key per attempt so a retried report replays instead of duplicating; the same key with "
+        "a different payload is rejected with 409 idempotency_conflict. verification_state is never caller-asserted."
+    ),
+)
 def report_execution(
     session_id: str = "default",
     directive_id: str = "",
@@ -937,6 +1003,8 @@ def report_execution(
     failure_reason: str | None = None,
     details: dict | None = None,
     rollback_performed: bool = False,
+    lease_generation: int | None = None,
+    idempotency_key: str | None = None,
 ) -> dict:
     return tools.report_execution(
         session_id=session_id,
@@ -946,6 +1014,8 @@ def report_execution(
         failure_reason=failure_reason,
         details=details,
         rollback_performed=rollback_performed,
+        lease_generation=lease_generation,
+        idempotency_key=idempotency_key,
     )
 
 
@@ -982,6 +1052,35 @@ def reset_takeover_state(
         activation_keywords=activation_keywords,
         stop_keywords=stop_keywords,
     )
+
+
+@mcp.tool(
+    name="tce.dreams",
+    description=(
+        "Read the owner's open aspiration proposals and record that they were shown. "
+        "action='list' returns the open proposals and THEN marks exactly those proposals 'surfaced' — "
+        "listing is what puts them in front of the owner, and that record is the only thing that keeps "
+        "'he never answered' distinguishable from 'he said no'. The ids marked come back in "
+        "surfaced_recorded. action='surfaced' with proposal_id records a single display. "
+        "This tool CANNOT accept, reject, snooze or unsnooze a proposal, and never will: a verdict requires "
+        "a verified human identity and this MCP process authenticates as an executor, structurally barred "
+        "from the host-capture credential. Passing a verdict action returns a refusal, not a verdict. Only "
+        "the owner can answer, by running `tce dreams accept --id <proposal_id>` (or reject / snooze / "
+        "unsnooze) from the CLI — say so rather than trying another tool. "
+        "Each proposal quotes messages the owner is receipted as having typed; render 'attribution' with it "
+        "('you said' vs 'from your imported history') and never present imported history as something said "
+        "today. 'nonresponse' (never_surfaced | awaiting_response | ignored) is a separate axis from status "
+        "and is never a rejection. An empty list is a real answer: on a corpus with too few trusted human "
+        "messages the system refuses to generate proposals, and that refusal is correct — do not fill the "
+        "gap with suggestions of your own."
+    ),
+)
+def dreams(
+    session_id: str = "default",
+    action: str = "list",
+    proposal_id: str = "",
+) -> dict:
+    return tools.dreams(session_id=session_id, action=action, proposal_id=proposal_id)
 
 
 TOOL_PROFILE_STATUS = apply_tool_profile(mcp, get_settings().mcp_tool_profile)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,6 +16,19 @@ class Settings(BaseSettings):
     lite_db_path: str = "/data/tce-lite.db"
     auth_mode: str = "bearer"
     api_tokens: str = "local-dev-token"
+    allow_default_token: bool = False
+    # P1 trusted capture: host-capture credentials are a separate capability from api_tokens.
+    host_capture_tokens: str = ""
+    # One token per line; missing/unreadable => empty set (logged once). Lets the host-capture credential
+    # live outside the repo .env that is mounted into the API container.
+    host_capture_tokens_file: str = ""
+    capture_max_chars: int = 2000
+    capture_delivery_stale_seconds: int = 21600
+    capture_opportunity_ttl_seconds: int = 3600
+    capture_extraction_enabled: bool = True
+    decision_extraction_batch_size: int = 100
+    decision_extraction_lease_seconds: int = 300
+    decision_extraction_max_attempts: int = 10
     block_sensitivity: int = 3
     default_operation_mode: str = "timeline_only"
     clone_max_turns_per_interaction: int = 8
@@ -111,6 +126,22 @@ class Settings(BaseSettings):
     context_retrieval_trigger_score: float = 0.68
     context_retrieval_escalate_score: float = 0.52
     context_retrieval_budget_ms: int = 120
+    # --- P2 durable task state and bounded latency (§0.5) ---
+    takeover_turn_budget_ms: int = 3500
+    task_state_enabled: bool = True
+    task_state_markdown_enabled: bool = True
+    task_state_markdown_max_steps: int = 24
+    planning_async_enabled: bool | None = None
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    planning_pending_hint_ms: int = 1500
+    retrieval_deadline_enabled: bool = True
+    retrieval_deadline_floor_ms: int = 5
+    retrieval_statement_floor_ms: int = 10
+    retrieval_advisor_min_ms: int = 250
+    sqlite_progress_instructions: int = 1000
     context_backend_timeout_ms: int = 60
     takeover_retrieval_confidence_trigger: float = 0.70
     takeover_retrieval_low_evidence_threshold: int = 2
@@ -195,17 +226,14 @@ class Settings(BaseSettings):
     # default; with it off the plan code paths are inert.
     takeover_plan_enabled: bool = True
     takeover_plan_max_steps: int = 8
-    # Use the model gateway to decompose an objective. Off by default; the
-    # deterministic fallback runs whenever this is off or the model fails.
-    takeover_plan_llm_enabled: bool = True
-    takeover_plan_llm_timeout_seconds: int = 25
+    # NOTE (P2 §5.1): takeover_plan_llm_enabled / takeover_plan_llm_timeout_seconds /
+    # takeover_dream_llm_enabled are DELETED from Lite. Lite has no worker, no Redis and no
+    # model gateway (D2), so they were declared and read nowhere.
     # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
     # A hosted API is the better default here: decomposition runs once per
     # objective, quality matters more than latency, and a small local model is
     # both slower and weaker at planning.
     takeover_plan_llm_provider: str = "openai"
-    # Form dreams by reading the user's own messages instead of counting rows.
-    takeover_dream_llm_enabled: bool = True
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
@@ -238,6 +266,49 @@ class Settings(BaseSettings):
     typed_contract_enabled: bool = False
     workflow_template_reuse_min_reliability: float = 0.70
     takeover_execution_claim_ttl_seconds: int = 300
+    # ---- P3: authority charter, effect journal, verification, dispatch budget --------------
+    # Every one of these has a named read site; a setting with no reader is deleted, not documented.
+    # True here and True in Full (services/tce_api/tce_api/config.py), per design §0.7.
+    # With it on, claim_execution refuses a mutating directive minted before a charter exists --
+    # exactly what U2/G6(d) intends. That turned 18 pre-P3 integration tests red, because they
+    # claim without a charter; each of those fixtures now pins TCE_CHARTER_ENFORCEMENT_ENABLED=0
+    # explicitly and says why, so they keep measuring the pre-charter transitions they were
+    # written for. Both switch positions are exercised by tests/integration/test_charter_lite.py
+    # (test_claim_is_refused_without_a_charter, test_claim_succeeds_under_an_active_charter).
+    # NOTE the honest limit: with this on, a deployment is charter-GATED at claim. That is a
+    # protocol gate, not an OS one -- GET /v1/governance/status reports
+    # effective_execution_enforcement, which is "sandbox_enforced" only when a passing sandbox
+    # self-test backs it and "protocol_only" otherwise.
+    #
+    # OFF by default, matching Full. With this on, claim_execution refuses a mutating action kind
+    # without an active charter, and every auto-generated takeover directive is
+    # action_kind="takeover_step" -> the mutating capability process.execute. A charter needs a
+    # verified human and a source_receipt_id only the host-capture credential can write, and nothing
+    # in scripts/ mints one -- so on by default bricked takeover on a fresh install. Enforcement is
+    # opt-in until that bootstrap exists: TCE_CHARTER_ENFORCEMENT_ENABLED=1 once a charter is created
+    # (docs/charter.md). On, with no charter, the refusal is correct -- it is a choice the operator made.
+    charter_enforcement_enabled: bool = False
+    charter_default_ttl_seconds: int = 43200
+    charter_max_ttl_seconds: int = 604800
+    charter_min_ttl_seconds: int = 300
+    effect_journal_enabled: bool = True
+    effect_unknown_pause_enabled: bool = True
+    effect_journal_retention_days: int = 365
+    verification_enabled: bool = True
+    verification_runner_principal: str = "system:verifier"
+    verification_reviewer_model_enabled: bool = False
+    verification_max_checks: int = 8
+    verification_check_timeout_seconds: int = 900
+    dispatch_startup_reconcile_enabled: bool = True
+    dispatch_startup_reconcile_batch: int = 200
+    budget_default_minor_units: int = 200
+    budget_currency: str = "USD"
+    permit_scope_digest_enforced: bool = True
+    sandbox_self_test_max_age_seconds: int = 3600
+    # P0 trust boundary: require reporters to echo the lease they hold (fencing token) and
+    # require exact workspace/owner tags on events (drop the legacy untagged-row branch).
+    takeover_lease_strict: bool = False
+    scope_strict_tags: bool = False
     takeover_enforcement_mode: str = "strict_takeover"
     advisor_primary_provider: str = "openai"
     advisor_primary_model: str = "gpt-4o-mini"
@@ -294,10 +365,80 @@ class Settings(BaseSettings):
     redaction_zone_paths: str = Field(default="")
     cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
+    # ---- P4: the decision policy adds exactly two settings, and neither is a threshold ------
+    # Every number that can move an abstention or a qualification verdict lives in
+    # shared/tce_shared/policy_thresholds.py as a frozen module constant, hashed into
+    # THRESHOLDS_SHA, which is a bound key on the qualification record. A threshold a caller
+    # can move is not a threshold: set the floor low, run the report, write a QUALIFIED record
+    # with an unchanged digest, put the floor back, and nothing downstream can tell.
+    #
+    # These two are scoping and advisor-presence switches, not floors, and even they are
+    # hashed into PolicyTuning.tuning_sha() -- also a bound key -- so moving one after a
+    # qualification is written invalidates it rather than silently re-using it.
+    # Same names and same defaults as services/tce_api/tce_api/config.py.
+    policy_allow_unscoped_project_evidence: bool = True
+    # CSV. Governs only the ABSENT advisor (which on Lite is every turn: Lite has no
+    # server-side model gateway). A FAILED advisor forces an abstention regardless of this
+    # setting -- abstention on a dead model is the default, not a knob.
+    policy_advisor_required_families: str = ""
+    # ---- P5: dream proposals -----------------------------------------------------------
+    # Same names and same defaults as services/tce_api/tce_api/config.py, so a reader can diff
+    # the two files and a setting cannot mean one thing on Full and another on Lite.
+    #
+    # ``takeover_dream_llm_enabled`` stays DELETED from Lite (see the note above): Lite has no
+    # model gateway, so ``POST /v1/dreams/refresh`` refuses ``model_unavailable`` on every call
+    # and there is no gate for the flag to open.  ``dream_proposals_enabled`` IS present,
+    # because every other dream route — storage, the fold, the transitions, the validators, the
+    # sweep and the pursuit reconciler — is backend-neutral and fully functional here.
+    dream_proposals_enabled: bool = True
+    dream_message_limit: int = 60
+    dream_min_messages: int = 10
+    dream_min_message_chars: int = 25
+    dream_max_message_chars: int = 1200
+    dream_max_proposals_per_run: int = 3
+    dream_min_citations: int = 2
+    dream_max_citations: int = 6
+    dream_quote_max_chars: int = 200
+    dream_min_quote_overlap_tokens: int = 2
+    dream_min_citation_relevance_tokens: int = 1
+    dream_max_live_proposals: int = 20
+    dream_duplicate_similarity: float = 0.60
+    dream_material_new_citations: int = 2
+    dream_material_max_similarity: float = 0.60
+    dream_rejected_cooldown_days: int = 30
+    # Must be >= dream_rejected_cooldown_days, or a rejection ages out of the scan window
+    # before its cooldown expires and suppression lifts by amnesia rather than by evidence.
+    dream_rejected_lookback_days: int = 365
+    dream_rejected_scan_limit: int = 200
+    dream_max_reproposals: int = 2
+    dream_nonresponse_after_surfaces: int = 3
+    dream_resurface_min_hours: int = 24
+    # Strictly greater than dream_resurface_min_hours: slowing re-surfacing down is the ONLY
+    # functional effect NonresponseState.IGNORED has.
+    dream_resurface_ignored_hours: int = 168
+    dream_snooze_default_days: int = 7
+    dream_proposal_ttl_days: int = 45
+    dream_run_stale_minutes: int = 30
+    dream_list_limit: int = 10
+
+    # ---- P6: operational-proof pilot ---------------------------------------------------
+    # Same four names and same four defaults as services/tce_api/tce_api/config.py.  Every
+    # number that can move a verdict lives in tce_shared.pilot_thresholds, not here.
+    pilot_enrollment_enabled: bool = False
+    pilot_allocation_salt: str = "tce-pilot-p6-v1"
+    pilot_human_baseline_enabled: bool = False
+    # NOT an expiry: a late close is recorded as late_close=true and counted, because refusing
+    # it would convert a finished episode into a coverage deficit that can never be repaired.
+    pilot_close_grace_days: int = 90
 
     @property
     def token_set(self) -> set[str]:
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}
+
+    @property
+    def host_capture_token_set(self) -> set[str]:
+        tokens = {token.strip() for token in self.host_capture_tokens.split(",") if token.strip()}
+        return tokens | _read_host_capture_tokens_file(self.host_capture_tokens_file)
 
     @property
     def cors_origins(self) -> list[str]:
@@ -329,6 +470,18 @@ class Settings(BaseSettings):
         return [item.strip().lower() for item in self.advisor_required_categories.split(",") if item.strip()]
 
     @property
+    def effective_planning_async_enabled(self) -> bool:
+        """R6: async planning follows the model planner.
+
+        Lite has no worker, no Redis and no model gateway (D2), so the fallback branch is the
+        literal False: planning stays inline and deterministic and planning_pending is never
+        emitted.
+        """
+        if self.planning_async_enabled is not None:
+            return bool(self.planning_async_enabled)
+        return False
+
+    @property
     def effective_advisor_total_budget_ms(self) -> int:
         return min(
             max(500, int(self.advisor_total_budget_ms)),
@@ -355,6 +508,25 @@ class Settings(BaseSettings):
             max(0.05, float(self.search_embedding_timeout_seconds)),
             max(0.05, float(self.search_embedding_timeout_hard_cap_seconds)),
         )
+
+
+_logger = logging.getLogger(__name__)
+_tokens_file_warned: set[str] = set()
+
+
+def _read_host_capture_tokens_file(path: str) -> set[str]:
+    """Union source for host-capture tokens: one token per line; missing/unreadable => empty (logged once)."""
+    target = str(path or "").strip()
+    if not target:
+        return set()
+    try:
+        lines = Path(target).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        if target not in _tokens_file_warned:
+            _tokens_file_warned.add(target)
+            _logger.warning("host capture tokens file %s unreadable: %s", target, exc)
+        return set()
+    return {line.strip() for line in lines if line.strip() and not line.strip().startswith("#")}
 
 
 @lru_cache(maxsize=1)

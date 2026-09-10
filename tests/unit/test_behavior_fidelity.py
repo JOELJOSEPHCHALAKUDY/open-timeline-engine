@@ -12,6 +12,10 @@ from tce_shared.behavior_fidelity import (
 )
 from tce_shared.events import BehaviorEvidenceRequest
 
+# ``predict_behavior`` now measures recency against the moment of the decision, not against
+# the newest row in the corpus, so every call names its decision time explicitly.
+_DECIDED_AT = datetime(2026, 3, 1, tzinfo=UTC)
+
 
 def _evidence(index: int, *, selected: str = "minimal verified fix") -> dict:
     return {
@@ -92,6 +96,7 @@ def test_prediction_ignores_superseded_evidence() -> None:
             "situation_summary": "Choose implementation scope for a production bug",
             "objective_text": "Fix production bug without broad regression",
         },
+        decision_at=_DECIDED_AT,
         candidate_choices=["minimal verified fix", "broad refactor"],
     )
     assert result["predicted_choice"] == "minimal verified fix"
@@ -109,6 +114,7 @@ def test_historical_prediction_does_not_apply_future_supersession() -> None:
             "situation_summary": "Choose implementation scope for a production bug",
             "objective_text": "Fix production bug without broad regression",
         },
+        decision_at=datetime(2026, 1, 2, 12, tzinfo=UTC),
         candidate_choices=["minimal verified fix", "broad refactor"],
         historical_as_of=datetime(2026, 1, 2, 12, tzinfo=UTC),
     )
@@ -121,6 +127,7 @@ def test_historical_prediction_does_not_apply_future_supersession() -> None:
             "situation_summary": "Choose implementation scope for a production bug",
             "objective_text": "Fix production bug without broad regression",
         },
+        decision_at=_DECIDED_AT,
         candidate_choices=["minimal verified fix", "broad refactor"],
     )
     assert current["predicted_choice"] is None
@@ -139,6 +146,7 @@ def test_prediction_ignores_confirmed_contradicted_evidence() -> None:
             "situation_summary": "Choose implementation scope for a production bug",
             "objective_text": "Fix production bug without broad regression",
         },
+        decision_at=_DECIDED_AT,
         candidate_choices=["minimal verified fix", "broad refactor"],
     )
     assert result["predicted_choice"] == "minimal verified fix"
@@ -206,9 +214,92 @@ def test_prediction_never_returns_choice_outside_candidate_set() -> None:
             "situation_summary": "Choose implementation scope for a production bug",
             "objective_text": "Fix production bug without broad regression",
         },
+        decision_at=_DECIDED_AT,
         candidate_choices=["minimal verified fix", "ask for clarification"],
     )
 
     assert result["predicted_choice"] is None
     assert result["abstained"] is True
     assert result["ranked_choices"] == []
+
+
+# --- Y8 one layer deeper: the storage gate's own self-report term -----------------------
+
+
+def _gate_payload(confidence: float, *, rationale: str = "") -> dict:
+    """One evidence payload.  ``confidence`` is whatever the writer of the row claimed.
+
+    Content is deliberately parked just under the threshold on its own merits: source
+    ``inferred`` (0.10), an outcome, a candidate set and an action, and no rationale.  Under
+    the old weights that summed to 0.48 and the writer's own number decided the rest.
+    """
+
+    payload: dict = {
+        "evidence_source": "inferred",
+        "memory_class": "decision",
+        "lifecycle_status": "active",
+        "outcome": "the deploy held for a week",
+        "available_choices": ["minimal verified fix", "broad refactor"],
+        "action_taken": "patch focused module and run scoped tests",
+        "confidence": confidence,
+    }
+    if rationale:
+        payload["rationale"] = rationale
+    return payload
+
+
+def test_storage_gate_ignores_a_caller_supplied_confidence_number() -> None:
+    """Two rows identical but for the number their writer attached to themselves.
+
+    ``learning_eligible`` is the WHERE clause of the policy evidence loader, so a writer who
+    could move this number could make its own evidence eligible and then, one hop later, make
+    that evidence look strong.  The gate now scores content and provenance only.
+    """
+
+    unconfident = behavior_storage_gate(_gate_payload(0.0), threshold=0.55)
+    confident = behavior_storage_gate(_gate_payload(1.0), threshold=0.55)
+    assert unconfident == confident
+    assert confident["learning_eligible"] is False
+    assert confident["decision"] == "audit_only"
+
+
+def test_storage_gate_still_admits_the_same_documented_evidence_it_always_did() -> None:
+    """The threshold has to keep meaning what it meant: the freed weight moved to the
+    rationale, so a row that states why it was decided scores exactly what it scored before,
+    and a row that does not is no longer carried over the line by a self-report."""
+
+    documented = behavior_storage_gate(
+        {
+            "evidence_source": "explicit",
+            "memory_class": "preference",
+            "lifecycle_status": "active",
+            "rationale": "Keep the change reversible and verify the affected package",
+            "outcome": "tests passed",
+            "available_choices": ["minimal verified fix", "broad refactor"],
+            "action_taken": "patch focused module and run scoped tests",
+            "confidence": 0.95,
+        },
+        threshold=0.55,
+    )
+    assert documented["score"] == 0.95
+    assert documented["learning_eligible"] is True
+
+    undocumented = behavior_storage_gate(_gate_payload(1.0), threshold=0.55)
+    assert undocumented["reasons"] == ["missing_rationale"]
+
+
+def test_storage_gate_reads_no_writer_supplied_number_at_all() -> None:
+    """Not just ``confidence``: no numeric key a writer invents may move the score."""
+
+    baseline = behavior_storage_gate(_gate_payload(0.0, rationale="reversible and verified"), threshold=0.55)
+    for key, value in (
+        ("confidence", 1.0),
+        ("score", 1.0),
+        ("storage_score", 1.0),
+        ("weight", 1.0),
+        ("certainty", 1.0),
+        ("strength", 1.0),
+    ):
+        payload = _gate_payload(0.0, rationale="reversible and verified")
+        payload[key] = value
+        assert behavior_storage_gate(payload, threshold=0.55) == baseline, key

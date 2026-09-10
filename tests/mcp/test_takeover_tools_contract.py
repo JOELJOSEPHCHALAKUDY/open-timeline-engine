@@ -70,3 +70,49 @@ def test_takeover_step_slim_includes_v3_fields() -> None:
     assert "execution_permit_required" in slim
     assert "execution_permit_id" in slim
     assert "continuity_ok" in slim
+
+
+def _tool_params(name: str) -> set[str]:
+    tools = {tool.name: tool for tool in server.mcp._tool_manager.list_tools()}
+    assert name in tools, name
+    return set(tools[name].parameters["properties"])
+
+
+def test_report_execution_tool_exposes_lease_and_idempotency() -> None:
+    params = _tool_params("tce.report_execution")
+    assert {"lease_generation", "idempotency_key"} <= params
+    # verification is never caller-asserted: no such tool argument exists
+    assert "verification_state" not in params
+
+
+def test_get_resume_packet_tool_exposes_scoped_continuity_params() -> None:
+    params = _tool_params("tce.get_resume_packet")
+    assert {"source_session_id", "legacy_session_scope", "current_git"} <= params
+    assert {"query", "target_owner", "session_id", "k", "include_cross_user"} <= params
+
+
+def test_takeover_step_slim_passes_project_binding_and_lease() -> None:
+    from tce_mcp.tools import _slim_takeover_result
+
+    slim = _slim_takeover_result(
+        {
+            "state": {
+                "session_id": "s1",
+                "active": True,
+                "mode": "takeover",
+                "persona_mode": "shadow",
+                "takeover_context": {"objective": "ship feature", "turn_count": 2},
+                "lease_generation": 3,
+            },
+            "action": "advisor_takeover",
+            "classification": "decisive",
+            "enforced": True,
+            "final_response": None,
+            "safety_decision": "allow",
+            "note": "directive",
+            "project_binding": "unbound",
+            "continuity_ok": True,
+        }
+    )
+    assert slim["project_binding"] == "unbound"
+    assert slim["state"]["lease_generation"] == 3

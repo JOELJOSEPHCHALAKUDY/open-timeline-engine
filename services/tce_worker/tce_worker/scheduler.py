@@ -15,6 +15,7 @@ def enqueue_maintenance_jobs() -> None:
     lifecycle_queue_name = getattr(settings, "queue_lifecycle_name", "tce-default")
     patterns_queue = Queue(patterns_queue_name, connection=redis_conn)
     lifecycle_queue = Queue(lifecycle_queue_name, connection=redis_conn)
+    default_queue = Queue(settings.queue_default_name, connection=redis_conn)
     retry = Retry(max=settings.worker_retry_max, interval=settings.retry_intervals)
 
     now = datetime.now(tz=UTC)
@@ -49,6 +50,19 @@ def enqueue_maintenance_jobs() -> None:
         int(settings.handoff_outbox_batch_size),
         retry=retry,
     )
+    if bool(getattr(settings, "decision_extraction_enabled", True)):
+        default_queue.enqueue(
+            "tce_worker.jobs.decision_extraction.run",
+            None,
+            int(getattr(settings, "decision_extraction_batch_size", 100)),
+            retry=retry,
+        )
+    if bool(getattr(settings, "planning_enabled", True)):
+        # Full never sweeps planning jobs in-process; it enqueues the job, which is what gives
+        # a queue_unavailable job a specified path back to execution on the next tick.
+        default_queue.enqueue(
+            "tce_worker.jobs.planning.run", None, int(settings.planning_job_batch_size), retry=retry
+        )
     if bool(getattr(settings, "qdrant_enabled", False)) and bool(getattr(settings, "qdrant_sync_enabled", True)):
         lifecycle_queue.enqueue(
             "tce_worker.jobs.qdrant_sync.run",

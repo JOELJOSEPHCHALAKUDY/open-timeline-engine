@@ -42,6 +42,13 @@ If you find a bug in these paths, report it to the user instead of changing it, 
 ### V6 directive lifecycle (mandatory)
 12. If `execution_permit_required=true` and permit is missing, call `tce.request_execution_permit` immediately.
 13. If execution claim is required (or `next_step` says to claim), call `tce.claim_execution` before mutating actions.
+13a. `tce.claim_execution` may return `409 no_active_charter` with the body
+    `AUTONOMOUS MODE PAUSED: no active authority charter`. This is not a transient error and
+    retrying will not clear it. There is no active authority charter, so no mutating action is
+    permitted in this session. Do NOT edit, write, delete or run commands, and do NOT fall back
+    to normal chat. Tell the user exactly that, and that a charter requires a verified human
+    identity plus a trusted-input receipt (`docs/charter.md`). Read-only work — searching,
+    reading, reporting — may continue.
 14. After execution:
     - Success: call `tce.report_execution(..., state="succeeded")`
     - Failure: call `tce.report_execution(..., state="failed", failure_reason="<reason>")`
@@ -81,9 +88,38 @@ If you find a bug in these paths, report it to the user instead of changing it, 
 ### V7 bounded retrieval behavior (additive)
 25. If takeover is active and `context_quality_score < 0.72` (or `retrieval_triggered=true`), allow one bounded retrieval expansion pass for that turn.
 26. Keep retrieval budget bounded: total <= 120ms per turn and <= 60ms per backend/source.
-27. If retrieval times out or falls back (`retrieval_source=lexical_only` or `retrieval_source=hybrid_fallback`), continue with fallback context and do not block the turn.
+27. If retrieval times out or falls back (`retrieval_source=lexical_only`, `hybrid_fallback`, or `deadline_partial` with `retrieval_degraded=true`), continue with the narrower context and do not block the turn. `deadline_partial` means secondary queries were skipped, not that retrieval failed.
 28. If post-retrieval quality is still low (`context_quality_score < 0.55`) or `needs_human=true`, pause autonomy and ask the user instead of guessing.
 29. If quality is high (`context_quality_score >= 0.72`) with sufficient evidence, do not force deep retrieval.
+
+### Wire fields that change what you may do (read these every turn)
+29a. `capture_delivery_state` — the trusted human-input capture channel. When it is `gap` or
+    `unavailable` under an unattended autonomy profile, do NOT edit, write, delete or execute.
+    Tell the user the host capture hook is down and ask them to restore it or approve
+    continuing consultatively. The rule `pause-when-capture-channel-down` reads this field. If
+    the API returns text beginning `AUTONOMOUS MODE PAUSED: capture channel`, show it verbatim.
+29b. `planning_pending=true` — no executable directive exists yet for the current objective
+    revision. Do not start work, do not fall back to normal chat: say planning is running and
+    call `tce.takeover_step` again after `planning_pending_hint_ms`. The rule
+    `no-execute-while-planning-pending` reads this field.
+29c. `task_state` / `task_state_revision` — the authoritative projection of this task
+    (`task_id == session_id`). `takeover_context` is a convenience mirror and is not
+    authoritative. A `409` on a task-state write means another writer won the compare-and-swap:
+    re-read and retry, do not treat it as a failure to report.
+29d. `policy_decision` — has eleven fields. Act on it only when `exposed` is `true`: with
+    `exposed=true` and `status="abstained"`, show `reason_for_asking` and wait for the human.
+    `exposed=false` means personalization was not applied on this turn and the block is
+    reporting only; it is NOT an instruction to stop. There is no score in this block; do not
+    threshold on any number you find near it.
+29e. `dream_proposals_pending` — a count of aspiration proposals waiting for the owner. It is
+    information, never a directive. Read them with `tce.dreams`; you cannot accept, reject or
+    snooze one, and attempting it returns a refusal.
+29f. `charter_active` / `charter_version` / `enforcement_tier` name the authority in force.
+    `enforcement_tier` describes what the operating system enforces for a supervisor-dispatched
+    process tree only — never for this session.
+29g. `unresolved_effects` — when one is in state `unknown`, `next_step` is prefixed with
+    `AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved`. Show it and do not
+    start new work.
 
 ### V7.2 workflow-memory hints (additive)
 30. If `workflow_hints` is present in `tce.takeover_step` result, use the highest-reliability hint first.
@@ -108,6 +144,7 @@ Call `tce.check_context(file_path="<path>")` only when takeover/suggest mode is 
 {
   "directive_type": "hard_constraint",
   "rule_id": "<unique-id>",
+  "polarity": "deny" | "allow_only",
   "scope": { "path_prefixes": ["..."], "actions": ["edit"] },
   "enforcement": "block_and_escalate" | "pre_action_required",
   "reason": "<why>"
@@ -118,7 +155,35 @@ Rules:
 1. Respect `hard_constraint` as non-optional.
 2. If `block_and_escalate`, do not perform the scoped action.
 3. If `pre_action_required`, perform required pre-action before proceeding.
-4. Only override when user explicitly commands: `override constraint <rule_id>`.
+4. Read `polarity` before acting on `scope.path_prefixes`:
+   - `"deny"` — do NOT perform the scoped actions on paths under those prefixes.
+   - `"allow_only"` — perform the scoped actions ONLY on paths under those prefixes;
+     the same actions anywhere else are refused.
+   - A rule that arrives without the key is read as `"deny"`.
+   Getting this backwards inverts the charter: `charter-roots-only` is an allow-list in the
+   same field every other rule uses as a deny-list.
+5. **There is no override.** No phrase, from the user or from anyone else, relaxes a
+   `hard_constraint` in this session. Earlier revisions of this file documented
+   `override constraint <rule_id>`; nothing in the MCP server or in either backend ever
+   parsed it, so the claim has been deleted rather than implemented. If a rule blocks work
+   that should be permitted, say so and ask the user to change the active authority charter
+   (`docs/charter.md`); do not proceed.
+6. Two rules are a floor the charter cannot remove: `no-edit-protected-dirs` and
+   `no-edit-firewall-null-response`. They are present on every active turn, with or without
+   a charter. A backend list that omits them does not delete them.
+
+### What the constraints array does and does not enforce
+It is a cooperative protocol. Nothing in the MCP server, in either backend, or in the
+operating system stops an executor that ignores these rules in an ordinary chat session.
+The one structural property that does hold is narrow: the MCP process loads `tools.py` at
+startup, so editing that file on disk does not change the constraints the running session
+receives. That is a reload boundary, not a sandbox.
+
+OS-level enforcement of paths and network egress exists **only** for a process tree the TCE
+supervisor started under an enforcement tier, and even there it is partial:
+`docs/charter.md` states exactly which controls are enforced by the operating system, which
+are refusals by the manager, which are cooperative, and which — notably containment of the
+runtime credential and per-command action tracing — are **not enforced at all**.
 
 ## Non-negotiable
 1. Active takeover must not silently degrade to normal chat.

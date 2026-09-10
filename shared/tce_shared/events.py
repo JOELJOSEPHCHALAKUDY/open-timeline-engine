@@ -7,7 +7,59 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# ``DreamProposalStatus`` and ``NonresponseState`` are declared in
+# ``tce_shared.aspirations`` and imported here, never mirrored.  Two StrEnums that must
+# agree is a drift waiting to happen, and the dependency only runs one way: this module
+# imports pydantic, ``aspirations`` must not, because the worker loads it.
+from .aspirations import DreamProposalStatus, NonresponseState
+
+# The seven decision-policy enums are declared in ``tce_shared.decision_policy`` and
+# re-exported here, never re-declared.  ``decision_policy`` must stay pydantic-free so the
+# worker can import it, and this module imports pydantic below, so the dependency can only
+# point one way.  ``QualificationState`` has no reader in this module; it is re-exported for
+# the two backends, which is why it carries the redundant alias.
+from .decision_policy import (
+    AbstainReason,
+    AdvisorAgreement,
+    ConflictStatus,
+    DecisionStatus,
+    ExposureState,
+    OodStatus,
+)
+from .decision_policy import QualificationState as QualificationState
+
+# The P6 pilot vocabulary is declared in ``tce_shared.pilot_enrollment`` and imported here,
+# never mirrored.  That module must stay pydantic-free — the report script and the worker both
+# import it — so the dependency only runs one way, exactly as it does for ``decision_policy``.
+from .pilot_enrollment import (
+    AllocationKind,
+    ClauseState,
+    CompletionBasis,
+    DeliveryUsefulness,
+    PilotArm,
+    RelevanceVerdict,
+    RescueLevel,
+    ReviewVerdict,
+)
+from .task_state import NextPermittedAction, TaskStatus
 from .version import SCHEMA_VERSION
+
+
+class TrustedInputOriginKind(StrEnum):
+    HUMAN_INPUT = "human_input"
+    MANAGER_INSTRUCTION = "manager_instruction"
+    EXECUTOR_OUTPUT = "executor_output"
+    IMPORTED_TRANSCRIPT = "imported_transcript"
+    TOOL_RESULT = "tool_result"
+
+
+class CaptureDeliveryState(StrEnum):
+    UNKNOWN = "unknown"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    SPOOLING = "spooling"
+    GAP = "gap"
+    UNAVAILABLE = "unavailable"
 
 
 class EventType(StrEnum):
@@ -118,6 +170,9 @@ class EventSearchRequest(BaseModel):
     k: int = Field(default=10, ge=1, le=100)
     time_start: datetime | None = None
     time_end: datetime | None = None
+    continuity_intent: bool = False
+    target_owner: str | None = None
+    project_id: str | None = None
 
 
 class EventSearchHit(BaseModel):
@@ -434,6 +489,8 @@ class DirectiveExecutionState(StrEnum):
     FAILED = "failed"
     BLOCKED = "blocked"
     ABANDONED = "abandoned"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
 
 
 class FailureClass(StrEnum):
@@ -475,6 +532,148 @@ class TakeoverLatencyBreakdown(BaseModel):
     total: int = 0
 
 
+# --------------------------------------------------------------------------- task state (P2)
+#
+# The pydantic layer may depend on the pure layer; the reverse is forbidden. Mirroring the
+# two task-state enums here rather than re-declaring their values by hand is what keeps the
+# wire vocabulary and the fold's vocabulary from drifting apart.
+
+
+class TaskLifecycleStatus(StrEnum):
+    AWAITING_OBJECTIVE = "awaiting_objective"
+    PLANNING = "planning"
+    ACTIVE = "active"
+    BLOCKED = "blocked"
+    AWAITING_DECISION = "awaiting_decision"
+    AWAITING_VERIFICATION = "awaiting_verification"
+    DONE = "done"
+    CANCELLED = "cancelled"
+
+
+class TaskNextPermittedAction(StrEnum):
+    AWAIT_OWNER_OBJECTIVE = "await_owner_objective"
+    AWAIT_PLANNING = "await_planning"
+    EXECUTE_STEP = "execute_step"
+    AWAIT_DECISION = "await_decision"
+    AWAIT_VERIFICATION = "await_verification"
+    RESOLVE_EFFECTS = "resolve_effects"
+    BLOCKED = "blocked"
+    NONE = "none"
+
+
+def to_lifecycle_status(value: TaskStatus | str) -> TaskLifecycleStatus:
+    """The ONE conversion at every wire boundary.
+
+    Unknown values fail closed to AWAITING_VERIFICATION: never DONE, and never a terminal
+    that silently stops autonomy. Assigning a TaskStatus straight into a
+    TaskLifecycleStatus field is a type error, which is what stops two backends inventing
+    two conversions and diverging on the unknown case.
+    """
+    try:
+        return TaskLifecycleStatus(str(value))
+    except ValueError:
+        return TaskLifecycleStatus.AWAITING_VERIFICATION
+
+
+def to_next_permitted_action(value: NextPermittedAction | str) -> TaskNextPermittedAction:
+    """The ONE conversion at every wire boundary. Unknown fails closed to NONE, never EXECUTE_STEP."""
+    try:
+        return TaskNextPermittedAction(str(value))
+    except ValueError:
+        return TaskNextPermittedAction.NONE
+
+
+class TaskStateVerificationRef(BaseModel):
+    verification_id: str
+    directive_id: UUID | None = None
+    state: str = "unverified"
+    method: str = "none"
+    recorded_at: datetime | None = None
+    contract_revision: int = 0
+    plan_id: str | None = None
+    evidence_event_ids: list[UUID] = Field(default_factory=list)
+    summary: str = ""
+
+
+class TaskStateUnresolvedEffect(BaseModel):
+    effect_id: str
+    kind: str = "directive"
+    description: str = ""
+    opened_at: datetime | None = None
+    directive_id: UUID | None = None
+    paths: list[str] = Field(default_factory=list)
+
+
+class TaskStateSummary(BaseModel):
+    task_id: str = ""
+    revision: int = 0
+    contract_revision: int = 0
+    status: TaskLifecycleStatus = TaskLifecycleStatus.AWAITING_OBJECTIVE
+    next_permitted_action: TaskNextPermittedAction = TaskNextPermittedAction.AWAIT_OWNER_OBJECTIVE
+    plan_state: str = "absent"
+    plan_producer: str | None = None
+    open_step_index: int | None = None
+    open_decision_count: int = 0
+    unresolved_effect_count: int = 0
+    source_revision: str = ""
+
+
+class TaskStateProjectionResponse(BaseModel):
+    projection_id: UUID
+    uri: str
+    task_id: str = ""
+    view: str = "state"
+    format: str = "markdown"
+    mime_type: str = "text/markdown; charset=utf-8"
+    schema_version: str = "v1"
+    source_revision: str = ""
+    content_sha256: str = ""
+    generated_at: datetime
+    revision: int = 0
+    contract_revision: int = 0
+    source_evidence_ids: list[UUID] = Field(default_factory=list)
+    trust_level: str = "projection"
+    sensitivity: int = Field(default=1, ge=0, le=3)
+    read_only: bool = True
+    projection_learning_eligible: bool = False
+    expires_at: datetime | None = None
+    evidence_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    redaction_applied: bool = False
+    content: str = ""
+
+
+class TaskCancelRequest(BaseModel):
+    reason: str = Field(default="owner_cancelled", max_length=400)
+
+
+class TaskCancelResponse(BaseModel):
+    task_id: str = ""
+    revision: int = 0
+    cancelled_planning_jobs: int = 0
+    cancelled_directives: int = 0
+    revoked_constraints: int = 0
+    expired_permits: int = 0
+    cancelled_rq_jobs: int = 0
+
+
+class PlanningJobStatusResponse(BaseModel):
+    job_id: UUID
+    task_id: str = ""
+    job_kind: str = ""
+    state: str = "pending"
+    attempts: int = 0
+    max_attempts: int = 3
+    producer: str | None = None
+    contract_revision: int = 0
+    input_revision: str = ""
+    queue_state: str = "inline"
+    cancel_requested: bool = False
+    last_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class TakeoverGoal(BaseModel):
     id: UUID
     session_id: str
@@ -496,6 +695,11 @@ class TakeoverGoal(BaseModel):
     status: AutonomyGoalStatus = AutonomyGoalStatus.CANDIDATE
     created_at: datetime
     updated_at: datetime
+    step_index: int | None = None
+    parent_goal_id: UUID | None = None
+    depends_on: list[int] = Field(default_factory=list)
+    attempts: int = 0
+    mutating: bool = False
 
 
 class AutonomyNotice(BaseModel):
@@ -534,6 +738,13 @@ class DirectiveExecution(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+    lease_generation: int = 0
+    claimed_executor: str | None = None
+    lease_expires_at: datetime | None = None
+    verification_state: str = "unverified"
+    report_idempotency_key: str | None = None
+    cancelled_at: datetime | None = None
+    cancel_reason: str | None = None
 
 
 class AffectiveScores(BaseModel):
@@ -636,6 +847,7 @@ class TakeoverStepResponse(BaseModel):
     retrieval_triggered: bool = False
     retrieval_source: str = "none"
     retrieval_reason: str | None = None
+    project_binding: str = "unbound"
     retrieval_latency_ms: int = 0
     retrieval_hit_count: int = 0
     feedback_adjustment_applied: bool = False
@@ -652,6 +864,25 @@ class TakeoverStepResponse(BaseModel):
     episode_boost_applied: bool = False
     activation_boost_applied: bool = False
     behavior_fidelity_gate: dict[str, Any] = Field(default_factory=dict)
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    open_decision_opportunity_id: UUID | None = None
+    planning_pending: bool = False
+    planning_job_id: UUID | None = None
+    planning_pending_hint_ms: int = 0
+    task_state: TaskStateSummary = Field(default_factory=TaskStateSummary)
+    task_state_revision: int = 0
+    charter_active: bool = False
+    charter_version: str = ""
+    enforcement_tier: str | None = None
+    unresolved_effects: list[dict[str, Any]] = Field(default_factory=list)
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
+    # ---- P4 ----
+    policy_decision: PolicyDecisionBlock | None = None
+    # ---- P5 ----
+    # A count, not a payload.  The proposals themselves are read through ``tce.dreams``/
+    # ``GET /v1/dreams``, which run the citation validation; putting proposal text on the turn
+    # response would put unvalidated quotes in front of the owner on every step.
+    dream_proposals_pending: int = 0
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -694,6 +925,9 @@ class ExecutionPermitRequest(BaseModel):
     target_paths: list[str] = Field(default_factory=list)
     command_preview: str | None = None
     estimated_change_size: int = Field(default=0, ge=0)
+    directive_id: UUID | None = None
+    attempt: int | None = Field(default=None, ge=1)
+    objective_hash: str | None = None
 
 
 class ExecutionPermitResolveRequest(BaseModel):
@@ -766,6 +1000,9 @@ class ExecutionReportRequest(BaseModel):
     step_output: dict[str, Any] | None = None
     contract_type: str | None = None
     rollback_performed: bool = False
+    lease_generation: int | None = Field(default=None, ge=0)
+    idempotency_key: str | None = Field(default=None, max_length=160)
+    cancel_reason: str | None = Field(default=None, max_length=500)
 
 
 class ResumePacketRequest(BaseModel):
@@ -774,12 +1011,16 @@ class ResumePacketRequest(BaseModel):
     session_id: str = "default"
     k: int = Field(default=5, ge=1, le=20)
     include_cross_user: bool = True
+    source_session_id: str | None = None
+    legacy_session_scope: bool = False
+    current_git: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResumePacketAnchor(BaseModel):
     file: str
     line: int | None = Field(default=None, ge=1)
     symbol: str | None = None
+    stale: bool | None = None
 
 
 class ResumePacketChangeSummary(BaseModel):
@@ -816,6 +1057,18 @@ class ResumePacketResponse(BaseModel):
     files: list[ResumePacketFileItem] = Field(default_factory=list)
     continuation_steps: list[str] = Field(default_factory=list)
     retrieval_meta: ResumePacketRetrievalMeta = Field(default_factory=ResumePacketRetrievalMeta)
+    source_session_id: str | None = None
+    source_owner_id: str | None = None
+    record_ts: datetime | None = None
+    anchor_freshness: str = "unknown"
+    freshness_reasons: list[str] = Field(default_factory=list)
+    project_binding: str = "unbound"
+    task_id: str | None = None
+    task_state_revision: int = 0
+    contract_revision: int = 0
+    verification_refs: list[TaskStateVerificationRef] = Field(default_factory=list)
+    unresolved_effects: list[TaskStateUnresolvedEffect] = Field(default_factory=list)
+    source_event_id: UUID | None = None
 
 
 class CompletionCaptureRequest(BaseModel):
@@ -831,6 +1084,7 @@ class CompletionCaptureRequest(BaseModel):
     anchors: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     change_summary: dict[str, Any] = Field(default_factory=dict)
     milestone_schema: str = Field(default="v1", pattern="^v1$")
+    app_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompletionCaptureResponse(BaseModel):
@@ -841,6 +1095,7 @@ class CompletionCaptureResponse(BaseModel):
     contract_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
     captured_at: datetime
+    project_binding: str = "unbound"
 
 
 class ResumeFeedbackRequest(BaseModel):
@@ -916,6 +1171,17 @@ class GovernanceStatusResponse(BaseModel):
     server_boundary_secure: bool
     production_autonomy_ready: bool
     limitations: list[str] = Field(default_factory=list)
+    charter_active: bool = False
+    charter_id: str | None = None
+    charter_version: str | None = None
+    charter_expires_at: str | None = None
+    enforcement_tier: str | None = None
+    sandbox_self_test_passed: bool = False
+    sandbox_self_test_at: str | None = None
+    sandbox_provider: str = ""
+    action_tracing_available: bool = False
+    spend_enforcement: str = "unsupported"
+    uid_separation: bool = False
     schema_version: str = "v1"
 
 
@@ -924,6 +1190,12 @@ class ExecutionStatusResponse(BaseModel):
     pending: list[DirectiveExecution] = Field(default_factory=list)
     recent: list[DirectiveExecution] = Field(default_factory=list)
     generated_at: datetime
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    task_state_revision: int = 0
+    next_permitted_action: TaskNextPermittedAction = TaskNextPermittedAction.NONE
+    verification_state: str = "unverified"
+    unresolved_effects: list[dict[str, Any]] = Field(default_factory=list)
+    enforcement_tier: str | None = None
 
 
 class TakeoverPreloadRequest(BaseModel):
@@ -942,6 +1214,7 @@ class TakeoverPreloadResponse(BaseModel):
     working_set_json: dict[str, Any] = Field(default_factory=dict)
     refreshed_at: datetime
     decision_source: TakeoverDecisionSource = TakeoverDecisionSource.DELIBERATION
+    project_binding: str = "unbound"
 
 
 class TakeoverFeedbackRequest(BaseModel):
@@ -956,6 +1229,7 @@ class TakeoverFeedbackRequest(BaseModel):
     correction_text: str | None = None
     observation_ids: list[UUID] | None = None
     situation_type: str | None = None
+    opportunity_id: UUID | None = None
 
 
 class TakeoverFeedbackResponse(BaseModel):
@@ -985,6 +1259,7 @@ class BehaviorEvidenceRequest(BaseModel):
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+    # Ignored server-side: confirmation is never caller-asserted (P0 trust boundary).
     confirmed_at: datetime | None = None
     supersedes_observation_id: UUID | None = None
     contradicts_observation_ids: list[UUID] = Field(default_factory=list, max_length=40)
@@ -1079,10 +1354,12 @@ class BehaviorPilotOutcomeRequest(BaseModel):
     agent_choice: str | None = Field(default=None, max_length=500)
     top3_choices: list[str] = Field(default_factory=list, max_length=3)
     actual_choice: str = Field(min_length=1, max_length=500)
-    agent_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     abstained: bool = False
-    action_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
-    workflow_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    # There is no ``agent_confidence``, no ``action_similarity`` and no ``workflow_similarity``
+    # here, and there must not be.  All three were the party under test scoring its own answer,
+    # and the gate that read them computed a *perfect* calibration score for a perfectly inverted
+    # reporter.  The columns remain in the two pilot tables — dropping a column that held a human
+    # answer is refused — but no code reads or writes them.
     correction_required: bool = False
     outcome_regret: bool = False
     irrelevant_personalization: bool = False
@@ -1114,9 +1391,6 @@ class BehaviorPilotArmMetrics(BaseModel):
     top1_agreement: float | None = None
     top3_agreement: float | None = None
     non_abstained_precision: float | None = None
-    calibration_brier: float | None = None
-    mean_action_similarity: float | None = None
-    mean_workflow_similarity: float | None = None
     stale_memory_use_rate: float | None = None
     irrelevant_personalization_rate: float | None = None
     correction_rate: float | None = None
@@ -1140,7 +1414,9 @@ class BehaviorPilotGate(BaseModel):
     coverage_complete: bool = False
     latency_passed: bool = False
     quality_passed: bool = False
-    safety_passed: bool = True
+    # Three-valued: ``"not_computable"`` when no completed trial has been reported.  A boolean
+    # that defaulted to ``True`` made an empty corpus read as a safety pass.
+    safety_passed: bool | str = "not_computable"
     evaluation_ready: bool = False
     reasons: list[str] = Field(default_factory=list)
 
@@ -1183,6 +1459,8 @@ class BehaviorPredictionResponse(BaseModel):
     predicted_action: str | None = None
     fidelity_gate: dict[str, Any] = Field(default_factory=dict)
     schema_version: str = "v1"
+    # ---- P4 ----
+    policy_decision: PolicyDecisionBlock | None = None
 
 
 class BehaviorEvaluationRequest(BaseModel):
@@ -1312,6 +1590,12 @@ class BehaviorShadowPredictionItem(BaseModel):
     latency_ms: int
     created_at: datetime
     schema_version: str = "v1"
+    prediction_stage: str = "retrospective"
+    resolution_state: str = "resolved"
+    opportunity_id: UUID | None = None
+    decision_family: str | None = None
+    frozen_at: datetime | None = None
+    resolved_at: datetime | None = None
 
 
 class BehaviorShadowStatusResponse(BaseModel):
@@ -1410,11 +1694,772 @@ class CloneAdviceResponse(BaseModel):
     recommended_actions: list[str]
     do: list[str]
     dont: list[str]
-    confidence: float
+    confidence: float = Field(
+        default=0.0,
+        description=(
+            "Uncalibrated vote-share heuristic derived from the policy result. It is NOT a "
+            "probability and nothing in this system is calibrated; do not threshold on it."
+        ),
+    )
     evidence_strength: str
     citations: list[UUID]
     conflict_flags: list[str]
     loop_guard: dict[str, Any]
     policy: dict[str, Any]
     clone_context: dict[str, Any] | None = None
-    evidence_observations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_observations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Retrieval provenance for recall_source accounting; never the evidence for a "
+            "choice. The evidence for a choice is policy_decision.evidence_observation_ids, "
+            "which is bound to the option that was actually selected."
+        ),
+    )
+
+
+class TrustedInputCapture(BaseModel):
+    session_id: str = Field(min_length=1, max_length=200)
+    delivery_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: str = Field(max_length=8000)
+    origin_kind: TrustedInputOriginKind = TrustedInputOriginKind.HUMAN_INPUT
+    observed_at: datetime
+    original_char_count: int = Field(ge=0)
+    content_truncated: bool = False
+    redaction_applied: list[str] = Field(default_factory=list)
+    sequence: int | None = None
+    prompt_id: str | None = Field(default=None, max_length=200)
+    hook_event_name: str = "UserPromptSubmit"
+    host_client: str = Field(default="claude", max_length=32)
+    cwd: str | None = Field(default=None, max_length=1024)
+    project_hint: dict[str, Any] = Field(default_factory=dict)
+    spool_depth: int = Field(default=0, ge=0)
+    spool_failures: int = Field(default=0, ge=0)
+    gap_since: datetime | None = None
+    schema_version: str = "v1"
+
+
+class TrustedInputReceipt(BaseModel):
+    receipt_id: UUID
+    event_id: UUID | None = None
+    delivery_key: str
+    content_sha256: str
+    origin_kind: TrustedInputOriginKind
+    capture_principal: str
+    observed_at: datetime
+    ingested_at: datetime
+    deduplicated: bool = False
+    extraction_state: str = "pending"
+    queue_state: str = "inline"
+    capture_delivery_state: CaptureDeliveryState = CaptureDeliveryState.UNKNOWN
+    schema_version: str = "v1"
+
+
+# ---------------------------------------------------------------------------------------------
+# Charter, dispatch, effect journal, verification and sandbox self-test wire models.
+#
+# Two shapes here are deliberately missing a field, and the absence is the control:
+#
+#   * EffectResolveRequest has no `actor`.  The actor is derived server-side from the authenticated
+#     identity, so a caller cannot claim to be the reconciler and reopen a terminal effect.
+#   * VerificationResultRequest has no `verdict`, no `reason`, no digest-match flags and no
+#     `runner_principal`.  Evidence goes in, the API grades it, and a self-report cannot become a
+#     verification by asserting one.
+# ---------------------------------------------------------------------------------------------
+
+
+class CharterCapsPayload(BaseModel):
+    max_attempts: int = Field(default=3, ge=1, le=20)
+    max_concurrent_dispatches: int = Field(default=1, ge=1, le=8)
+    max_wall_seconds: int = Field(default=1800, ge=60, le=86400)
+    budget_minor_units: int = Field(default=0, ge=0)
+    budget_currency: str = "USD"
+    spend_enforcement: str = "unsupported"
+
+
+class CharterCreateRequest(BaseModel):
+    project_id: str | None = None
+    enforcement_tier: str = "container"
+    permitted_roots: list[str] = Field(default_factory=list)
+    protected_write_prefixes: list[str] = Field(default_factory=lambda: ["tests/", ".github/", ".local/"])
+    denied_read_paths: list[str] = Field(
+        default_factory=lambda: ["~/.ssh", "~/Library/Keychains", "~/.aws", "~/.claude", "~/.codex"]
+    )
+    permitted_capabilities: list[str] = Field(default_factory=list)
+    confirm_required_capabilities: list[str] = Field(default_factory=list)
+    egress_mode: str = "deny_all"
+    runtime_allowlist: list[list[str]] = Field(default_factory=list)
+    caps: CharterCapsPayload = Field(default_factory=CharterCapsPayload)
+    ttl_seconds: int | None = Field(default=None, ge=1)
+    task_families: list[str] = Field(default_factory=list)
+    charter_version: str = "v1"
+    credential_risk_acknowledged: bool = False
+    source_receipt_id: UUID
+    session_id: str = "default"
+
+
+class CharterResponse(BaseModel):
+    charter: dict[str, Any] | None = None
+    charter_id: UUID | None = None
+    status: str = "draft"
+    charter_digest: str = ""
+    charter_version: str = "v1"
+    policy_revision: str = ""
+    enforcement_tier: str | None = None
+    credential_risk_acknowledged: bool = False
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    superseded_by: UUID | None = None
+    narrowing_ids: list[str] = Field(default_factory=list)
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class CharterNarrowingRequest(BaseModel):
+    charter_id: UUID
+    session_id: str = "default"
+    source_receipt_id: UUID
+    remove_roots: list[str] = Field(default_factory=list)
+    remove_capabilities: list[str] = Field(default_factory=list)
+    add_protected_write_prefixes: list[str] = Field(default_factory=list)
+    add_denied_read_paths: list[str] = Field(default_factory=list)
+    enforcement_tier: str | None = None
+    egress_mode: str | None = None
+    budget_minor_units: int | None = Field(default=None, ge=0)
+    max_attempts: int | None = Field(default=None, ge=1)
+    max_wall_seconds: int | None = Field(default=None, ge=1)
+    max_concurrent_dispatches: int | None = Field(default=None, ge=1)
+    expires_at: datetime | None = None
+    reason: str = ""
+
+
+class DispatchOpenRequest(BaseModel):
+    session_id: str = "default"
+    directive_id: UUID
+    task_id: str | None = None
+    attempt: int = Field(default=1, ge=1)
+    runtime_id: str
+    runtime_version: str
+    surface: str
+    model_id: str = ""
+    contract_digest: str = ""
+    task_family: str = "unspecified"
+    enforcement_tier: str
+    sandbox_provider: str
+    sandbox_profile_digest: str | None = None
+    sandbox_self_test_id: UUID | None = None
+    provider_run_id: str
+    provider_turn_id: str | None = None
+    request_minor_units: int | None = Field(default=None, ge=0)
+    idempotency_key: str = ""
+
+
+class DispatchResponse(BaseModel):
+    dispatch_id: UUID
+    directive_id: UUID
+    attempt: int = 1
+    charter_id: UUID
+    charter_digest: str = ""
+    enforcement_tier: str
+    sandbox_provider: str = ""
+    sandbox_profile_digest: str | None = None
+    sandbox_self_test_id: UUID | None = None
+    runtime_id: str = ""
+    runtime_version: str = ""
+    surface: str = ""
+    model_id: str = ""
+    contract_digest: str = ""
+    capability_matrix: dict[str, str] = Field(default_factory=dict)
+    provider_run_id: str | None = None
+    provider_turn_id: str | None = None
+    task_family: str = "unspecified"
+    budget_reserved_minor_units: int = 0
+    budget_currency: str = "USD"
+    spend_enforcement: str = "unsupported"
+    cap_applied: dict[str, float] | None = None
+    cost_minor_units: int | None = None
+    cost_source: str | None = None
+    tokens_input: int = 0
+    tokens_output: int = 0
+    tokens_cached_input: int = 0
+    tokens_reasoning: int = 0
+    human_intervention_count: int = 0
+    outcome: str | None = None
+    terminal_reason: str | None = None
+    wall_ms: int | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    reconciled_at: datetime | None = None
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class DispatchReconcileRequest(BaseModel):
+    outcome: str
+    terminal_reason: str = ""
+    wall_ms: int = Field(default=0, ge=0)
+    human_intervention_count: int = Field(default=0, ge=0)
+    reconciliation: dict[str, Any] = Field(default_factory=dict)
+
+
+class EffectOpenRequest(BaseModel):
+    session_id: str = "default"
+    directive_id: UUID
+    dispatch_id: UUID | None = None
+    task_id: str | None = None
+    kind: str
+    capability: str
+    resource: str = ""
+    argv: list[str] = Field(default_factory=list)
+    reversibility: str
+    description: str = ""
+    enforcement_tier: str
+    action_tracing: str
+    lease_generation: int = Field(default=0, ge=0)
+    provider_run_id: str | None = None
+    provider_turn_id: str | None = None
+    runtime_id: str | None = None
+    runtime_version: str | None = None
+    model_id: str | None = None
+
+
+class EffectResolveRequest(BaseModel):
+    target_state: str
+    resolution_source: str
+    expected_lease: int = Field(ge=0)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+
+
+class EffectResponse(BaseModel):
+    effect_id: UUID
+    directive_id: UUID
+    seq: int = 0
+    state: str = "prepared"
+    intent_digest: str = ""
+    kind: str = ""
+    capability: str = ""
+    resource: str = ""
+    reversibility: str = "unknown"
+    enforcement_tier: str = ""
+    action_tracing: str = ""
+    lease_generation: int = 0
+    claimed_executor: str | None = None
+    provider_run_id: str | None = None
+    opened_at: datetime | None = None
+    resolved_at: datetime | None = None
+    resolution_source: str | None = None
+    pause_required: bool = False
+    pause_reason: str = ""
+    generated_at: datetime
+    schema_version: str = "v1"
+
+
+class AcceptanceCheckPayload(BaseModel):
+    check_id: str
+    argv: list[str] = Field(min_length=1)
+    cwd_rel: str = "."
+    expect_exit_code: int = 0
+    timeout_seconds: int = Field(default=900, ge=1, le=3600)
+
+
+class AcceptanceCriteriaRequest(BaseModel):
+    directive_id: UUID
+    task_id: str | None = None
+    charter_id: UUID | None = None
+    checks: list[AcceptanceCheckPayload] = Field(min_length=1)
+    corpus_manifest: list[list[str]] = Field(default_factory=list)
+
+
+class AcceptanceCriteriaResponse(BaseModel):
+    criteria_id: UUID
+    directive_id: UUID
+    criteria_digest: str
+    corpus_digest: str
+    checks: list[AcceptanceCheckPayload] = Field(default_factory=list)
+    corpus_manifest: list[list[str]] = Field(default_factory=list)
+    frozen_at: datetime
+    frozen_by: str
+    policy_revision: str = ""
+    schema_version: str = "v1"
+
+
+class CheckResultPayload(BaseModel):
+    check_id: str
+    argv: list[str] = Field(default_factory=list)
+    exit_code: int
+    duration_ms: int = Field(default=0, ge=0)
+    stdout_sha256: str
+    stderr_sha256: str
+    excerpt: str = Field(default="", max_length=2000)
+
+
+class VerificationResultRequest(BaseModel):
+    directive_id: UUID
+    results: list[CheckResultPayload] = Field(default_factory=list)
+    observed_corpus_digest: str
+    observed_corpus_manifest: list[list[str]] = Field(default_factory=list)
+    platform: str = ""
+    commit_sha: str | None = None
+    tree_sha: str | None = None
+    reviewer_model: dict[str, Any] | None = None
+
+
+class VerificationResultResponse(BaseModel):
+    verification_id: UUID
+    directive_id: UUID
+    verdict: str
+    reason: str = ""
+    verification_state: str = "unverified"
+    criteria_digest_at_run: str = ""
+    corpus_digest_at_run: str = ""
+    criteria_digest_match: bool = False
+    corpus_digest_match: bool = False
+    runner_principal: str = ""
+    executing_identity: str = ""
+    platform: str = ""
+    commit_sha: str | None = None
+    tree_sha: str | None = None
+    advisory: bool = True
+    recorded_at: datetime
+    schema_version: str = "v1"
+
+
+class SandboxAssertionPayload(BaseModel):
+    name: str
+    expected: str = ""
+    observed: str = ""
+    passed: bool = False
+
+
+class SandboxSelfTestRequest(BaseModel):
+    host_id: str = ""
+    sandbox_provider: str
+    provider_version: str = ""
+    profile_digest: str = ""
+    assertions: list[SandboxAssertionPayload] = Field(default_factory=list)
+    passed: bool = False
+    uid_separation: bool = False
+
+
+class SandboxSelfTestResponse(BaseModel):
+    self_test_id: UUID
+    sandbox_provider: str
+    profile_digest: str = ""
+    passed: bool = False
+    uid_separation: bool = False
+    assertions: list[SandboxAssertionPayload] = Field(default_factory=list)
+    ran_at: datetime
+    schema_version: str = "v1"
+
+
+# ---- P4 ----
+# The seven decision-policy enums are declared in ``tce_shared.decision_policy`` and imported
+# at the top of this module, never re-declared here.  ``decision_policy`` has to stay
+# pydantic-free so the worker can import it, and this module imports pydantic on line 8, so
+# the dependency can only point one way.
+
+class PolicyDecisionBlock(BaseModel):
+    """What one turn's decision policy decided, and whether it was allowed to be used.
+
+    ``status`` and ``exposed`` are separate on purpose.  "We abstained" and "we were not
+    allowed to speak" are different facts, and collapsing them into one wire value is what
+    turned an unqualified family into a human escalation in an earlier draft.
+
+    There is no score on this block.  ``policy_score`` is uncalibrated and an executor reading
+    a number it cannot interpret is how four different fields came to be named some form of
+    "confidence"; and there is no calibrated sibling to add, because nothing in this system is
+    calibrated.
+    """
+
+    status: DecisionStatus
+    selected_option: str | None = None
+    abstain_reason: AbstainReason | None = None
+    reason_for_asking: str | None = None
+    ood_status: OodStatus = OodStatus.UNKNOWN
+    conflict_status: ConflictStatus = ConflictStatus.NONE
+    evidence_observation_ids: list[str] = Field(default_factory=list, max_length=12)
+    decision_policy_revision: str = ""
+    exposed: bool = False
+    exposure_state: ExposureState = ExposureState.NO_QUALIFICATION
+    advisor_agreement: AdvisorAgreement = AdvisorAgreement.ABSENT
+
+
+# ``PolicyDecisionBlock`` is declared after the two responses that carry it, because this file
+# is append-only across phases and re-ordering it would rewrite another phase's block.  The
+# forward reference therefore has to be resolved explicitly, or the field stays an unbuilt
+# ForwardRef and the OpenAPI document silently loses the schema.
+TakeoverStepResponse.model_rebuild()
+BehaviorPredictionResponse.model_rebuild()
+
+
+# ---- P5 ----
+# Wire models for the four dream-proposal routes.  They live here, once, so that Full and Lite
+# import one definition and OpenAPI parity is mechanical rather than careful.
+#
+# There is no status enum declared in this block: ``DreamProposalStatus`` and
+# ``NonresponseState`` are imported from ``tce_shared.aspirations`` at the top of the module.
+
+
+class DreamProposalCitation(BaseModel):
+    """One quoted message behind a proposal.
+
+    ``receipt_id`` is required, not optional.  A message reaches a proposal only through a
+    ``trusted_input_receipts`` row binding it to the subject, so a citation without one could
+    not have been built — and a nullable field here would invite a future writer to build one.
+    The quote is a verbatim span of the cited message, checked against the decrypted body
+    before the proposal is written and again before it is shown.
+    """
+
+    event_id: UUID
+    receipt_id: UUID
+    origin_kind: str
+    observed_at: datetime
+    quote: str
+
+
+class DreamProposal(BaseModel):
+    """A proposal the owner can answer, and the evidence he can check it against.
+
+    Two fields carry the honesty of the whole surface.  ``citations_verified`` says whether the
+    citations behind this response were checked cheaply (existence, scope, sensitivity, receipt
+    binding) or deeply (the body decrypted and the quote re-found in it), so a reader is never
+    left guessing how much the system just proved.  ``attribution`` says whether these are words
+    the owner is receipted as having typed or lines from imported history — ``"you said"``
+    versus ``"from your imported history"`` — because a quote whose provenance is unclear is
+    worth less than no quote at all.
+
+    ``nonresponse`` is a separate axis from ``status`` and never becomes a verdict.  A proposal
+    nobody ever surfaced reads ``never_surfaced`` however old it is.
+    """
+
+    id: UUID
+    workspace_id: str
+    project_id: str | None = None
+    scope_kind: str
+    status: DreamProposalStatus
+    nonresponse: NonresponseState
+    surfaced_count: int = 0
+    surfaced_attested: bool = False
+    title: str
+    connection: str = ""
+    benefit: str = ""
+    first_step: str = ""
+    citations: list[DreamProposalCitation] = Field(default_factory=list)
+    citation_count: int = 0
+    citations_verified: str = "cheap"
+    evidence_basis: str
+    evidence_revision: str = ""
+    attribution: str = ""
+    supersedes_proposal_id: UUID | None = None
+    snooze_until: datetime | None = None
+    expires_at: datetime | None = None
+    task_id: str | None = None
+    plan_root_goal_id: UUID | None = None
+    pursuit_started_at: datetime | None = None
+    completed_at: datetime | None = None
+    rejection_reason: str = ""
+    revision: int = 0
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "v1"
+
+
+class DreamProposalListResponse(BaseModel):
+    proposals: list[DreamProposal] = Field(default_factory=list)
+    total: int = 0
+    citations_verified: str = "cheap"
+    schema_version: str = "v1"
+
+
+class DreamProposalTransitionRequest(BaseModel):
+    """One route, one closed vocabulary.
+
+    The verb is in the body rather than the path so the vocabulary is closed on the wire: a
+    reader of the schema can see the five legal actions, and a sixth cannot arrive by someone
+    adding a route.  ``surfaced`` is a display record, not a verdict, and is the only action an
+    executor may post.
+    """
+
+    session_id: str = "default"
+    action: str
+    reason: str = ""
+    snooze_until: datetime | None = None
+
+
+class DreamRefreshRequest(BaseModel):
+    """``app_context`` is a project *hint*, resolved through the authenticated scope.
+
+    It is never an identity.  A project id is client-assertable, so the hint is entitlement-
+    checked against the subject's own receipts before a run is allowed to bind to it.  There is
+    no ``scope_kind`` field: the scope kind is derived from the resolved scope, and a body that
+    could assert it would be a second source of truth for the one thing that decides which
+    corpus a run reads.
+    """
+
+    session_id: str = "default"
+    app_context: dict[str, Any] | None = None
+
+
+class DreamRefreshResponse(BaseModel):
+    """What the refresh did, including — especially including — refusing to do anything.
+
+    A generation path that is entirely broken must not read as "no proposals today".  ``state``
+    and ``refusal_reason`` are always populated, and ``refusals``/``pool_drops`` carry the
+    per-reason counts, so an over-refusing system is visible in the response rather than looking
+    like a quiet week.
+    """
+
+    run_id: UUID | None = None
+    state: str = "refused"
+    refusal_reason: str = ""
+    proposals_written: int = 0
+    refusals: dict[str, int] = Field(default_factory=dict)
+    pool_size: int = 0
+    pool_drops: dict[str, int] = Field(default_factory=dict)
+    swept: dict[str, int] = Field(default_factory=dict)
+    reconciled: dict[str, int] = Field(default_factory=dict)
+    schema_version: str = "v1"
+
+
+# ======================================================================================
+# P6 — the operational-proof pilot.  Enrolment, adjudication and the read-only report.
+#
+# Two shapes carry the honesty of this surface.  ``PilotEnrolmentRequest`` has no
+# ``episode_key`` and no ``arm_id``: both are server-derived, so re-enrolling the same work reuses
+# its arm. A new session id still draws again in the same cell -- see pilot_enrollment.episode_key --
+# and that residual is surfaced by close_coverage rather than prevented; arm shopping
+# with no analogue here.  ``PilotClaimBReport`` has no ``supported`` field, and must never
+# acquire one — a caller cannot render Claim B as a supported claim because the type has
+# nowhere to put one.
+# ======================================================================================
+
+
+class PilotEnrolmentRequest(BaseModel):
+    """Enrol a piece of work BEFORE it starts.  The server computes the episode and the arm.
+
+    ``objective_text`` is hashed server-side with the existing producer; the caller never sends
+    an ``objective_hash`` and never sends an ``episode_key``.  ``elect_arm`` is the human-baseline
+    election branch and is refused unless ``pilot_human_baseline_enabled`` is on.
+    """
+
+    session_id: str = Field(min_length=1, max_length=200)
+    project_id: str | None = Field(default=None, max_length=200)
+    decision_family: str = Field(min_length=1, max_length=80)
+    objective_text: str = Field(min_length=1, max_length=2000)
+    task_id: str | None = Field(default=None, max_length=200)
+    elect_arm: PilotArm | None = None
+
+
+class PilotEnrolmentResponse(BaseModel):
+    """``reused=true`` means this work was already enrolled and kept its original arm."""
+
+    episode_id: UUID
+    episode_key: str
+    arm_id: PilotArm
+    arm_class: str
+    allocation_kind: AllocationKind
+    stratum_id: str
+    slot: int
+    block_ordinal: int
+    allocated_at: datetime
+    revealed_at: datetime | None = None
+    reused: bool = False
+    enrolled_before_execution: bool = True
+    arm_set_sha: str = ""
+    allocation_salt_sha256: str = ""
+    schema_version: str = "v1"
+
+
+class PilotObservationRequest(BaseModel):
+    """``agent_asserted`` diagnostics.  No gate clause may read any field on this model.
+
+    These exist because the executor's account of a run is genuinely useful when reading a
+    surprising cell, and they have a named reader — the report's diagnostics block.  They are
+    stored in their own table and returned under their own ``self_reported`` key so that no
+    renderer can mistake them for evidence.
+    """
+
+    agent_notes: str = Field(default="", max_length=2000)
+    agent_declared_steps: list[str] = Field(default_factory=list, max_length=40)
+    agent_self_rated_difficulty: int | None = Field(default=None, ge=0, le=10)
+
+
+class PilotObservationResponse(BaseModel):
+    observation_id: UUID
+    episode_id: UUID
+    recorded: bool = True
+    producer_class: str = "agent_asserted"
+    read_by_any_gate: bool = False
+    observed_at: datetime
+    schema_version: str = "v1"
+
+
+class PilotEpisodeCloseRequest(BaseModel):
+    """The adjudication.  Only a verified human may post it.
+
+    ``deviated`` is deliberately absent: the server computes it from ``executed_arm`` against the
+    assigned arm and never accepts it.  ``completion_basis`` is absent for the same reason — it
+    is derived from P3 verification, then P2 task state, and only then falls back to ``finished``.
+    """
+
+    executed_arm: PilotArm
+    rescue_level: RescueLevel
+    finished: bool
+    review_verdict: ReviewVerdict
+    review_minutes: int = Field(default=0, ge=0, le=600)
+    deviation_reason: str = Field(default="", max_length=500)
+    unfinished_reason: str = Field(default="", max_length=500)
+
+
+class PilotEpisodeCloseResponse(BaseModel):
+    episode_id: UUID
+    close_id: UUID
+    deviated: bool = False
+    adjudication_independent: bool = True
+    adjudicator_verified: bool = True
+    completion_basis: CompletionBasis = CompletionBasis.UNFINISHED
+    late_close: bool = False
+    closed_at: datetime
+    schema_version: str = "v1"
+
+
+class PilotEpisodeSummary(BaseModel):
+    episode_id: UUID
+    episode_key: str
+    project_id: str | None = None
+    decision_family: str
+    arm_id: PilotArm
+    arm_class: str
+    allocation_kind: AllocationKind
+    block_ordinal: int = 0
+    slot: int = 0
+    allocated_at: datetime
+    revealed_at: datetime | None = None
+    closed_at: datetime | None = None
+    executed_arm: PilotArm | None = None
+    deviated: bool = False
+    rescue_level: RescueLevel | None = None
+    completion_basis: CompletionBasis | None = None
+    review_verdict: ReviewVerdict | None = None
+    late_close: bool = False
+    schema_version: str = "v1"
+
+
+class PilotEpisodeListResponse(BaseModel):
+    episodes: list[PilotEpisodeSummary] = Field(default_factory=list)
+    total: int = 0
+    schema_version: str = "v1"
+
+
+class DreamRelevanceAdjudicationRequest(BaseModel):
+    """A judgement about a proposal's FIT, independent of whether it was accepted.
+
+    ``blind_claimed`` is the client's word.  ``blind_verified`` on the response is the server's,
+    checked against P5's append-only event log.  A rejection is a preference; a ``not_relevant``
+    adjudication is a claim about the proposal, and the second is never derived from the first.
+    """
+
+    relevance: RelevanceVerdict
+    rationale: str = Field(default="", max_length=500)
+    blind_claimed: bool = False
+    delivery_useful: DeliveryUsefulness | None = None
+    supersedes_adjudication_id: UUID | None = None
+
+
+class DreamRelevanceAdjudicationResponse(BaseModel):
+    """``blind_claimed`` is what the caller said; ``blind_verified`` is what the server found.
+
+    ``blind_reason`` and ``delivery_reason`` come from the closed lists in
+    ``tce_shared.dream_adjudication`` (``BLIND_REASONS``, ``DELIVERY_REASONS``).  They are here so
+    a ``false`` is never a bare ``false``: an owner who is told his blindness claim was refused
+    can see that it was refused because he gave the verdict himself, and a usefulness answer that
+    does not count says it was answered inside the 30-day lookback rather than silently vanishing
+    from the metric.
+    """
+
+    adjudication_id: UUID
+    proposal_id: UUID
+    relevance: RelevanceVerdict
+    blind_claimed: bool = False
+    blind_verified: bool = False
+    blind_reason: str = ""
+    delivery_useful: DeliveryUsefulness | None = None
+    counted_for_delivery: bool = False
+    delivery_reason: str = ""
+    adjudicated_at: datetime
+    supersedes_adjudication_id: UUID | None = None
+    schema_version: str = "v1"
+
+
+class PilotClause(BaseModel):
+    """PASS, SHORTFALL(measured, floor) or NOT_COMPUTABLE(reason).  There is no fourth state."""
+
+    name: str
+    state: ClauseState
+    measured: float | None = None
+    floor: float | None = None
+    comparison: str = "<"
+    reason: str = ""
+    detail: str = ""
+    rendered: str = ""
+
+
+class PilotCellReport(BaseModel):
+    """One ``(project_id, decision_family)`` cell.  Nothing here is averaged with anything else."""
+
+    project_id: str | None = None
+    decision_family: str
+    supported: bool = False
+    clauses: list[PilotClause] = Field(default_factory=list)
+    shortfalls: list[str] = Field(default_factory=list)
+    exclusions: dict[str, int] = Field(default_factory=dict)
+    enrolled: int = 0
+    closed: int = 0
+    closed_by_arm: dict[str, int] = Field(default_factory=dict)
+    success_by_arm: dict[str, int] = Field(default_factory=dict)
+    as_treated_by_arm: dict[str, int] = Field(default_factory=dict)
+    complete_blocks: int = 0
+    active_days: int = 0
+    calendar_days: int = 0
+    comparisons: dict[str, Any] = Field(default_factory=dict)
+    cost: PilotClause | None = None
+    human_intervention: PilotClause | None = None
+
+
+class PilotClaimBReport(BaseModel):
+    """**No ``supported`` field, ever.**  See ``pilot_enrollment.ClaimBVerdict``."""
+
+    state: str = "not_computable"
+    clause: PilotClause | None = None
+    closed: int = 0
+    randomized: int = 0
+    elected: int = 0
+    sentence: str = ""
+
+
+class PilotReportResponse(BaseModel):
+    """The read-only report.  It grants nothing and no promotion path reads it."""
+
+    generated_at: datetime
+    thresholds_version: str = ""
+    thresholds_sha: str = ""
+    thresholds_effective_at: datetime | None = None
+    single_participant_notice: str = ""
+    pooling_refused: str = ""
+    success_definition: str = ""
+    enrolled_total: int = 0
+    strata_total: int = 0
+    arms_enabled: list[str] = Field(default_factory=list)
+    arm_availability: dict[str, str] = Field(default_factory=dict)
+    cells: list[PilotCellReport] = Field(default_factory=list)
+    worst_cell: PilotCellReport | None = None
+    claim_b: PilotClaimBReport = Field(default_factory=PilotClaimBReport)
+    cost: PilotClause | None = None
+    human_intervention: PilotClause | None = None
+    dreams: dict[str, Any] = Field(default_factory=dict)
+    notices: list[str] = Field(default_factory=list)
+    schema_version: str = "v1"
+

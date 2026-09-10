@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
 import random
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
@@ -16,7 +15,7 @@ from typing import Any, TypedDict
 
 import httpx
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from tce_model_gateway import get_gateway
 from tce_shared.autonomy_context import (
@@ -25,12 +24,22 @@ from tce_shared.autonomy_context import (
     propagate_episode_score,
     summary_coverage_ratio,
 )
+from tce_shared.deadline import (
+    RETRIEVAL_REASON_DEADLINE_SKIP,
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
+    Deadline,
+    RetrievalLedger,
+    embedding_cache_key,
+    embedding_cooldown_key,
+)
 from tce_shared.events import EventSearchHit, EventSearchRequest
 from tce_shared.handoff import handoff_intent, task_overlap_score
 from tce_shared.policy import ConsumerContext
+from tce_shared.scope import ResolvedScope, resolve_scope
 
 from .cache_clients import get_redis_client
 from .config import get_settings
+from .deadline_pg import absorb_pg_deadline, begin_pg_deadline, finish_pg_deadline
 from .policy import PolicyEngine
 
 logger = logging.getLogger(__name__)
@@ -47,6 +56,7 @@ _RETRIEVAL_COUNTERS: dict[str, int] = {
     "lexical_only": 0,
     "hybrid_fallback": 0,
     "qdrant": 0,
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL: 0,
 }
 _QUERY_EXPANSION_SYNONYMS: dict[str, tuple[str, ...]] = {
     "bug": ("error", "issue", "defect"),
@@ -70,15 +80,6 @@ _RETRYABLE_ERROR_TOKENS = (
     "502",
     "504",
 )
-_CROSS_USER_HINT_RE = re.compile(r"(?:@|user[:=]|owner[:=]|from\s+)([a-z0-9][a-z0-9._-]{1,63})")
-_CROSS_USER_TRIGGER_RE = re.compile(r"\b(cross[-\s]?user|across users?|same workspace|shared workspace|other user)\b")
-_CROSS_USER_HISTORY_RE = re.compile(
-    r"\b(history|chat|conversation|session|discuss|discussion|recent work|recent changes|what did)\b"
-)
-_CROSS_USER_HANDOFF_RE = re.compile(
-    r"\b(continue|resume|pick up|handoff|hand off|follow up)\b.*\b(codex|claude)\b"
-)
-_CROSS_USER_DIRECT_NAMES = ("codex", "claude")
 _TSQUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:#@+\-]*")
 _TSQUERY_SUBTOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _TSQUERY_MAX_TERMS = 32
@@ -92,6 +93,14 @@ _OWNER_SCOPE_PREDICATE = r"""
     (context->>'_tce_owner' IS NULL
      OR btrim(context->>'_tce_owner', E' \t\n\r\f\v') = ''
      OR lower(btrim(context->>'_tce_owner', E' \t\n\r\f\v'))
+        = ANY(CAST(:scope_owners AS text[])))
+"""
+# Strict variants (settings.scope_strict_tags): untagged legacy rows are no longer admitted.
+_WORKSPACE_SCOPE_PREDICATE_STRICT = """
+    (context->>'_tce_workspace' = :scope_workspace)
+"""
+_OWNER_SCOPE_PREDICATE_STRICT = r"""
+    (lower(btrim(context->>'_tce_owner', E' \t\n\r\f\v'))
         = ANY(CAST(:scope_owners AS text[])))
 """
 
@@ -200,48 +209,43 @@ def _normalized_channel_weights(lexical_weight: float, vector_weight: float) -> 
     return lexical / total, vector / total
 
 
-def _scope_sql_parts(*, workspace_id: str, owner_ids: list[str]) -> tuple[list[str], dict[str, Any]]:
+def _scope_sql_parts(*, workspace_id: str, owner_ids: list[str], strict: bool = False) -> tuple[list[str], dict[str, Any]]:
     normalized_owners = sorted({_normalize_owner_id_token(owner) for owner in owner_ids if owner})
-    predicates = [_WORKSPACE_SCOPE_PREDICATE]
+    predicates = [_WORKSPACE_SCOPE_PREDICATE_STRICT if strict else _WORKSPACE_SCOPE_PREDICATE]
     params: dict[str, Any] = {"scope_workspace": workspace_id}
     if normalized_owners:
-        predicates.append(_OWNER_SCOPE_PREDICATE)
+        predicates.append(_OWNER_SCOPE_PREDICATE_STRICT if strict else _OWNER_SCOPE_PREDICATE)
         params["scope_owners"] = normalized_owners
     return predicates, params
 
 
-def _query_requests_cross_user_memory(query_text: str) -> bool:
-    lowered = _collapse_whitespace(query_text.lower())
-    if not lowered:
-        return False
-    if _CROSS_USER_TRIGGER_RE.search(lowered):
-        return True
-    if _CROSS_USER_HANDOFF_RE.search(lowered):
-        return True
-    if "memory" in lowered and "from " in lowered:
-        return True
-    if "timeline" in lowered and "from " in lowered:
-        return True
-    if "vice versa" in lowered:
-        return True
-    if any(name in lowered for name in _CROSS_USER_DIRECT_NAMES):
-        if "memory" in lowered:
-            return True
-        if "timeline" in lowered:
-            return True
-        if _CROSS_USER_HISTORY_RE.search(lowered):
-            return True
-    return False
+def scope_from_consumer(consumer_ctx: ConsumerContext) -> ResolvedScope:
+    """Fallback scope for callers that did not attach one to the consumer context (never body-derived)."""
+    if consumer_ctx.scope is not None:
+        return consumer_ctx.scope
+    shim = _ConsumerAuthShim(consumer_ctx)
+    return resolve_scope(shim)
 
 
-def _extract_owner_hints(query_text: str) -> set[str]:
-    lowered = _collapse_whitespace(query_text.lower())
-    hints = {_normalize_owner_id_token(match.group(1)) for match in _CROSS_USER_HINT_RE.finditer(lowered)}
-    for token in re.split(r"[^a-z0-9._-]+", lowered):
-        normalized = _normalize_owner_id_token(token)
-        if normalized in _CROSS_USER_DIRECT_NAMES:
-            hints.add(normalized)
-    return {hint for hint in hints if hint}
+class _ConsumerAuthShim:
+    def __init__(self, consumer_ctx: ConsumerContext) -> None:
+        self._ctx = consumer_ctx
+
+    @property
+    def consumer(self) -> str:
+        return self._ctx.consumer
+
+    @property
+    def workspace_id(self) -> str:
+        return self._ctx.workspace_id
+
+    @property
+    def user_id(self) -> str:
+        return self._ctx.owner_id
+
+    @property
+    def behavior_subject_id(self) -> str:
+        return self._ctx.owner_id
 
 
 def _owner_matches_hint(owner_id: str, hint: str) -> bool:
@@ -266,11 +270,21 @@ def _load_handoff_records_map(
     workspace_id: str,
     owner_ids: list[str],
     max_records: int,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not owner_ids:
         return {}
+    settings = get_settings()
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="handoff_records",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT id, event_id, anchors_json, schema_version
@@ -286,7 +300,8 @@ def _load_handoff_records_map(
                 "owner_ids": owner_ids,
                 "record_limit": max(1, int(max_records)),
             },
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         try:
             db.rollback()
@@ -306,88 +321,56 @@ def _load_handoff_records_map(
     return by_event
 
 
-def _resolve_owner_scope(
+def _guarded_rows(
     db: Session,
+    deadline: Deadline | None,
+    ledger: RetrievalLedger | None,
     *,
-    workspace_id: str,
-    owner_id: str,
-    query_text: str,
-) -> tuple[set[str], bool, list[str]]:
-    normalized_owner = _normalize_owner_id_token(owner_id)
-    default_scope = {normalized_owner} if normalized_owner else set()
-    if not _query_requests_cross_user_memory(query_text):
-        return default_scope, False, sorted(default_scope)
+    name: str,
+    requested_ms: int,
+    floor_ms: int,
+    run: Callable[[], Sequence[Any]],
+) -> list[Any]:
+    """Run one READ under a statement-timeout guard, or skip it when the budget is gone.
 
-    owner_candidates = set(default_scope)
+    Writes never come through here: the guard is a read-only device, and a skipped write
+    would report a revision that was never persisted.
+    """
+    guard = begin_pg_deadline(
+        db, deadline, name=name, ledger=ledger, requested_ms=requested_ms, floor_ms=floor_ms
+    )
+    if guard is None:
+        return []
     try:
-        rows = db.execute(
-            text(
-                """
-                SELECT DISTINCT context->>'_tce_owner' AS owner_id
-                FROM events
-                WHERE context->>'_tce_workspace' = :workspace_id
-                  AND context->>'_tce_owner' IS NOT NULL
-                LIMIT 400
-                """
-            ),
-            {"workspace_id": workspace_id},
-        ).mappings().all()
-        for row in rows:
-            normalized = _normalize_owner_id_token(row.get("owner_id"))
-            if normalized:
-                owner_candidates.add(normalized)
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        return default_scope, False, sorted(default_scope)
-
-    if not owner_candidates:
-        return default_scope, False, sorted(default_scope)
-
-    hints = _extract_owner_hints(query_text)
-    if hints:
-        matched = {
-            owner_candidate
-            for owner_candidate in owner_candidates
-            if any(_owner_matches_hint(owner_candidate, hint) for hint in hints)
-        }
-    else:
-        matched = set(owner_candidates)
-
-    if normalized_owner:
-        matched.add(normalized_owner)
-    if not matched:
-        return default_scope, False, sorted(default_scope)
-    applied = matched != default_scope
-    return matched, applied, sorted(matched)[:6]
+        rows = list(run())
+    except (OperationalError, DBAPIError) as exc:
+        if not absorb_pg_deadline(guard, db, exc):
+            raise
+        return []
+    finish_pg_deadline(guard, db, rows=len(rows))
+    return rows
 
 
-def _expand_owner_scope_from_rows(
-    rows: list[dict[str, Any]],
-    *,
-    workspace_id: str,
-    current_scope: set[str],
-) -> set[str]:
-    normalized_workspace = _normalize_owner_id_token(workspace_id)
-    expanded_scope = set(current_scope)
-    for row in rows:
-        context = row.get("context") if isinstance(row, dict) else None
-        if not isinstance(context, dict):
-            continue
-        event_workspace = _normalize_owner_id_token(context.get("_tce_workspace"))
-        if event_workspace and event_workspace != normalized_workspace:
-            continue
-        event_owner = _normalize_owner_id_token(context.get("_tce_owner"))
-        if event_owner:
-            expanded_scope.add(event_owner)
-    return expanded_scope
+def _retrieval_floor_ms(settings: Any) -> int:
+    return max(1, int(getattr(settings, "retrieval_statement_floor_ms", 10)))
 
 
-def _consumer_is_executor_consumer(consumer: str) -> bool:
-    normalized = _normalize_owner_id_token(consumer)
-    return normalized.endswith("-executor") or normalized.endswith("-executer") or "-executor" in normalized or "-executer" in normalized
+def _backend_slice_ms(settings: Any) -> int:
+    return max(1, int(getattr(settings, "context_backend_timeout_ms", 60)))
+
+
+def _resolve_owner_scope(*, scope: ResolvedScope) -> tuple[set[str], bool, list[str]]:
+    """Owner scope comes only from the server-bound ResolvedScope.
+
+    The set widens beyond the caller's own owner id solely through explicit
+    continuity intent (target_owner + continuity_intent); no query heuristics,
+    no executor-name sniffing, no post-hoc expansion from unscoped rows.
+    """
+    owners = {_normalize_owner_id_token(owner) for owner in scope.owner_ids if _normalize_owner_id_token(owner)}
+    if not owners:
+        owners = {_normalize_owner_id_token(scope.owner_id)} if _normalize_owner_id_token(scope.owner_id) else set()
+    applied = len(owners) > 1 and bool(scope.continuity_intent)
+    return owners, applied, sorted(owners)[:6]
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -456,75 +439,94 @@ def _search_scale_trigger_met(
     workspace_id: str,
     owner_id: str,
 ) -> bool:
+    """Best-effort scale probes. Each runs inside its own savepoint.
+
+    Both queries are optional diagnostics, but they used to run directly on the caller's request session
+    and call ``db.rollback()`` from a bare ``except``. On Postgres the ``retrieval_eval_runs`` probe
+    raised UndefinedTable on every request, so that rollback silently discarded whatever the turn had
+    already written -- including the task-state CAS. A savepoint keeps a failed probe local to itself.
+    """
+
     now = datetime.now(tz=UTC)
     try:
-        event_count = int(
-            db.execute(
-                text(
-                    """
-                    SELECT COUNT(1)
-                    FROM events
-                    WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
-                      AND (context->>'_tce_owner' IS NULL OR context->>'_tce_owner' = :owner_id)
-                    """
-                ),
-                {"workspace_id": workspace_id, "owner_id": owner_id},
-            ).scalar()
-            or 0
-        )
+        with db.begin_nested():
+            event_count = int(
+                db.execute(
+                    text(
+                        """
+                        SELECT COUNT(1)
+                        FROM events
+                        WHERE (context->>'_tce_workspace' IS NULL OR context->>'_tce_workspace' = :workspace_id)
+                          AND (context->>'_tce_owner' IS NULL OR context->>'_tce_owner' = :owner_id)
+                        """
+                    ),
+                    {"workspace_id": workspace_id, "owner_id": owner_id},
+                ).scalar()
+                or 0
+            )
         if event_count >= 10000:
             return True
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         pass
     try:
-        row = db.execute(
-            text(
-                """
-                SELECT
-                    COUNT(1) AS samples,
-                    AVG((COALESCE(style_alignment, 0) + COALESCE(decision_traceability, 0)) / 2.0) AS avg_score
-                FROM retrieval_eval_runs
-                WHERE workspace_id = :workspace_id
-                  AND user_id = :user_id
-                  AND completed_at >= :cutoff
-                """
-            ),
-            {
-                "workspace_id": workspace_id,
-                "user_id": owner_id,
-                "cutoff": now - timedelta(days=7),
-            },
-        ).mappings().first()
+        with db.begin_nested():
+            row = (
+                db.execute(
+                    text(
+                        """
+                        SELECT
+                            COUNT(1) AS samples,
+                            AVG((COALESCE(style_alignment, 0) + COALESCE(decision_traceability, 0)) / 2.0) AS avg_score
+                        FROM retrieval_eval_runs
+                        WHERE workspace_id = :workspace_id
+                          AND user_id = :user_id
+                          AND completed_at >= :cutoff
+                        """
+                    ),
+                    {
+                        "workspace_id": workspace_id,
+                        "user_id": owner_id,
+                        "cutoff": now - timedelta(days=7),
+                    },
+                )
+                .mappings()
+                .first()
+            )
         if row is not None and int(row.get("samples") or 0) >= 3:
             if float(row.get("avg_score") or 1.0) < 0.72:
                 return True
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         pass
     return False
 
 
 def _embed_cache_key(query: str) -> str:
-    normalized_query = _collapse_whitespace(query).strip().lower()
-    return f"tce:embed:{hashlib.sha256(normalized_query.encode()).hexdigest()[:16]}"
+    """Model- and dimension-scoped, so a model swap cannot serve stale vectors."""
+    settings = get_settings()
+    return embedding_cache_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        dimensions=int(getattr(settings, "embed_dimensions", 1024)),
+        query_text=query,
+    )
 
 
-def _embed_timeout_cooldown_key(query: str) -> str:
-    normalized_query = _collapse_whitespace(query).strip().lower()
-    return f"tce:embed:cooldown:{hashlib.sha256(normalized_query.encode()).hexdigest()[:16]}"
+def _embed_timeout_cooldown_key(cooldown_scope: str) -> str:
+    """Model- and scope-keyed cooldown.
+
+    ``cooldown_scope`` is the workspace id at every retrieval call site: one slow embedding
+    model should silence the workspace that hit it, not one exact query string.
+    """
+    settings = get_settings()
+    return embedding_cooldown_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        workspace_id=_collapse_whitespace(cooldown_scope).strip().lower(),
+    )
 
 
-def _is_embedding_timeout_cooldown_active(query: str, *, settings: Any) -> bool:
+def _is_embedding_timeout_cooldown_active(cooldown_scope: str, *, settings: Any) -> bool:
     if not bool(getattr(settings, "search_embedding_timeout_cooldown_enabled", True)):
         return False
-    key = _embed_timeout_cooldown_key(query)
+    key = _embed_timeout_cooldown_key(cooldown_scope)
     now = monotonic()
     memo_expiry = _EMBED_TIMEOUT_COOLDOWN_MEMO.get(key)
     if memo_expiry is not None:
@@ -544,10 +546,12 @@ def _is_embedding_timeout_cooldown_active(query: str, *, settings: Any) -> bool:
         return False
 
 
-def _mark_embedding_timeout_cooldown(query: str, *, settings: Any, cooldown_seconds: float) -> None:
+def _mark_embedding_timeout_cooldown(
+    cooldown_scope: str, *, settings: Any, cooldown_seconds: float
+) -> None:
     if cooldown_seconds <= 0:
         return
-    key = _embed_timeout_cooldown_key(query)
+    key = _embed_timeout_cooldown_key(cooldown_scope)
     if len(_EMBED_TIMEOUT_COOLDOWN_MEMO) >= _EMBED_TIMEOUT_COOLDOWN_MEMO_MAX_SIZE:
         _EMBED_TIMEOUT_COOLDOWN_MEMO.pop(next(iter(_EMBED_TIMEOUT_COOLDOWN_MEMO)))
     _EMBED_TIMEOUT_COOLDOWN_MEMO[key] = monotonic() + cooldown_seconds
@@ -690,11 +694,20 @@ def _read_feedback_signals(
     workspace_id: str,
     event_ids: list[Any],
     settings: Any,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[Any, float]:
     if not bool(getattr(settings, "search_feedback_enabled", True)) or not event_ids:
         return {}
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="feedback_signals",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT source_event_id AS event_id,
@@ -719,7 +732,8 @@ def _read_feedback_signals(
                 """
             ),
             {"workspace_id": workspace_id, "event_ids": [str(value) for value in event_ids]},
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         return {}
 
@@ -744,11 +758,21 @@ def _load_episode_score_lookup(
     owner_ids: list[str],
     query_text: str,
     max_rows: int = 180,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[Any, float]:
     if not owner_ids or not str(query_text or "").strip():
         return {}
+    settings = get_settings()
     try:
-        rows = db.execute(
+        rows = _guarded_rows(
+            db,
+            deadline,
+            ledger,
+            name="episode_scores",
+            requested_ms=_backend_slice_ms(settings),
+            floor_ms=_retrieval_floor_ms(settings),
+            run=lambda: db.execute(
             text(
                 """
                 SELECT eel.event_id,
@@ -768,7 +792,8 @@ def _load_episode_score_lookup(
                 "owner_ids": owner_ids,
                 "row_limit": max(20, int(max_rows)),
             },
-        ).mappings().all()
+            ).mappings().all(),
+        )
     except Exception:
         return {}
     scores: dict[Any, float] = {}
@@ -913,9 +938,22 @@ def _qdrant_search_longterm(
     search_limit: int,
     settings: Any,
     consumer_ctx: ConsumerContext,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[list[str], dict[str, float], str | None]:
     base_url = _qdrant_base_url(settings)
     timeout_seconds = _qdrant_timeout_seconds(settings)
+    qdrant_timeout_ms = max(20, int(getattr(settings, "qdrant_timeout_ms", 60)))
+    if deadline is not None:
+        if not deadline.allows(qdrant_timeout_ms):
+            if ledger is not None:
+                ledger.record_skip(
+                    "qdrant",
+                    remaining_ms=deadline.remaining_ms(),
+                    reason=RETRIEVAL_REASON_DEADLINE_SKIP,
+                )
+            return [], {}, "deadline_expired_skip"
+        timeout_seconds = max(0.01, deadline.slice_ms(qdrant_timeout_ms) / 1000.0)
     collection = _qdrant_collection(settings)
     retry_attempts = max(1, int(getattr(settings, "qdrant_retry_max_attempts", 2)))
     retry_backoff_ms = max(1, int(getattr(settings, "qdrant_retry_backoff_ms", 12)))
@@ -938,6 +976,8 @@ def _qdrant_search_longterm(
     started = monotonic()
     body: dict[str, Any] = {}
     for attempt in range(retry_attempts):
+        if deadline is not None and not deadline.allows(qdrant_timeout_ms):
+            break
         try:
             with httpx.Client(base_url=base_url, timeout=timeout_seconds) as client:
                 response = client.post(f"/collections/{collection}/points/search", json=payload)
@@ -1027,8 +1067,18 @@ def run_search(
     search_request: EventSearchRequest,
     consumer_ctx: ConsumerContext,
     policy_engine: PolicyEngine,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[list[EventSearchHit], list[Any], int, dict[str, Any]]:
+    """``deadline`` and ``ledger`` are the retrieval child and the turn ledger, passed BY VALUE.
+
+    Both default to ``None`` so ``POST /v1/search`` and ``POST /v1/context/bundle`` are
+    unchanged: with no deadline the guard installs nothing at all.
+    """
     settings = get_settings()
+    retrieval_floor_ms = _retrieval_floor_ms(settings)
+    backend_slice_ms = _backend_slice_ms(settings)
     retrieval_started = monotonic()
     query_text = search_request.query.strip()
     match_all = bool(search_request.match_all) or query_text in {"", "*"}
@@ -1040,12 +1090,8 @@ def run_search(
     )
     planner_used = bool(len(planned_queries) > 1)
     subquery_labels = [str(item.get("label") or "") for item in planned_queries if str(item.get("label") or "").strip()]
-    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope(
-        db,
-        workspace_id=consumer_ctx.workspace_id,
-        owner_id=consumer_ctx.owner_id,
-        query_text=query_text,
-    )
+    scope = consumer_ctx.scope or scope_from_consumer(consumer_ctx)
+    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope(scope=scope)
     owner_scope_ids = sorted(owner_scope)
 
     # Base filters for both lexical and ANN candidate queries.
@@ -1078,18 +1124,19 @@ def run_search(
         where_parts.append("ts <= :time_end")
         params["time_end"] = search_request.time_end
 
-    workspace_scope_parts, workspace_scope_params = _scope_sql_parts(
-        workspace_id=consumer_ctx.workspace_id,
-        owner_ids=[],
-    )
-    workspace_where_sql = " AND ".join([*where_parts, *workspace_scope_parts])
-    workspace_params = {**params, **workspace_scope_params}
     active_scope_parts, active_scope_params = _scope_sql_parts(
         workspace_id=consumer_ctx.workspace_id,
         owner_ids=owner_scope_ids,
+        strict=bool(getattr(settings, "scope_strict_tags", False)),
     )
     where_parts.extend(active_scope_parts)
     params.update(active_scope_params)
+    # Project narrowing only on explicit request (the bundle passes a bound project explicitly);
+    # an inherited session project never auto-filters an ordinary search.
+    explicit_project_id = str(search_request.project_id or "").strip()
+    if explicit_project_id:
+        where_parts.append("context->>'project_id' = :scope_project")
+        params["scope_project"] = explicit_project_id
 
     candidate_pool_multiplier = max(1, int(getattr(settings, "search_candidate_pool_multiplier", 8)))
     candidate_pool_max = max(search_request.k, int(getattr(settings, "search_candidate_pool_max", 400)))
@@ -1114,7 +1161,6 @@ def run_search(
     fts_candidate_count = 0
     trigram_candidate_count = 0
     scope_requery_applied = False
-    ownerless_fts_requery: Callable[[], list[dict[str, Any]]] | None = None
     feedback_adjustment_applied = False
     query_expansion_used = False
     query_expansion_terms: list[str] = []
@@ -1200,9 +1246,7 @@ def run_search(
             ).mappings().all()
             return [dict(row) for row in result]
 
-        def _run_fts_query(tsquery: str, *, include_owner_scope: bool) -> list[dict[str, Any]]:
-            selected_where = base_where_sql if include_owner_scope else workspace_where_sql
-            selected_params = params if include_owner_scope else workspace_params
+        def _run_fts_query(tsquery: str) -> list[dict[str, Any]]:
             fts_sql = f"""
                 SELECT id, ts, actor, source, domain, task_type, event_type,
                        title, summary_l0, summary_l1_json, sensitivity, context, authority_level,
@@ -1213,14 +1257,14 @@ def run_search(
                            2|32
                        ) AS lexical_rank
                 FROM events
-                WHERE {selected_where}
+                WHERE {base_where_sql}
                   AND search_tsv @@ to_tsquery('english', :tsq)
                 ORDER BY lexical_rank DESC, ts DESC
                 LIMIT :fts_limit
             """
             result = db.execute(
                 text(fts_sql),
-                {**selected_params, "tsq": tsquery, "fts_limit": limit},
+                {**params, "tsq": tsquery, "fts_limit": limit},
             ).mappings().all()
             return [dict(row) for row in result]
 
@@ -1305,7 +1349,9 @@ def run_search(
             return result
 
         def _do_embed() -> list[float] | None:
-            if _is_embedding_timeout_cooldown_active(query_text, settings=settings):
+            if _is_embedding_timeout_cooldown_active(
+                consumer_ctx.workspace_id, settings=settings
+            ):
                 embed_state["reason"] = "embedding_timeout_cooldown"
                 return None
             try:
@@ -1323,7 +1369,7 @@ def run_search(
                     embed_state["reason"] = "embedding_retry_exhausted"
                     if embed_timeout_cooldown_enabled:
                         _mark_embedding_timeout_cooldown(
-                            query_text,
+                            consumer_ctx.workspace_id,
                             settings=settings,
                             cooldown_seconds=embed_timeout_cooldown_seconds,
                         )
@@ -1426,12 +1472,15 @@ def run_search(
         fts_rows: list[dict[str, Any]] = []
         if tsquery:
             try:
-                fts_rows = _run_fts_query(tsquery, include_owner_scope=True)
-
-                def _ownerless_fts_requery() -> list[dict[str, Any]]:
-                    return _run_fts_query(tsquery, include_owner_scope=False)
-
-                ownerless_fts_requery = _ownerless_fts_requery
+                fts_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="fts_primary",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=lambda: _run_fts_query(tsquery),
+                )
                 lexical_channel = "fts_primary"
             except (ProgrammingError, DBAPIError) as exc:
                 logger.warning("event FTS query failed; continuing with ILIKE candidates: %s", exc)
@@ -1443,7 +1492,15 @@ def run_search(
         # fill the requested result set. Running both paths unconditionally made
         # every search pay for the legacy full scan.
         if len(fts_rows) < search_request.k:
-            ilike_rows = _run_lexical_query(lexical_terms, expansion_mode=False)
+            ilike_rows = _guarded_rows(
+                db,
+                deadline,
+                ledger,
+                name="lexical_fill",
+                requested_ms=backend_slice_ms,
+                floor_ms=retrieval_floor_ms,
+                run=lambda: _run_lexical_query(lexical_terms, expansion_mode=False),
+            )
             if fts_rows:
                 lexical_channel = "fts_plus_ilike_fill"
             elif lexical_channel != "ilike_fallback_error":
@@ -1497,7 +1554,15 @@ def run_search(
         trigram_rows: list[dict[str, Any]] = []
         if bool(getattr(settings, "search_rrf_enabled", False)):
             try:
-                trigram_rows = _run_trigram_query()
+                trigram_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="trigram",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=_run_trigram_query,
+                )
             except (ProgrammingError, DBAPIError) as exc:
                 logger.warning("event trigram query failed; continuing without trigram candidates: %s", exc)
                 db.rollback()
@@ -1517,7 +1582,20 @@ def run_search(
                 secondary_terms = [f"%{planned_query}%"]
                 if not secondary_terms[0].strip("%"):
                     continue
-                extra_rows = _run_lexical_query(secondary_terms, expansion_mode=False)
+                subquery_terms = list(secondary_terms)
+
+                def _run_subquery(terms: list[str] = subquery_terms) -> list[dict[str, Any]]:
+                    return _run_lexical_query(terms, expansion_mode=False)
+
+                extra_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name=f"lexical_subquery_{index}",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=_run_subquery,
+                )
                 for rank, row in enumerate(extra_rows):
                     ilike_rank_lookup.setdefault(row["id"], rank)
                 _merge_rows(extra_rows, str(planned.get("label") or "objective"))
@@ -1538,22 +1616,36 @@ def run_search(
             float(getattr(settings, "search_embedding_quick_timeout_seconds", configured_embed_timeout)),
         )
         embed_timeout = min(configured_embed_timeout, embed_quick_timeout)
+
+        def _join_timeout() -> float:
+            """Re-evaluated per join: slice_ms must never be cached, or the second join
+            spends a budget the first one already burned."""
+            if deadline is None:
+                return embed_timeout
+            return max(0.01, deadline.slice_ms(int(embed_timeout * 1000)) / 1000.0)
+
         try:
-            entity_event_ids = entity_future.result(timeout=embed_timeout)
+            entity_event_ids = entity_future.result(timeout=_join_timeout())
         except TimeoutError:
             logger.warning("entity-graph query timed out after %.2fs; continuing without graph bonus", embed_timeout)
             entity_event_ids = set()
+            if ledger is not None:
+                ledger.record_timeout("entity_graph", budget_ms=int(embed_timeout * 1000))
+            # cancel() is a no-op on a running future: the thread keeps working and the
+            # result is abandoned. P2 records the abandonment rather than resizing the pool.
             entity_future.cancel()
 
         try:
-            query_embedding = embed_future.result(timeout=embed_timeout)
+            query_embedding = embed_future.result(timeout=_join_timeout())
         except TimeoutError:
             logger.warning("vector embedding timed out after %.2fs; continuing lexical-only search", embed_timeout)
             query_embedding = None
             retrieval_reason = "embedding_timeout"
+            if ledger is not None:
+                ledger.record_timeout("embedding", budget_ms=int(embed_timeout * 1000))
             if embed_timeout_cooldown_enabled:
                 _mark_embedding_timeout_cooldown(
-                    query_text,
+                    consumer_ctx.workspace_id,
                     settings=settings,
                     cooldown_seconds=embed_timeout_cooldown_seconds,
                 )
@@ -1580,14 +1672,22 @@ def run_search(
                 LIMIT :ann_limit
             """
             try:
-                ann_rows = db.execute(
-                    text(ann_sql),
-                    {
-                        **params,
-                        "query_embedding": _embedding_as_vector_literal(query_embedding),
-                        "ann_limit": ann_limit,
-                    },
-                ).mappings().all()
+                ann_rows = _guarded_rows(
+                    db,
+                    deadline,
+                    ledger,
+                    name="pgvector_ann",
+                    requested_ms=backend_slice_ms,
+                    floor_ms=retrieval_floor_ms,
+                    run=lambda: db.execute(
+                        text(ann_sql),
+                        {
+                            **params,
+                            "query_embedding": _embedding_as_vector_literal(query_embedding),
+                            "ann_limit": ann_limit,
+                        },
+                    ).mappings().all(),
+                )
                 for ann_row in ann_rows:
                     ann_similarity = float(ann_row.get("ann_similarity") or 0.0)
                     vector_similarity_lookup[ann_row["id"]] = max(
@@ -1618,6 +1718,8 @@ def run_search(
                         search_limit=ann_limit,
                         settings=settings,
                         consumer_ctx=consumer_ctx,
+                        deadline=deadline,
+                        ledger=ledger,
                     )
                     if qdrant_error:
                         if not retrieval_reason:
@@ -1631,14 +1733,22 @@ def run_search(
                               AND CAST(id AS TEXT) = ANY(:event_ids)
                             LIMIT :row_limit
                         """
-                        qdrant_rows = db.execute(
-                            text(qdrant_rows_sql),
-                            {
-                                **params,
-                                "event_ids": qdrant_ids,
-                                "row_limit": ann_limit,
-                            },
-                        ).mappings().all()
+                        qdrant_rows = _guarded_rows(
+                            db,
+                            deadline,
+                            ledger,
+                            name="qdrant_rows",
+                            requested_ms=backend_slice_ms,
+                            floor_ms=retrieval_floor_ms,
+                            run=lambda: db.execute(
+                                text(qdrant_rows_sql),
+                                {
+                                    **params,
+                                    "event_ids": qdrant_ids,
+                                    "row_limit": ann_limit,
+                                },
+                            ).mappings().all(),
+                        )
                         for q_row in qdrant_rows:
                             event_id_key = str(q_row.get("id") or "")
                             q_score = float(qdrant_scores.get(event_id_key, 0.0))
@@ -1676,38 +1786,7 @@ def run_search(
         if not retrieval_source:
             retrieval_source = "lexical_only"
 
-        if (
-            not merged_rows
-            and not cross_user_scope_applied
-            and ownerless_fts_requery is not None
-        ):
-            try:
-                requery_rows = ownerless_fts_requery()
-            except (ProgrammingError, DBAPIError) as exc:
-                logger.warning("owner-scope FTS requery failed; keeping user-only scope: %s", exc)
-                db.rollback()
-                requery_rows = []
-                lexical_channel = "ilike_fallback_error"
-                retrieval_reason = "fts_scope_requery_failed"
-            expanded_scope = _expand_owner_scope_from_rows(
-                requery_rows,
-                workspace_id=consumer_ctx.workspace_id,
-                current_scope=owner_scope,
-            )
-            if requery_rows and expanded_scope != owner_scope:
-                scope_requery_applied = True
-                owner_scope = expanded_scope
-                owner_scope_ids = sorted(owner_scope)
-                cross_user_scope_applied = True
-                cross_user_scope_owners = owner_scope_ids[:6]
-                retrieval_reason = "owner_scope_auto_expand_no_hits"
-                fts_rank_lookup = _normalize_fts_rank_lookup(requery_rows)
-                fts_candidate_count = len(requery_rows)
-                lexical_channel = "fts_primary"
-                for row in requery_rows:
-                    merged_rows.setdefault(row["id"], dict(row))
-                    subquery_labels_by_event.setdefault(row["id"], set()).add("objective")
-                lexical_candidate_count = len(merged_rows)
+        # An empty result inside scope stays empty: no implicit peer/owner expansion (P0 trust boundary).
         rows = list(merged_rows.values())
         citation_dup_ratio = _citation_dup_ratio(rows)
 
@@ -1753,12 +1832,16 @@ def run_search(
         workspace_id=consumer_ctx.workspace_id,
         event_ids=[row["id"] for row in rows],
         settings=settings,
+        deadline=deadline,
+        ledger=ledger,
     )
     handoff_map = _load_handoff_records_map(
         db,
         workspace_id=consumer_ctx.workspace_id,
         owner_ids=owner_scope_ids,
         max_records=max(search_request.k * 6, 30),
+        deadline=deadline,
+        ledger=ledger,
     )
     handoff_query_intent = handoff_intent(query_text)
     episode_score_lookup = _load_episode_score_lookup(
@@ -1767,6 +1850,8 @@ def run_search(
         owner_ids=owner_scope_ids,
         query_text=query_text,
         max_rows=max(search_request.k * 12, 120),
+        deadline=deadline,
+        ledger=ledger,
     ) if (planner_used and intent_retrieval_enabled) else {}
 
     def _score_rows(active_owner_scope: set[str]) -> tuple[list[tuple[float, dict[str, Any]]], int, int, bool]:
@@ -1860,38 +1945,7 @@ def run_search(
         return local_scored, local_blocked, local_owner_scope_blocked, local_feedback_applied
 
     scored_events, blocked, owner_scope_blocked, feedback_adjustment_applied = _score_rows(owner_scope)
-    owner_scope_blocked_ratio = float(owner_scope_blocked) / float(max(1, len(rows)))
-    auto_expand_on_blocked_ratio = bool(
-        _consumer_is_executor_consumer(consumer_ctx.consumer) and owner_scope_blocked_ratio >= 0.95
-    )
-    if (
-        not cross_user_scope_applied
-        and owner_scope_blocked > 0
-        and (not scored_events or auto_expand_on_blocked_ratio)
-    ):
-        expanded_scope = _expand_owner_scope_from_rows(
-            rows,
-            workspace_id=consumer_ctx.workspace_id,
-            current_scope=owner_scope,
-        )
-        if expanded_scope != owner_scope:
-            owner_scope = expanded_scope
-            owner_scope_ids = sorted(owner_scope)
-            cross_user_scope_applied = True
-            cross_user_scope_owners = owner_scope_ids[:6]
-            handoff_map = _load_handoff_records_map(
-                db,
-                workspace_id=consumer_ctx.workspace_id,
-                owner_ids=owner_scope_ids,
-                max_records=max(search_request.k * 6, 30),
-            )
-            if not retrieval_reason:
-                retrieval_reason = (
-                    "owner_scope_auto_expand_no_hits"
-                    if not scored_events
-                    else "owner_scope_auto_expand_high_block_ratio"
-                )
-            scored_events, blocked, _, feedback_adjustment_applied = _score_rows(owner_scope)
+    # owner_scope_blocked is telemetry only: rows outside the owner scope never widen it.
     if not match_all:
         rerank_strategy = "score_sort"
     mmr_candidate_pool = max(
@@ -1959,6 +2013,11 @@ def run_search(
     )
     if match_all:
         retrieval_source = "none"
+    if ledger is not None and ledger.degraded():
+        # A truncated candidate set is LABELLED, never silently returned as complete.
+        retrieval_source = RETRIEVAL_SOURCE_DEADLINE_PARTIAL
+        if not retrieval_reason:
+            retrieval_reason = RETRIEVAL_REASON_DEADLINE_SKIP
     _bump_retrieval_counter(retrieval_source)
     episode_event_id_keys = {
         str(key) for key, value in episode_score_lookup.items() if float(value or 0.0) > 0.0
@@ -1990,6 +2049,9 @@ def run_search(
         "feedback_adjustment_applied": bool(feedback_adjustment_applied),
         "cross_user_scope_applied": bool(cross_user_scope_applied),
         "cross_user_scope_owners": cross_user_scope_owners,
+        "owner_scope_blocked": int(owner_scope_blocked),
+        "project_binding": scope.project_binding,
+        "policy_revision": scope.policy_revision,
         "handoff_hits_count": len(top_handoff_record_ids),
         "top_handoff_record_ids": top_handoff_record_ids,
         "resume_packet_available": bool(top_handoff_record_ids),
@@ -2008,4 +2070,9 @@ def run_search(
         "mmr_candidates": int(mmr_candidates),
         "citation_dup_ratio": float(round(citation_dup_ratio, 4)),
     }
+    # The ten deadline keys are always present, in both backends, whether or not a deadline
+    # was supplied — the parity assertion is on the key SET, not on the values.
+    retrieval_meta.update(
+        (ledger or RetrievalLedger()).to_meta(deadline)
+    )
     return hits, citations, blocked, retrieval_meta

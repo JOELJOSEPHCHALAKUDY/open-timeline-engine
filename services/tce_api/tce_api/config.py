@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -226,6 +228,18 @@ class Settings(BaseSettings):
     takeover_confirm_keyword: str = "confirm"
     takeover_deny_keyword: str = "abort"
     takeover_autonomy_policy_default: str = "human_consultative"
+    # P1 trusted capture: host-capture credential + extraction/opportunity knobs.
+    host_capture_tokens: str = ""
+    # One token per line; missing/unreadable => empty set (logged once). Lets the host-capture credential
+    # live outside the repo .env that is mounted into the API container.
+    host_capture_tokens_file: str = ""
+    capture_max_chars: int = 2000
+    capture_delivery_stale_seconds: int = 21600
+    capture_opportunity_ttl_seconds: int = 3600
+    capture_extraction_enabled: bool = True
+    decision_extraction_batch_size: int = 100
+    decision_extraction_lease_seconds: int = 300
+    decision_extraction_max_attempts: int = 10
     takeover_goal_source: str = "open_discovery"
     takeover_goal_min_confidence: float = 0.62
     takeover_goal_selection_min_confidence: float = 0.62
@@ -237,7 +251,10 @@ class Settings(BaseSettings):
     takeover_plan_max_steps: int = 8
     # Use the model gateway to decompose an objective. Off by default; the
     # deterministic fallback runs whenever this is off or the model fails.
-    takeover_plan_llm_enabled: bool = True
+    # P2 R6: this knob now selects whether the WORKER may use a model to decompose an
+    # objective, not whether the request thread may. The bounded control path never calls a
+    # model gateway on the plan path (exit gate G1a).
+    takeover_plan_llm_enabled: bool = False
     takeover_plan_llm_timeout_seconds: int = 25
     # "openai" | "anthropic" | "ollama". Empty falls back to model_provider.
     # A hosted API is the better default here: decomposition runs once per
@@ -245,7 +262,8 @@ class Settings(BaseSettings):
     # both slower and weaker at planning.
     takeover_plan_llm_provider: str = "openai"
     # Form dreams by reading the user's own messages instead of counting rows.
-    takeover_dream_llm_enabled: bool = True
+    # P2: consumed by the worker's dream_synthesis job, never by the request thread.
+    takeover_dream_llm_enabled: bool = False
     takeover_permit_ttl_seconds: int = 300
     takeover_continuity_gap_seconds: int = 600
     takeover_needs_human_threshold_cold: float = 0.45
@@ -278,6 +296,8 @@ class Settings(BaseSettings):
     typed_contract_enabled: bool = False
     workflow_template_reuse_min_reliability: float = 0.70
     takeover_execution_claim_ttl_seconds: int = 300
+    takeover_lease_strict: bool = False
+    scope_strict_tags: bool = False
     takeover_enforcement_mode: str = "strict_takeover"
     advisor_primary_provider: str = "openai"
     advisor_primary_model: str = "gpt-4o-mini"
@@ -336,9 +356,170 @@ class Settings(BaseSettings):
     cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
 
+    # --- P2 durable task state and bounded latency (design 0.5) ---
+    takeover_turn_budget_ms: int = 3500
+    task_state_enabled: bool = True
+    task_state_markdown_enabled: bool = True
+    task_state_markdown_max_steps: int = 24
+    planning_async_enabled: bool | None = None
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    planning_pending_hint_ms: int = 1500
+    retrieval_deadline_enabled: bool = True
+    retrieval_deadline_floor_ms: int = 5
+    retrieval_statement_floor_ms: int = 10
+    retrieval_advisor_min_ms: int = 250
+    sqlite_progress_instructions: int = 1000
+
+    # --- P3 charter, effect journal, verification, dispatch (design 0.7) ---
+    # OFF by default, and that is deliberate. When this is on, claim_execution refuses a mutating
+    # action kind without an active charter -- and every auto-generated takeover directive is
+    # action_kind="takeover_step", which maps to the mutating capability process.execute. Creating a
+    # charter needs a verified human AND a source_receipt_id from trusted_input_receipts, which only
+    # the host-capture credential can write, and nothing in scripts/ mints one. Shipping this on by
+    # default therefore bricked takeover on a fresh install: step, claim, 409 no_active_charter, with
+    # no path out that the installer provides.
+    #
+    # A new control must not disable the product it is protecting. Enforcement is opt-in until the
+    # bootstrap path exists: set TCE_CHARTER_ENFORCEMENT_ENABLED=1 once you have created a charter
+    # (docs/charter.md walks through it). With it on and no charter, the refusal is correct and
+    # intended -- that is the operator's choice, not a default they never made.
+    charter_enforcement_enabled: bool = False
+    charter_default_ttl_seconds: int = 43200
+    charter_max_ttl_seconds: int = 604800
+    charter_min_ttl_seconds: int = 300
+    effect_journal_enabled: bool = True
+    effect_unknown_pause_enabled: bool = True
+    effect_journal_retention_days: int = 365
+    verification_enabled: bool = True
+    verification_runner_principal: str = "system:verifier"
+    verification_reviewer_model_enabled: bool = False
+    verification_max_checks: int = 8
+    verification_check_timeout_seconds: int = 900
+    dispatch_startup_reconcile_enabled: bool = True
+    dispatch_startup_reconcile_batch: int = 200
+    budget_default_minor_units: int = 200
+    budget_currency: str = "USD"
+    permit_scope_digest_enforced: bool = True
+    sandbox_self_test_max_age_seconds: int = 3600
+    # Repo paths the git change summary may be computed against.  Empty means "no repo is
+    # reachable", which is the honest state inside the service containers (git is not installed
+    # and no repo is bind-mounted).
+    git_change_summary_repo_allowlist: str = ""
+
+    # ---- P4 decision policy ----
+    # Two settings, and neither is a threshold.  Every number that can move an abstention or a
+    # qualification verdict lives in ``tce_shared.policy_thresholds`` as a frozen constant
+    # hashed into ``THRESHOLDS_SHA``, because a threshold a caller can move is not a threshold:
+    # sweeping an env var until coverage clears and then reverting it is invisible to the
+    # exposure check.  Both of these are hashed into ``PolicyTuning.tuning_sha()``, which is
+    # itself a bound key on the qualification record, so even a scoping switch cannot be moved
+    # after a family qualifies without invalidating that qualification.
+    policy_allow_unscoped_project_evidence: bool = True
+    """Admit NULL-project observations as evidence.  Producer and reader:
+    ``policy_store.load_policy_evidence``.  Scoping, not a threshold — ``decision_observations``
+    had no ``project_id`` before P4, so every historical row keeps NULL forever."""
+
+    policy_advisor_required_families: str = ""
+    """CSV of decision families that refuse to decide without an advisor contribution.
+    Producer: ``policy_store._policy_tuning``; reader: ``decision_policy._advisor_stage``.
+    It governs only the *absent* advisor (Lite, replay).  A *failed* advisor call abstains
+    unconditionally, before this setting is consulted."""
+
+    @property
+    def policy_advisor_required_family_set(self) -> frozenset[str]:
+        return frozenset(
+            item.strip() for item in self.policy_advisor_required_families.split(",") if item.strip()
+        )
+
+    # ---- P5 dream proposals ----
+    # Every one of these has a named reader; a setting with no reader is a knob pretending to be
+    # a decision, and ``tests/unit/test_aspirations.py::test_every_setting_has_a_reader`` walks
+    # the tree to prove it.  ``takeover_dream_llm_enabled`` above is the existing model gate and
+    # is NOT redeclared here.
+    dream_proposals_enabled: bool = True
+    """Master switch for the four ``/v1/dreams`` routes.  Reader: ``main._require_dreams_enabled``."""
+
+    dream_message_limit: int = 60
+    """LIMIT on the candidate-message statement.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_min_messages: int = 10
+    """Below this the refresh route refuses ``insufficient_messages`` synchronously, before the
+    model gate, so a corpus that cannot support a proposal reads as a refusal rather than as a
+    quiet week.  Reader: ``main.refresh_dreams``."""
+
+    dream_min_message_chars: int = 25
+    """Acknowledgements are not intentions.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_max_message_chars: int = 1200
+    """Per-message truncation, for the prompt only; the persisted hash is always the receipt's
+    hash of the full original.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_max_proposals_per_run: int = 3
+    dream_min_citations: int = 2
+    dream_max_citations: int = 6
+    dream_quote_max_chars: int = 200
+    dream_min_quote_overlap_tokens: int = 2
+    dream_min_citation_relevance_tokens: int = 1
+    dream_max_live_proposals: int = 20
+    dream_duplicate_similarity: float = 0.60
+    dream_material_new_citations: int = 2
+    dream_material_max_similarity: float = 0.60
+    dream_rejected_cooldown_days: int = 30
+    dream_rejected_lookback_days: int = 365
+    """Must be >= ``dream_rejected_cooldown_days``: a rejection that ages out of the scan window
+    before its cooldown expires lifts suppression by amnesia.  Reader:
+    ``dream_store.load_rejected_proposals``."""
+    dream_rejected_scan_limit: int = 200
+    dream_max_reproposals: int = 2
+    dream_nonresponse_after_surfaces: int = 3
+    dream_resurface_min_hours: int = 24
+    dream_resurface_ignored_hours: int = 168
+    """``NonresponseState.IGNORED``'s one functional effect: a longer re-surface interval.  It
+    never suppresses a theme and never counts as a rejection."""
+    dream_snooze_default_days: int = 7
+    dream_proposal_ttl_days: int = 45
+    dream_run_stale_minutes: int = 30
+    """A crashed run must not wedge a scope forever: ``dream_store.start_generation_run`` sweeps
+    ``running`` rows older than this to ``failed``/``run_abandoned`` before taking the slot."""
+    dream_list_limit: int = 10
+
+    # ---- P6 operational-proof pilot ----
+    # Four settings, each with a named reader, and that is the whole list.  EVERY number that
+    # can move a verdict lives in ``tce_shared.pilot_thresholds`` instead, where it is frozen and
+    # hashed: a threshold a caller can sweep is not a threshold.
+    pilot_enrollment_enabled: bool = False
+    """Master switch for the six P6 routes.  Reader: ``main._require_pilot_enrollment`` -> 404."""
+
+    pilot_allocation_salt: str = "tce-pilot-p6-v1"
+    """HMAC key for the permuted-block permutation.  Readers: ``pilot_store.enroll_episode`` ->
+    ``pilot_enrollment.allocate_arm``; its sha256 is copied onto every stratum and episode row so
+    that a mid-pilot change is visible to the report rather than silently pooled."""
+
+    pilot_human_baseline_enabled: bool = False
+    """Gate on the ``elect_arm='owner_unassisted'`` branch of ``POST /v1/pilot/episodes``.
+    Reader: ``pilot_store.enroll_episode`` -> ``pilot_enrollment.resolve_enrolment``."""
+
+    pilot_close_grace_days: int = 90
+    """Reader: ``pilot_store.close_episode`` -> the ``late_close`` flag.  Deliberately NOT an
+    expiry.  ``behavior_pilot_assignment_ttl_days`` rejects a late outcome with a 409, which over
+    a four-to-six week MINIMUM window converts a finished episode into a permanent coverage
+    deficit that can never be repaired.  P6 records ``late_close=true`` and counts the episode."""
+
+    @property
+    def git_change_summary_repos(self) -> list[str]:
+        return [item.strip() for item in self.git_change_summary_repo_allowlist.split(",") if item.strip()]
+
     @property
     def token_set(self) -> set[str]:
         return {token.strip() for token in self.api_tokens.split(",") if token.strip()}
+
+    @property
+    def host_capture_token_set(self) -> set[str]:
+        tokens = {t.strip() for t in self.host_capture_tokens.split(",") if t.strip()}
+        return tokens | _read_host_capture_tokens_file(self.host_capture_tokens_file)
 
     @property
     def redaction_zones(self) -> list[str]:
@@ -395,11 +576,38 @@ class Settings(BaseSettings):
         )
 
     @property
+    def effective_planning_async_enabled(self) -> bool:
+        """R6: async planning follows the model planner. With the model off (the default),
+        planning stays inline and deterministic and planning_pending is never emitted."""
+        if self.planning_async_enabled is not None:
+            return bool(self.planning_async_enabled)
+        return bool(getattr(self, "takeover_plan_llm_enabled", False))
+
+    @property
     def effective_search_embedding_timeout_seconds(self) -> float:
         return min(
             max(0.05, float(self.search_embedding_timeout_seconds)),
             max(0.05, float(self.search_embedding_timeout_hard_cap_seconds)),
         )
+
+
+_logger = logging.getLogger(__name__)
+_tokens_file_warned: set[str] = set()
+
+
+def _read_host_capture_tokens_file(path: str) -> set[str]:
+    """Union source for host-capture tokens: one token per line; missing/unreadable => empty (logged once)."""
+    target = str(path or "").strip()
+    if not target:
+        return set()
+    try:
+        lines = Path(target).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        if target not in _tokens_file_warned:
+            _tokens_file_warned.add(target)
+            _logger.warning("host capture tokens file %s unreadable: %s", target, exc)
+        return set()
+    return {line.strip() for line in lines if line.strip() and not line.strip().startswith("#")}
 
 
 @lru_cache(maxsize=1)

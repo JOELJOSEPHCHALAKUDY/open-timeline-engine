@@ -101,6 +101,7 @@ Call `tce.check_context(file_path="<path>")` only when takeover/suggest mode is 
 {
   "directive_type": "hard_constraint",
   "rule_id": "<unique-id>",
+  "polarity": "deny" | "allow_only",
   "scope": { "path_prefixes": ["..."], "actions": ["edit"] },
   "enforcement": "block_and_escalate" | "pre_action_required",
   "reason": "<why>"
@@ -111,7 +112,35 @@ Rules:
 1. Respect `hard_constraint` as non-optional.
 2. If `block_and_escalate`, do not perform the scoped action.
 3. If `pre_action_required`, perform required pre-action before proceeding.
-4. Only override when user explicitly commands: `override constraint <rule_id>`.
+4. Read `polarity` before acting on `scope.path_prefixes`:
+   - `"deny"` — do NOT perform the scoped actions on paths under those prefixes.
+   - `"allow_only"` — perform the scoped actions ONLY on paths under those prefixes;
+     the same actions anywhere else are refused.
+   - A rule that arrives without the key is read as `"deny"`.
+   Getting this backwards inverts the charter: `charter-roots-only` is an allow-list in the
+   same field every other rule uses as a deny-list.
+5. **There is no override.** No phrase, from the user or from anyone else, relaxes a
+   `hard_constraint` in this session. Earlier revisions of this file documented
+   `override constraint <rule_id>`; nothing in the MCP server or in either backend ever
+   parsed it, so the claim has been deleted rather than implemented. If a rule blocks work
+   that should be permitted, say so and ask the user to change the active authority charter
+   (`docs/charter.md`); do not proceed.
+6. Two rules are a floor the charter cannot remove: `no-edit-protected-dirs` and
+   `no-edit-firewall-null-response`. They are present on every active turn, with or without
+   a charter. A backend list that omits them does not delete them.
+
+### What the constraints array does and does not enforce
+It is a cooperative protocol. Nothing in the MCP server, in either backend, or in the
+operating system stops an executor that ignores these rules in an ordinary chat session.
+The one structural property that does hold is narrow: the MCP process loads `tools.py` at
+startup, so editing that file on disk does not change the constraints the running session
+receives. That is a reload boundary, not a sandbox.
+
+OS-level enforcement of paths and network egress exists **only** for a process tree the TCE
+supervisor started under an enforcement tier, and even there it is partial:
+`docs/charter.md` states exactly which controls are enforced by the operating system, which
+are refusals by the manager, which are cooperative, and which — notably containment of the
+runtime credential and per-command action tracing — are **not enforced at all**.
 
 ## Non-negotiable
 1. Active takeover must not silently degrade to normal chat.

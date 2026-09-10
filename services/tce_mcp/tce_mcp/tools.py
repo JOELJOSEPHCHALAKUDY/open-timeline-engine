@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.version import MCP_SCHEMA_VERSION
@@ -366,8 +368,25 @@ def _persona_standdown_ack(persona_mode: str) -> str:
 
 # ---------------------------------------------------------------------------
 # Hard constraints — machine-readable locks sent in every takeover result.
-# Executors MUST treat directive_type="hard_constraint" as non-overridable
-# unless the user explicitly says "override constraint <rule_id>".
+#
+# Executors MUST treat directive_type="hard_constraint" as non-overridable.
+# There is NO override mechanism.  Earlier revisions of this comment, of
+# CLAUDE.md and of AGENTS.md told executors that the user could say
+# "override constraint <rule_id>"; no code anywhere in this repository ever
+# parsed that phrase, in this process or in either backend.  The claim was
+# documentation with no implementation and it has been deleted rather than
+# implemented (P3 §0.6).  An executor that needs a rule relaxed must ask the
+# user to change the active authority charter.
+#
+# Every rule carries a mandatory ``polarity`` field:
+#   "deny"       -- scope.path_prefixes is a DENY list: do NOT perform the
+#                   scoped actions on paths under those prefixes.
+#   "allow_only" -- scope.path_prefixes is an ALLOW list: perform the scoped
+#                   actions ONLY on paths under those prefixes.
+# A rule that arrives without the key is read as "deny" for backwards
+# compatibility.  The flag exists because ``charter-roots-only`` puts an
+# allow-list into the same field every pre-P3 rule used as a deny-list, and
+# without it a conforming executor reads the charter as its exact inverse.
 # ---------------------------------------------------------------------------
 PROTECTED_PATH_PREFIXES = [
     "shared/tce_shared/",
@@ -378,10 +397,14 @@ PROTECTED_PATH_PREFIXES = [
     "infra/",
 ]
 
+# Verbatim prefix of the API's capture-channel pause text (tce_api/tce_lite_api takeover_step, design §4.8).
+CAPTURE_CHANNEL_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: capture channel"
+
 HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "no-edit-protected-dirs",
+        "polarity": "deny",
         "scope": {
             "path_prefixes": PROTECTED_PATH_PREFIXES,
             "actions": ["edit", "write", "delete"],
@@ -395,6 +418,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "no-edit-firewall-null-response",
+        "polarity": "deny",
         "scope": {
             "path_prefixes": ["services/tce_mcp/"],
             "actions": ["edit"],
@@ -409,6 +433,7 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
     {
         "directive_type": "hard_constraint",
         "rule_id": "must-check-context-before-edit",
+        "polarity": "deny",
         "scope": {
             "actions": ["edit", "write"],
         },
@@ -418,7 +443,232 @@ HARD_CONSTRAINTS: list[dict[str, Any]] = [
             "If signal='block', do NOT edit. If signal='warn', review past_decisions."
         ),
     },
+    {
+        "directive_type": "hard_constraint",
+        "rule_id": "pause-when-capture-channel-down",
+        "polarity": "deny",
+        "scope": {
+            "actions": ["edit", "write", "delete", "execute"],
+        },
+        "enforcement": "pre_action_required",
+        "reason": (
+            "Before any mutating action, check capture_delivery_state in this result. If it is 'gap' or "
+            "'unavailable' and the autonomy profile is unattended, do NOT edit, write, delete, or execute; "
+            "tell the user the trusted human-input capture channel is down and ask them to restore the host "
+            "capture hook or approve continuing consultatively (autonomy profile human_consultative)."
+        ),
+    },
 ]
+
+# Conditional constraint: composed onto a COPY of HARD_CONSTRAINTS for the turns where
+# planning_pending is true, and never appended to HARD_CONSTRAINTS itself.  HARD_CONSTRAINTS
+# is a module-level list assigned by reference on every active turn, so appending to it would
+# forbid all mutation for every session in this process, forever.
+PLANNING_PENDING_CONSTRAINT: dict[str, Any] = {
+    "directive_type": "hard_constraint",
+    "rule_id": "no-execute-while-planning-pending",
+    "polarity": "deny",
+    "scope": {"actions": ["edit", "write", "delete", "execute"]},
+    "enforcement": "block_and_escalate",
+    "reason": (
+        "planning_pending=true means no approved plan exists for the current objective "
+        "revision. Any mutation now would execute against an invalidated or absent plan. "
+        "Wait for the next tce.takeover_step to return a directive."
+    ),
+}
+
+# ---- P4 ----
+# Conditional constraint: composed onto the per-turn list _merge_constraints returns, on the
+# turns where the decision policy abstained AND was allowed to speak.  Same rule as the
+# planning constraint above and for the same reason: HARD_CONSTRAINTS is process-global and
+# assigned by reference on every active turn, so a static append would tell every executor in
+# this process never to mutate anything for the life of the process.
+#
+# The ``exposed`` conjunct is load-bearing, not defensive.  Today ZERO decision families are
+# qualified, so every turn abstains and every turn carries exposed=false; without the conjunct
+# this rule would fire on every single turn and forbid all work.  ``exposed=true`` means a
+# family earned permission to use personalization AND the policy still declined to choose --
+# which is the only state in which "wait for the human" is the right instruction.
+POLICY_ABSTENTION_CONSTRAINT: dict[str, Any] = {
+    "directive_type": "hard_constraint",
+    "rule_id": "no-execute-on-policy-abstention",
+    "polarity": "deny",
+    "scope": {"actions": ["edit", "write", "delete", "execute"]},
+    "enforcement": "block_and_escalate",
+    "reason": (
+        "policy_decision.status='abstained' with exposed=true means the decision policy "
+        "declined to select an option for this turn. Show reason_for_asking and wait for the "
+        "human; do not mutate anything."
+    ),
+}
+
+# The eleven keys of ``PolicyDecisionBlock`` (shared/tce_shared/events.py), which is what
+# ``DecisionResult.block_payload()`` emits.  This is a firewall, not a convenience: the full
+# ``DecisionResult.to_payload()`` also carries ``policy_score``, an UNCALIBRATED vote share,
+# and an executor reading a number it cannot interpret is how four different fields in this
+# system came to be named some form of "confidence".  Projecting here means a backend that
+# hands the wide payload to the wire still cannot get a score past this process.
+POLICY_DECISION_KEYS: tuple[str, ...] = (
+    "status",
+    "selected_option",
+    "abstain_reason",
+    "reason_for_asking",
+    "ood_status",
+    "conflict_status",
+    "evidence_observation_ids",
+    "decision_policy_revision",
+    "exposed",
+    "exposure_state",
+    "advisor_agreement",
+)
+
+
+# ---------------------------------------------------------------------------
+# The constraint floor (P3 §9.3, §0.9I).
+#
+# From P3 onward the backend may supply its own ``constraints`` array, projected
+# from the active authority charter.  The charter may only ADD to the floor; it
+# may never remove it.  These two rule ids are the floor: one protects the
+# enforcement code itself, the other protects THIS module — the firewall that
+# strips directive text out of the tool result.  A charter that could delete
+# them would let the first approved charter remove the protection on the very
+# channel the constraints travel through.
+#
+# WHAT THIS DOES AND DOES NOT ENFORCE.  These rules are a cooperative protocol.
+# Nothing in this process, in either backend, or in the operating system stops
+# an executor that ignores them.  The one structural property that does hold is
+# narrow and worth stating exactly: this module is loaded into the MCP server at
+# process start, so an executor editing ``tools.py`` on disk does not change the
+# constraints its own running session receives.  That is a reload boundary, not
+# a sandbox.  OS-level enforcement of paths and egress exists only for a process
+# tree the supervisor started under an enforcement tier (docs/charter.md).
+# ---------------------------------------------------------------------------
+FLOOR_CONSTRAINT_RULE_IDS: frozenset[str] = frozenset(
+    {"no-edit-protected-dirs", "no-edit-firewall-null-response"}
+)
+
+# Verbatim prefix of the unresolved-effect pause (P3 §9.3).  Scoped to effect rows in
+# state "unknown" ONLY: "prepared" and "running" rows are non-empty for the whole of a
+# healthy dispatch, so triggering on those would prepend a pause on every step of a run
+# that is working correctly.
+UNRESOLVED_EFFECT_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved"
+
+
+def _constraint_polarity(value: Any) -> str:
+    """Normalise a rule's polarity.  A rule without the key is read as ``deny``."""
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"deny", "allow_only"} else "deny"
+
+
+def _normalize_constraint(rule: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy one rule and guarantee it carries a polarity.
+
+    The copy matters: ``HARD_CONSTRAINTS`` and ``PROTECTED_PATH_PREFIXES`` are module-level
+    objects shared by reference on every active turn, so a consumer that mutated a returned
+    rule in place would change what every later session in this process receives.
+    """
+    normalized = copy.deepcopy(rule)
+    normalized["polarity"] = _constraint_polarity(normalized.get("polarity"))
+    return normalized
+
+
+def _merge_constraints(backend: Any) -> list[dict[str, Any]]:
+    """Compose the constraint array for one turn: the floor first, then the backend's rules.
+
+    ``backend`` is whatever the API returned in ``constraints`` — normally
+    ``tce_shared.charter.charter_constraints(...)`` projected from the active charter, and
+    ``None`` (or an empty list) when no charter is active.
+
+    * ``backend`` empty/absent/not-a-list  -> the local ``HARD_CONSTRAINTS`` fallback, which
+      keeps every pre-P3 rule including ``must-check-context-before-edit``.
+    * ``backend`` non-empty -> the two floor rules, taken from ``HARD_CONSTRAINTS`` so their
+      text cannot be rewritten from the wire, followed by every backend rule whose ``rule_id``
+      is not already present.  A backend copy of a floor rule is dropped, not merged: the
+      local text wins.
+
+    Every returned rule carries ``polarity``.  Nothing here mutates a module-level object.
+    """
+    if not isinstance(backend, list) or not backend:
+        return [_normalize_constraint(rule) for rule in HARD_CONSTRAINTS]
+
+    merged: list[dict[str, Any]] = [
+        _normalize_constraint(rule)
+        for rule in HARD_CONSTRAINTS
+        if str(rule.get("rule_id") or "") in FLOOR_CONSTRAINT_RULE_IDS
+    ]
+    seen: set[str] = {str(rule["rule_id"]) for rule in merged}
+    for item in backend:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("rule_id") or "").strip()
+        if not rule_id or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        merged.append(_normalize_constraint(item))
+    return merged
+
+
+# ---- P4 ----
+def _slim_policy_decision(value: Any) -> dict[str, Any] | None:
+    """Project the backend's ``policy_decision`` onto exactly ``POLICY_DECISION_KEYS``.
+
+    Returns ``None`` when the backend sent nothing, or sent something that is not a dict —
+    an absent policy block and a malformed one are the same fact to an executor, and neither
+    is a reason to invent a decision.
+
+    Keys the backend did not send are absent from the projection rather than defaulted.  A
+    missing ``exposed`` must not read as ``false``-that-we-checked, because the two consumers
+    below (``_policy_abstention_applies`` and the executor) both treat absence as "no
+    permission", and defaulting here would hide a producer that forgot the field.
+
+    Anything not in ``POLICY_DECISION_KEYS`` is dropped, ``policy_score`` first among them.
+    """
+    if not isinstance(value, dict):
+        return None
+    projected: dict[str, Any] = {key: value[key] for key in POLICY_DECISION_KEYS if key in value}
+    if not projected:
+        return None
+    ids = projected.get("evidence_observation_ids")
+    if isinstance(ids, list):
+        projected["evidence_observation_ids"] = [str(item) for item in ids][:12]
+    elif "evidence_observation_ids" in projected:
+        projected["evidence_observation_ids"] = []
+    return projected
+
+
+def _policy_abstention_applies(policy_decision: dict[str, Any] | None) -> bool:
+    """True only when the policy abstained AND the family had permission to speak.
+
+    Both conjuncts are required.  ``status == "abstained"`` alone is the state of every turn
+    on today's corpus (an ordinary takeover turn offers no candidate options, so the policy
+    abstains with ``no_candidate_match``), and a rule that fires on every turn forbids all
+    work.  ``exposed is True`` -- identity, not truthiness -- is the permission half.
+    """
+    if not policy_decision:
+        return False
+    return policy_decision.get("exposed") is True and str(policy_decision.get("status") or "") == "abstained"
+
+
+def _unknown_effect_ids(unresolved_effects: Any) -> list[str]:
+    """Return the ids of effect rows whose state is ``unknown``.
+
+    A row without an explicit state is NOT treated as unknown.  That direction is
+    deliberate: the API's own ``final_response`` carries the authoritative pause, and
+    over-triggering here would prepend a pause to every step of a healthy dispatch
+    (P3 §9.3 / G15).
+    """
+    if not isinstance(unresolved_effects, list):
+        return []
+    ids: list[str] = []
+    for item in unresolved_effects:
+        if not isinstance(item, dict):
+            continue
+        state = str(item.get("state") or item.get("effect_state") or "").strip().lower()
+        if state != "unknown":
+            continue
+        ids.append(str(item.get("effect_id") or item.get("id") or "").strip())
+    return ids
+
 
 
 def with_schema(payload: dict[str, Any]) -> dict[str, Any]:
@@ -426,8 +676,15 @@ def with_schema(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def search_events(query: str, filters: dict[str, Any] | None = None, k: int = 10, time_range: dict[str, str] | None = None) -> dict[str, Any]:
-    body: dict[str, Any] = {"query": query, "filters": filters or {}, "k": k}
+def search_events(
+    query: str,
+    filters: dict[str, Any] | None = None,
+    k: int = 10,
+    time_range: dict[str, str] | None = None,
+    app_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Core MCP calls carry project binding: the request always names the project it runs in.
+    body: dict[str, Any] = {"query": query, "filters": filters or {}, "k": k, "app_context": with_project_context(app_context)}
     if time_range:
         if time_range.get("start"):
             body["time_start"] = time_range["start"]
@@ -450,6 +707,9 @@ def get_resume_packet(
     session_id: str = "default",
     k: int = 5,
     include_cross_user: bool = True,
+    source_session_id: str | None = None,
+    legacy_session_scope: bool = False,
+    current_git: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = client.get_resume_packet(
         {
@@ -458,6 +718,9 @@ def get_resume_packet(
             "session_id": session_id,
             "k": k,
             "include_cross_user": include_cross_user,
+            "source_session_id": source_session_id,
+            "legacy_session_scope": legacy_session_scope,
+            "current_git": current_git or {},
         }
     )
     citations: list[str] = []
@@ -483,6 +746,7 @@ def complete_task(
     git: dict[str, Any] | None = None,
     anchors: list[dict[str, Any]] | None = None,
     change_summary: dict[str, Any] | None = None,
+    app_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = client.capture_completion(
         {
@@ -497,6 +761,7 @@ def complete_task(
             "git": git or {},
             "anchors": anchors or [],
             "change_summary": change_summary or {},
+            "app_context": with_project_context(app_context),
             "milestone_schema": "v1",
         }
     )
@@ -684,8 +949,9 @@ def retrieval_eval_run(
     return with_schema({"kind": "retrieval_eval_run", "result": result, "citations": []})
 
 
-def get_patterns(domain: str | None = None, min_confidence: float = 0.5) -> dict[str, Any]:
-    patterns = client.get_patterns(domain=domain, min_confidence=min_confidence)
+def get_patterns(domain: str | None = None, min_confidence: float = 0.5, app_context: dict[str, Any] | None = None) -> dict[str, Any]:
+    project = with_project_context(app_context)
+    patterns = client.get_patterns(domain=domain, min_confidence=min_confidence, project_id=str(project.get("project_id") or "") or None)
     citations: list[str] = []
     for pattern in patterns:
         citations.extend(pattern.get("evidence_event_ids", []))
@@ -884,6 +1150,25 @@ def get_behavior_review_projection() -> dict[str, Any]:
     return client.get_behavior_review_projection()
 
 
+def get_task_state_projection(task_id: str) -> dict[str, Any]:
+    """Fetch the read-only Markdown projection of one task's state.
+
+    Backs the ``tce://workspace/{workspace_id}/task/{task_id}/state.md`` MCP *resource*.
+    It is deliberately not exposed as a tool: keeping it off the tool surface keeps it out
+    of ``_slim_takeover_result`` and out of the executor's mutating vocabulary.
+
+    ``TCEApiClient`` is not owned by this change, so the request goes through its generic
+    GET helper rather than through a new named client method.
+    """
+    response = client._get(f"/v1/tasks/{quote(str(task_id), safe='')}/state.md")
+    response.raise_for_status()
+    payload: Any = response.json()
+    if not isinstance(payload, dict):
+        return {}
+    projection: dict[str, Any] = payload
+    return projection
+
+
 def assign_behavior_projection_pilot(
     trial_key: str,
     situation_summary: str,
@@ -918,10 +1203,7 @@ def report_behavior_projection_pilot_outcome(
     actual_choice: str,
     agent_choice: str | None = None,
     top3_choices: list[str] | None = None,
-    agent_confidence: float = 0.0,
     abstained: bool = False,
-    action_similarity: float = 0.0,
-    workflow_similarity: float = 0.0,
     correction_required: bool = False,
     outcome_regret: bool = False,
     irrelevant_personalization: bool = False,
@@ -935,10 +1217,7 @@ def report_behavior_projection_pilot_outcome(
             "agent_choice": agent_choice,
             "top3_choices": top3_choices or [],
             "actual_choice": actual_choice,
-            "agent_confidence": agent_confidence,
             "abstained": abstained,
-            "action_similarity": action_similarity,
-            "workflow_similarity": workflow_similarity,
             "correction_required": correction_required,
             "outcome_regret": outcome_regret,
             "irrelevant_personalization": irrelevant_personalization,
@@ -1521,6 +1800,8 @@ def report_execution(
     failure_reason: str | None = None,
     details: dict[str, Any] | None = None,
     rollback_performed: bool = False,
+    lease_generation: int | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     normalized_details = _normalize_execution_milestone_details(
         state=state,
@@ -1536,6 +1817,8 @@ def report_execution(
         "failure_reason": failure_reason,
         "details": normalized_details,
         "rollback_performed": rollback_performed,
+        "lease_generation": lease_generation,
+        "idempotency_key": idempotency_key,
     }
     result_payload = client.report_execution(payload)
     return with_schema({"kind": "execution_report", "result": result_payload, "citations": []})
@@ -1544,6 +1827,25 @@ def report_execution(
 def get_execution_status(session_id: str = "default") -> dict[str, Any]:
     result = client.get_execution_status(session_id=session_id)
     return with_schema({"kind": "execution_status", "result": result, "citations": []})
+
+
+def _lease_generation_from_result(state: dict[str, Any], result: dict[str, Any]) -> int | None:
+    """Surface the directive lease the executor must echo on tce.report_execution.
+
+    The API carries the lease on ``pending_execution`` (a DirectiveExecution);
+    an explicit ``state.lease_generation`` wins when present.
+    """
+    raw = state.get("lease_generation")
+    if raw is None:
+        pending = result.get("pending_execution")
+        if isinstance(pending, dict):
+            raw = pending.get("lease_generation")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -1575,6 +1877,9 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             "project_context": project_context if isinstance(project_context, dict) else {},
         },
     }
+    lease_generation = _lease_generation_from_result(state, result)
+    if lease_generation is not None:
+        slim_state["lease_generation"] = lease_generation
 
     note = result.get("note")
     final_response = result.get("final_response")
@@ -1610,6 +1915,11 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
     if execution_claim_required:
         has_directive = False
 
+    # Planning-lifecycle derivations, computed BEFORE the branch chain so both the
+    # branch and the constraint composition below read the same values.
+    planning_pending: bool = bool(result.get("planning_pending", False))
+    hint_ms: int = int(result.get("planning_pending_hint_ms", 0) or 0) or 1500
+
     # Build the action instruction.
     # This is the ONLY mechanism to steer non-Claude executors (e.g. OpenAI).
     needs_human = bool(result.get("needs_human", False))
@@ -1632,6 +1942,12 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             final_response
             or "Execution claim required for this mutating directive. Call tce.claim_execution and then continue."
         )
+    elif needs_human and safety == "allow" and str(final_response or "").startswith(CAPTURE_CHANNEL_PAUSE_PREFIX):
+        # Capture-channel pause (design §4.8): the API's text must reach the
+        # executor verbatim in BOTH fields so it is shown to the user unchanged.
+        has_directive = False
+        next_step = str(final_response)
+        visible_response = str(final_response)
     elif needs_human and safety == "allow":
         has_directive = False
         next_step = (
@@ -1659,8 +1975,32 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
             "call tce.check_context(file_path) first. If it returns "
             "signal='block', do NOT edit that file. Take action now."
         )
+        if lease_generation is not None:
+            next_step += (
+                f" When the objective is complete, call tce.report_execution with lease_generation={lease_generation} "
+                "(the fencing token from your claim) and a stable idempotency_key."
+            )
         # Strip the directive from final_response so the LLM can't echo it
         visible_response = None
+    elif (
+        planning_pending
+        and not execution_permit_required
+        and not execution_claim_required
+        and not result.get("pending_execution")
+        and str(result.get("directive_state") or "") not in {"pending", "in_progress"}
+    ):
+        # A plan is being produced asynchronously and no executable directive exists yet.
+        # This branch sits BELOW the directive branch and additionally asserts that no
+        # execution lock is held (CLAUDE.md rule 18a defines the lock as pending_execution
+        # present OR directive_state in {pending, in_progress}), so a live directive is
+        # never hidden behind a "poll again" message.
+        has_directive = False
+        next_step = (
+            "PLANNING IN PROGRESS. No executable directive exists yet for this objective. "
+            "Do NOT start work and do NOT fall back to normal chat. Tell the user planning is "
+            f"running, then call tce.takeover_step again in about {hint_ms} ms to collect the plan."
+        )
+        visible_response = final_response or "Planning the objective; no directive yet."
     else:
         next_step = None
         visible_response = final_response
@@ -1668,6 +2008,12 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
     # Extract condensed clone_advice so the executor gets past-decision context
     # without flooding the tool result.  Keep it tight (~300 chars).
     clone_hints = _extract_clone_hints(result.get("clone_advice"))
+
+    # ---- P4 ----  What the decision policy decided this turn, and whether it was allowed to
+    # be used.  ``status`` and ``exposed`` are separate on purpose: "we abstained" and "we were
+    # not allowed to speak" are different facts.  No score crosses this line (see
+    # POLICY_DECISION_KEYS).
+    policy_decision = _slim_policy_decision(result.get("policy_decision"))
 
     slim = {
         "state": slim_state,
@@ -1690,20 +2036,87 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "execution_permit_required": execution_permit_required,
         "execution_permit_id": execution_permit_id,
         "continuity_ok": bool(result.get("continuity_ok", True)),
+        "capture_delivery_state": str(result.get("capture_delivery_state") or "unknown"),
+        "open_decision_opportunity_id": result.get("open_decision_opportunity_id"),
+        "project_binding": str(result.get("project_binding") or "unbound"),
         "directive_id": result.get("directive_id"),
         "directive_state": result.get("directive_state"),
         "pending_execution": result.get("pending_execution"),
         "retry_scheduled": bool(result.get("retry_scheduled", False)),
         "autonomy_notice": result.get("autonomy_notice"),
+        # Task-state / planning passthrough.  This dict is an explicit whitelist: a key that
+        # is not listed here is dropped silently, and a stale MCP process keeps dropping it
+        # after the API upgrades.  Every name the next_step string above interpolates must
+        # therefore appear here too.
+        "planning_pending": planning_pending,
+        "planning_job_id": result.get("planning_job_id"),
+        "planning_pending_hint_ms": int(result.get("planning_pending_hint_ms", 0) or 0),
+        "task_state_revision": int(result.get("task_state_revision", 0) or 0),
+        "task_state": result.get("task_state", {}),
+        "citations": [str(item) for item in (result.get("citations") or [])][:12],
+        # ---- P4 ----  An explicit whitelist drops any key not named here, so this line is
+        # what makes policy_decision reach the executor at all.  A stale MCP process keeps
+        # dropping it after the API upgrades: this module is loaded at process start, so the
+        # MCP client (Claude Desktop, Codex, Cursor) must be restarted after a TCE upgrade.
+        "policy_decision": policy_decision,
+        # ---- P5 ----  How many aspiration proposals are waiting for the owner right now.
+        # One integer and nothing else: P5 contributes no constraint rule (p45_shared.md
+        # §3.2 clause 5) and forwards no proposal text through this path.  The executor
+        # calls tce.dreams to read them, which is also what records that they were shown.
+        # Same whitelist caveat as policy_decision: this module is loaded at MCP process
+        # start, so a stale MCP client keeps dropping this key after the API upgrades and
+        # must be restarted.
+        "dream_proposals_pending": int(result.get("dream_proposals_pending") or 0),
     }
     if clone_hints:
         slim["clone_hints"] = clone_hints
 
     # Attach hard constraints when takeover is active so the executor
     # sees them every turn — machine-readable, not prose.
+    #
+    # The SOURCE changed in P3, the shape did not: when the backend projects the active
+    # authority charter into ``constraints`` we merge it onto the floor; when it does not,
+    # _merge_constraints returns the local HARD_CONSTRAINTS fallback unchanged.  Either way
+    # the two floor rules survive and every rule carries a polarity.
+    #
+    # HARD_CONSTRAINTS is process-global and must never be mutated: it is read on every
+    # active turn, so a single append would forbid all mutation for every session in this
+    # process for the life of the process.  _merge_constraints composes a fresh, deep-copied
+    # list per turn; the planning rule is appended to that copy, never to the global.
     is_active = slim_state.get("active", False)
     if is_active:
-        slim["constraints"] = HARD_CONSTRAINTS
+        constraints: list[dict[str, Any]] = _merge_constraints(result.get("constraints"))
+        if planning_pending:
+            constraints.append(_normalize_constraint(PLANNING_PENDING_CONSTRAINT))
+        # ---- P4 ----  Last in the order, and conditional on BOTH halves of the policy block.
+        # Order is floor rules, the rest of HARD_CONSTRAINTS, charter-derived rules, the
+        # planning rule, then this one; tests/mcp/test_policy_contract.py pins it.
+        if _policy_abstention_applies(policy_decision):
+            constraints.append(_normalize_constraint(POLICY_ABSTENTION_CONSTRAINT))
+        slim["constraints"] = constraints
+
+        # Charter provenance, forwarded only while takeover is active.  These say WHICH
+        # authority is in force and under WHICH enforcement tier; docs/charter.md states
+        # what each tier does and does not enforce.
+        slim["charter_active"] = bool(result.get("charter_active", False))
+        slim["charter_version"] = str(result.get("charter_version") or "")
+        slim["enforcement_tier"] = result.get("enforcement_tier")
+        unresolved_effects = result.get("unresolved_effects")
+        slim["unresolved_effects"] = unresolved_effects if isinstance(unresolved_effects, list) else []
+
+        # The pause is scoped to effect rows in state "unknown" — an effect that may have
+        # landed and may be irreversible, and that nothing has resolved.  "prepared" and
+        # "running" rows are the normal state of a live dispatch and must not pause it.
+        unknown_ids = _unknown_effect_ids(unresolved_effects)
+        if unknown_ids:
+            pause_text = (
+                f"{UNRESOLVED_EFFECT_PAUSE_PREFIX} and may be irreversible. "
+                f"Resolve effect {unknown_ids[0]} before continuing."
+            )
+            existing_next_step = slim.get("next_step")
+            slim["next_step"] = (
+                f"{pause_text} {existing_next_step}" if existing_next_step else pause_text
+            )
 
     # Include persona acknowledgement on activation so the executor
     # greets the user in-character. Bake it into final_response AND
@@ -1762,6 +2175,9 @@ def _extract_clone_hints(clone_advice: dict[str, Any] | None) -> dict[str, Any] 
                 {
                     "situation": summary,
                     "decision": response,
+                    # Keep the observation id so a hint the executor acts on is traceable
+                    # back to the decision_observations row it came from.
+                    "observation_id": obs.get("observation_id"),
                     "recall_source": obs.get("recall_source", "exact"),
                     "similarity": obs.get("similarity"),
                 }
@@ -1827,3 +2243,215 @@ def reset_takeover_state(
         payload["final_response"] = ack
 
     return with_schema(payload)
+
+
+# ---------------------------------------------------------------------------
+# ---- P5 ----  Aspiration proposals.
+#
+# This tool is the READ-AND-RECORD half of the proposal surface, and only that half.
+# Listing a proposal is what puts it in front of the owner, so listing is also what
+# records ``surfaced`` — that record is the only thing that keeps *nonresponse* (the
+# owner never answered) distinguishable from *rejection* (the owner said no).  A GET
+# that silently marks nothing would make the two indistinguishable again, which is the
+# defect P5 exists to remove.
+#
+# The tool deliberately does NOT offer accept / reject / snooze / unsnooze.  Those are
+# verdicts, a verdict requires a verified human identity, and this process authenticates
+# as an executor: ``config.py`` pins ``mcp_role = "executor"`` and
+# ``client.assert_executor_credential_is_not_host_capture`` raises if the process is ever
+# handed the host-capture credential.  A tool that offered an action it would always be
+# 403'd on would be worse than one that does not offer it, so the refusal is explicit and
+# names the client that can do it.
+#
+# P5 adds NO constraint rule and touches no line of ``_merge_constraints``
+# (p45_shared.md §3.2 clause 5).  Its only additive slim-result key is the integer
+# ``dream_proposals_pending``.
+# ---------------------------------------------------------------------------
+
+DREAM_TOOL_ACTIONS: tuple[str, ...] = ("list", "surfaced")
+
+# Every spelling of a verdict an executor might try.  Matched only to produce a useful
+# refusal — this process cannot authenticate for any of them.
+DREAM_VERDICT_ACTION_NAMES: frozenset[str] = frozenset(
+    {"accept", "accepted", "reject", "rejected", "snooze", "snoozed", "unsnooze", "unsnoozed"}
+)
+
+DREAM_VERDICT_REFUSAL: str = (
+    "A dream verdict (accept, reject, snooze, unsnooze) requires a verified human identity. "
+    "This MCP process authenticates as an executor and is structurally barred from holding the "
+    "host-capture credential, so it cannot record one. Ask the owner to run "
+    "`tce dreams accept --id <proposal_id>` (or reject / snooze / unsnooze) from the CLI. "
+    "Do not re-try this through any other tool."
+)
+
+DREAM_UNKNOWN_ACTION_REFUSAL: str = (
+    "tce.dreams accepts action='list' (read the open proposals, which also records that they "
+    "were shown) or action='surfaced' with proposal_id (record that one proposal was shown)."
+)
+
+
+def _dream_citation_summary(raw: Any) -> dict[str, Any]:
+    """One citation, reduced to what an executor needs to render it.
+
+    The ``quote`` is passed through unaltered: it is a verbatim span of a message the owner
+    is receipted as having typed, and truncating it here would make the thing on screen no
+    longer the thing that was verified.  Length is already bounded server-side by
+    ``dream_quote_max_chars``.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "event_id": str(raw.get("event_id") or ""),
+        "origin_kind": str(raw.get("origin_kind") or ""),
+        "observed_at": raw.get("observed_at"),
+        "quote": str(raw.get("quote") or ""),
+    }
+
+
+def _dream_proposal_summary(raw: Any) -> dict[str, Any]:
+    """One proposal, reduced to the fields that carry meaning to a reader.
+
+    ``attribution`` is carried because it is load-bearing, not decorative: a proposal built
+    from imported history reads "from your imported history" and must never be rendered as
+    "you said".  ``nonresponse`` is carried for the same reason it exists — so a reader can
+    see that "no answer yet" is not "no".
+    """
+    if not isinstance(raw, dict):
+        return {}
+    citations = [
+        summary
+        for summary in (_dream_citation_summary(item) for item in (raw.get("citations") or []))
+        if summary
+    ]
+    return {
+        "id": str(raw.get("id") or ""),
+        "title": str(raw.get("title") or ""),
+        "connection": str(raw.get("connection") or ""),
+        "benefit": str(raw.get("benefit") or ""),
+        "first_step": str(raw.get("first_step") or ""),
+        "status": str(raw.get("status") or ""),
+        "nonresponse": str(raw.get("nonresponse") or ""),
+        "surfaced_count": int(raw.get("surfaced_count") or 0),
+        "attribution": str(raw.get("attribution") or ""),
+        "evidence_basis": str(raw.get("evidence_basis") or ""),
+        "citations_verified": str(raw.get("citations_verified") or ""),
+        "citation_count": int(raw.get("citation_count") or len(citations)),
+        "citations": citations,
+        "snooze_until": raw.get("snooze_until"),
+        "expires_at": raw.get("expires_at"),
+        "project_id": raw.get("project_id"),
+        "scope_kind": str(raw.get("scope_kind") or ""),
+    }
+
+
+def _record_dream_surfaced(*, session_id: str, proposal_id: str) -> bool:
+    """Record that one proposal was put in front of the owner.  Best effort, by design.
+
+    A refusal here must never fail the read.  The transition route rate-limits re-surfacing
+    (a second ``surfaced`` inside the re-surface interval appends nothing), so a non-2xx or
+    a transport error is an ordinary outcome and is reported as a count, not raised.
+    """
+    if not proposal_id:
+        return False
+    try:
+        response = client._post(
+            f"/v1/dreams/{quote(str(proposal_id), safe='')}/transition",
+            {"session_id": session_id, "action": "surfaced"},
+        )
+    except Exception:
+        return False
+    return 200 <= int(response.status_code) < 300
+
+
+def dreams(
+    session_id: str = "default",
+    action: str = "list",
+    proposal_id: str = "",
+) -> dict[str, Any]:
+    """Read open aspiration proposals, and record that they were shown.
+
+    ``action="list"``     — fetch the open proposals, then post ``surfaced`` for exactly the
+                            ones returned.  The ids marked are reported back in
+                            ``surfaced_recorded``.
+    ``action="surfaced"`` — record that a single proposal (``proposal_id``) was shown.
+    """
+    normalized = str(action or "list").strip().lower()
+
+    if normalized in DREAM_VERDICT_ACTION_NAMES:
+        return with_schema(
+            {
+                "kind": "dream_action_refused",
+                "action": normalized,
+                "refused": True,
+                "reason": "verdict_requires_verified_human",
+                "next_step": DREAM_VERDICT_REFUSAL,
+                "citations": [],
+            }
+        )
+
+    if normalized == "surfaced":
+        recorded = _record_dream_surfaced(session_id=session_id, proposal_id=str(proposal_id or "").strip())
+        return with_schema(
+            {
+                "kind": "dream_surfaced",
+                "proposal_id": str(proposal_id or "").strip(),
+                "surfaced_recorded": [str(proposal_id).strip()] if recorded else [],
+                "citations": [],
+            }
+        )
+
+    if normalized != "list":
+        return with_schema(
+            {
+                "kind": "dream_action_refused",
+                "action": normalized,
+                "refused": True,
+                "reason": "unknown_action",
+                "next_step": DREAM_UNKNOWN_ACTION_REFUSAL,
+                "citations": [],
+            }
+        )
+
+    # The route decides how many rows to return (``dream_list_limit``).  The tool asserts no
+    # page size: a client-chosen limit is a second source of truth for how much of the owner's
+    # own history he is allowed to see.
+    response = client._get("/v1/dreams", params={"session_id": session_id})
+    response.raise_for_status()
+    payload: Any = response.json()
+    body: dict[str, Any] = payload if isinstance(payload, dict) else {}
+    proposals = [
+        summary
+        for summary in (_dream_proposal_summary(item) for item in (body.get("proposals") or []))
+        if summary.get("id")
+    ]
+
+    # Record the display for exactly what was rendered, and nothing else.
+    surfaced_recorded = [
+        item["id"]
+        for item in proposals
+        if _record_dream_surfaced(session_id=session_id, proposal_id=str(item["id"]))
+    ]
+
+    citations: list[str] = []
+    for item in proposals:
+        for citation in item.get("citations") or []:
+            event_id = str(citation.get("event_id") or "")
+            if event_id and event_id not in citations:
+                citations.append(event_id)
+
+    result: dict[str, Any] = {
+        "kind": "dream_proposals",
+        "proposals": proposals,
+        "proposal_count": len(proposals),
+        "surfaced_recorded": surfaced_recorded,
+        "citations": citations[:12],
+        "verdicts_require": DREAM_VERDICT_REFUSAL,
+    }
+    # ``citations_verified`` says how much the list route actually proved before returning
+    # these rows ("cheap": existence, scope, sensitivity ceiling and receipt binding; the
+    # detail route re-checks the quotes themselves).  Forwarding it means the reader is never
+    # left guessing, and an empty list stays legible as an empty list rather than as silence.
+    for key in ("total", "citations_verified"):
+        if key in body:
+            result[key] = body[key]
+    return with_schema(result)

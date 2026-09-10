@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import uuid
@@ -12,10 +11,19 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from tce_model_gateway import get_gateway
+from tce_shared.deadline import (
+    ADVISOR_TURN_DEADLINE,
+    Deadline,
+    RetrievalLedger,
+    embedding_cache_key,
+)
+from tce_shared.scope import ResolvedScope, ScopeDialect, observations_scope_predicate
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 
 from .cache_clients import get_redis_client
 from .config import get_settings
+from .deadline_pg import absorb_pg_deadline, begin_pg_deadline, finish_pg_deadline
+from .policy_store import policy_columns_available
 
 logger = logging.getLogger(__name__)
 _OBS_EMBED_CACHE_TTL = 600
@@ -40,6 +48,7 @@ def _ensure_decision_observation_schema(db: Session) -> None:
         return
     try:
         db.execute(text("ALTER TABLE decision_observations ADD COLUMN IF NOT EXISTS superseded_by UUID"))
+        db.execute(text("ALTER TABLE decision_observations ADD COLUMN IF NOT EXISTS origin_kind TEXT"))
         db.execute(
             text(
                 """
@@ -83,30 +92,51 @@ def _situation_candidates(raw: str | None) -> list[str]:
 
 def query_similar_observations(
     db: Session,
-    consumer_id: str,
-    workspace_id: str,
-    subject_user_id: str,
+    *,
+    scope: ResolvedScope,
     situation_type: str,
     situation_text: str | None = None,
     limit: int = 5,
+    ledger: RetrievalLedger | None = None,
 ) -> list[dict[str, Any]]:
     """Query promoted observations for one behavior subject.
 
-    Executor identity is intentionally not part of this filter: multiple
-    executors may contribute evidence for the same authorized human subject.
+    Executor identity is intentionally not part of this filter: multiple executors may
+    contribute evidence for the same authorized human subject.  ``consumer_id`` used to be a
+    parameter here and was never referenced in the SQL — a parameter that does nothing is a
+    parameter a reader trusts — so it is gone rather than documented.
+
+    The scope clauses are *rendered* by ``observations_scope_predicate`` rather than
+    hand-written.  Before P4 this query was scoped by ``(workspace_id, subject_user_id,
+    situation_type)`` and nothing else, while the context bundle assembled in the same handler
+    was project-scoped -- so the advisor was shown one project's evidence for another project's
+    question.  A hand-written clause that forgets one compiles, type-checks and leaks.
+
+    The deadline arrives through ``ADVISOR_TURN_DEADLINE`` rather than a parameter: this
+    function is reached from ``clone_advice``, several frames below the turn that owns it.
     """
+    deadline: Deadline | None = ADVISOR_TURN_DEADLINE.get()
     settings = get_settings()
     _ensure_decision_observation_schema(db)
     candidates = _situation_candidates(situation_type)
+    predicate = observations_scope_predicate(
+        scope,
+        dialect=ScopeDialect.POSTGRES,
+        # The project column arrives with alembic 20260909_0040. Until it does, this scopes by
+        # workspace and subject alone rather than issuing SQL the database will reject: one
+        # rejected statement aborts the surrounding transaction, and this runs on the turn path.
+        include_project=policy_columns_available(db),
+    )
+    scope_where = predicate.where_sql
+    scope_params = dict(predicate.named_params)
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, situation_type, situation_summary, context_snapshot,
                    user_response, response_reasoning, outcome, outcome_sentiment,
-                   source_event_ids, confidence, ts
+                   source_event_ids, confidence, ts, selected_choice, evidence_source
             FROM decision_observations
-            WHERE workspace_id = :workspace_id
-              AND subject_user_id = :subject_user_id
+            WHERE {scope_where}
               AND situation_type = ANY(:situation_types)
               AND learning_eligible = true
               AND superseded_by IS NULL
@@ -118,8 +148,7 @@ def query_similar_observations(
             """
         ),
         {
-            "workspace_id": workspace_id,
-            "subject_user_id": subject_user_id,
+            **scope_params,
             "situation_types": candidates,
             "limit": limit,
         },
@@ -137,6 +166,11 @@ def query_similar_observations(
             "source_event_ids": row[8] or [],
             "confidence": row[9],
             "ts": row[10].isoformat() if row[10] else None,
+            # The prompt renders the chosen option and how the row was captured, and the policy
+            # maps the choice onto the offered options.  Neither was selected before, so the
+            # advisor was shown a decision with no decision in it.
+            "selected_choice": row[11],
+            "evidence_source": row[12],
             "recall_source": "exact",
             "similarity": None,
         }
@@ -147,7 +181,7 @@ def query_similar_observations(
         or not situation_text
         or not _should_use_semantic_fallback(
             db,
-            workspace_id=workspace_id,
+            workspace_id=scope.workspace_id,
             exact_count=len(results),
             settings=settings,
         )
@@ -158,20 +192,35 @@ def query_similar_observations(
     if not query_embedding:
         return results[:limit]
 
+    # This block used to open a bare `with db.begin_nested(): SET LOCAL ...`. RELEASE does not
+    # revert SET LOCAL, so it left its timeout in force for the rest of the transaction.
+    timeout_ms = max(1, int(getattr(settings, "obs_semantic_query_timeout_ms", 80)))
+    floor_ms = max(1, int(getattr(settings, "retrieval_statement_floor_ms", 10)))
+    guard = begin_pg_deadline(
+        db,
+        deadline if deadline is not None else Deadline.unbounded("observations"),
+        name="observation_ann",
+        ledger=ledger,
+        requested_ms=timeout_ms,
+        floor_ms=floor_ms,
+    )
+    if guard is None:
+        return results[:limit]
     try:
-        timeout_ms = max(1, int(getattr(settings, "obs_semantic_query_timeout_ms", 80)))
-        with db.begin_nested():
-            db.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
-            vector_rows = db.execute(
+        vector_rows = db.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, situation_type, situation_summary, context_snapshot,
                            user_response, response_reasoning, outcome, outcome_sentiment,
-                           source_event_ids, confidence, ts,
+                           source_event_ids, confidence, ts, selected_choice, evidence_source,
                            1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
                     FROM decision_observations
-                    WHERE workspace_id = :workspace_id
-                      AND subject_user_id = :subject_user_id
+                    WHERE {scope_where}
+                      -- P4: the semantic arm keeps the situation filter.  It used to drop it
+                      -- entirely, so the fallback returned cross-situation rows in precisely
+                      -- the low-evidence cases where abstaining matters most: it was widest
+                      -- exactly where the evidence was thinnest.
+                      AND situation_type = ANY(:situation_types)
                       AND learning_eligible = true
                       AND embedding IS NOT NULL
                       AND superseded_by IS NULL
@@ -183,15 +232,19 @@ def query_similar_observations(
                     """
                 ),
                 {
-                    "workspace_id": workspace_id,
-                    "subject_user_id": subject_user_id,
+                    **scope_params,
+                    "situation_types": candidates,
                     "query_embedding": _embedding_as_vector_literal(query_embedding),
                     "limit": max(limit, settings.obs_semantic_top_k),
                 },
             ).fetchall()
     except Exception as exc:
-        logger.warning("semantic observation recall failed; using exact-only observations: %s", exc)
+        if not absorb_pg_deadline(guard, db, exc):
+            logger.warning(
+                "semantic observation recall failed; using exact-only observations: %s", exc
+            )
         return results[:limit]
+    finish_pg_deadline(guard, db, rows=len(vector_rows))
 
     seen = {item["id"] for item in results}
     for row in vector_rows:
@@ -211,8 +264,10 @@ def query_similar_observations(
                 "source_event_ids": row[8] or [],
                 "confidence": row[9],
                 "ts": row[10].isoformat() if row[10] else None,
+                "selected_choice": row[11],
+                "evidence_source": row[12],
                 "recall_source": "semantic",
-                "similarity": float(row[11]) if row[11] is not None else None,
+                "similarity": float(row[13]) if row[13] is not None else None,
             }
         )
         seen.add(row_id)
@@ -259,12 +314,21 @@ def _embedding_as_vector_literal(embedding: list[float]) -> str:
     return "[" + ",".join(f"{float(value):.8f}" for value in embedding) + "]"
 
 
+def _observation_embedding_cache_key(query: str, settings: Any) -> str:
+    """Model- and dimension-scoped, so a model swap cannot serve stale vectors."""
+    return embedding_cache_key(
+        model_id=str(getattr(settings, "embed_model", "")),
+        dimensions=int(getattr(settings, "embed_dimensions", 1024)),
+        query_text=query,
+    )
+
+
 def _get_cached_observation_embedding(query: str, settings: Any) -> list[float] | None:
     try:
         cache = get_redis_client(settings.redis_url)
         if cache is None:
             return None
-        key = f"tce:obs-embed:{hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]}"
+        key = _observation_embedding_cache_key(query, settings)
         raw = cache.get(key)
         if raw:
             decoded = json.loads(raw)
@@ -280,7 +344,7 @@ def _set_cached_observation_embedding(query: str, embedding: list[float], settin
         cache = get_redis_client(settings.redis_url)
         if cache is None:
             return
-        key = f"tce:obs-embed:{hashlib.sha256(query.encode('utf-8')).hexdigest()[:16]}"
+        key = _observation_embedding_cache_key(query, settings)
         cache.setex(key, _OBS_EMBED_CACHE_TTL, json.dumps(embedding))
     except Exception:
         pass
@@ -494,11 +558,11 @@ def save_observation(db: Session, observation: dict[str, Any]) -> UUID:
             INSERT INTO decision_observations
                 (consumer_id, workspace_id, ts, situation_type, situation_summary,
                  context_snapshot, user_response, response_reasoning, outcome,
-                 outcome_sentiment, source_event_ids, confidence, superseded_by)
+                 outcome_sentiment, source_event_ids, confidence, superseded_by, origin_kind)
             VALUES
                 (:consumer_id, :workspace_id, :ts, :situation_type, :situation_summary,
                  CAST(:context_snapshot AS jsonb), :user_response, :response_reasoning, :outcome,
-                 :outcome_sentiment, :source_event_ids, :confidence, NULL)
+                 :outcome_sentiment, :source_event_ids, :confidence, NULL, :origin_kind)
             RETURNING id
             """
         ),
@@ -515,6 +579,8 @@ def save_observation(db: Session, observation: dict[str, Any]) -> UUID:
             "outcome_sentiment": observation.get("outcome_sentiment"),
             "source_event_ids": observation.get("source_event_ids", []),
             "confidence": observation.get("confidence", 1.0),
+            # P1: routine writers tag their origin so extraction treats them as context, never evidence.
+            "origin_kind": (str(observation.get("origin_kind") or "") or None),
         },
     )
     observation_id = result.scalar_one()

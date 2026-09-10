@@ -14,6 +14,9 @@ from tce_shared.redaction import (
     redact_payload as shared_redact_payload,
 )
 from tce_shared.redaction import (
+    redact_project_hint as shared_redact_project_hint,
+)
+from tce_shared.redaction import (
     redact_text as shared_redact_text,
 )
 
@@ -28,6 +31,12 @@ def redact_payload(payload: Any, hints: Iterable[str] | None = None) -> tuple[An
     return shared_redact_payload(payload, hints=hints, allowlist_keys=ALLOWLIST_KEYS)
 
 
+def redact_project_hint(hint: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Sanitize a host-supplied project hint. Deliberately ignores ALLOWLIST_KEYS: 'repo', 'project'
+    and 'branch' are exactly the keys a credential URL hides in."""
+    return shared_redact_project_hint(hint)
+
+
 def apply_redaction_zones(
     payload: dict[str, Any], context: dict[str, Any], zones: Iterable[str]
 ) -> tuple[dict[str, Any], bool]:
@@ -39,5 +48,6 @@ __all__ = [
     "SECRET_PATTERNS",
     "apply_redaction_zones",
     "redact_payload",
+    "redact_project_hint",
     "redact_text",
 ]

@@ -20,11 +20,13 @@ ignore = ["B008"]
 "tests/eval/harness/*.py" = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
-pythonpath = ["services/tce_api", "services/tce_worker", "services/tce_mcp", "services/tce_lite_api", "shared"]
+pythonpath = ["services/tce_api", "services/tce_worker", "services/tce_mcp", "services/tce_lite_api", "services/tce_supervisor", "shared"]
 testpaths = ["tests"]
 markers = [
   "e2e: requires a live Full PostgreSQL stack and MCP transport",
   "integration: requires an API integration environment",
+  "subprocess: spawns a real process; exempt from the tests/conftest.py _no_subprocess guard",
+  "network: connects off-loopback; exempt from the tests/conftest.py _no_socket guard",
 ]
 
 [tool.mypy]

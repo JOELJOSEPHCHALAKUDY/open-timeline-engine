@@ -216,6 +216,17 @@ set_env_key() {
   mv "$tmp" "$ENV_FILE"
 }
 
+unset_env_key() {
+  # Remove a key from .env entirely (used for credentials that must never live in a
+  # file mounted into the API container / readable from an executor shell).
+  local key="$1"
+  local tmp
+  [ -f "$ENV_FILE" ] || return 0
+  tmp="$(mktemp)"
+  awk -v k="$key" '$0 !~ ("^" k "=")' "$ENV_FILE" > "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
 backup_env() {
   if [ -n "${ENV_BACKUP:-}" ]; then
     return
@@ -745,6 +756,60 @@ ensure_python3() {
   return 0
 }
 
+HOST_CAPTURE_CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/open-timeline-engine"
+HOST_CAPTURE_TOKEN_FILE="${HOST_CAPTURE_CONFIG_DIR}/host_capture.token"
+HOST_CAPTURE_ENV_FILE="${HOST_CAPTURE_CONFIG_DIR}/host_capture.env"
+
+resolved_human_subject_id() {
+  # The human behind the executors: the id MCP clients send as X-TCE-Behavior-Subject.
+  local fallback="$1"
+  local value
+  value="$(env_value_or_default "TCE_MCP_BEHAVIOR_SUBJECT_ID" "")"
+  [ -z "$value" ] && value="$(env_value_or_default "TCE_BEHAVIOR_SUBJECT_ID" "")"
+  [ -z "$value" ] && value="$(env_value_or_default "TCE_MCP_USER_ID" "")"
+  [ -z "$value" ] && value="$fallback"
+  printf '%s' "$value"
+}
+
+provision_host_capture_credentials() {
+  # Separate credential for the trusted human-input hook (scripts/tce_capture_input.py).
+  # It lives ONLY in a 0600 file under ~/.config/open-timeline-engine and is never written
+  # to the repo .env: .env is bind-mounted into the API container and readable by any
+  # executor with a shell in the workspace, which would defeat the credential separation.
+  # The API reads the same file through TCE_HOST_CAPTURE_TOKENS_FILE, mounted read-only at
+  # /run/secrets/tce_host_capture_token (infra/docker-compose*.yml). It is NEVER passed to
+  # configure_mcp_clients.sh and never written as TCE_API_TOKEN(S).
+  local workspace_id="$1"
+  local human_user_id="$2"
+  local api_url="$3"
+  local executor_token="$4"
+  local token=""
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Warning: python3 missing; host capture credential not provisioned."
+    return 1
+  fi
+  if [ -s "$HOST_CAPTURE_TOKEN_FILE" ]; then
+    token="$(head -n 1 "$HOST_CAPTURE_TOKEN_FILE" | tr -d '[:space:]')"
+  fi
+  if [ -z "$token" ] || [ "$token" = "$executor_token" ] || [ "$token" = "local-dev-token" ] || [ "$token" = "changeme" ]; then
+    token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  fi
+  if ! (umask 077 && mkdir -p "$HOST_CAPTURE_CONFIG_DIR" && printf '%s\n' "$token" > "$HOST_CAPTURE_TOKEN_FILE"); then
+    echo "Warning: could not write ${HOST_CAPTURE_TOKEN_FILE}; the capture hook will report 'disabled'."
+    return 1
+  fi
+  chmod 700 "$HOST_CAPTURE_CONFIG_DIR" 2>/dev/null || true
+  chmod 600 "$HOST_CAPTURE_TOKEN_FILE" 2>/dev/null || true
+  (umask 077 && printf 'TCE_CAPTURE_WORKSPACE=%s\nTCE_CAPTURE_USER=%s\nTCE_API_BASE_URL=%s\n' "$workspace_id" "$human_user_id" "$api_url" > "$HOST_CAPTURE_ENV_FILE") || true
+  chmod 600 "$HOST_CAPTURE_ENV_FILE" 2>/dev/null || true
+  # Never persist the credential in the repo .env (it is mounted into the API container and
+  # readable from any executor shell); scrub a value left there by an older install.
+  unset_env_key "TCE_HOST_CAPTURE_TOKENS"
+  echo "Host capture credential: ${HOST_CAPTURE_TOKEN_FILE} (workspace=${workspace_id}, user=${human_user_id}; never written to .env, never shared with MCP clients)"
+  return 0
+}
+
 install_cli_capture_runtime() {
   if ! ensure_python3; then
     echo "Warning: skipping CLI capture runtime setup (python3 missing)."
@@ -772,6 +837,8 @@ if [ -f "$ROOT/.env" ]; then
   . "$ROOT/.env"
   set +a
 fi
+# The host capture credential is server-side only; the executor CLI must never present it.
+unset TCE_HOST_CAPTURE_TOKENS TCE_HOST_CAPTURE_TOKEN
 : "${TCE_USER_CONSUMER_ID:=${TCE_MCP_EXECUTOR_CONSUMER_ID:-codex-executor}}"
 : "${TCE_USER_ID:=${TCE_MCP_EXECUTOR_USER_ID:-${TCE_USER_CONSUMER_ID}}}"
 : "${TCE_USER_WORKSPACE_ID:=${TCE_MCP_WORKSPACE_ID:-personal}}"
@@ -1218,43 +1285,25 @@ install_client_hooks() {
 
   echo "Step 12 - Client hooks"
 
+  local hooks_generator="${ROOT}/scripts/generate_client_hooks.py"
+  local capture_script="${ROOT}/scripts/tce_capture_input.py"
+  if [ ! -f "$hooks_generator" ] || [ ! -f "$capture_script" ]; then
+    echo "  Hook generator or capture hook missing under ${ROOT}/scripts; skipping client hook setup."
+    return 1
+  fi
+
+  # Hook JSON is produced by scripts/generate_client_hooks.py (plain dict -> json.dumps, no f-strings),
+  # so the JSON braces inside hook commands stay single. UserPromptSubmit always carries two hooks:
+  # [trusted human-input capture, takeover-policy echo], in that order.
   local hooks_json
-  hooks_json=$(python3 -c "
-import json, sys
-self_heal = sys.argv[1]
-hooks = {
-    'hooks': {
-        'UserPromptSubmit': [{
-                'matcher': '*',
-                'hooks': [{
-                    'type': 'command',
-                'command': 'echo \'{\"systemMessage\": \"[TCE-HOOK] Conditional takeover policy: scan chat history for activation and stand-down state. Call mcp__tce-executor__tce_takeover_step only on activation turns and while takeover is active (use executor session_id, for example codex/claude, with activation_mode_default=takeover). On stand-down turns, call mcp__tce-executor__tce_reset_takeover_state. While inactive, respond naturally and do not call takeover_step or check_context in normal flow. If has_directive=true, execute the objective immediately. If safety_decision=confirm_required, ask for confirmation.\"}\'',
-                'timeout': 10
-            }]
-        }],
-        'PostToolUse': [{
-            'matcher': 'Edit|Write',
-            'hooks': [{
-                'type': 'command',
-                'command': 'if echo \"\$TOOL_INPUT\" | grep -q \"open-timeline-engine\"; then echo \\'{\"systemMessage\": \"[TCE-SELF-HEAL] You modified a TCE file. Run: bash ' + self_heal + ' then continue the current workflow. Call mcp__tce-executor__tce_takeover_step only if takeover is active in this chat; otherwise continue naturally.\"}\\'; else echo \\'{\"continue\": true}\\'; fi',
-                'timeout': 10
-            }]
-        }],
-        'Stop': [{
-            'matcher': '*',
-            'hooks': [{
-                'type': 'command',
-                'command': 'echo \'{"systemMessage": "[TCE-COMPLETION] Before ending after any mutating change, call mcp__tce-executor__tce_complete_task with the title, touched files, decision, outcome/next step, git refs, and anchors. Skip only when tce.report_execution already captured this completion."}\'',
-                'timeout': 10
-            }]
-        }]
-    }
-}
-print(json.dumps(hooks, indent=2))
-" "$self_heal_path" 2>/dev/null) || {
+  hooks_json=$(python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client claude 2>/dev/null) || {
     echo "  Failed to generate hooks JSON."
     return 1
   }
+  local codex_hooks_json
+  codex_hooks_json=$(python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client codex 2>/dev/null) || codex_hooks_json="$hooks_json"
+  local cursor_hooks_json
+  cursor_hooks_json=$(python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client cursor 2>/dev/null) || cursor_hooks_json="$hooks_json"
 
   local installed_any="false"
 
@@ -1264,15 +1313,8 @@ print(json.dumps(hooks, indent=2))
   if [ -d "$claude_settings_dir" ] || [ -d "${HOME}/.claude" ]; then
     mkdir -p "$claude_settings_dir"
     if [ -f "$claude_settings" ]; then
-      python3 -c "
-import json, sys
-existing = json.load(open(sys.argv[1]))
-new_hooks = json.loads(sys.argv[2])
-existing.setdefault('hooks', {})
-existing['hooks'].update(new_hooks.get('hooks', {}))
-json.dump(existing, open(sys.argv[1], 'w'), indent=2)
-print('  Merged hooks into ' + sys.argv[1])
-" "$claude_settings" "$hooks_json"
+      python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client claude --merge-into "$claude_settings" >/dev/null \
+        && echo "  Merged hooks into ${claude_settings}"
     else
       echo "$hooks_json" > "$claude_settings"
       echo "  Created ${claude_settings}"
@@ -1286,28 +1328,29 @@ print('  Merged hooks into ' + sys.argv[1])
     mkdir -p "$cursor_settings_dir"
     local cursor_settings="${cursor_settings_dir}/settings.json"
     if [ -f "$cursor_settings" ]; then
-      python3 -c "
-import json, sys
-existing = json.load(open(sys.argv[1]))
-new_hooks = json.loads(sys.argv[2])
-existing.setdefault('hooks', {})
-existing['hooks'].update(new_hooks.get('hooks', {}))
-json.dump(existing, open(sys.argv[1], 'w'), indent=2)
-print('  Merged hooks into ' + sys.argv[1])
-" "$cursor_settings" "$hooks_json"
+      python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client cursor --merge-into "$cursor_settings" >/dev/null \
+        && echo "  Merged hooks into ${cursor_settings}"
     else
-      echo "$hooks_json" > "$cursor_settings"
+      echo "$cursor_hooks_json" > "$cursor_settings"
       echo "  Created ${cursor_settings}"
     fi
     installed_any="true"
   fi
 
-  # Codex
+  # Codex: hooks live in <workspace>/.codex/hooks.json and need `[features] hooks = true` in <workspace>/.codex/config.toml
   local codex_home="${CODEX_HOME:-${HOME}/.codex}"
   if [ -d "$codex_home" ] || command -v codex >/dev/null 2>&1; then
-    echo "  [NOTE] Codex detected. Hook JSON saved for manual setup."
+    local codex_workspace_dir="${workspace_root}/.codex"
+    mkdir -p "$codex_workspace_dir"
+    if python3 "$hooks_generator" --self-heal "$self_heal_path" --capture-script "$capture_script" --client codex --merge-into "${codex_workspace_dir}/hooks.json" >/dev/null 2>&1 \
+      && python3 "$hooks_generator" --ensure-codex-config "${codex_workspace_dir}/config.toml" >/dev/null 2>&1; then
+      echo "  Codex hooks: ${codex_workspace_dir}/hooks.json (features.hooks enabled in ${codex_workspace_dir}/config.toml)"
+    else
+      echo "  [NOTE] Codex detected but hook setup failed; hook JSON saved under docs/mcp-config/generated/ for manual setup."
+    fi
     mkdir -p "${ROOT}/docs/mcp-config/generated"
     echo "$hooks_json" > "${ROOT}/docs/mcp-config/generated/client_hooks.json"
+    echo "$codex_hooks_json" > "${ROOT}/docs/mcp-config/generated/codex_hooks.json"
     installed_any="true"
   fi
 
@@ -1315,6 +1358,7 @@ print('  Merged hooks into ' + sys.argv[1])
     echo "  No supported clients detected. Saving hooks to docs/mcp-config/generated/client_hooks.json"
     mkdir -p "${ROOT}/docs/mcp-config/generated"
     echo "$hooks_json" > "${ROOT}/docs/mcp-config/generated/client_hooks.json"
+    echo "$codex_hooks_json" > "${ROOT}/docs/mcp-config/generated/codex_hooks.json"
   fi
 }
 
@@ -1640,6 +1684,7 @@ if [ "$ACTION" = "fix" ]; then
 
   install_cli_capture_runtime || true
   install_mcp_runtime || true
+  provision_host_capture_credentials "$workspace_id" "$(resolved_human_subject_id "$user_id")" "$api_url" "$api_token" || true
 
   if [ -x "${ROOT}/scripts/self-heal.sh" ]; then
     echo "Running self-heal (rebuild + re-activate takeover)..."
@@ -2511,6 +2556,11 @@ fi
 
 echo
 echo "Launching stack (${STACK_MODE}) ..."
+# Trusted human-input capture credential (separate from the executor token). Provisioned before the
+# stack starts so the 0600 token file exists when compose bind-mounts it read-only into tce-api and
+# tce-worker (TCE_HOST_CAPTURE_TOKENS_FILE=/run/secrets/tce_host_capture_token).
+provision_host_capture_credentials "$workspace_id" "$(resolved_human_subject_id "${USER:-local-user}")" "http://localhost:$(env_value_or_default "TCE_API_PORT" "8080")" "$api_token" || true
+
 "${ROOT}/scripts/start.sh" "$STACK_MODE" --detach
 ensure_qdrant_ready_for_stack "$STACK_MODE" || true
 configure_maintenance_scheduler_for_stack "$STACK_MODE"
@@ -2762,7 +2812,10 @@ else
   echo "Autonomy tick scheduler: not configured"
 fi
 if [ -f "${PWD}/.claude/settings.json" ]; then
-  echo "Client hooks: ${PWD}/.claude/settings.json (UserPromptSubmit + PostToolUse)"
+  echo "Client hooks: ${PWD}/.claude/settings.json (UserPromptSubmit capture+policy, PostToolUse, Stop)"
+fi
+if [ -s "$HOST_CAPTURE_TOKEN_FILE" ]; then
+  echo "Host capture hook: ${ROOT}/scripts/tce_capture_input.py (credential ${HOST_CAPTURE_TOKEN_FILE}, spool ~/.cache/open-timeline-engine/capture-spool)"
 fi
 echo "Install log: ${INSTALL_LOG}"
 if [ "$STACK_MODE" = "full" ]; then

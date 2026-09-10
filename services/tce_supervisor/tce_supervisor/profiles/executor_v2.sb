@@ -1,0 +1,67 @@
+;; TCE executor profile v2 — deny-by-default. Rendered per dispatch; never run as-is.
+;; Parameters (all mandatory, all supplied by sandbox.render_profile):
+;;   TASKDIR TASKROOT HOMEDIR PYROOT
+;; Protected-write clauses are EXPANDED by the renderer, one per prefix; see PROTECTED-BLOCK.
+(version 1)
+(deny default)
+
+;; --- process -------------------------------------------------------------------------------
+(allow process-fork)
+(allow process-exec
+    (subpath "/usr") (subpath "/bin") (subpath "/sbin")
+    (subpath "/opt/homebrew")
+    (subpath "/Applications/ChatGPT.app")
+    (subpath (param "PYROOT"))
+    (subpath (param "TASKDIR")))
+;; last-match-wins: these carve OUT of the /usr and /bin allows above.
+(deny process-exec
+    (literal "/usr/bin/osascript")
+    (literal "/usr/bin/open")
+    (literal "/bin/launchctl")
+    (literal "/usr/bin/automator")
+    (literal "/usr/bin/sudo")
+    (literal "/usr/bin/su"))
+(allow sysctl-read)
+(allow mach-lookup)
+(deny mach-lookup
+    (global-name "com.apple.coreservices.launchservicesd")
+    (global-name "com.apple.CoreServices.coreservicesd")
+    (global-name "com.apple.lsd.mapdb")
+    (global-name "com.apple.lsd.modifydb"))
+
+;; --- filesystem: read ----------------------------------------------------------------------
+;; The HOMEDIR deny comes FIRST so that a task root under $HOME is still readable,
+;; and so that every later allow is an explicit, reviewable carve-out.
+(deny file-read* (subpath (param "HOMEDIR")))
+(allow file-read*
+    (subpath "/usr") (subpath "/bin") (subpath "/sbin")
+    (subpath "/System") (subpath "/Library")
+    (subpath "/opt/homebrew")
+    (subpath "/Applications/ChatGPT.app")
+    (subpath "/private/etc") (subpath "/dev") (subpath "/private/var/run")
+    (literal "/"))
+;; the pinned interpreter, which on this host lives under $HOME (uv-managed).
+(allow file-read* (subpath (param "PYROOT")))
+;; the ancestor chain of TASKDIR as directory literals only. codex walks the ancestors of
+;; CODEX_HOME at startup; without these it dies with
+;;   "error loading default config after config error: Operation not permitted".
+(allow file-read* (literal "/private/tmp") (literal (param "TASKROOT")))
+(allow file-read* (subpath (param "TASKDIR")))
+(allow file-read-metadata)
+
+;; --- filesystem: write ---------------------------------------------------------------------
+(allow file-write* (subpath (param "TASKDIR")))
+;; PROTECTED-BLOCK: the renderer replaces this line with one clause per protected prefix and
+;; REFUSES to render when the list is empty. A zero-clause render would silently allow.
+;;PROTECTED-BLOCK;;
+(allow file-write-data (literal "/dev/null"))
+
+;; --- network -------------------------------------------------------------------------------
+(deny network*)
+;; egress_mode = "https_only" renders the next two lines; "deny_all" renders NEITHER.
+(allow network-outbound (remote ip "*:443"))
+;; DNS needs mDNSResponder's unix socket. An UNQUALIFIED (remote unix-socket) also hands the
+;; agent /var/run/docker.sock -> the full Docker control API -> docker run -v /:/host.
+;; The filter matches the RESOLVED path: /var is a symlink to private/var, so the literal
+;; must be written /private/var/run/... or it matches nothing and DNS silently dies.
+(allow network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))

@@ -1,10 +1,13 @@
 from .archive_events import run as run_archive_events
 from .compaction import run as run_compaction
+from .decision_extraction import run as run_decision_extraction
+from .dream_synthesis import run as run_dream_synthesis
 from .embed_observations import run as run_embed_observations
 from .embedding import run as run_embedding
 from .episode_extraction import run as run_episode_extraction
 from .graph_health import run as run_graph_health
 from .patterns import run as run_patterns
+from .planning import run as run_planning
 from .qdrant_sync import run as run_qdrant_sync
 from .reflection import run as run_reflection
 from .semantic_consolidation import run as run_semantic_consolidation
@@ -19,9 +22,12 @@ __all__ = [
     "run_semantic_consolidation",
     "run_qdrant_sync",
     "run_compaction",
+    "run_decision_extraction",
     "run_archive_events",
     "run_patterns",
     "run_workflow",
     "run_validation",
     "run_graph_health",
+    "run_planning",
+    "run_dream_synthesis",
 ]

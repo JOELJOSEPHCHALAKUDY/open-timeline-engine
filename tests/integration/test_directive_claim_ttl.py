@@ -35,6 +35,11 @@ def lite_ctx(tmp_path) -> Iterator[tuple[TestClient, str]]:
     settings.lite_db_path = db_path
     settings.api_tokens = "lite-test-token"
     settings.default_operation_mode = "clone_advisor"
+    # Pre-charter fixture. P3's U2 gate refuses a mutating claim without an active charter;
+    # this file measures transitions that predate charters, so it pins the documented off
+    # switch (design §0.7 / G6(d)) and its assertions keep measuring exactly what they did.
+    # Enforcement ON is covered in tests/integration/test_charter_lite.py, both positions.
+    settings.charter_enforcement_enabled = False
     with TestClient(app) as client:
         yield client, db_path
 
@@ -71,7 +76,8 @@ def _claim_directive(client: TestClient, session_id: str) -> str:
             "session_id": session_id,
             "persona_mode": "shadow",
             "task": "update the changelog notes",
-            "app_context": {"domain": "coding"},
+            # A mutating directive needs a bound project; an unbound context is refused.
+            "app_context": {"domain": "coding", "project": "open-timeline-engine", "project_root": "/work/open-timeline-engine"},
             "constraints": {"k": 4},
             "allow_fallback": True,
         },

@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import text
+from tce_shared.policy_evaluation import episode_key
 
 from ..config import get_settings
 from ..db import SessionLocal
@@ -97,6 +98,71 @@ def _upsert_experience_pattern(
             "status": "active" if confidence >= 0.8 else ("needs_review" if confidence >= 0.5 else "suppressed"),
         },
     )
+
+
+def _reflection_attribution(
+    db: Any,
+    *,
+    workspace_id: str,
+    subject_user_id: str,
+    session_id: str,
+    context: dict[str, Any],
+) -> dict[str, str | None]:
+    """The four P4 learning-scope columns for a reflection-derived observation.
+
+    A reflection has no `decision_opportunity`, so `decision_family` is genuinely unknown and stays
+    `NULL` — which is also correct rather than merely honest: `policy_store.load_policy_evidence`
+    selects on `decision_family`, and a machine-written reflection summary is not adjudicated human
+    evidence for any decision family and must never be retrieved as if it were.
+
+    `project_id`, `task_id` and `episode_key` are not unknown. P2's `task_states` row for this
+    session carries the project, the task and the two components (`objective_hash`,
+    `last_cancel_seq`) that `policy_evaluation.episode_key` needs, so the key computed here is the
+    same key the freeze site computes for the same session — which is the whole point of the column:
+    a split may not straddle an episode, and a row with a fabricated or absent key silently can.
+    """
+
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT project_id, task_id, objective_hash, last_cancel_seq
+                FROM task_states
+                WHERE workspace_id = :workspace_id AND session_id = :session_id
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"workspace_id": workspace_id, "session_id": session_id},
+        )
+        .mappings()
+        .first()
+    )
+    project_id = str(context.get("project_id") or "").strip() or None
+    task_id: str | None = None
+    objective_hash: str | None = None
+    cancel_epoch = 0
+    if row is not None:
+        project_id = str(row.get("project_id") or "").strip() or project_id
+        task_id = str(row.get("task_id") or "").strip() or None
+        objective_hash = str(row.get("objective_hash") or "").strip() or None
+        try:
+            cancel_epoch = int(row.get("last_cancel_seq") or 0)
+        except (TypeError, ValueError):
+            cancel_epoch = 0
+    return {
+        "project_id": project_id,
+        "decision_family": None,
+        "task_id": task_id,
+        "episode_key": episode_key(
+            workspace_id=workspace_id,
+            subject_user_id=subject_user_id,
+            project_id=project_id,
+            session_id=session_id,
+            objective_hash=objective_hash,
+            cancel_epoch=cancel_epoch,
+        ),
+    }
 
 
 def run(event_id: str, workspace_id: str | None = None, user_id: str | None = None) -> dict[str, Any]:
@@ -269,12 +335,14 @@ def run(event_id: str, workspace_id: str | None = None, user_id: str | None = No
                 INSERT INTO decision_observations (
                     id, consumer_id, workspace_id, ts, situation_type, situation_summary,
                     context_snapshot, user_response, response_reasoning, outcome,
-                    outcome_sentiment, source_event_ids, confidence
+                    outcome_sentiment, source_event_ids, confidence,
+                    project_id, decision_family, task_id, episode_key
                 )
                 VALUES (
                     :id, :consumer_id, :workspace_id, :ts, :situation_type, :situation_summary,
                     CAST(:context_snapshot AS jsonb), :user_response, :response_reasoning, :outcome,
-                    :outcome_sentiment, :source_event_ids, :confidence
+                    :outcome_sentiment, :source_event_ids, :confidence,
+                    :project_id, :decision_family, :task_id, :episode_key
                 )
                 """
             ),
@@ -292,6 +360,13 @@ def run(event_id: str, workspace_id: str | None = None, user_id: str | None = No
                 "outcome_sentiment": "positive" if success else "negative",
                 "source_event_ids": [parsed_id],
                 "confidence": 0.72 if success else 0.62,
+                **_reflection_attribution(
+                    db,
+                    workspace_id=scoped_workspace,
+                    subject_user_id=scoped_user,
+                    session_id=session_id,
+                    context=context,
+                ),
             },
         )
 

@@ -630,16 +630,23 @@ def graph_snapshot_for_events(
 ) -> dict[str, Any]:
     if not event_ids:
         return {"entities": [], "relationships": [], "facts": []}
+    # Best-effort snapshot, run inside a savepoint. The bare `except` below used to leave the caller's
+    # session in an aborted transaction, so a failure here surfaced much later as an InFailedSqlTransaction
+    # on an unrelated statement -- POST /v1/takeover/step returned 500 whenever this ran. The DISTINCT/ORDER BY
+    # mismatch that made it fail on every Postgres call is fixed above; the savepoint is what keeps a future
+    # failure local.
     try:
-        ids_list = list(event_ids)
-        entity_rows = db.execute(
+        with db.begin_nested():
+            ids_list = list(event_ids)
+            entity_rows = db.execute(
             text(
                 """
                 SELECT DISTINCT
                   en.id,
                   en.entity_type,
                   en.entity_key,
-                  en.display_name
+                  en.display_name,
+                  en.updated_at
                 FROM entity_nodes en
                 JOIN event_entity_links eel ON eel.entity_id = en.id
                 WHERE eel.workspace_id = :workspace_id
@@ -655,8 +662,8 @@ def graph_snapshot_for_events(
                 "event_ids": ids_list,
                 "max_entities": max_entities,
             },
-        ).mappings().all()
-        relationship_rows = db.execute(
+            ).mappings().all()
+            relationship_rows = db.execute(
             text(
                 """
                 SELECT
@@ -675,8 +682,8 @@ def graph_snapshot_for_events(
                 "event_ids": ids_list,
                 "max_relationships": max_relationships,
             },
-        ).mappings().all()
-        fact_rows = db.execute(
+            ).mappings().all()
+            fact_rows = db.execute(
             text(
                 """
                 SELECT fact_key, fact_value, active, event_id, supersedes_event_id, created_at
@@ -689,7 +696,7 @@ def graph_snapshot_for_events(
                 """
             ),
             {"workspace_id": workspace_id, "owner_id": owner_id, "event_ids": ids_list},
-        ).mappings().all()
+            ).mappings().all()
     except Exception:
         return {"entities": [], "relationships": [], "facts": []}
 

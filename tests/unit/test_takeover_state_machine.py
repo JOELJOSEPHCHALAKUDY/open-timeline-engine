@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from tce_shared.decision_policy import (
+    AbstainReason,
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    ExposureState,
+    decide,
+)
 from tce_shared.events import SafetyDecision, TakeoverClassification, TakeoverMode, TakeoverPolicy
 from tce_shared.takeover import (
     _is_vague_objective,
@@ -30,32 +42,119 @@ def test_takeover_enforcement_passes_through_decisive_in_takeover_mode() -> None
     assert final == "Do you want me to continue?"
 
 
-def test_takeover_enforcement_weak_evidence_produces_task_specific_directive() -> None:
-    """Weak evidence should produce task-specific directives, not generic boilerplate."""
+_POLICY_NOW = datetime(2026, 6, 1, tzinfo=UTC)
+
+
+def _thin_evidence_row(index: int) -> dict[str, Any]:
+    summary = "should i add a caching layer in front of the read path"
+    return {
+        "id": f"00000000-0000-0000-0000-{index:012d}",
+        "ts": (_POLICY_NOW - timedelta(days=2)).isoformat(),
+        "situation_type": "routine_task",
+        "situation_summary": summary,
+        "objective_text": summary,
+        "constraints": {},
+        "context_snapshot": {},
+        "selected_choice": "add a caching layer",
+        "action_taken": "add a caching layer",
+        "evidence_source": "explicit",
+        "lifecycle_status": "active",
+        "learning_eligible": True,
+        "valid_from": (_POLICY_NOW - timedelta(days=2)).isoformat(),
+        "project_id": "proj-1",
+    }
+
+
+def _abstaining_policy() -> DecisionResult:
+    """A real, unexposed abstention from the real policy — not a hand-built stub."""
+
+    summary = "should i add a caching layer in front of the read path"
+    request = DecisionRequest(
+        decision_family="routine_task",
+        situation_type="routine_task",
+        situation_summary=summary,
+        objective_text=summary,
+        constraints={},
+        context_snapshot={},
+        candidate_options=("add a caching layer", "leave the read path alone"),
+        evidence_rows=(_thin_evidence_row(1),),
+        decision_at=_POLICY_NOW,
+        workspace_id="ws",
+        subject_user_id="subject",
+        project_id="proj-1",
+        episode_key="episode",
+        evidence_revision="rev-1",
+        evidence_cutoff_at=None,
+        retrieval_version="full-knn-v1",
+        model_id="model-a",
+        runtime_version="runtime-1",
+    )
+    result = decide(request)
+    assert result.status is DecisionStatus.ABSTAINED
+    assert result.abstain_reason is AbstainReason.INADEQUATE_EVIDENCE
+    assert result.exposed is False  # no qualification record exists, and that is the default
+    return result
+
+
+def test_exposed_abstention_hands_off() -> None:
+    """Weak evidence used to produce the MOST confident text this function can emit.
+
+    The turn was rewritten through ``build_decisive_response`` under
+    ``weak_evidence_decisive``, and the resulting DECISIVE classification then scored higher
+    in the certainty heuristic than a HANDOFF would have — so suppressing the uncertainty
+    raised the confidence number that gates ``needs_human``.  An exposed abstention now asks
+    instead.
+    """
+
+    policy = replace(_abstaining_policy(), exposed=True, exposure_state=ExposureState.EXPOSED)
     final, enforced, reason, classification = ensure_takeover_response(
         mode=TakeoverMode.TAKEOVER,
-        text="No strong prior found; proceeding with conservative defaults.",
+        text="No prior to go on; proceeding with conservative defaults.",
         task="implement caching layer",
         takeover_context={"objective": "implement caching layer", "turn_count": 3},
-        advice={
-            "evidence_strength": "weak",
-            "clone_context": {
-                "clone_prompt": "full prompt here",
-                "situation_type": "routine_task",
-                "fingerprint": {
-                    "decision_making": {"risk_tolerance": "high"},
-                    "priorities": {"speed_vs_quality": 0.3},
-                },
-                "similar_observations": [],
-                "session_context": {},
-            },
-        },
+        advice={"evidence_strength": "weak"},
+        policy=policy,
     )
     assert enforced is True
-    assert reason == "weak_evidence_decisive"
-    assert "implement caching layer" in final
-    assert "ACT NOW" in final  # must contain action instruction
-    assert "Move fast" in final  # speed_vs_quality < 0.4
+    assert reason == "policy_abstention"
+    assert classification == TakeoverClassification.HANDOFF
+    assert final == policy.reason_for_asking
+    assert "ACT NOW" not in final
+
+
+def test_unexposed_abstention_is_byte_identical_to_no_policy() -> None:
+    """The unit half of the compatibility gate.
+
+    Every decision family is unqualified today, so every turn takes this path.  If an
+    unqualified family changed the turn, P4 would be a product shutdown rather than a
+    measurement.
+    """
+
+    policy = _abstaining_policy()
+    assert policy.exposed is False
+    kwargs: dict[str, Any] = dict(
+        mode=TakeoverMode.TAKEOVER,
+        text="No prior to go on; proceeding with conservative defaults.",
+        task="implement caching layer",
+        takeover_context={"objective": "implement caching layer", "turn_count": 3},
+        advice={"evidence_strength": "weak"},
+    )
+    assert ensure_takeover_response(**kwargs, policy=policy) == ensure_takeover_response(**kwargs, policy=None)
+
+
+def test_weak_evidence_no_longer_triggers_a_decisive_rewrite() -> None:
+    """The reason code ``weak_evidence_decisive`` is gone, and so is the branch behind it."""
+
+    final, enforced, reason, _ = ensure_takeover_response(
+        mode=TakeoverMode.TAKEOVER,
+        text="Applying the migration and running the smoke suite now.",
+        task="implement caching layer",
+        takeover_context={"objective": "implement caching layer", "turn_count": 3},
+        advice={"evidence_strength": "weak"},
+    )
+    assert reason != "weak_evidence_decisive"
+    assert enforced is False
+    assert final == "Applying the migration and running the smoke suite now."
 
 
 def test_takeover_safety_confirm_and_deny_paths() -> None:
@@ -253,7 +352,6 @@ def test_decision_confidence_and_deliberation_gating() -> None:
     confidence, components = compute_decision_confidence(
         objective="implement takeover autonomy v3 pipeline",
         message="hey beru take over and implement takeover autonomy v3 pipeline",
-        classification=TakeoverClassification.DECISIVE,
         working_set={"evidence_count": 8, "top_patterns": [{"confidence": 0.81}]},
         recent_outcomes=[{"result": "success"}, {"result": "success"}],
     )

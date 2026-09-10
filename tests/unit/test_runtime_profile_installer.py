@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).parents[2]
 SCRIPT = ROOT / "scripts" / "apply_runtime_profile.sh"
 
@@ -15,6 +17,7 @@ def _values(path: Path) -> dict[str, str]:
     )
 
 
+@pytest.mark.subprocess  # runs scripts/apply_runtime_profile.sh for real
 def test_profile_application_preserves_existing_values_by_default(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("TCE_CORS_ALLOW_ORIGINS=https://example.test\nCUSTOM=value\n", encoding="utf-8")
@@ -31,6 +34,7 @@ def test_profile_application_preserves_existing_values_by_default(tmp_path: Path
     assert values["CUSTOM"] == "value"
 
 
+@pytest.mark.subprocess  # runs scripts/apply_runtime_profile.sh for real
 def test_profile_application_overwrites_only_profile_owned_keys(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("TCE_CORS_ALLOW_ORIGINS=*\nCUSTOM=value\n", encoding="utf-8")
@@ -55,6 +59,7 @@ def test_profile_application_overwrites_only_profile_owned_keys(tmp_path: Path) 
     assert values["CUSTOM"] == "value"
 
 
+@pytest.mark.subprocess  # runs scripts/apply_runtime_profile.sh for real
 def test_profile_application_rejects_unknown_profile(tmp_path: Path) -> None:
     result = subprocess.run(
         [str(SCRIPT), "--profile", "../../bad", "--env-file", str(tmp_path / ".env")],
@@ -67,6 +72,7 @@ def test_profile_application_rejects_unknown_profile(tmp_path: Path) -> None:
     assert "Invalid runtime profile" in result.stderr
 
 
+@pytest.mark.subprocess  # runs scripts/apply_runtime_profile.sh for real
 def test_research_profile_selects_research_tools_and_clone_advisor(tmp_path: Path) -> None:
     env_file = tmp_path / ".env"
 

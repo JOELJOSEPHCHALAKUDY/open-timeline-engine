@@ -103,6 +103,7 @@ def test_real_stdio_mcp_cross_executor_takeover() -> None:
         )
     )
     assert captured["result"]["delivery_status"] == "delivered"
+    # Claude resumes from a distinct session id: the reader's own session is not a candidate filter.
     resumed = asyncio.run(
         _call_tool(
             claude_token,
@@ -111,14 +112,54 @@ def test_real_stdio_mcp_cross_executor_takeover() -> None:
             {
                 "query": "read codex timeline MCP transport continuity handoff",
                 "target_owner": "codex-executor",
-                "session_id": "e2e-shared",
+                "session_id": "e2e-reader",
                 "k": 5,
                 "include_cross_user": True,
+                "current_git": {"commit": "mcp123"},
             },
         )
     )
     packet = resumed["result"]
     assert packet["files"][0]["path"] == "services/tce_mcp/tce_mcp/server.py"
+    assert packet["source_session_id"] == "e2e-shared"
+    assert packet["anchor_freshness"] == "current"
+
+    # Reverse direction over the same transport: Claude completes, Codex resumes from a new session.
+    reverse_key = f"e2e:mcp:reverse:{uuid.uuid4()}"
+    reverse_captured = asyncio.run(
+        _call_tool(
+            claude_token,
+            "claude-executor",
+            "tce.complete_task",
+            {
+                "completion_key": reverse_key,
+                "title": "MCP transport reverse continuity handoff",
+                "files": ["services/tce_mcp/tce_mcp/tools.py"],
+                "decision": "Verify the reverse resume path over MCP",
+                "next_step": "Open the get_resume_packet tool",
+                "session_id": "e2e-claude-a",
+                "git": {"branch": "e2e", "commit": "rev123"},
+                "anchors": [{"file": "services/tce_mcp/tce_mcp/tools.py", "line": 447, "symbol": "get_resume_packet"}],
+            },
+        )
+    )
+    assert reverse_captured["result"]["delivery_status"] == "delivered"
+    codex_resumed = asyncio.run(
+        _call_tool(
+            codex_token,
+            "codex-executor",
+            "tce.get_resume_packet",
+            {
+                "query": "read claude timeline MCP transport reverse continuity handoff",
+                "target_owner": "claude-executor",
+                "session_id": "e2e-codex-b",
+                "k": 5,
+                "include_cross_user": True,
+            },
+        )
+    )
+    assert codex_resumed["result"]["source_session_id"] == "e2e-claude-a"
+    assert codex_resumed["result"]["files"][0]["path"] == "services/tce_mcp/tce_mcp/tools.py"
     feedback = asyncio.run(
         _call_tool(
             claude_token,
@@ -231,9 +272,6 @@ def test_real_stdio_mcp_behavior_projection_pilot_and_html_review() -> None:
                 "agent_choice": "minimal verified change",
                 "top3_choices": ["minimal verified change", "broad rewrite"],
                 "actual_choice": "minimal verified change",
-                "agent_confidence": 0.9,
-                "action_similarity": 1.0,
-                "workflow_similarity": 1.0,
                 "used_evidence_ids": assignment_result["citations"],
             },
         )

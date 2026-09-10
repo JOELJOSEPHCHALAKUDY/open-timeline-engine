@@ -68,6 +68,59 @@ class Settings(BaseSettings):
     qdrant_sync_max_batches: int = 10
     worker_listen_queues: str = "tce-default,tce-embeddings,tce-patterns,tce-lifecycle"
     worker_enable_scheduler: bool = True
+    decision_extraction_enabled: bool = True
+    decision_extraction_batch_size: int = 100
+    decision_extraction_lease_seconds: int = 300
+    decision_extraction_max_attempts: int = 10
+    capture_opportunity_ttl_seconds: int = 3600
+    behavior_storage_min_score: float = 0.55
+    security_encryption_key_id: str = "local-dev"
+    security_encryption_secret: str = ""
+    planning_enabled: bool = True
+    planning_job_lease_seconds: int = 120
+    planning_job_max_attempts: int = 3
+    planning_job_batch_size: int = 20
+    planning_job_backoff_cap_seconds: int = 900
+    # These two knobs now select whether the WORKER may use a model, not whether a request
+    # thread may. Off by default: the bounded control path must never wait on one.
+    takeover_plan_llm_enabled: bool = False
+    takeover_dream_llm_enabled: bool = False
+    takeover_plan_llm_timeout_seconds: float = 25.0
+    takeover_plan_max_steps: int = 8
+    # Without these two, create_gateway falls through to its 30 s default in the worker.
+    advisor_attempt_timeout_ms: int = 900
+    advisor_read_timeout_ms: int = 900
+    # Read by the relocated dream-message reader on its first line.
+    block_sensitivity: int = 3
+    # ---- P5 ----
+    # The generation half of the proposal settings (p5_design.md 0.8).  The worker carries
+    # only the names the synthesis job itself reads.  The route owns dream_proposals_enabled,
+    # dream_run_stale_minutes, dream_snooze_default_days, dream_list_limit and the two
+    # re-surface intervals; duplicating those here would be a second source of truth for a
+    # number the worker never consults.  dream_nonresponse_after_surfaces is here because the
+    # duplicate-merge path appends an event and every append re-folds the proposal.  Defaults
+    # are the canonical ones in tce_shared.aspirations.DREAM_SETTING_DEFAULTS, and
+    # test_worker_dream_synthesis.py pins the two together so a drift breaks the build.
+    dream_message_limit: int = 60
+    dream_min_messages: int = 10
+    dream_min_message_chars: int = 25
+    dream_max_message_chars: int = 1200
+    dream_max_proposals_per_run: int = 3
+    dream_min_citations: int = 2
+    dream_max_citations: int = 6
+    dream_quote_max_chars: int = 200
+    dream_min_quote_overlap_tokens: int = 2
+    dream_min_citation_relevance_tokens: int = 1
+    dream_max_live_proposals: int = 20
+    dream_duplicate_similarity: float = 0.60
+    dream_material_new_citations: int = 2
+    dream_material_max_similarity: float = 0.60
+    dream_rejected_cooldown_days: int = 30
+    dream_rejected_lookback_days: int = 365
+    dream_rejected_scan_limit: int = 200
+    dream_max_reproposals: int = 2
+    dream_proposal_ttl_days: int = 45
+    dream_nonresponse_after_surfaces: int = 3
 
     @property
     def confidence_weights(self) -> tuple[float, float, float, float]:

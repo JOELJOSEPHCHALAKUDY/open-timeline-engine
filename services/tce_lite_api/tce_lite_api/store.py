@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
+import shutil
 import sqlite3
 import subprocess
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 from uuid import UUID
 
 from fastapi import HTTPException
+from tce_shared import continuity as _shared_continuity
 from tce_shared.autonomy_context import (
     SUMMARY_VERSION,
     autonomy_profile_tuning,
@@ -35,6 +39,37 @@ from tce_shared.autonomy_goals import (
     score_goal,
 )
 from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence
+from tce_shared.charter import (
+    CharterRequired,
+    charter_constraints,
+    charter_sensitive_path_hit,
+    require_charter_for_action,
+)
+from tce_shared.deadline import (
+    RETRIEVAL_SOURCE_DEADLINE_PARTIAL,
+    SQLITE_INTERRUPT_MARKER,
+    Deadline,
+    RetrievalLedger,
+    retrieval_child,
+)
+from tce_shared.decision_capture import (
+    HOST_CAPTURE_CAPABILITY,
+    HOST_CAPTURE_SOURCE,
+    HUMAN_INPUT_TASK_TYPE,
+    TRUSTED_ORIGINS,
+    HumanResolution,
+)
+from tce_shared.decision_policy import (
+    AdvisorContribution,
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    advice_names_a_candidate,
+    context_evidence_snapshot,
+    decide,
+    evidence_strength_label,
+    failed_advisor_contribution,
+)
 from tce_shared.events import (
     AgentRole,
     AutonomyGoalSource,
@@ -42,6 +77,8 @@ from tce_shared.events import (
     AutonomyNotice,
     AutonomyPolicyProfile,
     AutonomyRiskTier,
+    BehaviorEvidenceSource,
+    CaptureDeliveryState,
     CloneAdviceRequest,
     CloneAdviceResponse,
     DirectiveExecution,
@@ -63,6 +100,7 @@ from tce_shared.events import (
     GoalKind,
     OperationMode,
     PatternFeedbackRequest,
+    PolicyDecisionBlock,
     ResumePacketAnchor,
     ResumePacketChangeSummary,
     ResumePacketFileItem,
@@ -90,6 +128,20 @@ from tce_shared.events import (
     TakeoverState,
     TakeoverStepRequest,
     TakeoverStepResponse,
+    TaskStateSummary,
+    to_lifecycle_status,
+    to_next_permitted_action,
+)
+from tce_shared.execution_transitions import (
+    SYSTEM_ACTOR,
+    TERMINAL_STATES,
+    TransitionReason,
+    completion_payload_fingerprint,
+    idempotency_outcome,
+    permit_binding_ok,
+    permit_scope_digest,
+    report_payload_fingerprint,
+    validate_transition,
 )
 from tce_shared.failure_classifier import classify_failure, retry_strategy_for_attempt
 from tce_shared.fingerprint import (
@@ -120,11 +172,23 @@ from tce_shared.handoff import (
 )
 from tce_shared.project_context import canonical_project_context
 from tce_shared.redaction import apply_redaction_zones, redact_payload, redact_text
+from tce_shared.scope import (
+    PROJECT_BOUND,
+    PROJECT_UNBOUND,
+    SCOPE_POLICY_REVISION,
+    ResolvedScope,
+    ScopeDialect,
+    events_scope_predicate,
+    handoffs_scope_predicate,
+    normalize_owner_token,
+    resolve_scope,
+)
 from tce_shared.situation import SITUATION_TYPES, classify_situation
 from tce_shared.takeover import (
     build_decisive_response,
     build_next_action,
     classify_text,
+    compute_context_quality_score,
     compute_decision_confidence,
     contains_phrase,
     ensure_takeover_response,
@@ -140,8 +204,49 @@ from tce_shared.takeover import (
     should_trigger_deliberation,
     update_recent_outcomes,
 )
+from tce_shared.task_state import (
+    CANCEL_REASON_STAND_DOWN,
+    PLANNING_JOB_KIND_DECOMPOSE,
+    PLANNING_PRODUCER_DETERMINISTIC,
+    TASK_STATE_POLICY_REVISION,
+    InvalidationPlan,
+    PlanStepState,
+    TaskStateEvent,
+    TaskStateEventKind,
+    TaskStatePreconditionFailed,
+    TaskStateProjection,
+    TaskStateRevisionConflict,
+    TaskStatus,
+    charter_for_task,
+    charter_to_json,
+    deterministic_plan,
+    invalidation_for_objective_change,
+    objective_contract_revision,
+    objective_set_required,
+    plan_input_revision,
+    plan_steps_to_json,
+    root_status,
+    stamp_verification_provenance,
+    task_scope_digest,
+    task_state_summary_fields,
+)
+from tce_shared.task_state import approved_plan_id as shared_approved_plan_id
 
 from .auth import AuthContext
+from .behavior_control_store import freeze_shadow_prediction, resolve_shadow_prediction
+from .capture_store import (
+    capture_delivery_state,
+    close_opportunities,
+    extract_pending_inputs,
+    get_opportunity,
+    insert_human_resolution,
+    insert_opportunity,
+    mark_opportunity_relayed,
+    open_opportunity_for_session,
+    resolve_opportunity,
+    resolved_opportunity_for_objective,
+)
+from .charter_store import load_active_charter
 from .config import Settings, get_settings
 from .continuity_store import (
     deliver_handoff_safely,
@@ -149,11 +254,40 @@ from .continuity_store import (
     record_resume_attempt,
     record_resume_progress,
 )
+from .deadline_sqlite import (
+    absorb_sqlite_deadline,
+    begin_sqlite_deadline,
+    finish_sqlite_deadline,
+)
+from .dream_store import count_pending_proposals
+from .plan_rows import write_plan_rows
+from .planning_store import (
+    enqueue_planning_job,
+    pending_directive_ids,
+    pending_planning_job_ids,
+    sweep_stale_planning_jobs,
+)
+from .policy_store import (
+    LITE_MODEL_ID,
+    LITE_RUNTIME_VERSION,
+    build_decision_request,
+    persist_policy_decision,
+    qualification_gate,
+)
+from .reconcile import pause_guard_for_session, resolve_effects_for_directive
 from .store_graph import (
     _ensure_owner_membership,
     _index_graph,
     _scope_match,
     graph_snapshot_for_events,
+)
+from .task_state_store import (
+    ApplySideEffectsLite,
+    apply_task_state_events,
+    ensure_task_state,
+    insert_task_verification,
+    load_task_state,
+    run_cas_section,
 )
 from .types import (
     CloneArbitrationRequest,
@@ -163,6 +297,7 @@ from .types import (
     EvidenceEvent,
     PatternItem,
 )
+from .verification_store import verification_stats_for_session
 
 _FTS5_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _FTS5_MAX_TERMS = 32
@@ -219,15 +354,55 @@ _RETRYABLE_DB_TOKENS = (
     "timeout",
     "temporarily unavailable",
 )
-_CROSS_USER_HINT_RE_LITE = re.compile(r"(?:@|user[:=]|owner[:=]|from\s+)([a-z0-9][a-z0-9._-]{1,63})")
-_CROSS_USER_TRIGGER_RE_LITE = re.compile(r"\b(cross[-\s]?user|across users?|same workspace|shared workspace|other user)\b")
-_CROSS_USER_HISTORY_RE_LITE = re.compile(
-    r"\b(history|chat|conversation|session|discuss|discussion|recent work|recent changes|what did)\b"
-)
-_CROSS_USER_HANDOFF_RE_LITE = re.compile(
-    r"\b(continue|resume|pick up|handoff|hand off|follow up)\b.*\b(codex|claude)\b"
-)
-_CROSS_USER_DIRECT_NAMES_LITE = ("codex", "claude")
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopeAuthShim:
+    """Minimal AuthLike for store entry points that receive workspace/owner ids instead of an AuthContext."""
+
+    consumer: str
+    workspace_id: str
+    user_id: str
+    behavior_subject_id: str
+
+
+def _scope_for(
+    scope: ResolvedScope | None,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    consumer: str | None = None,
+    project_hint: Mapping[str, Any] | None = None,
+) -> ResolvedScope:
+    """Return the caller-supplied scope or derive one from the server-bound workspace/owner pair."""
+    if scope is not None:
+        return scope
+    shim = _ScopeAuthShim(consumer=consumer or owner_id, workspace_id=workspace_id, user_id=owner_id, behavior_subject_id=owner_id)
+    return resolve_scope(shim, project_hint=project_hint)
+
+
+def _session_project_context_lite(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str | None,
+    workspace_id: str,
+    user_id: str,
+) -> dict[str, Any] | None:
+    """Project context previously bound on the takeover session (inherited binding), if any."""
+    if not session_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT takeover_context FROM takeover_sessions WHERE session_id = ? AND workspace_id = ? AND user_id = ? LIMIT 1",
+            (session_id, workspace_id, user_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    context = json_loads(row["takeover_context"], {})
+    project = context.get("project_context") if isinstance(context, dict) else None
+    return dict(project) if isinstance(project, dict) and project else None
 
 
 class _LiteMMRCandidate(TypedDict):
@@ -235,6 +410,14 @@ class _LiteMMRCandidate(TypedDict):
     hit: EventSearchHit
     row: sqlite3.Row
     tokens: set[str]
+
+
+
+# Lite runs no server-side model gateway, and P4 does not add one (design §9.2). Named here
+# so the one place that depends on it says which fact it depends on.
+LITE_HAS_SERVER_SIDE_ADVISOR = False
+
+logger = logging.getLogger(__name__)
 
 
 def now_utc() -> datetime:
@@ -245,6 +428,12 @@ def _is_retryable_db_error(exc: Exception) -> bool:
     text = str(exc).strip().lower()
     if not text:
         return False
+    # A deadline abort raises sqlite3.OperationalError("interrupted"). It is the ONE
+    # OperationalError that must never be retried: the budget that produced it has not grown,
+    # so a retry can only spend the turn's remaining time to fail the same way. The token list
+    # happens not to match it today; this first check makes that a design property, not luck.
+    if SQLITE_INTERRUPT_MARKER in text:
+        return False
     return any(token in text for token in _RETRYABLE_DB_TOKENS)
 
 
@@ -252,6 +441,7 @@ def _run_sql_retry[T](
     fn: Callable[[], T],
     *,
     settings: Settings,
+    deadline: Deadline | None = None,
 ) -> T:
     retry_enabled = bool(getattr(settings, "search_retry_enabled", True))
     if not retry_enabled:
@@ -272,11 +462,56 @@ def _run_sql_retry[T](
             remaining_ms = retry_budget_ms - elapsed_ms
             if remaining_ms <= 0:
                 raise
+            # The sleeps are invisible to the progress handler, so without this a 40 ms retry
+            # budget could sit entirely outside the deadline (C3-G8).
+            if deadline is not None:
+                if not deadline.allows(int(getattr(settings, "retrieval_statement_floor_ms", 10))):
+                    raise
+                remaining_ms = min(remaining_ms, deadline.remaining_ms())
+                if remaining_ms <= 0:
+                    raise
             delay_ms = min(remaining_ms, backoff_ms * (2 ** attempt))
             time.sleep(float(delay_ms) / 1000.0)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("sqlite retry loop exited unexpectedly")
+
+
+def _guarded_read[T](
+    conn: sqlite3.Connection,
+    name: str,
+    fn: Callable[[], T],
+    *,
+    settings: Settings,
+    deadline: Deadline | None,
+    ledger: RetrievalLedger | None,
+    empty: Callable[[], T] = list,  # type: ignore[assignment]
+) -> T:
+    """Run one READ under the turn's retrieval deadline (§6.3).
+
+    Writes are NEVER wrapped in a deadline guard (R11) — this helper is for read queries only.
+    Every exit path tears the progress handler down, because the Lite connection is reused for
+    the turn's own writes and a leaked handler would abort its COMMIT.
+    """
+    guard = begin_sqlite_deadline(
+        conn,
+        deadline,
+        name=name,
+        ledger=ledger,
+        requested_ms=int(getattr(settings, "context_retrieval_budget_ms", 120)),
+        floor_ms=int(getattr(settings, "retrieval_statement_floor_ms", 10)),
+        instructions=int(getattr(settings, "sqlite_progress_instructions", 1000)),
+    )
+    if guard is None:
+        return empty()
+    try:
+        result = _run_sql_retry(fn, settings=settings, deadline=deadline)
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        if not absorb_sqlite_deadline(guard, exc):
+            raise
+        return empty()
+    finish_sqlite_deadline(guard)
+    return result
 
 
 def _bump_retrieval_counter(source: str) -> None:
@@ -746,40 +981,6 @@ def _normalize_owner_token_lite(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def _query_requests_cross_user_memory_lite(query_text: str) -> bool:
-    lowered = _collapse_whitespace_lite(query_text).lower()
-    if not lowered:
-        return False
-    if _CROSS_USER_TRIGGER_RE_LITE.search(lowered):
-        return True
-    if _CROSS_USER_HANDOFF_RE_LITE.search(lowered):
-        return True
-    if "memory" in lowered and "from " in lowered:
-        return True
-    if "timeline" in lowered and "from " in lowered:
-        return True
-    if "vice versa" in lowered:
-        return True
-    if any(name in lowered for name in _CROSS_USER_DIRECT_NAMES_LITE):
-        if "memory" in lowered:
-            return True
-        if "timeline" in lowered:
-            return True
-        if _CROSS_USER_HISTORY_RE_LITE.search(lowered):
-            return True
-    return False
-
-
-def _extract_owner_hints_lite(query_text: str) -> set[str]:
-    lowered = _collapse_whitespace_lite(query_text).lower()
-    hints = {_normalize_owner_token_lite(match.group(1)) for match in _CROSS_USER_HINT_RE_LITE.finditer(lowered)}
-    for token in re.split(r"[^a-z0-9._-]+", lowered):
-        normalized = _normalize_owner_token_lite(token)
-        if normalized in _CROSS_USER_DIRECT_NAMES_LITE:
-            hints.add(normalized)
-    return {hint for hint in hints if hint}
-
-
 def _owner_matches_hint_lite(owner_id: str, hint: str) -> bool:
     owner = _normalize_owner_token_lite(owner_id)
     token = _normalize_owner_token_lite(hint)
@@ -834,60 +1035,18 @@ def _load_handoff_records_map_lite(
     return by_event
 
 
-def _resolve_owner_scope_lite(
-    conn: sqlite3.Connection,
-    *,
-    workspace_id: str,
-    owner_id: str,
-    query_text: str,
-) -> tuple[set[str], bool, list[str]]:
-    normalized_owner = _normalize_owner_token_lite(owner_id)
-    default_scope = {normalized_owner} if normalized_owner else set()
-    if not _query_requests_cross_user_memory_lite(query_text):
-        return default_scope, False, sorted(default_scope)
+def _resolve_owner_scope_lite(*, scope: ResolvedScope) -> tuple[set[str], bool, list[str]]:
+    """Owner scope comes from the server-bound ResolvedScope only.
 
-    owner_candidates = set(default_scope)
-    try:
-        rows = conn.execute(
-            """
-            SELECT DISTINCT json_extract(context, '$._tce_owner') AS owner_id
-            FROM events
-            WHERE json_extract(context, '$._tce_workspace') = ?
-              AND json_extract(context, '$._tce_owner') IS NOT NULL
-            LIMIT 400
-            """,
-            (workspace_id,),
-        ).fetchall()
-        for row in rows:
-            normalized = _normalize_owner_token_lite(row["owner_id"] if row and "owner_id" in row.keys() else None)
-            if normalized:
-                owner_candidates.add(normalized)
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        return default_scope, False, sorted(default_scope)
-
-    if not owner_candidates:
-        return default_scope, False, sorted(default_scope)
-
-    hints = _extract_owner_hints_lite(query_text)
-    if hints:
-        matched = {
-            owner_candidate
-            for owner_candidate in owner_candidates
-            if any(_owner_matches_hint_lite(owner_candidate, hint) for hint in hints)
-        }
-    else:
-        matched = set(owner_candidates)
-
-    if normalized_owner:
-        matched.add(normalized_owner)
-    if not matched:
-        return default_scope, False, sorted(default_scope)
-    applied = matched != default_scope
-    return matched, applied, sorted(matched)[:6]
+    Cross-owner reads are never inferred from query wording or from rows that
+    happened to match; they require explicit continuity intent (target_owner +
+    include_cross_user) which resolve_scope already folded into owner_ids.
+    """
+    owners = {normalize_owner_token(owner) for owner in scope.owner_ids if normalize_owner_token(owner)}
+    if not owners:
+        owners = {normalize_owner_token(scope.owner_id)}
+    applied = len(owners) > 1 and bool(scope.continuity_intent)
+    return owners, applied, sorted(owners)[:6]
 
 
 def _scope_match_with_owner_scope_lite(
@@ -903,27 +1062,6 @@ def _scope_match_with_owner_scope_lite(
     if event_owner and owner_scope and event_owner not in owner_scope:
         return False
     return True
-
-
-def _expand_owner_scope_from_rows_lite(
-    rows: list[sqlite3.Row],
-    *,
-    workspace_id: str,
-    current_scope: set[str],
-) -> set[str]:
-    normalized_workspace = _normalize_owner_token_lite(workspace_id)
-    expanded_scope = set(current_scope)
-    for row in rows:
-        context = json_loads(row["context"], {})
-        if not isinstance(context, dict):
-            continue
-        event_workspace = _normalize_owner_token_lite(context.get("_tce_workspace"))
-        if event_workspace and event_workspace != normalized_workspace:
-            continue
-        event_owner = _normalize_owner_token_lite(context.get("_tce_owner"))
-        if event_owner:
-            expanded_scope.add(event_owner)
-    return expanded_scope
 
 
 def _citation_dup_ratio_lite(rows: list[sqlite3.Row]) -> float:
@@ -1329,7 +1467,13 @@ def _feedback_score(conn: sqlite3.Connection, pattern_id: str) -> float:
 
 
 def _update_patterns_from_event(
-    conn: sqlite3.Connection, event_id: str, event: EventEnvelope, settings: Settings
+    conn: sqlite3.Connection,
+    event_id: str,
+    event: EventEnvelope,
+    settings: Settings,
+    *,
+    workspace_id: str,
+    owner_id: str,
 ) -> None:
     statement = f"In {event.domain}, you commonly run {event.task_type} tasks via {event.source}."
     pattern_type = "workflow"
@@ -1343,32 +1487,34 @@ def _update_patterns_from_event(
         (event.domain, pattern_type, statement),
     ).fetchone()
 
+    # Pattern statistics and evidence are computed inside the ingesting workspace/owner only.
+    scope_sql = "AND json_extract(context, '$._tce_workspace') = ? AND json_extract(context, '$._tce_owner') = ?"
     total = conn.execute(
-        "SELECT COUNT(1) AS c FROM events WHERE domain = ? AND task_type = ?",
-        (event.domain, event.task_type),
+        f"SELECT COUNT(1) AS c FROM events WHERE domain = ? AND task_type = ? {scope_sql}",
+        (event.domain, event.task_type, workspace_id, owner_id),
     ).fetchone()["c"]
     cutoff = (now_utc() - timedelta(days=30)).isoformat()
     recent = conn.execute(
-        "SELECT COUNT(1) AS c FROM events WHERE domain = ? AND task_type = ? AND ts >= ?",
-        (event.domain, event.task_type, cutoff),
+        f"SELECT COUNT(1) AS c FROM events WHERE domain = ? AND task_type = ? AND ts >= ? {scope_sql}",
+        (event.domain, event.task_type, cutoff, workspace_id, owner_id),
     ).fetchone()["c"]
     source_count = conn.execute(
-        """
+        f"""
         SELECT COUNT(1) AS c
         FROM events
-        WHERE domain = ? AND task_type = ? AND source = ?
+        WHERE domain = ? AND task_type = ? AND source = ? {scope_sql}
         """,
-        (event.domain, event.task_type, event.source),
+        (event.domain, event.task_type, event.source, workspace_id, owner_id),
     ).fetchone()["c"]
     evidence_rows = conn.execute(
-        """
+        f"""
         SELECT id
         FROM events
-        WHERE domain = ? AND task_type = ?
+        WHERE domain = ? AND task_type = ? {scope_sql}
         ORDER BY ts DESC
         LIMIT 12
         """,
-        (event.domain, event.task_type),
+        (event.domain, event.task_type, workspace_id, owner_id),
     ).fetchall()
     evidence_ids = [row["id"] for row in evidence_rows]
 
@@ -1812,6 +1958,17 @@ def store_event(
 ) -> UUID:
     if not _ingest_source_allowed(settings, event.source):
         raise HTTPException(status_code=403, detail=f"event source '{event.source}' is not allowed for ingest")
+    if HOST_CAPTURE_CAPABILITY not in auth.capabilities:
+        # Human-origin events are only writable through the host-capture capability; an executor
+        # (or an api token asserting role=user) cannot forge a human input event.
+        context_in = event.context if isinstance(event.context, dict) else {}
+        if (
+            str(event.task_type or "").strip() == HUMAN_INPUT_TASK_TYPE
+            or str(event.source or "").strip().lower() == HOST_CAPTURE_SOURCE
+            or str(context_in.get("input_origin") or "") in TRUSTED_ORIGINS
+            or "capture_principal" in context_in
+        ):
+            raise HTTPException(status_code=403, detail="human-origin events require the host capture capability")
 
     idempotency_key = str(getattr(event, "idempotency_key", "") or "").strip() or None
     source_id = str(getattr(event, "source_id", "") or "").strip() or None
@@ -1936,6 +2093,14 @@ def store_event(
     )
     conn.commit()
     _ensure_owner_membership(conn, auth.workspace_id, auth.user_id)
+    if (
+        auth.behavior_subject_id
+        and auth.behavior_subject_id != auth.user_id
+        and str(getattr(settings, "workspace_access_mode", "compat") or "compat").strip().lower() != "strict"
+    ):
+        # Compat mode: an executor acting for a human subject must not lock that human out of their own
+        # workspace (memberships are auto-seeded from the first stored event). Strict mode stays explicit.
+        _ensure_owner_membership(conn, auth.workspace_id, auth.behavior_subject_id)
     _index_graph(
         conn=conn,
         event_id=str(event_id),
@@ -1948,7 +2113,7 @@ def store_event(
         context=context,
         payload=payload,
     )
-    _update_patterns_from_event(conn, str(event_id), event, settings)
+    _update_patterns_from_event(conn, str(event_id), event, settings, workspace_id=auth.workspace_id, owner_id=auth.user_id)
     _seed_episode_from_event_lite(
         conn,
         event=event,
@@ -2024,8 +2189,13 @@ def search_events(
     settings: Settings,
     workspace_id: str,
     owner_id: str,
+    scope: ResolvedScope | None = None,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[EventSearchResponse, int, dict[str, Any]]:
     retrieval_started = time.perf_counter()
+    scope = _scope_for(scope, workspace_id=workspace_id, owner_id=owner_id)
     query_text = body.query.strip().lower()
     match_all = bool(body.match_all) or query_text in {"", "*"}
     intent_retrieval_enabled = bool(getattr(settings, "intent_retrieval_enabled", False))
@@ -2036,12 +2206,7 @@ def search_events(
     )
     planner_used = bool(len(planned_queries) > 1)
     subquery_labels = [str(item.get("label") or "") for item in planned_queries if str(item.get("label") or "").strip()]
-    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope_lite(
-        conn,
-        workspace_id=workspace_id,
-        owner_id=owner_id,
-        query_text=query_text,
-    )
+    owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope_lite(scope=scope)
     query_expansion_used = False
     query_expansion_terms: list[str] = []
     rerank_strategy = "none"
@@ -2096,14 +2261,27 @@ def search_events(
     fts_candidate_count = 0
     base_clauses = list(clauses)
     base_params = list(params)
+    # Server-bound scope predicate (shared definition): workspace + owner tags, lenient for
+    # legacy untagged rows unless scope_strict_tags. The FTS join needs the qualified column.
+    scope_strict = bool(getattr(settings, "scope_strict_tags", False))
+    scope_predicate = events_scope_predicate(scope, dialect=ScopeDialect.SQLITE, strict=scope_strict, context_column="context")
+    scope_predicate_fts = events_scope_predicate(scope, dialect=ScopeDialect.SQLITE, strict=scope_strict, context_column="e.context")
+    scope_clauses = list(scope_predicate.clauses)
+    scope_clauses_fts = list(scope_predicate_fts.clauses)
+    scope_params = list(scope_predicate.positional_params)
+    requested_project_id = str(getattr(body, "project_id", None) or "").strip() or None
+    if requested_project_id:
+        scope_clauses.append("json_extract(context, '$.project_id') = ?")
+        scope_clauses_fts.append("json_extract(e.context, '$.project_id') = ?")
+        scope_params.append(requested_project_id)
 
     def _query_rows(
         search_patterns: list[str] | None = None,
         *,
         expansion_mode: bool = False,
     ) -> list[sqlite3.Row]:
-        local_clauses = list(base_clauses)
-        local_params = list(base_params)
+        local_clauses = list(base_clauses) + scope_clauses
+        local_params = list(base_params) + scope_params
         if search_patterns:
             term_conditions = []
             for _ in search_patterns:
@@ -2127,10 +2305,11 @@ def search_events(
                 local_params,
             ).fetchall()
 
-        return _run_sql_retry(_query, settings=settings)
+        return _guarded_read(conn, "lexical", _query, settings=settings, deadline=deadline, ledger=ledger)
 
     def _query_fts_rows(fts_query: str) -> list[sqlite3.Row]:
-        local_params = [fts_query, *base_params, limit]
+        local_params = [fts_query, *base_params, *scope_params, limit]
+        fts_clauses = [f"e.{clause}" for clause in base_clauses] + scope_clauses_fts
 
         def _query() -> list[sqlite3.Row]:
             return conn.execute(
@@ -2141,14 +2320,14 @@ def search_events(
                 FROM events_fts
                 JOIN events e ON e.id = events_fts.event_id
                 WHERE events_fts MATCH ?
-                  AND {' AND '.join(f'e.{clause}' for clause in base_clauses)}
+                  AND {' AND '.join(fts_clauses)}
                 ORDER BY events_fts.rank, e.ts DESC
                 LIMIT ?
                 """,
                 local_params,
             ).fetchall()
 
-        return _run_sql_retry(_query, settings=settings)
+        return _guarded_read(conn, "fts", _query, settings=settings, deadline=deadline, ledger=ledger)
 
     search_patterns: list[str] = []
     expansion_enabled = bool(getattr(settings, "search_query_expansion_enabled", False))
@@ -2186,7 +2365,12 @@ def search_events(
             try:
                 rows = _query_fts_rows(fts_query)
                 lexical_channel = "fts5_primary"
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
+                # A deadline abort must NOT be laundered into a LIKE fallback: the caller
+                # records it as deadline_expired_abort, and mislabelling it as
+                # like_fallback_error makes G8 unobservable.
+                if SQLITE_INTERRUPT_MARKER in str(exc).lower():
+                    raise
                 rows = []
                 lexical_channel = "like_fallback_error"
         fts_candidate_count = len(rows)
@@ -2473,33 +2657,8 @@ def search_events(
         return local_scored, local_blocked, local_owner_scope_blocked, local_feedback_applied
 
     scored, blocked, owner_scope_blocked, feedback_adjustment_applied = _score_rows_for_scope(owner_scope)
-    owner_scope_blocked_ratio = float(owner_scope_blocked) / float(max(1, len(rows)))
-    normalized_owner_id = _normalize_owner_token_lite(owner_id)
-    auto_expand_on_blocked_ratio = bool(
-        (normalized_owner_id.endswith("-executor") or normalized_owner_id.endswith("-executer"))
-        and owner_scope_blocked_ratio >= 0.95
-    )
-    if (
-        not cross_user_scope_applied
-        and owner_scope_blocked > 0
-        and (not scored or auto_expand_on_blocked_ratio)
-    ):
-        expanded_scope = _expand_owner_scope_from_rows_lite(
-            rows,
-            workspace_id=workspace_id,
-            current_scope=owner_scope,
-        )
-        if expanded_scope != owner_scope:
-            owner_scope = expanded_scope
-            cross_user_scope_applied = True
-            cross_user_scope_owners = sorted(owner_scope)[:6]
-            handoff_map = _load_handoff_records_map_lite(
-                conn,
-                workspace_id=workspace_id,
-                owner_ids=sorted(owner_scope),
-                max_records=max(body.k * 6, 30),
-            )
-            scored, blocked, _, feedback_adjustment_applied = _score_rows_for_scope(owner_scope)
+    # P0: a miss inside the owner scope stays empty. No implicit peer/workspace expansion;
+    # owner_scope_blocked is retained as telemetry only.
     if not match_all:
         rerank_strategy = "score_sort"
     mmr_candidate_pool = max(
@@ -2568,8 +2727,13 @@ def search_events(
         "trigram_candidate_count": 0,
         "rrf_applied": False,
         "candidate_pool_limit": int(limit),
-        "scope_prefilter_applied": False,
+        # True only from explicit request intent (continuity target owner or explicit project_id);
+        # the always-on workspace/owner predicate is the baseline, not a prefilter.
+        "scope_prefilter_applied": bool(cross_user_scope_applied or requested_project_id),
         "scope_requery_applied": False,
+        "owner_scope_blocked": int(owner_scope_blocked),
+        "policy_revision": SCOPE_POLICY_REVISION,
+        "project_binding": scope.project_binding,
         "score_components_version": 2,
         "hit_count": len(hits),
         "vector_used": False,
@@ -2596,6 +2760,11 @@ def search_events(
         "mmr_candidates": int(mmr_candidates),
         "citation_dup_ratio": float(round(citation_dup_ratio, 4)),
     }
+    # The ten deadline keys (§6.5). The KEY SET must be identical in Full and Lite; the values
+    # may differ. A parity test asserts key-set equality, not value equality.
+    retrieval_meta.update((ledger or RetrievalLedger()).to_meta(deadline))
+    if ledger is not None and ledger.degraded():
+        retrieval_meta["source"] = RETRIEVAL_SOURCE_DEADLINE_PARTIAL
     return response, blocked, retrieval_meta
 
 
@@ -2642,6 +2811,46 @@ def _resume_file_items_from_record_lite(record: dict[str, Any], *, query_text: s
     return output[:40]
 
 
+def _assess_anchor_freshness_lite(
+    *,
+    record_git: Mapping[str, Any] | None,
+    record_ts: datetime | None,
+    current_git: Mapping[str, Any] | None,
+    now: datetime,
+    max_age_hours: float = 72.0,
+) -> tuple[str, list[str]]:
+    """Label a handoff's git anchor as current/stale/unknown against the reader's checkout.
+
+    Delegates to ``tce_shared.continuity.assess_anchor_freshness`` when the shared helper is
+    present; the local rules below are the same contract (never "current" without a commit match).
+    """
+    shared = getattr(_shared_continuity, "assess_anchor_freshness", None)
+    if callable(shared):
+        label, reasons = shared(record_git=record_git, record_ts=record_ts, current_git=current_git, now=now, max_age_hours=max_age_hours)
+        return str(label), [str(item) for item in reasons]
+    current = dict(current_git or {})
+    record = dict(record_git or {})
+    current_commit = str(current.get("commit") or "").strip().lower()
+    if not current_commit:
+        return "unknown", ["no_current_commit"]
+    record_repo = str(record.get("repo") or record.get("remote") or "").strip().lower()
+    current_repo = str(current.get("repo") or current.get("remote") or "").strip().lower()
+    if record_repo and current_repo and record_repo != current_repo:
+        return "stale", ["repo_mismatch"]
+    record_commit = str(record.get("commit") or "").strip().lower()
+    if not record_commit:
+        return "unknown", ["record_commit_missing"]
+    if record_commit[:12] != current_commit[:12]:
+        return "stale", ["commit_mismatch"]
+    reasons = ["commit_match"]
+    if record_ts is not None:
+        record_at = record_ts if record_ts.tzinfo else record_ts.replace(tzinfo=UTC)
+        now_at = now if now.tzinfo else now.replace(tzinfo=UTC)
+        if (now_at - record_at) > timedelta(hours=max_age_hours):
+            reasons.append("older_than_max_age")
+    return "current", reasons
+
+
 def get_resume_packet(
     conn: sqlite3.Connection,
     *,
@@ -2650,41 +2859,45 @@ def get_resume_packet(
     settings: Settings,
 ) -> ResumePacketResponse:
     started = time.perf_counter()
-    if body.include_cross_user:
-        owner_scope, cross_user_scope_applied, cross_user_scope_owners = _resolve_owner_scope_lite(
-            conn,
-            workspace_id=auth.workspace_id,
-            owner_id=auth.user_id,
-            query_text=body.query,
-        )
-    else:
-        owner_scope = {_normalize_owner_token_lite(auth.user_id)}
-        cross_user_scope_applied = False
-        cross_user_scope_owners = sorted(owner_scope)
-    target_owner = _normalize_owner_token_lite(body.target_owner)
-    if target_owner:
-        filtered = {owner for owner in owner_scope if _owner_matches_hint_lite(owner, target_owner)}
-        if filtered:
-            owner_scope = filtered.union({_normalize_owner_token_lite(auth.user_id)})
-            cross_user_scope_owners = sorted(owner_scope)[:6]
-            cross_user_scope_applied = owner_scope != {_normalize_owner_token_lite(auth.user_id)}
-    owner_ids = sorted([item for item in owner_scope if item])
-    if not owner_ids:
-        owner_ids = [_normalize_owner_token_lite(auth.user_id)]
-    placeholders = ",".join("?" for _ in owner_ids)
+    requested_at = datetime.now(tz=UTC)
+    # Reader session (body.session_id) is NOT a candidate filter any more: default candidate scope
+    # is the authorised workspace/owner set inside the retention window. An optional
+    # source_session_id narrows to one source conversation; legacy_session_scope restores the
+    # pre-P0 reader-session equality for old clients.
+    target_owner = str(body.target_owner or "").strip() or None
+    continuity_intent = bool(body.include_cross_user and target_owner)
+    source_session_id = str(getattr(body, "source_session_id", None) or "").strip() or None
+    legacy_session_scope = bool(getattr(body, "legacy_session_scope", False))
+    current_git_raw = getattr(body, "current_git", None)
+    current_git: dict[str, Any] = dict(current_git_raw) if isinstance(current_git_raw, dict) else {}
+    scope = auth.resolved_scope(
+        session_project=_session_project_context_lite(conn, session_id=body.session_id, workspace_id=auth.workspace_id, user_id=auth.user_id),
+        task_id=body.session_id,
+        target_owner=target_owner,
+        continuity_intent=continuity_intent,
+        source_session_id=source_session_id,
+        legacy_session_scope=legacy_session_scope,
+        retention_days=int(settings.handoff_retention_days),
+    )
+    if continuity_intent and target_owner:
+        # Hard filter on the targeted peer, mirroring Full: the reader's own handoffs
+        # must not win a query that explicitly asked for someone else's work.
+        scope = scope.narrowed_to_owner(target_owner)
+    owner_scope_ids = scope.sql_owner_ids()
+    cross_user_scope_applied = any(owner != auth.user_id for owner in owner_scope_ids)
+    cross_user_scope_owners = owner_scope_ids[:6]
+    predicate = handoffs_scope_predicate(scope, dialect=ScopeDialect.SQLITE, reader_session_id=body.session_id, now=requested_at)
     rows = conn.execute(
         f"""
         SELECT id, owner_id, session_id, ts, title, decision, next_step, status,
                files_json, anchors_json, git_json, change_summary_json, objective_text,
-               source, event_id, schema_version
+               source, event_id, schema_version, project_id, executor_id
         FROM handoff_records
-        WHERE workspace_id = ?
-          AND owner_id IN ({placeholders})
-          AND session_id = ?
+        WHERE {predicate.where_sql}
         ORDER BY ts DESC
         LIMIT ?
         """,
-        (auth.workspace_id, *owner_ids, body.session_id, max(20, int(body.k) * 20)),
+        (*predicate.positional_params, max(20, int(body.k) * 20)),
     ).fetchall()
     candidates: list[dict[str, Any]] = []
     for row in rows:
@@ -2705,6 +2918,8 @@ def get_resume_packet(
             "source": str(row["source"] or "native"),
             "event_id": str(row["event_id"] or ""),
             "schema_version": str(row["schema_version"] or ""),
+            "project_id": str(row["project_id"] or "") if "project_id" in row.keys() and row["project_id"] else None,
+            "executor_id": str(row["executor_id"] or "") if "executor_id" in row.keys() and row["executor_id"] else None,
         }
         if not row_map["objective_text"]:
             objective_text, _ = normalize_objective_text(
@@ -2724,6 +2939,16 @@ def get_resume_packet(
     selected_id = str(selected.get("id") or "").strip()
     selected_uuid = UUID(selected_id)
     files = _resume_file_items_from_record_lite(selected, query_text=body.query)
+    selected_ts = selected.get("ts")
+    freshness, freshness_reasons = _assess_anchor_freshness_lite(
+        record_git=selected.get("git_json") if isinstance(selected.get("git_json"), dict) else None,
+        record_ts=selected_ts if isinstance(selected_ts, datetime) else None,
+        current_git=current_git,
+        now=requested_at,
+    )
+    anchor_stale: bool | None = True if freshness == "stale" else (False if freshness == "current" else None)
+    for item in files:
+        item.anchors = [ResumePacketAnchor(**{**anchor.model_dump(), "stale": anchor_stale}) for anchor in item.anchors]
     packet_id = uuid.uuid4()
     response = ResumePacketResponse(
         packet_id=packet_id,
@@ -2731,6 +2956,12 @@ def get_resume_packet(
         selection_reason="task_overlap_then_recency",
         cross_user_scope_applied=bool(cross_user_scope_applied),
         cross_user_scope_owners=list(cross_user_scope_owners),
+        source_session_id=str(selected.get("session_id") or "") or None,
+        source_owner_id=str(selected.get("owner_id") or "") or None,
+        record_ts=selected_ts if isinstance(selected_ts, datetime) else None,
+        anchor_freshness=freshness,
+        freshness_reasons=freshness_reasons,
+        project_binding=scope.project_binding,
         task_summary=str(selected.get("title") or "")[:160],
         decision=str(selected.get("decision") or "")[:500],
         next_step=str(selected.get("next_step") or "")[:300],
@@ -2749,7 +2980,6 @@ def get_resume_packet(
             alternates=alternates,
         ),
     )
-    selected_ts = selected.get("ts")
     if isinstance(selected_ts, datetime):
         returned_at = datetime.now(tz=UTC)
         record_resume_attempt(
@@ -2766,6 +2996,7 @@ def get_resume_packet(
             requested_at=returned_at - timedelta(milliseconds=response.retrieval_meta.latency_ms),
             returned_at=returned_at,
             handoff_ts=selected_ts,
+            source_session_id=str(selected.get("session_id") or "") or None,
         )
     return response
 
@@ -2777,7 +3008,12 @@ def list_patterns(
     workspace_id: str,
     owner_id: str,
     limit: int = 100,
+    scope: ResolvedScope | None = None,
 ) -> list[PatternItem]:
+    scope = _scope_for(scope, workspace_id=workspace_id, owner_id=owner_id)
+    scope_owner_ids = scope.sql_owner_ids() or [owner_id]
+    takeover_domain = f"{scope.workspace_id}:takeover"
+    domain = _scoped_domain_lite(domain, scope)
     clauses = ["confidence >= ?", "status != 'suppressed'"]
     params: list[Any] = [min_confidence]
     if domain:
@@ -2806,10 +3042,15 @@ def list_patterns(
             if not evidence_row:
                 continue
             evidence_context = json_loads(evidence_row["context"], {})
-            if isinstance(evidence_context, dict) and _scope_match(evidence_context, workspace_id, owner_id):
+            if isinstance(evidence_context, dict) and any(_scope_match(evidence_context, scope.workspace_id, owner) for owner in scope_owner_ids):
                 evidence_ids.append(evidence_id)
         if raw_evidence_ids and not evidence_ids:
             continue
+        if not raw_evidence_ids:
+            # Evidence-free patterns are only visible in the caller's own takeover domain or the
+            # explicitly requested (non-foreign) domain; otherwise in-scope evidence is required.
+            if str(row["domain"] or "") not in {takeover_domain, domain}:
+                continue
         items.append(
             PatternItem(
                 id=UUID(row["id"]),
@@ -2822,6 +3063,21 @@ def list_patterns(
             )
         )
     return items
+
+
+def _scoped_domain_lite(domain: str | None, scope: ResolvedScope) -> str | None:
+    """Drop a body-supplied ``<other-workspace>:takeover`` domain.
+
+    Learned patterns have no workspace column; per-workspace rows are keyed only by
+    ``f"{workspace_id}:takeover"``, so honouring a foreign takeover domain from the request would
+    read another workspace's learned rows. Only the caller's own takeover domain or a
+    non-takeover domain survives.
+    """
+    if not domain:
+        return None
+    if domain.endswith(":takeover") and domain != f"{scope.workspace_id}:takeover":
+        return None
+    return domain
 
 
 def _workflows_for_domain(domain: str | None) -> list[dict[str, Any]]:
@@ -2853,12 +3109,24 @@ def context_bundle(
     settings: Settings,
     workspace_id: str,
     owner_id: str,
+    scope: ResolvedScope | None = None,
+    *,
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> tuple[ContextBundleResponse, int]:
+    scope = _scope_for(
+        scope,
+        workspace_id=workspace_id,
+        owner_id=owner_id,
+        project_hint=request.app_context if isinstance(request.app_context, dict) else None,
+    )
     query_hash = hashlib.sha256(
         json_dumps(
             {
                 "workspace_id": workspace_id,
                 "owner_id": owner_id,
+                "owner_ids": scope.sql_owner_ids(),
+                "project_id": scope.project_id if scope.project_binding == PROJECT_BOUND else None,
                 "body": request.model_dump(mode="json"),
             }
         ).encode("utf-8")
@@ -2872,7 +3140,7 @@ def context_bundle(
         if datetime.now().timestamp() < expiry:
             return ContextBundleResponse.model_validate(json_loads(cached["bundle"], {})), 0
 
-    domain = request.app_context.get("domain") if isinstance(request.app_context, dict) else None
+    domain = _scoped_domain_lite(request.app_context.get("domain") if isinstance(request.app_context, dict) else None, scope)
     task_type = request.app_context.get("task_type") if isinstance(request.app_context, dict) else None
     min_conf = float(request.constraints.get("min_confidence", 0.5)) if request.constraints else 0.5
     k = int(request.constraints.get("k", 12)) if request.constraints else 12
@@ -2883,10 +3151,14 @@ def context_bundle(
             query=request.task,
             filters=EventFilter(domain=domain, task_type=task_type),
             k=k,
+            project_id=scope.project_id if scope.project_binding == PROJECT_BOUND else None,
         ),
         settings=settings,
         workspace_id=workspace_id,
         owner_id=owner_id,
+        scope=scope,
+        deadline=deadline,
+        ledger=ledger,
     )
     evidence_events = [
         EvidenceEvent(
@@ -2906,6 +3178,7 @@ def context_bundle(
         workspace_id=workspace_id,
         owner_id=owner_id,
         limit=8,
+        scope=scope,
     )
     typed_memory: dict[str, list[str]] = {
         "facts": [],
@@ -2957,10 +3230,20 @@ def context_bundle(
                 ],
             ]
         )[:500]
-    if cold_start:
-        summary = (
-            "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance."
-        )
+    # P4 (G17): the cold-start summary rewrite is deleted, producer and all.
+    #
+    # It was one of two magic strings that another module then pattern-matched on:
+    # `ensure_takeover_response` read this text back out of the advice payload and rewrote the
+    # turn through `build_decisive_response`, so the LOWEST-evidence turns produced the MOST
+    # confident output, and the resulting DECISIVE classification scored 0.92 against 0.58 for
+    # a handoff -- raising the very decision_confidence that gates needs_human. Builder A
+    # deleted both reads; leaving the producer alive only means the same string finds a new
+    # reader later.
+    #
+    # The fact itself is not lost. It already travels structurally as `policy["cold_start"]`
+    # below, and thin evidence now travels as `policy_decision.abstain_reason` and
+    # `reason_for_asking` -- a named field a caller can branch on, rather than a sentence
+    # smuggled into a summary.
 
     bundle = ContextBundleResponse(
         summary=summary,
@@ -2973,6 +3256,7 @@ def context_bundle(
             "blocked_count": blocked,
             "applied_redactions": [],
             "cold_start": cold_start,
+            "project_binding": scope.project_binding,
             "evidence_count": len(evidence_events),
             "pattern_count": len(top_patterns),
             "typed_memory_counts": {key: len(value) for key, value in typed_memory.items()},
@@ -3294,13 +3578,14 @@ def context_brief(
     app_context: dict[str, Any] | None = None,
     constraints: dict[str, Any] | None = None,
     max_items: int = 15,
+    scope: ResolvedScope | None = None,
 ) -> dict[str, Any]:
     context_req = ContextBundleRequest(
         task=task,
         app_context=app_context or {},
         constraints=constraints or {},
     )
-    bundle, _ = context_bundle(conn, context_req, settings, workspace_id=workspace_id, owner_id=user_id)
+    bundle, _ = context_bundle(conn, context_req, settings, workspace_id=workspace_id, owner_id=user_id, scope=scope)
     typed_memory = bundle.structured_context.get("typed_memory", {}) if isinstance(bundle.structured_context, dict) else {}
     typed_facts = [str(item).strip() for item in typed_memory.get("facts", []) if str(item).strip()]
     typed_opinions = [str(item).strip() for item in typed_memory.get("opinions", []) if str(item).strip()]
@@ -4244,17 +4529,19 @@ def autonomy_project_kpis(
             DirectiveExecutionState.ABANDONED.value,
         } and bool(state_bucket.get("has_success")):
             state_bucket["reopened_after_success"] = True
-        meta = json_loads(row["meta"], {})
-        if not isinstance(meta, dict):
-            meta = {}
-        verification_summary = meta.get("verification_summary")
-        verification_map = verification_summary if isinstance(verification_summary, dict) else meta.get("verification")
-        if isinstance(verification_map, dict):
-            required_checks = _required_verification_checks_lite(settings)
-            verification_runs += 1
-            verification_ok = all(bool(verification_map.get(check, False)) for check in required_checks)
-            if verification_ok:
-                verification_passed += 1
+    # F3 -- verification_runs/passed come from `verification_results`, rows the API graded from
+    # evidence a distinct principal submitted.  They used to come from the directive's own
+    # meta["verification"] booleans, i.e. the implementer grading itself on the one metric that
+    # decides whether it may keep running unattended.
+    try:
+        verification_runs, verification_passed = verification_stats_for_session(
+            conn,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except sqlite3.Error:
+        verification_runs, verification_passed = 0, 0
     project_count = len(project_state)
     completed_projects = sum(1 for item in project_state.values() if bool(item.get("has_success")))
     reopened_projects = sum(1 for item in project_state.values() if bool(item.get("reopened_after_success")))
@@ -4265,7 +4552,9 @@ def autonomy_project_kpis(
         else float(needs_human_turns)
     )
     reopen_rate = (float(reopened_projects) / max(1, completed_projects)) if completed_projects > 0 else 0.0
-    verification_pass_rate = (float(verification_passed) / max(1, verification_runs)) if verification_runs > 0 else 1.0
+    # Fail CLOSED with no verification runs: passing vacuously at zero runs is what let the
+    # autonomy band reach project_autonomy_ready without a single verification ever happening.
+    verification_pass_rate = (float(verification_passed) / max(1, verification_runs)) if verification_runs > 0 else 0.0
     thresholds = {
         "min_project_completion_rate": float(getattr(settings, "autonomy_kpi_min_project_completion_rate", 0.80)),
         "max_manual_interventions_per_project": float(
@@ -4283,7 +4572,7 @@ def autonomy_project_kpis(
         "verification_pass_rate": (
             verification_pass_rate >= thresholds["min_verification_pass_rate"]
             if verification_runs > 0
-            else True
+            else False
         ),
     }
     passed = all(bool(value) for value in checks.values())
@@ -4467,7 +4756,9 @@ def activity_summary(
     period: str,
     domain: str | None,
     max_events: int,
+    scope: ResolvedScope | None = None,
 ) -> dict[str, Any]:
+    scope = _scope_for(scope, workspace_id=workspace_id, owner_id=owner_id)
     start_ts, end_ts = summary_window(period)
     clauses = [
         "ts >= ?",
@@ -4479,6 +4770,9 @@ def activity_summary(
         end_ts.isoformat(),
         max_read_sensitivity(settings),
     ]
+    scope_predicate = events_scope_predicate(scope, dialect=ScopeDialect.SQLITE, strict=bool(getattr(settings, "scope_strict_tags", False)))
+    clauses.extend(scope_predicate.clauses)
+    params.extend(scope_predicate.positional_params)
     if domain:
         clauses.append("domain = ?")
         params.append(domain)
@@ -4709,12 +5003,17 @@ def _query_similar_observations_lite(
     query_tokens = _tokenize_text(situation_text)
     if not query_tokens:
         return results[:limit]
+    # P4: the semantic arm keeps its situation_type filter.  It used to drop it entirely,
+    # which returned cross-situation rows in precisely the low-evidence cases where abstaining
+    # matters most -- the fallback was widest exactly where the evidence was thinnest.  Full's
+    # ANN arm regains the same filter for the same reason.
     candidate_rows = conn.execute(
-        """
+        f"""
         SELECT id, ts, situation_type, situation_summary, user_response, response_reasoning,
                outcome, outcome_sentiment, confidence, source_event_ids, context_snapshot
         FROM decision_observations
         WHERE workspace_id = ? AND subject_user_id = ? AND superseded_by IS NULL
+          AND situation_type IN ({placeholders})
           AND learning_eligible = 1
           AND lifecycle_status = 'active'
           AND (valid_from = '' OR valid_from <= ?)
@@ -4722,7 +5021,7 @@ def _query_similar_observations_lite(
         ORDER BY ts DESC
         LIMIT 200
         """,
-        (workspace_id, subject_user_id, current_ts, current_ts),
+        (workspace_id, subject_user_id, *candidates, current_ts, current_ts),
     ).fetchall()
     scored: list[tuple[float, sqlite3.Row]] = []
     for row in candidate_rows:
@@ -4865,15 +5164,24 @@ def build_clone_advice(
         settings=settings,
         workspace_id=auth.workspace_id,
         owner_id=auth.user_id,
+        scope=auth.resolved_scope(
+            project_hint=body.app_context if isinstance(body.app_context, dict) else None,
+            session_project=_session_project_context_lite(conn, session_id=getattr(body, "session_id", None), workspace_id=auth.workspace_id, user_id=auth.user_id),
+        ),
     )
     pattern_conf = [pattern.confidence for pattern in bundle.top_patterns]
     confidence = sum(pattern_conf) / len(pattern_conf) if pattern_conf else 0.45
     citation_count = len(bundle.citations)
-    evidence_strength = "medium"
+    # P4: one vocabulary across both backends.  Full emitted {strong, moderate, weak} and Lite
+    # emitted {high, medium, low}, so any branch keyed on the label could never fire on Lite --
+    # a silent policy fork hiding inside a string.  The labels here are now the shared ones
+    # ``decision_policy.evidence_strength_label`` returns.  Nothing reads this field to steer a
+    # turn any more (the read in ``ensure_takeover_response`` is gone), so it is provenance.
+    evidence_strength = "moderate"
     if citation_count >= 5 and confidence >= 0.65:
-        evidence_strength = "high"
+        evidence_strength = "strong"
     elif citation_count < 2 or confidence < 0.45:
-        evidence_strength = "low"
+        evidence_strength = "weak"
 
     conflict_flags: list[str] = []
     if fallback_used:
@@ -4945,6 +5253,14 @@ def build_clone_arbitration(
     )
 
 
+def _default_autonomy_policy_profile() -> AutonomyPolicyProfile:
+    """New sessions honour TCE_TAKEOVER_AUTONOMY_POLICY_DEFAULT; invalid values fall back to consultative."""
+    try:
+        return AutonomyPolicyProfile(str(getattr(get_settings(), "takeover_autonomy_policy_default", "") or "human_consultative"))
+    except ValueError:
+        return AutonomyPolicyProfile.HUMAN_CONSULTATIVE
+
+
 def takeover_state(
     conn: sqlite3.Connection,
     session_id: str,
@@ -4988,7 +5304,7 @@ def takeover_state(
             last_deliberation_at=None,
             recent_outcomes_json=[],
             autonomy_score=0.5,
-            autonomy_policy_profile=AutonomyPolicyProfile.HUMAN_CONSULTATIVE,
+            autonomy_policy_profile=_default_autonomy_policy_profile(),
             active_goal_id=None,
             goal_queue_size=0,
             last_discovery_at=None,
@@ -5271,6 +5587,13 @@ def reset_takeover_state(
         (session_id, workspace_id, user_id),
     )
     conn.commit()
+    _record_stand_down_lite(
+        conn,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        session_id=session_id,
+        now=now_utc(),
+    )
     return takeover_state(
         conn=conn,
         session_id=session_id,
@@ -5290,13 +5613,31 @@ def _build_takeover_working_set(
     task: str,
     app_context: dict[str, Any],
     constraints: dict[str, Any],
+    deadline: Deadline | None = None,
+    ledger: RetrievalLedger | None = None,
 ) -> dict[str, Any]:
+    # S6: the retrieval child is built HERE, immediately above the bundle call, not at the top of
+    # the turn — a child's clock starts at construction, and everything the turn does before
+    # retrieval would otherwise burn the whole retrieval budget before retrieval began. With the
+    # knob off this returns the (unbounded) turn deadline unchanged, so no guard is installed.
+    retrieval_deadline = (
+        retrieval_child(
+            deadline,
+            enabled=bool(getattr(settings, "retrieval_deadline_enabled", True)),
+            budget_ms=int(getattr(settings, "context_retrieval_budget_ms", 120)),
+        )
+        if deadline is not None
+        else None
+    )
     bundle, _blocked = context_bundle(
         conn,
         ContextBundleRequest(task=task, app_context=app_context, constraints=constraints),
         settings=settings,
         workspace_id=auth.workspace_id,
         owner_id=auth.user_id,
+        scope=auth.resolved_scope(project_hint=app_context if isinstance(app_context, dict) else None),
+        deadline=retrieval_deadline,
+        ledger=ledger,
     )
     citation_limit = max(1, int(getattr(settings, "takeover_citation_snippet_max_items", 20)))
     citation_ids = list(bundle.citations[:citation_limit])
@@ -5375,21 +5716,40 @@ def _record_takeover_action(
     conn.commit()
 
 
-def _is_mutating_intent(message: str, task: str | None, final_response: str | None) -> bool:
-    joined = " ".join([message or "", task or "", final_response or ""]).lower()
-    hints = (
-        "edit ",
-        "change ",
-        "fix ",
-        "implement ",
-        "update ",
-        "refactor ",
-        "rename ",
-        "delete ",
-        "write ",
-        "create ",
-    )
-    return any(token in joined for token in hints)
+# The verbs that mean "this turn intends to write something".  Matched on word boundaries, so
+# "fix" is found in `ship the stripe webhook fix` and not in `prefixed`.
+#
+# The list used to be matched as `"fix "` etc. -- verb plus a literal trailing space -- which
+# silently missed every verb at the end of a string.  `ship the stripe webhook fix` is a mutating
+# objective and scored as a non-mutating one, and the gate fired on those turns only because its
+# third input, the system's own reply, echoed the objective back with a space after it.  Removing
+# that input without fixing this would have dropped the permit requirement on exactly those turns.
+_MUTATING_VERBS: tuple[str, ...] = (
+    "edit",
+    "change",
+    "fix",
+    "implement",
+    "update",
+    "refactor",
+    "rename",
+    "delete",
+    "write",
+    "create",
+)
+_MUTATING_VERB_RE = re.compile(r"\b(?:" + "|".join(_MUTATING_VERBS) + r")\b", re.IGNORECASE)
+
+
+def _is_mutating_intent(message: str, task: str | None) -> bool:
+    """Does this turn intend a write?  A property of what the OWNER asked and what the objective is.
+
+    `final_response` -- the system's own reply for this turn -- used to be a third input, and on
+    the turns where the message and the objective carried no verb it decided the gate by itself.
+    A permit gate that reads the system's own words can be talked past by rewording the reply,
+    which is the anti-pattern this whole plan closes.  It is gone; never add an output of this
+    turn back as an input to it.
+    """
+
+    return bool(_MUTATING_VERB_RE.search(" ".join([message or "", task or ""])))
 
 
 def _clamp_confidence_lite(value: float, low: float = 0.05, high: float = 0.98) -> float:
@@ -5839,7 +6199,32 @@ def _goal_from_row(row: sqlite3.Row) -> TakeoverGoal:
         status=AutonomyGoalStatus(str(row["status"] or AutonomyGoalStatus.CANDIDATE.value)),
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        step_index=_row_int_or_none(row, "step_index"),
+        parent_goal_id=_row_uuid_or_none(row, "parent_goal_id"),
+        depends_on=[int(item) for item in json_loads(_row_get(row, "depends_on_json"), []) if str(item).lstrip("-").isdigit()],
+        attempts=int(_row_get(row, "attempt_count") or 0),
+        mutating=bool(int(_row_get(row, "mutating") or 0)),
     )
+
+
+def _row_int_or_none(row: sqlite3.Row, name: str) -> int | None:
+    value = _row_get(row, name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _row_uuid_or_none(row: sqlite3.Row, name: str) -> UUID | None:
+    value = _row_get(row, name)
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _notice_from_row(row: sqlite3.Row) -> AutonomyNotice:
@@ -5858,7 +6243,112 @@ def _notice_from_row(row: sqlite3.Row) -> AutonomyNotice:
     )
 
 
+# Single column list used by EVERY directive SELECT/INSERT so the lease/fencing columns are never
+# silently dropped by a copy-pasted projection. 29 columns: 21 legacy + 8 P0 trust-boundary columns.
+_DIRECTIVE_COLUMNS = (
+    "directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind, attempt, state, requires_permit, permit_id, claimed_by, "
+    "started_at, finished_at, expires_at, failure_class, failure_reason, retry_strategy, meta, created_at, updated_at, "
+    "lease_generation, claimed_executor, lease_expires_at, verification_state, report_idempotency_key, report_payload_hash, cancelled_at, cancel_reason"
+)
+_DIRECTIVE_INSERT_PLACEHOLDERS = ", ".join("?" for _ in range(29))
+
+
+def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    """Read an optional column; rows read through an old projection (or a pre-migration DB) still parse."""
+    return row[key] if key in row.keys() else default
+
+
+class _DirectiveLease(NamedTuple):
+    """Fencing/idempotency columns of a directive row (auth-bound, never taken from the request body)."""
+
+    lease_generation: int
+    claimed_executor: str | None
+    verification_state: str
+    report_idempotency_key: str | None
+    report_payload_hash: str | None
+
+
+def _directive_lease_from_row(row: sqlite3.Row) -> _DirectiveLease:
+    return _DirectiveLease(
+        lease_generation=int(_row_get(row, "lease_generation") or 0),
+        claimed_executor=(str(_row_get(row, "claimed_executor")) if _row_get(row, "claimed_executor") else None),
+        verification_state=str(_row_get(row, "verification_state") or "unverified"),
+        report_idempotency_key=(str(_row_get(row, "report_idempotency_key")) if _row_get(row, "report_idempotency_key") else None),
+        report_payload_hash=(str(_row_get(row, "report_payload_hash")) if _row_get(row, "report_payload_hash") else None),
+    )
+
+
+def _write_directive_audit(
+    conn: sqlite3.Connection,
+    *,
+    consumer: str,
+    action: str,
+    query: dict[str, Any],
+    policy_decisions: dict[str, Any],
+) -> None:
+    """Durable audit row for a lifecycle decision (late evidence for rejected reports is retained here)."""
+    conn.execute(
+        """
+        INSERT INTO audit_log(id, ts, consumer, action, query, result_event_ids, policy_decisions, latency_ms)
+        VALUES (?, ?, ?, ?, ?, '[]', ?, 0)
+        """,
+        (str(uuid.uuid4()), now_utc().isoformat(), consumer, action, json_dumps(query), json_dumps(policy_decisions)),
+    )
+    conn.commit()
+
+
+def _reject_directive_transition(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    directive_id: str,
+    current_state: str,
+    lease_generation: int,
+    claimed_executor: str | None,
+    reason: str,
+    message: str,
+    requested_state: str,
+    presented_lease: int | None,
+    payload_hash: str | None,
+    late_payload: dict[str, Any] | None,
+    action: str,
+) -> HTTPException:
+    """Audit a rejected lifecycle transition and build the 409 the caller raises.
+
+    Callers roll back any dirty write before calling this so the audit commit is clean.
+    """
+    _write_directive_audit(
+        conn,
+        consumer=auth.consumer,
+        action=action,
+        query={
+            "directive_id": directive_id,
+            "requested_state": requested_state,
+            "reason": reason,
+            "presented_lease": presented_lease,
+            "current_lease": lease_generation,
+            "claimed_executor": claimed_executor,
+            "actor": auth.consumer,
+            "payload_hash": payload_hash,
+            "late_payload": late_payload or {},
+        },
+        policy_decisions={"reason": reason, "policy_revision": SCOPE_POLICY_REVISION},
+    )
+    return HTTPException(
+        status_code=409,
+        detail={
+            "reason": reason,
+            "directive_id": directive_id,
+            "state": current_state,
+            "lease_generation": lease_generation,
+            "claimed_executor": claimed_executor,
+            "message": message,
+        },
+    )
+
+
 def _directive_from_row(row: sqlite3.Row) -> DirectiveExecution:
+    lease = _directive_lease_from_row(row)
     return DirectiveExecution(
         directive_id=UUID(str(row["directive_id"])),
         session_id=str(row["session_id"]),
@@ -5881,6 +6371,13 @@ def _directive_from_row(row: sqlite3.Row) -> DirectiveExecution:
         meta=json_loads(row["meta"], {}),
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+        lease_generation=lease.lease_generation,
+        claimed_executor=lease.claimed_executor,
+        lease_expires_at=datetime.fromisoformat(str(_row_get(row, "lease_expires_at"))) if _row_get(row, "lease_expires_at") else None,
+        verification_state=lease.verification_state,
+        report_idempotency_key=lease.report_idempotency_key,
+        cancelled_at=datetime.fromisoformat(str(_row_get(row, "cancelled_at"))) if _row_get(row, "cancelled_at") else None,
+        cancel_reason=(str(_row_get(row, "cancel_reason")) if _row_get(row, "cancel_reason") else None),
     )
 
 
@@ -5890,10 +6387,8 @@ def _load_pending_directive(
     state: TakeoverState,
 ) -> DirectiveExecution | None:
     row = conn.execute(
-        """
-        SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-               attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-               failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+        f"""
+        SELECT {_DIRECTIVE_COLUMNS}
         FROM directive_executions
         WHERE session_id = ? AND workspace_id = ? AND user_id = ?
           AND state IN (?, ?)
@@ -5911,54 +6406,123 @@ def _load_pending_directive(
     if row is None:
         return None
     directive = _directive_from_row(row)
+    lease = _directive_lease_from_row(row)
     now_stamp = now_utc()
     # expires_at is the CLAIM-WINDOW deadline: it only reaps a PENDING
     # directive that was never claimed. An IN_PROGRESS directive is actively
     # being worked and may legitimately run past the claim TTL; it is reaped
     # only by the stale-work window below (keyed off started_at/updated_at).
+    # Both reaps go through the shared validator as the system actor and commit with a fenced
+    # UPDATE; a 0-row result means a legitimate claim/report won the race and is left alone.
     if (
         directive.state == DirectiveExecutionState.PENDING
         and directive.expires_at
         and directive.expires_at < now_stamp
     ):
-        conn.execute(
-            """
-            UPDATE directive_executions
-            SET state = ?, updated_at = ?, finished_at = ?, failure_reason = COALESCE(failure_reason, ?)
-            WHERE directive_id = ?
-            """,
-            (
-                DirectiveExecutionState.ABANDONED.value,
-                now_stamp.isoformat(),
-                now_stamp.isoformat(),
-                "claim window expired",
-                str(directive.directive_id),
-            ),
+        decision = validate_transition(
+            current_state=DirectiveExecutionState.PENDING,
+            claimed_by=None,
+            lease_generation=lease.lease_generation,
+            requested=DirectiveExecutionState.ABANDONED,
+            actor=SYSTEM_ACTOR,
+            actor_lease=None,
         )
-        conn.commit()
+        if decision.allowed:
+            reaped = conn.execute(
+                """
+                UPDATE directive_executions
+                SET state = ?, updated_at = ?, finished_at = ?, failure_reason = COALESCE(failure_reason, ?)
+                WHERE directive_id = ? AND state = ? AND lease_generation = ?
+                """,
+                (
+                    DirectiveExecutionState.ABANDONED.value,
+                    now_stamp.isoformat(),
+                    now_stamp.isoformat(),
+                    "claim window expired",
+                    str(directive.directive_id),
+                    DirectiveExecutionState.PENDING.value,
+                    lease.lease_generation,
+                ),
+            )
+            conn.commit()
+            if reaped.rowcount == 1:
+                _write_directive_audit(
+                    conn,
+                    consumer=SYSTEM_ACTOR,
+                    action=decision.audited_as,
+                    query={"directive_id": str(directive.directive_id), "from_state": "pending", "reason": "claim window expired", "lease_generation": lease.lease_generation},
+                    policy_decisions={"reason": "claim_window_expired", "policy_revision": SCOPE_POLICY_REVISION},
+                )
         return None
-    stale_seconds = 900
+    # Parity with Full's max(120, claim_ttl * 3): Lite hardcoded 900, which silently diverged from
+    # the claim TTL the operator actually configured.
+    stale_seconds = max(120, int(get_settings().takeover_execution_claim_ttl_seconds) * 3)
     stale_anchor = directive.started_at or directive.updated_at or directive.created_at
     if (
         directive.state == DirectiveExecutionState.IN_PROGRESS
         and stale_anchor is not None
         and stale_anchor < (now_stamp - timedelta(seconds=stale_seconds))
     ):
-        conn.execute(
-            """
-            UPDATE directive_executions
-            SET state = ?, updated_at = ?, finished_at = ?, failure_reason = COALESCE(failure_reason, ?)
-            WHERE directive_id = ?
-            """,
-            (
-                DirectiveExecutionState.ABANDONED.value,
-                now_stamp.isoformat(),
-                now_stamp.isoformat(),
-                "directive stale timeout",
-                str(directive.directive_id),
-            ),
+        decision = validate_transition(
+            current_state=DirectiveExecutionState.IN_PROGRESS,
+            claimed_by=lease.claimed_executor,
+            lease_generation=lease.lease_generation,
+            requested=DirectiveExecutionState.ABANDONED,
+            actor=SYSTEM_ACTOR,
+            actor_lease=None,
         )
-        conn.commit()
+        if decision.allowed:
+            # The reap bumps the lease so a stale worker that wakes up later is fenced out.
+            reaped = conn.execute(
+                """
+                UPDATE directive_executions
+                SET state = ?, lease_generation = ?, updated_at = ?, finished_at = ?, failure_reason = COALESCE(failure_reason, ?)
+                WHERE directive_id = ? AND state = ? AND lease_generation = ?
+                """,
+                (
+                    DirectiveExecutionState.ABANDONED.value,
+                    decision.next_lease,
+                    now_stamp.isoformat(),
+                    now_stamp.isoformat(),
+                    "directive stale timeout",
+                    str(directive.directive_id),
+                    DirectiveExecutionState.IN_PROGRESS.value,
+                    lease.lease_generation,
+                ),
+            )
+            effects_unknown = 0
+            if reaped.rowcount == 1:
+                # G1 -- the LIVE reaper resolves the effect journal too, in the SAME transaction as
+                # the lease bump.  Bumping the lease alone left every open effect open, so the
+                # `pause_guard_for_session` call a few lines later in this same takeover_step found
+                # nothing and the unknown-effect pause only ever fired after a restart.  The pause
+                # must fire on the step that reaps.
+                effects_unknown = int(
+                    resolve_effects_for_directive(
+                        conn,
+                        directive_id=str(directive.directive_id),
+                        bumped_lease=int(decision.next_lease),
+                        settings=get_settings(),
+                        now=now_stamp,
+                    )["effects_unknown"]
+                )
+            conn.commit()
+            if reaped.rowcount == 1:
+                _write_directive_audit(
+                    conn,
+                    consumer=SYSTEM_ACTOR,
+                    action=decision.audited_as,
+                    query={
+                        "directive_id": str(directive.directive_id),
+                        "from_state": "in_progress",
+                        "reason": "directive stale timeout",
+                        "lease_generation": lease.lease_generation,
+                        "next_lease": decision.next_lease,
+                        "claimed_executor": lease.claimed_executor,
+                        "effects_unknown": effects_unknown,
+                    },
+                    policy_decisions={"reason": "stale_timeout", "policy_revision": SCOPE_POLICY_REVISION},
+                )
         return None
     return directive
 
@@ -5997,7 +6561,13 @@ def _sync_enforcement_counters(conn: sqlite3.Connection, state: TakeoverState) -
     state.retry_backlog_count = int((retry_backlog_row["total"] if retry_backlog_row else 0) or 0)
 
 
-def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
+def _goal_cache_key_for_state(
+    state: TakeoverState,
+    auth: AuthContext,
+    *,
+    contract_revision: int = 0,
+    scope_digest: str = "",
+) -> str:
     objective_hash_value = state.objective_hash or objective_hash(str(state.takeover_context.get("objective", "")))
     state_version = f"{state.mode.value}:{state.autonomy_policy_profile.value}"
     return goal_cache_key(
@@ -6006,6 +6576,9 @@ def _goal_cache_key_for_state(state: TakeoverState, auth: AuthContext) -> str:
         session_id=state.session_id,
         objective_hash=objective_hash_value or "no-objective",
         state_version=state_version,
+        contract_revision=int(contract_revision),
+        scope_digest=scope_digest,
+        policy_revision=TASK_STATE_POLICY_REVISION,
     )
 
 
@@ -6278,16 +6851,28 @@ def discover_takeover_goals(
             "success_probability": success_probability,
         }
     if include_open_discovery:
+        # P0: open discovery reads only this owner's events (shared scope predicate), never the
+        # whole workspace timeline - another owner's titles must not become this user's goals.
+        session_project = state.takeover_context.get("project_context")
+        discovery_scope = auth.resolved_scope(
+            session_project=session_project if isinstance(session_project, dict) else None,
+            task_id=state.session_id,
+        )
+        discovery_predicate = events_scope_predicate(
+            discovery_scope,
+            dialect=ScopeDialect.SQLITE,
+            strict=bool(getattr(effective_settings, "scope_strict_tags", False)),
+        )
         rows = conn.execute(
-            """
+            f"""
             SELECT id, ts, event_type, title
             FROM events
-            WHERE (json_extract(context, '$._tce_workspace') IS NULL OR json_extract(context, '$._tce_workspace') = ?)
+            WHERE {discovery_predicate.where_sql}
               AND sensitivity <= ?
             ORDER BY ts DESC
             LIMIT 120
             """,
-            (auth.workspace_id, 2),
+            (*discovery_predicate.positional_params, 2),
         ).fetchall()
         for row in rows:
             title = str(row["title"] or "").strip()
@@ -6506,6 +7091,7 @@ def list_takeover_goals(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE session_id = ? AND workspace_id = ? AND user_id = ?
@@ -6520,6 +7106,7 @@ def list_takeover_goals(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE session_id = ? AND workspace_id = ? AND user_id = ? AND status = ?
@@ -6575,6 +7162,7 @@ def select_takeover_goal(
         SELECT id, session_id, workspace_id, user_id, title, description, source,
                priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+               step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                status, created_at, updated_at
         FROM autonomy_goals
         WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -6615,26 +7203,43 @@ def request_execution_permit_lite(
         command_preview=body.command_preview,
         estimated_change_size=body.estimated_change_size,
     )
-    sensitive_hit = any(
-        any(token in path.lower() for token in ("services/tce_mcp", "infra/", "secrets", ".env"))
-        for path in body.target_paths
+    # The charter is resolved SERVER-SIDE from auth + session. ExecutionPermitRequest is 100%
+    # client-supplied; a charter read from it would be the caller grading its own homework.
+    charter = load_active_charter(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=now,
     )
+    sensitive_hit = charter_sensitive_path_hit(charter, body.target_paths)
     decision, reason = evaluate_execution_permit(
         policy_profile=policy_profile,
         risk_tier=risk_tier,
         estimated_change_size=body.estimated_change_size,
         role=auth.role.value,
         sensitive_path_hit=sensitive_hit,
+        charter=charter,
+        action_kind=body.action_kind,
+        target_paths=body.target_paths,
     )
     permit_id = uuid.uuid4()
     expires_at = now + timedelta(seconds=max(30, int(permit_ttl_seconds)))
+    # Bind the permit to the requesting user/executor, the objective revision and the action scope.
+    # NULL binding columns act as wildcards (legacy permits); explicit values must match at claim/report.
+    state = takeover_state(conn, body.session_id, auth.workspace_id, auth.user_id)
+    bound_directive_id = getattr(body, "directive_id", None)
+    bound_attempt = getattr(body, "attempt", None)
+    bound_objective_hash = str(getattr(body, "objective_hash", None) or state.objective_hash or "").strip() or None
     conn.execute(
         """
         INSERT INTO execution_permits(
             id, session_id, workspace_id, action_kind, target_paths, command_preview,
-            estimated_change_size, decision, reason, confirmed_by, expires_at, created_at, resolved_at
+            estimated_change_size, decision, reason, confirmed_by, expires_at, created_at, resolved_at,
+            user_id, requested_by, directive_id, attempt, objective_hash, policy_revision, scope_digest,
+            charter_id, charter_version
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             str(permit_id),
@@ -6650,6 +7255,15 @@ def request_execution_permit_lite(
             expires_at.isoformat(),
             now.isoformat(),
             None,
+            auth.user_id,
+            auth.consumer,
+            str(bound_directive_id) if bound_directive_id else None,
+            int(bound_attempt) if bound_attempt is not None else None,
+            bound_objective_hash,
+            SCOPE_POLICY_REVISION,
+            permit_scope_digest(action_kind=body.action_kind, target_paths=list(body.target_paths), command_preview=body.command_preview),
+            (charter.charter_id if charter is not None else None),
+            (charter.charter_version if charter is not None else None),
         ),
     )
     conn.commit()
@@ -6669,17 +7283,44 @@ def resolve_execution_permit_lite(
     body: ExecutionPermitResolveRequest,
     confirm_keyword: str = "confirm",
 ) -> ExecutionPermitResponse:
-    row = conn.execute(
-        """
-        SELECT id, session_id, decision, reason, expires_at
-        FROM execution_permits
-        WHERE id = ? AND workspace_id = ?
-        LIMIT 1
-        """,
-        (str(body.permit_id), auth.workspace_id),
-    ).fetchone()
+    def _load_permit() -> sqlite3.Row | None:
+        found = conn.execute(
+            """
+            SELECT id, session_id, decision, reason, expires_at, resolved_at, requested_by
+            FROM execution_permits
+            WHERE id = ? AND workspace_id = ?
+            LIMIT 1
+            """,
+            (str(body.permit_id), auth.workspace_id),
+        ).fetchone()
+        return found if isinstance(found, sqlite3.Row) else None
+
+    def _response_from_row(current: sqlite3.Row) -> ExecutionPermitResponse:
+        current_decision = ExecutionPermitDecision(str(current["decision"]))
+        return ExecutionPermitResponse(
+            decision=current_decision,
+            reason=str(current["reason"] or ""),
+            permit_id=body.permit_id,
+            expires_at=datetime.fromisoformat(current["expires_at"]) if current["expires_at"] else None,
+            required_confirmation=confirm_keyword if current_decision == ExecutionPermitDecision.CONFIRM_REQUIRED else None,
+        )
+
+    row = _load_permit()
     if row is None:
         raise HTTPException(status_code=404, detail="permit not found")
+    already_resolved = _row_get(row, "resolved_at") is not None
+    if already_resolved or str(row["decision"]) != ExecutionPermitDecision.CONFIRM_REQUIRED.value:
+        # Idempotent: a permit that is not awaiting confirmation is returned unchanged.
+        return _response_from_row(row)
+    if auth.role != AgentRole.USER:
+        # Only a human operator may resolve a confirm_required permit; any executor identity is refused.
+        if auth.role == AgentRole.EXECUTOR and str(_row_get(row, "requested_by") or "") == auth.consumer:
+            raise HTTPException(status_code=403, detail="executor cannot self-approve a confirm_required permit")
+        raise HTTPException(status_code=403, detail="only an operator may resolve a confirm_required permit")
+    if not human_origin_verified(auth) and str(_row_get(row, "requested_by") or "") == auth.consumer:
+        # Same self-approval, laundered through the compat `X-TCE-Role: user` header on the requester's own
+        # bearer. Only a server-established identity may confirm a permit that this consumer requested.
+        raise HTTPException(status_code=403, detail="executor cannot self-approve a confirm_required permit")
     expires_at = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
     if expires_at and expires_at < now_utc():
         decision = ExecutionPermitDecision.BLOCKED
@@ -6687,19 +7328,37 @@ def resolve_execution_permit_lite(
     else:
         decision = ExecutionPermitDecision.ALLOW if body.approved else ExecutionPermitDecision.BLOCKED
         reason = "confirmed by operator" if body.approved else "denied by operator"
-    conn.execute(
+    resolved = conn.execute(
         """
         UPDATE execution_permits
-        SET decision = ?, reason = ?, confirmed_by = ?, resolved_at = ?
-        WHERE id = ?
+        SET decision = ?, reason = ?, confirmed_by = ?, resolved_by = ?, resolved_at = ?
+        WHERE id = ? AND workspace_id = ? AND resolved_at IS NULL AND decision = ?
         """,
         (
             decision.value,
             reason,
             body.confirmed_by or auth.user_id,
+            auth.consumer,
             now_utc().isoformat(),
             str(body.permit_id),
+            auth.workspace_id,
+            ExecutionPermitDecision.CONFIRM_REQUIRED.value,
         ),
+    )
+    if resolved.rowcount == 0:
+        # Lost the race against a concurrent resolution: return whatever won.
+        conn.rollback()
+        latest = _load_permit()
+        if latest is None:
+            raise HTTPException(status_code=404, detail="permit not found")
+        return _response_from_row(latest)
+    _resolve_safety_opportunity_from_permit(
+        conn,
+        auth=auth,
+        session_id=str(row["session_id"]),
+        approved=decision == ExecutionPermitDecision.ALLOW,
+        permit_id=str(body.permit_id),
+        now=now_utc(),
     )
     goal_cache_invalidate_l1(None)
     conn.execute(
@@ -6733,6 +7392,7 @@ def takeover_autonomy_status(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -6974,13 +7634,20 @@ def claim_execution(
     body: ExecutionClaimRequest,
     settings: Settings,
 ) -> DirectiveExecution:
+    # SQLite has no row locks: take the write lock for the whole read-validate-update sequence so two
+    # claimers cannot both observe lease N. The fenced UPDATE below is still the source of truth.
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     state = takeover_state(conn, body.session_id, auth.workspace_id, auth.user_id)
+    if _unattended_profile(state, settings):
+        paused_state = _capture_delivery_state_for(conn, auth=auth, settings=settings, now=now_utc())
+        if paused_state in {"gap", "unavailable"}:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail="AUTONOMOUS MODE PAUSED: capture channel unavailable")
     if body.directive_id:
         row = conn.execute(
-            """
-            SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-                   attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-                   failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+            f"""
+            SELECT {_DIRECTIVE_COLUMNS}
             FROM directive_executions
             WHERE directive_id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
             LIMIT 1
@@ -6989,10 +7656,8 @@ def claim_execution(
         ).fetchone()
     else:
         row = conn.execute(
-            """
-            SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-                   attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-                   failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+            f"""
+            SELECT {_DIRECTIVE_COLUMNS}
             FROM directive_executions
             WHERE session_id = ? AND workspace_id = ? AND user_id = ? AND state = ?
             ORDER BY created_at DESC
@@ -7001,23 +7666,92 @@ def claim_execution(
             (body.session_id, auth.workspace_id, auth.user_id, DirectiveExecutionState.PENDING.value),
         ).fetchone()
     if row is None:
+        conn.rollback()
         raise HTTPException(status_code=404, detail="no pending directive found")
     directive = _directive_from_row(row)
+    lease = _directive_lease_from_row(row)
     now = now_utc()
-    claimer = body.claimed_by or auth.user_id
+    # U2 --- the charter gate, BEFORE any state transition and never a fall-through to legacy
+    # behaviour. A revoked, expired or absent charter refuses the claim outright; the audit row is
+    # written first, because a refusal that is not durably recorded is not evidence.
+    charter = load_active_charter(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        now=now,
+    )
+    try:
+        require_charter_for_action(
+            charter,
+            action_kind=str(_row_get(row, "action_kind") or ""),
+            enforcement_enabled=bool(settings.charter_enforcement_enabled),
+            now=now,
+        )
+    except CharterRequired as exc:
+        conn.rollback()
+        _write_directive_audit(
+            conn,
+            consumer=auth.consumer,
+            action="claim_refused_no_charter",
+            query={
+                "directive_id": str(directive.directive_id),
+                "action_kind": exc.action_kind,
+                "session_id": body.session_id,
+            },
+            policy_decisions={"reason": exc.reason, "charter_enforcement_enabled": True},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "no_active_charter",
+                "message": "AUTONOMOUS MODE PAUSED: no active authority charter. A charter must be created and "
+                "approved by the owner before mutating work may be claimed. Ask the owner to approve "
+                "one, then retry.",
+                "action_kind": exc.action_kind,
+                "reason": exc.reason,
+            },
+        ) from exc
+    # Residual: in identity_claims_mode=compat auth.consumer derives from the X-TCE-Consumer header, so
+    # the lease binding is header-asserted; it is server-bound only under enforce. Two processes sharing
+    # one consumer identity are only fenced when takeover_lease_strict=True (lease echo required).
+    executor_id = auth.consumer
+    claimer = body.claimed_by or auth.user_id  # free-text label only; never used for authorisation
+    if directive.state in _TERMINAL_DIRECTIVE_STATES:
+        conn.rollback()
+        return directive
     if directive.state == DirectiveExecutionState.IN_PROGRESS:
-        if directive.claimed_by and directive.claimed_by != claimer:
-            raise HTTPException(status_code=409, detail="directive already claimed by another actor")
-        return directive
-    if directive.state in {
-        DirectiveExecutionState.SUCCEEDED,
-        DirectiveExecutionState.FAILED,
-        DirectiveExecutionState.BLOCKED,
-        DirectiveExecutionState.ABANDONED,
-    }:
-        return directive
+        reclaim = validate_transition(
+            current_state=directive.state,
+            claimed_by=lease.claimed_executor,
+            lease_generation=lease.lease_generation,
+            requested=DirectiveExecutionState.IN_PROGRESS,
+            actor=executor_id,
+            actor_lease=None,
+        )
+        conn.rollback()
+        if not reclaim.allowed:
+            raise _reject_directive_transition(
+                conn,
+                auth=auth,
+                directive_id=str(directive.directive_id),
+                current_state=directive.state.value,
+                lease_generation=lease.lease_generation,
+                claimed_executor=lease.claimed_executor,
+                reason=reclaim.reason.value,
+                message=reclaim.message,
+                requested_state=DirectiveExecutionState.IN_PROGRESS.value,
+                presented_lease=None,
+                payload_hash=None,
+                late_payload=None,
+                action="directive_claim_rejected",
+            )
+        return directive  # idempotent re-claim by the lease holder
 
     permit_id = directive.permit_id
+    permit_ok = True
+    permit_reason = "ok"
+    permit_expires: datetime | None = None
     if directive.requires_permit:
         if permit_id is None:
             permit_lookup = conn.execute(
@@ -7026,6 +7760,9 @@ def claim_execution(
                 FROM execution_permits
                 WHERE session_id = ? AND workspace_id = ? AND decision = ?
                   AND (expires_at IS NULL OR expires_at > ?)
+                  AND (user_id IS NULL OR user_id = ?)
+                  AND (objective_hash IS NULL OR ? IS NULL OR objective_hash = ?)
+                  AND (directive_id IS NULL OR directive_id = ?)
                 ORDER BY COALESCE(resolved_at, created_at) DESC
                 LIMIT 1
                 """,
@@ -7034,9 +7771,14 @@ def claim_execution(
                     auth.workspace_id,
                     ExecutionPermitDecision.ALLOW.value,
                     now.isoformat(),
+                    directive.user_id,
+                    directive.objective_hash,
+                    directive.objective_hash,
+                    str(directive.directive_id),
                 ),
             ).fetchone()
             if permit_lookup is None:
+                conn.rollback()
                 raise HTTPException(status_code=409, detail="directive requires permit but no permit_id attached")
             permit_id = UUID(str(permit_lookup["id"]))
             conn.execute(
@@ -7047,50 +7789,136 @@ def claim_execution(
                 """,
                 (str(permit_id), now.isoformat(), str(directive.directive_id)),
             )
+            conn.execute(
+                "UPDATE execution_permits SET directive_id = ?, attempt = ? WHERE id = ? AND directive_id IS NULL",
+                (str(directive.directive_id), int(directive.attempt), str(permit_id)),
+            )
             directive.permit_id = permit_id
         permit_row = conn.execute(
             """
-            SELECT decision, expires_at
+            SELECT decision, expires_at, user_id, directive_id, objective_hash, scope_digest,
+                   action_kind, target_paths, command_preview, charter_id
             FROM execution_permits
             WHERE id = ? AND session_id = ? AND workspace_id = ?
             LIMIT 1
             """,
             (str(permit_id), body.session_id, auth.workspace_id),
         ).fetchone()
-        if permit_row is None or str(permit_row["decision"]) != ExecutionPermitDecision.ALLOW.value:
+        if permit_row is None:
+            conn.rollback()
             raise HTTPException(status_code=409, detail="permit not approved")
         permit_expires = datetime.fromisoformat(permit_row["expires_at"]) if permit_row["expires_at"] else None
-        if permit_expires and permit_expires <= now:
-            raise HTTPException(status_code=409, detail="permit expired")
-    else:
-        permit_expires = None
+        permit_ok, permit_reason = permit_binding_ok(
+            permit_decision=str(permit_row["decision"]) if permit_row["decision"] else None,
+            permit_expires_at=permit_expires,
+            permit_user_id=str(_row_get(permit_row, "user_id")) if _row_get(permit_row, "user_id") else None,
+            permit_directive_id=str(_row_get(permit_row, "directive_id")) if _row_get(permit_row, "directive_id") else None,
+            permit_objective_hash=str(_row_get(permit_row, "objective_hash")) if _row_get(permit_row, "objective_hash") else None,
+            # C12/S-G16(b): the permit's recorded scope must still match the scope it was issued
+            # for. Under enforcement a NULL digest REFUSES rather than silently skipping the check.
+            permit_scope_digest=str(_row_get(permit_row, "scope_digest")) if _row_get(permit_row, "scope_digest") else None,
+            expected_scope_digest=permit_scope_digest(
+                action_kind=str(_row_get(permit_row, "action_kind") or ""),
+                target_paths=list(json_loads(_row_get(permit_row, "target_paths"), [])),
+                command_preview=(str(_row_get(permit_row, "command_preview")) if _row_get(permit_row, "command_preview") else None),
+            ),
+            scope_digest_enforced=bool(settings.permit_scope_digest_enforced),
+            # U3/S11: a permit minted under a charter that is no longer the active one is stale.
+            permit_charter_id=str(_row_get(permit_row, "charter_id")) if _row_get(permit_row, "charter_id") else None,
+            active_charter_id=(charter.charter_id if charter is not None else None),
+            directive_id=str(directive.directive_id),
+            directive_user_id=directive.user_id,
+            directive_objective_hash=directive.objective_hash,
+            started_at=None,
+            now=now,
+            phase="claim",
+        )
+
+    decision = validate_transition(
+        current_state=directive.state,
+        claimed_by=lease.claimed_executor,
+        lease_generation=lease.lease_generation,
+        requested=DirectiveExecutionState.IN_PROGRESS,
+        actor=executor_id,
+        actor_lease=None,
+        permit_ok=permit_ok,
+    )
+    if not decision.allowed:
+        conn.rollback()
+        raise _reject_directive_transition(
+            conn,
+            auth=auth,
+            directive_id=str(directive.directive_id),
+            current_state=directive.state.value,
+            lease_generation=lease.lease_generation,
+            claimed_executor=lease.claimed_executor,
+            reason=f"{TransitionReason.PERMIT_INVALID.value}:{permit_reason}" if decision.reason is TransitionReason.PERMIT_INVALID else decision.reason.value,
+            message=f"execution permit rejected: {permit_reason}" if decision.reason is TransitionReason.PERMIT_INVALID else decision.message,
+            requested_state=DirectiveExecutionState.IN_PROGRESS.value,
+            presented_lease=None,
+            payload_hash=None,
+            late_payload=None,
+            action="directive_claim_rejected",
+        )
 
     claim_expires = now + timedelta(seconds=max(30, int(settings.takeover_execution_claim_ttl_seconds)))
     if permit_expires is not None and permit_expires < claim_expires:
         claim_expires = permit_expires
-    conn.execute(
+    # Fenced claim: only the row that is still pending at the lease we validated against can move.
+    claimed = conn.execute(
         """
         UPDATE directive_executions
-        SET state = ?, claimed_by = ?, started_at = COALESCE(started_at, ?), expires_at = ?, updated_at = ?
-        WHERE directive_id = ?
+        SET state = ?, claimed_by = ?, claimed_executor = ?, lease_generation = ?, lease_expires_at = ?,
+            started_at = COALESCE(started_at, ?), expires_at = ?, updated_at = ?
+        WHERE directive_id = ? AND workspace_id = ? AND user_id = ?
+          AND state = ? AND lease_generation = ?
         """,
         (
             DirectiveExecutionState.IN_PROGRESS.value,
             claimer,
+            executor_id,
+            decision.next_lease,
+            claim_expires.isoformat(),
             now.isoformat(),
             claim_expires.isoformat(),
             now.isoformat(),
             str(directive.directive_id),
+            auth.workspace_id,
+            auth.user_id,
+            DirectiveExecutionState.PENDING.value,
+            lease.lease_generation,
         ),
     )
+    if claimed.rowcount != 1:
+        conn.rollback()
+        fresh = conn.execute(
+            f"SELECT {_DIRECTIVE_COLUMNS} FROM directive_executions WHERE directive_id = ? LIMIT 1",
+            (str(directive.directive_id),),
+        ).fetchone()
+        fresh_lease = _directive_lease_from_row(fresh) if fresh is not None else lease
+        fresh_state = str(fresh["state"]) if fresh is not None else directive.state.value
+        lost_reason = TransitionReason.CLAIMED_BY_OTHER if fresh_state == DirectiveExecutionState.IN_PROGRESS.value else TransitionReason.CONCURRENT_UPDATE
+        raise _reject_directive_transition(
+            conn,
+            auth=auth,
+            directive_id=str(directive.directive_id),
+            current_state=fresh_state,
+            lease_generation=fresh_lease.lease_generation,
+            claimed_executor=fresh_lease.claimed_executor,
+            reason=lost_reason.value,
+            message="another executor claimed this directive first" if lost_reason is TransitionReason.CLAIMED_BY_OTHER else "directive changed concurrently; re-read and retry",
+            requested_state=DirectiveExecutionState.IN_PROGRESS.value,
+            presented_lease=None,
+            payload_hash=None,
+            late_payload=None,
+            action="directive_claim_rejected",
+        )
     state.enforcement_mode = settings.takeover_enforcement_mode
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
     updated = conn.execute(
-        """
-        SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-               attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-               failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+        f"""
+        SELECT {_DIRECTIVE_COLUMNS}
         FROM directive_executions
         WHERE directive_id = ?
         LIMIT 1
@@ -7098,6 +7926,13 @@ def claim_execution(
         (str(directive.directive_id),),
     ).fetchone()
     conn.commit()
+    _write_directive_audit(
+        conn,
+        consumer=auth.consumer,
+        action=decision.audited_as,
+        query={"directive_id": str(directive.directive_id), "lease_generation": decision.next_lease, "claimed_executor": executor_id, "claimed_by": claimer},
+        policy_decisions={"reason": TransitionReason.OK.value, "policy_revision": SCOPE_POLICY_REVISION},
+    )
     return _directive_from_row(updated)
 
 
@@ -7289,6 +8124,55 @@ def _normalize_change_summary_map_lite(raw: Any) -> tuple[dict[str, dict[str, An
     return normalized, redacted_any
 
 
+def _charter_step_fields(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    owner_id: str,
+    session_id: str,
+    now: datetime,
+) -> tuple[bool, str, str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    """The five charter/effect fields carried by ``TakeoverStepResponse`` (§9.3).
+
+    ``constraints`` is the load-bearing one: it is the only channel that carries the charter's
+    machine-readable scope (``charter-roots-only``, the protected-write prefixes, the
+    confirm-required capabilities) to an executor. The MCP firewall merges it over its own floor,
+    so an EMPTY list here is not neutral -- it means the executor sees the floor and nothing about
+    this charter. ``unresolved_effects`` rows carry ``state`` because the firewall's pause reads it.
+
+    Fail-soft is deliberate and narrow: a step response that 500s because the charter tables are
+    unreachable would take down normal chat, and the ENFORCING paths (claim, dispatch, effect open)
+    resolve the charter themselves and fail closed there. This function only decides what an
+    executor is TOLD, never what it is allowed to do.
+    """
+    from tce_shared.effect_journal import unresolved_effects_json
+
+    from .effect_store import list_open_effects
+
+    try:
+        charter = load_active_charter(
+            conn, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id, now=now
+        )
+    except Exception:
+        charter = None
+    try:
+        records = list_open_effects(
+            conn, workspace_id=workspace_id, owner_id=owner_id, session_id=session_id
+        )
+    except Exception:
+        records = []
+    unresolved = unresolved_effects_json(records)
+    if charter is None:
+        return (False, "", None, unresolved, [])
+    return (
+        True,
+        str(charter.charter_version),
+        str(charter.enforcement_tier),
+        unresolved,
+        charter_constraints(charter),
+    )
+
+
 def _compute_git_change_summary_lite(
     *,
     files: list[str],
@@ -7297,18 +8181,33 @@ def _compute_git_change_summary_lite(
 ) -> dict[str, dict[str, Any]]:
     if not files:
         return {}
-    repo = str(git_payload.get("repo") or "").strip() or str(Path.cwd())
-    if not Path(repo).exists():
-        repo = str(Path.cwd())
+    # The repo path is constrained to the server's own working tree. It used to be
+    # `os.path.isdir(caller_supplied) or cwd`, which is an arbitrary-directory read the moment git
+    # is present in an image: a report could name any path on the host and have it inspected.
+    repo_root = Path.cwd().resolve()
+    requested = str(git_payload.get("repo") or "").strip()
+    repo = str(repo_root)
+    if requested:
+        try:
+            candidate = Path(requested).resolve()
+        except OSError:
+            candidate = repo_root
+        if candidate == repo_root or repo_root in candidate.parents:
+            repo = str(candidate)
+    git_binary = shutil.which("git")
+    if git_binary is None:
+        # An empty summary reads as "no changes"; this marker says "we could not look". They are
+        # different facts and the handoff must not conflate them.
+        return {"__unavailable__": {"unavailable": "git_not_present"}}
     commit = str(git_payload.get("commit") or "").strip()
     if commit:
-        args = ["git", "-C", repo, "show", "--numstat", "--format=", commit]
+        args = [git_binary, "-C", repo, "show", "--numstat", "--format=", commit]
     else:
-        args = ["git", "-C", repo, "diff", "--numstat", "HEAD~1", "HEAD"]
+        args = [git_binary, "-C", repo, "diff", "--numstat", "HEAD~1", "HEAD"]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=1.5, check=False)
     except Exception:
-        return {}
+        return {"__unavailable__": {"unavailable": "git_not_present"}}
     if proc.returncode != 0:
         return {}
     stats: dict[str, dict[str, Any]] = {}
@@ -7408,12 +8307,8 @@ def _persist_handoff_record_lite(
     return record_id
 
 
-_TERMINAL_DIRECTIVE_STATES = {
-    DirectiveExecutionState.SUCCEEDED,
-    DirectiveExecutionState.FAILED,
-    DirectiveExecutionState.BLOCKED,
-    DirectiveExecutionState.ABANDONED,
-}
+_TERMINAL_DIRECTIVE_STATES = set(TERMINAL_STATES)
+_CANCELLATION_STATES = {DirectiveExecutionState.CANCELLED, DirectiveExecutionState.REJECTED}
 
 
 def report_execution(
@@ -7424,10 +8319,8 @@ def report_execution(
     settings: Settings,
 ) -> dict[str, Any]:
     row = conn.execute(
-        """
-        SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-               attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-               failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+        f"""
+        SELECT {_DIRECTIVE_COLUMNS}
         FROM directive_executions
         WHERE directive_id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
         LIMIT 1
@@ -7437,6 +8330,15 @@ def report_execution(
     if row is None:
         raise HTTPException(status_code=404, detail="directive not found")
     current = _directive_from_row(row)
+    lease = _directive_lease_from_row(row)
+    # Trust boundary: the reporter is the AUTHENTICATED executor; the lease/idempotency fields the
+    # client echoes are compared against the row, never trusted as state.
+    executor_id = auth.consumer
+    body_payload = body.model_dump(mode="json")
+    payload_hash = report_payload_fingerprint(body_payload)
+    idempotency_key = str(getattr(body, "idempotency_key", None) or "").strip() or None
+    presented_lease_raw = getattr(body, "lease_generation", None)
+    presented_lease: int | None = int(presented_lease_raw) if presented_lease_raw is not None else None
     now = now_utc()
     rollback_available = bool(body.rollback_performed or bool((body.details or {}).get("rollback_available")))
     failure_class = None
@@ -7447,14 +8349,54 @@ def report_execution(
     execution_observation_id: str | None = None
     current_meta = dict(current.meta or {}) if isinstance(current.meta, dict) else {}
 
+    def _reject(reason: str, message: str, *, state_value: str, lease_value: int, executor_value: str | None, action: str = "directive_report_rejected") -> HTTPException:
+        return _reject_directive_transition(
+            conn,
+            auth=auth,
+            directive_id=str(body.directive_id),
+            current_state=state_value,
+            lease_generation=lease_value,
+            claimed_executor=executor_value,
+            reason=reason,
+            message=message,
+            requested_state=body.state.value,
+            presented_lease=presented_lease,
+            payload_hash=payload_hash,
+            late_payload=body_payload,
+            action=action,
+        )
+
     # Idempotent replay: the MCP client auto-retries POSTs, so a duplicate
     # report of an already-terminal directive must replay the recorded result
     # rather than mint a second retry directive, re-run side effects, or flip
-    # the terminal state.
+    # the terminal state. With an idempotency key the payload must match: same
+    # key + different payload is a 409 conflict, a different key is a mismatch.
     if current.state in _TERMINAL_DIRECTIVE_STATES:
-        prior = current_meta.get("report_result")
-        prior = prior if isinstance(prior, dict) else {}
-        return {
+        prior_raw = current_meta.get("report_result")
+        if not isinstance(prior_raw, dict):
+            # Terminal without a recorded report (reaped/abandoned by the system): there is nothing to
+            # replay, so a late report is rejected and its evidence is retained in the audit log.
+            conn.rollback()
+            raise _reject(
+                TransitionReason.TERMINAL.value,
+                "directive already terminal",
+                state_value=current.state.value,
+                lease_value=lease.lease_generation,
+                executor_value=lease.claimed_executor,
+            )
+        if lease.claimed_executor not in (None, executor_id):
+            # The recorded receipt belongs to the lease holder; a fenced-out executor is rejected
+            # (and its late payload retained) rather than handed the holder's result as a replay.
+            conn.rollback()
+            raise _reject(
+                TransitionReason.CLAIMED_BY_OTHER.value,
+                "directive is claimed by another executor",
+                state_value=current.state.value,
+                lease_value=lease.lease_generation,
+                executor_value=lease.claimed_executor,
+            )
+        prior = prior_raw
+        replay = {
             "directive_id": str(body.directive_id),
             "state": current.state.value,
             "retry_scheduled": bool(prior.get("retry_scheduled", False)),
@@ -7463,12 +8405,179 @@ def report_execution(
             "retry_strategy": prior.get("retry_strategy"),
             "retry_feedback": prior.get("retry_feedback", {}),
             "idempotent_replay": True,
+            "lease_generation": lease.lease_generation,
+            "verification_state": lease.verification_state,
             "updated_at": (
                 current.updated_at.isoformat()
                 if hasattr(current.updated_at, "isoformat")
                 else now.isoformat()
             ),
         }
+        if idempotency_key is None:
+            return replay  # legacy client without a key: plain replay
+        if lease.report_idempotency_key not in (None, idempotency_key):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "idempotency_key_mismatch",
+                    "directive_id": str(body.directive_id),
+                    "state": current.state.value,
+                    "lease_generation": lease.lease_generation,
+                    "claimed_executor": lease.claimed_executor,
+                    "message": "directive already terminal under a different idempotency key",
+                },
+            )
+        if idempotency_outcome(lease.report_payload_hash, payload_hash) == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "idempotency_conflict",
+                    "directive_id": str(body.directive_id),
+                    "state": current.state.value,
+                    "lease_generation": lease.lease_generation,
+                    "claimed_executor": lease.claimed_executor,
+                    "message": "same idempotency key with a different payload",
+                },
+            )
+        return replay
+
+    # Authorisation is judged when the effect is attempted: a report after permit expiry is still
+    # accepted when execution began (started_at) under the valid grant.
+    permit_ok = True
+    permit_reason = "ok"
+    if current.requires_permit and body.state in {DirectiveExecutionState.SUCCEEDED, DirectiveExecutionState.FAILED}:
+        permit_row = (
+            conn.execute(
+                "SELECT decision, expires_at, user_id, directive_id, objective_hash FROM execution_permits WHERE id = ? AND workspace_id = ? LIMIT 1",
+                (str(current.permit_id), auth.workspace_id),
+            ).fetchone()
+            if current.permit_id is not None
+            else None
+        )
+        if permit_row is None:
+            permit_ok, permit_reason = False, "permit_missing"
+        else:
+            permit_ok, permit_reason = permit_binding_ok(
+                permit_decision=str(permit_row["decision"]) if permit_row["decision"] else None,
+                permit_expires_at=datetime.fromisoformat(permit_row["expires_at"]) if permit_row["expires_at"] else None,
+                permit_user_id=str(_row_get(permit_row, "user_id")) if _row_get(permit_row, "user_id") else None,
+                permit_directive_id=str(_row_get(permit_row, "directive_id")) if _row_get(permit_row, "directive_id") else None,
+                permit_objective_hash=str(_row_get(permit_row, "objective_hash")) if _row_get(permit_row, "objective_hash") else None,
+                directive_id=str(current.directive_id),
+                directive_user_id=current.user_id,
+                directive_objective_hash=current.objective_hash,
+                started_at=current.started_at,
+                now=now,
+                phase="report",
+            )
+    decision = validate_transition(
+        current_state=current.state,
+        claimed_by=lease.claimed_executor,
+        lease_generation=lease.lease_generation,
+        requested=body.state,
+        actor=executor_id,
+        actor_lease=presented_lease,
+        permit_ok=permit_ok,
+        require_lease_echo=bool(getattr(settings, "takeover_lease_strict", False)),
+    )
+    if not decision.allowed:
+        conn.rollback()
+        raise _reject(
+            f"{TransitionReason.PERMIT_INVALID.value}:{permit_reason}" if decision.reason is TransitionReason.PERMIT_INVALID else decision.reason.value,
+            f"execution permit rejected: {permit_reason}" if decision.reason is TransitionReason.PERMIT_INVALID else decision.message,
+            state_value=current.state.value,
+            lease_value=lease.lease_generation,
+            executor_value=lease.claimed_executor,
+        )
+
+    # Cancellation / pre-execution rejection: an explicit audited transition that never invents a
+    # claim, mints no handoff, no retry and no observation.
+    if body.state in _CANCELLATION_STATES:
+        cancel_reason = str(getattr(body, "cancel_reason", None) or body.failure_reason or "cancelled by executor")[:500]
+        cancel_response: dict[str, Any] = {
+            "directive_id": str(body.directive_id),
+            "state": body.state.value,
+            "retry_scheduled": False,
+            "retry_directive_id": None,
+            "failure_class": None,
+            "retry_strategy": None,
+            "retry_feedback": {},
+            "cancel_reason": cancel_reason,
+            "lease_generation": lease.lease_generation,
+            "verification_state": lease.verification_state,
+            "updated_at": now.isoformat(),
+        }
+        cancel_meta = dict(current_meta)
+        cancel_meta["reported_state"] = body.state.value
+        cancel_meta["reported_at"] = now.isoformat()
+        cancel_meta["cancel_reason"] = cancel_reason
+        cancel_meta["report_result"] = {
+            "retry_scheduled": False,
+            "retry_directive_id": None,
+            "failure_class": None,
+            "retry_strategy": None,
+            "retry_feedback": {},
+            "cancel_reason": cancel_reason,
+        }
+        cancelled = conn.execute(
+            """
+            UPDATE directive_executions
+            SET state = ?, finished_at = ?, cancelled_at = ?, cancel_reason = ?,
+                failure_reason = COALESCE(failure_reason, ?), meta = ?,
+                report_idempotency_key = ?, report_payload_hash = ?, updated_at = ?
+            WHERE directive_id = ? AND workspace_id = ? AND user_id = ?
+              AND state = ? AND lease_generation = ?
+            """,
+            (
+                body.state.value,
+                now.isoformat(),
+                now.isoformat(),
+                cancel_reason,
+                cancel_reason,
+                json_dumps(cancel_meta),
+                idempotency_key,
+                payload_hash,
+                now.isoformat(),
+                str(body.directive_id),
+                auth.workspace_id,
+                auth.user_id,
+                current.state.value,
+                lease.lease_generation,
+            ),
+        )
+        if cancelled.rowcount != 1:
+            conn.rollback()
+            raise _reject(
+                TransitionReason.CONCURRENT_UPDATE.value,
+                "directive changed concurrently; re-read and retry",
+                state_value=current.state.value,
+                lease_value=lease.lease_generation,
+                executor_value=lease.claimed_executor,
+            )
+        cancel_state = takeover_state(conn, body.session_id, auth.workspace_id, auth.user_id)
+        cancel_context = dict(cancel_state.takeover_context or {})
+        cancel_context.pop("_pending_directive_locked", None)
+        cancel_context["last_cancelled_directive_id"] = str(current.directive_id)
+        cancel_context["last_cancelled_at"] = now.isoformat()
+        cancel_state.takeover_context = cancel_context
+        _sync_enforcement_counters(conn, cancel_state)
+        save_takeover_state(conn, cancel_state)
+        conn.commit()
+        _write_directive_audit(
+            conn,
+            consumer=auth.consumer,
+            action=decision.audited_as,
+            query={
+                "directive_id": str(body.directive_id),
+                "from_state": current.state.value,
+                "to_state": body.state.value,
+                "cancel_reason": cancel_reason,
+                "lease_generation": lease.lease_generation,
+                "actor": auth.consumer,
+            },
+            policy_decisions={"reason": TransitionReason.OK.value, "policy_revision": SCOPE_POLICY_REVISION},
+        )
+        return cancel_response
 
     merged_meta: dict[str, Any] = dict(current_meta)
     details_map = _merge_execution_report_details_lite(body)
@@ -7544,6 +8653,17 @@ def report_execution(
     merged_meta["reported_state"] = effective_state.value
     merged_meta["reported_at"] = now.isoformat()
 
+    # §6.5 step 4, the SECOND guard site. Full carries it (main.py, `report_paused`); without it
+    # here the report path mints a replacement PENDING directive over an effect whose outcome
+    # nobody can see -- which is exactly the silent restart the journal exists to stop.
+    report_paused, report_pause_reason, report_pause_effect = pause_guard_for_session(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        session_id=body.session_id,
+        settings=settings,
+    )
+
     if effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED, DirectiveExecutionState.ABANDONED}:
         failure_class = classify_failure(
             result=body.result,
@@ -7555,6 +8675,14 @@ def report_execution(
             failure_class=failure_class,
             rollback_available=rollback_available,
         )
+        if report_paused:
+            # An unresolved, possibly-irreversible effect means we do not know what happened.
+            # Scheduling a retry on top of it would repeat work whose outcome nobody can see.
+            retry_strategy = None
+            merged_meta["autonomy_pause"] = {
+                "reason": report_pause_reason,
+                "effect_id": report_pause_effect,
+            }
         if bool(getattr(settings, "retry_feedback_enabled", False)):
             retry_feedback = build_retry_feedback(
                 action_kind=current.action_kind,
@@ -7563,23 +8691,52 @@ def report_execution(
                 retry_strategy=retry_strategy,
             )
             merged_meta["retry_feedback"] = retry_feedback
-    conn.execute(
+    # Fenced commit: only the in_progress row still held by THIS executor at the lease we validated
+    # against may transition. verification_state is server-owned: a report never sets it.
+    transitioned = conn.execute(
         """
         UPDATE directive_executions
-        SET state = ?, finished_at = ?, failure_class = ?, failure_reason = ?, retry_strategy = ?, meta = ?, updated_at = ?
-        WHERE directive_id = ?
+        SET state = ?, finished_at = ?, failure_class = ?, failure_reason = ?, retry_strategy = ?, meta = ?,
+            report_idempotency_key = ?, report_payload_hash = ?, verification_state = 'unverified', updated_at = ?
+        WHERE directive_id = ? AND workspace_id = ? AND user_id = ?
+          AND state = ? AND lease_generation = ? AND claimed_executor = ?
         """,
         (
             effective_state.value,
             now.isoformat(),
             failure_class.value if failure_class else None,
-                effective_failure_reason,
-                retry_strategy.value if retry_strategy else None,
-                json_dumps(merged_meta),
-                now.isoformat(),
+            effective_failure_reason,
+            retry_strategy.value if retry_strategy else None,
+            json_dumps(merged_meta),
+            idempotency_key,
+            payload_hash,
+            now.isoformat(),
             str(body.directive_id),
+            auth.workspace_id,
+            auth.user_id,
+            DirectiveExecutionState.IN_PROGRESS.value,
+            lease.lease_generation,
+            executor_id,
         ),
     )
+    if transitioned.rowcount != 1:
+        conn.rollback()
+        fresh = conn.execute(
+            f"SELECT {_DIRECTIVE_COLUMNS} FROM directive_executions WHERE directive_id = ? LIMIT 1",
+            (str(body.directive_id),),
+        ).fetchone()
+        fresh_lease = _directive_lease_from_row(fresh) if fresh is not None else lease
+        fresh_state = str(fresh["state"]) if fresh is not None else current.state.value
+        lost_reason = TransitionReason.STALE_LEASE if fresh_lease.lease_generation != lease.lease_generation else TransitionReason.CONCURRENT_UPDATE
+        raise _reject(
+            lost_reason.value,
+            f"stale lease {lease.lease_generation}; current lease is {fresh_lease.lease_generation}"
+            if lost_reason is TransitionReason.STALE_LEASE
+            else "directive changed concurrently; re-read and retry",
+            state_value=fresh_state,
+            lease_value=fresh_lease.lease_generation,
+            executor_value=fresh_lease.claimed_executor,
+        )
     completion_outbox = enqueue_handoff(
         conn,
         workspace_id=auth.workspace_id,
@@ -7593,10 +8750,15 @@ def report_execution(
         source="native",
         redaction_applied=bool(milestone_result.get("redaction_applied", False)),
         now=now,
+        executor_id=auth.consumer,
+        # Without a payload_hash the CompletionConflictError guard is dead on this path: a second
+        # report with a DIFFERENT payload under the same completion_key would be accepted silently.
+        payload_hash=completion_payload_fingerprint(milestone),
     )
 
     if (
         settings.takeover_retry_enabled
+        and not report_paused
         and effective_state in {DirectiveExecutionState.FAILED, DirectiveExecutionState.BLOCKED}
         and int(current.attempt) < int(settings.takeover_retry_max_attempts)
         and retry_strategy not in {None, RetryStrategy.ESCALATE}
@@ -7623,13 +8785,9 @@ def report_execution(
         if retry_count < int(settings.takeover_retry_window_limit):
             retry_directive_id = uuid.uuid4()
             conn.execute(
-                """
-                INSERT INTO directive_executions(
-                    directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-                    attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-                    failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                f"""
+                INSERT INTO directive_executions({_DIRECTIVE_COLUMNS})
+                VALUES({_DIRECTIVE_INSERT_PLACEHOLDERS})
                 """,
                 (
                     str(retry_directive_id),
@@ -7659,6 +8817,14 @@ def report_execution(
                     ),
                     now.isoformat(),
                     now.isoformat(),
+                    0,
+                    None,
+                    None,
+                    "unverified",
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
             )
             retry_scheduled = True
@@ -7718,6 +8884,7 @@ def report_execution(
                 "situation_summary": f"execution:{current.action_kind}:{summary_key}"[:500],
                 "user_response": str(body.result or effective_failure_reason or execution_state)[:1000],
                 "response_reasoning": "execution_report",
+                "origin_kind": "executor_output",
                 "outcome": execution_state,
                 "outcome_sentiment": outcome_sentiment,
                 "confidence": 0.82 if effective_state == DirectiveExecutionState.SUCCEEDED else 0.66,
@@ -7798,6 +8965,23 @@ def report_execution(
     )
     state.recent_outcomes_json = updated_outcomes
     state.autonomy_score = updated_autonomy
+    # The durable projection, before the goal rows move: STEP_COMPLETED / STEP_BLOCKED /
+    # VERIFICATION_RECORDED with the REAL step_index and the S5 provenance stamp. Without this
+    # the Lite projection never leaves `candidate` and `root_status` has nothing to read.
+    report_contract_revision = _record_execution_task_state_lite(
+        conn,
+        auth=auth,
+        state=state,
+        body=body,
+        directive_id=str(current.directive_id),
+        # The SAME goal the two branches below mark done or blocked. A directive minted before
+        # the plan existed carries no goal of its own while the session is pointed at a plan
+        # step, and reading only `current.goal_id` there would emit an event with no step index
+        # for a report that does move a step.
+        goal_id=str(current.goal_id or state.active_goal_id or "") or None,
+        effective_state=effective_state,
+        now=now,
+    )
     if effective_state == DirectiveExecutionState.SUCCEEDED:
         goal_to_complete = current.goal_id or state.active_goal_id
         if goal_to_complete:
@@ -7844,6 +9028,45 @@ def report_execution(
             """,
             (state.session_id, state.workspace_id, state.user_id),
         )
+        # Must run last: it overrides awaiting_next_objective / objective / objective_hash that
+        # the lines above just set, which is the whole point of a plan. It is also the only
+        # place the root goal may be marked done, and only when root_status() agrees.
+        _advance_plan_after_completion_lite(
+            conn,
+            auth=auth,
+            state=state,
+            context=context,
+            contract_revision=report_contract_revision,
+        )
+    elif effective_state in {
+        DirectiveExecutionState.FAILED,
+        DirectiveExecutionState.BLOCKED,
+        DirectiveExecutionState.ABANDONED,
+        DirectiveExecutionState.CANCELLED,
+    }:
+        blocked_goal_id = current.goal_id or state.active_goal_id
+        if blocked_goal_id:
+            # The first write of AutonomyGoalStatus.BLOCKED anywhere in Lite, which is what
+            # makes _select_next_plan_step_lite's blocked guard live rather than dead code.
+            conn.execute(
+                """
+                UPDATE autonomy_goals
+                SET status = ?, blocked_reason = ?, attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
+                  AND plan_contract_revision = ?
+                """,
+                (
+                    AutonomyGoalStatus.BLOCKED.value,
+                    str(body.failure_reason or "")[:400],
+                    now.isoformat(),
+                    str(blocked_goal_id),
+                    state.session_id,
+                    state.workspace_id,
+                    state.user_id,
+                    int(report_contract_revision),
+                ),
+            )
     state.takeover_context = context
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
@@ -7894,6 +9117,8 @@ def report_execution(
         "completion_delivery_status": str(delivered_outbox["status"]),
         "objective_quality": context.get("objective_quality", {}),
         "objective_contract": context.get("objective_contract", {}),
+        "lease_generation": lease.lease_generation,
+        "verification_state": "unverified",
         "updated_at": now.isoformat(),
     }
 
@@ -7903,12 +9128,11 @@ def execution_status(
     *,
     auth: AuthContext,
     session_id: str,
+    settings: Settings | None = None,
 ) -> ExecutionStatusResponse:
     pending_rows = conn.execute(
-        """
-        SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-               attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-               failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+        f"""
+        SELECT {_DIRECTIVE_COLUMNS}
         FROM directive_executions
         WHERE session_id = ? AND workspace_id = ? AND user_id = ?
           AND state IN (?, ?)
@@ -7924,10 +9148,8 @@ def execution_status(
         ),
     ).fetchall()
     recent_rows = conn.execute(
-        """
-        SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-               attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-               failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+        f"""
+        SELECT {_DIRECTIVE_COLUMNS}
         FROM directive_executions
         WHERE session_id = ? AND workspace_id = ? AND user_id = ?
         ORDER BY updated_at DESC
@@ -7935,11 +9157,13 @@ def execution_status(
         """,
         (session_id, auth.workspace_id, auth.user_id),
     ).fetchall()
+    generated_at = now_utc()
     return ExecutionStatusResponse(
         session_id=session_id,
         pending=[_directive_from_row(row) for row in pending_rows],
         recent=[_directive_from_row(row) for row in recent_rows],
-        generated_at=now_utc(),
+        generated_at=generated_at,
+        capture_delivery_state=CaptureDeliveryState(_capture_delivery_state_for(conn, auth=auth, settings=settings or get_settings(), now=generated_at)),
     )
 
 
@@ -7963,10 +9187,17 @@ def takeover_preload(
         if isinstance(state.takeover_context, dict)
         else None
     )
+    explicit_app_context = dict(body.app_context) if isinstance(body.app_context, dict) else {}
     project_context = canonical_project_context(body.app_context, previous_project)
     if project_context:
         body.app_context = {**body.app_context, **project_context}
         state.takeover_context["project_context"] = project_context
+    project_binding = auth.resolved_scope(
+        project_hint=explicit_app_context,
+        session_project=previous_project if isinstance(previous_project, dict) else None,
+        task_id=body.session_id,
+    ).project_binding
+    state.takeover_context["project_binding"] = project_binding
     now = now_utc()
     resolved_task = resolve_objective(message=body.task, task=body.task, takeover_context=state.takeover_context)
     working_set = _build_takeover_working_set(
@@ -7988,6 +9219,7 @@ def takeover_preload(
         working_set_json=working_set,
         refreshed_at=now,
         decision_source=TakeoverDecisionSource.DELIBERATION,
+        project_binding=project_binding,
     )
 
 
@@ -8023,29 +9255,58 @@ def takeover_feedback(
 
     behavior_evidence_id: str | None = None
     if normalized_situation_type and body.correction_text:
-        supersedes_id = str(body.observation_ids[0]) if body.observation_ids else None
+        # P0: only a human operator can author human-origin correction evidence. An executor's
+        # correction_text is recorded as inferred (never confirmed, never superseding) and, even when it
+        # clears the storage score, is forced to learning_eligible=false / pending_review so it cannot
+        # influence behavior until a human reviews it. confirmed_at is never caller-asserted on either path.
+        is_human = auth.role == AgentRole.USER
+        supersedes_id = str(body.observation_ids[0]) if (body.observation_ids and is_human) else None
+        origin_label = "Human" if is_human else "Executor"
+        # An opportunity is resolved (human_resolutions + shadow label) only by a verified human: a
+        # header-asserted USER on the executor's bearer must not grade the executor's own prediction.
+        verified_human = human_origin_verified(auth)
+        target_opportunity = _feedback_target_opportunity(conn, auth=auth, state=state, body=body) if verified_human else None
+        if is_human:
+            evidence_source = BehaviorEvidenceSource.CORRECTION.value if supersedes_id else BehaviorEvidenceSource.EXPLICIT.value
+        else:
+            evidence_source = BehaviorEvidenceSource.INFERRED.value
         correction_evidence = normalize_behavior_evidence(
             {
                 "situation_type": normalized_situation_type,
-                "situation_summary": f"Human correction during {body.action_kind}",
+                "situation_summary": f"{origin_label} correction during {body.action_kind}",
                 "objective": str(state.takeover_context.get("objective") or f"feedback:{normalized_situation_type}"),
                 "selected_choice": body.correction_text,
-                "rationale": str(feedback_details.get("reasoning_summary") or "Human correction after takeover feedback"),
+                "rationale": str(feedback_details.get("reasoning_summary") or f"{origin_label} correction after takeover feedback"),
                 "action_taken": body.correction_text,
                 "outcome": body.result,
                 "outcome_sentiment": "negative" if feedback_type == "unhelpful" else "neutral",
                 "correction_text": body.correction_text if supersedes_id else "",
-                "evidence_source": "correction" if supersedes_id else "explicit",
+                "evidence_source": evidence_source,
                 "memory_class": "preference",
                 "supersedes_observation_id": supersedes_id,
-                "confidence": 1.0,
-                "confirmed_at": now_utc(),
+                "confidence": 1.0 if is_human else 0.5,
+                "confirmed_at": None,
             }
         )
+        if target_opportunity is not None:
+            correction_evidence["opportunity_id"] = str(target_opportunity["id"])
         correction_gate = behavior_storage_gate(
             correction_evidence,
             threshold=float(getattr(settings, "behavior_storage_min_score", 0.55)),
         )
+        # A header-asserted USER (compat mode, executor bearer) still stores its correction evidence, but it
+        # resolves nothing and stays pending review: only a server-verified human identity is learning-eligible.
+        if not verified_human and correction_gate["learning_eligible"]:
+            correction_gate = {
+                **correction_gate,
+                "learning_eligible": False,
+                "decision": "pending_review",
+                "reasons": [
+                    *list(correction_gate.get("reasons") or []),
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            }
         behavior_evidence_id = save_behavior_evidence_lite(
             conn,
             consumer_id=auth.consumer,
@@ -8055,6 +9316,20 @@ def takeover_feedback(
             storage_gate=correction_gate,
         )
         feedback_details["behavior_evidence_id"] = behavior_evidence_id
+        if target_opportunity is not None:
+            # Authenticated human feedback resolves the open decision it answers.
+            _resolve_opportunity_from_feedback(
+                conn,
+                auth=auth,
+                opportunity=target_opportunity,
+                observation_id=behavior_evidence_id,
+                selected_choice=str(correction_evidence.get("selected_choice") or body.correction_text or "")[:500],
+                now=now_utc(),
+            )
+            feedback_details["opportunity_id"] = str(target_opportunity["id"])
+            current_open = state.takeover_context.get("open_decision")
+            if isinstance(current_open, dict) and str(current_open.get("opportunity_id")) == str(target_opportunity["id"]):
+                state.takeover_context.pop("open_decision", None)
 
     feedback_observation_ids: list[str] = [str(value) for value in (body.observation_ids or [])]
     if behavior_evidence_id is not None and not feedback_observation_ids:
@@ -8087,7 +9362,14 @@ def takeover_feedback(
             alpha_max=settings.feedback_alpha_max,
         )
         feedback_details.setdefault("feedback_alpha", adjusted_alpha)
-        if body.correction_text or feedback_type in {"unhelpful", "negative", "wrong"}:
+        wants_fingerprint_update = bool(body.correction_text) or feedback_type in {"unhelpful", "negative", "wrong"}
+        if wants_fingerprint_update and auth.role != AgentRole.USER:
+            # Only attributable human input may move the behavioral fingerprint. An
+            # executor's correction is already held as pending_review evidence above;
+            # letting it also nudge the fingerprint here is the self-reinforcement loop
+            # where the system learns its own output and calls it the owner's preference.
+            feedback_details.setdefault("fingerprint_update", "withheld_non_human_caller")
+        elif wants_fingerprint_update:
             fingerprint = apply_feedback_to_fingerprint(
                 fingerprint,
                 feedback_type=feedback_type or "unhelpful",
@@ -8145,12 +9427,1255 @@ def takeover_feedback(
     )
 
 
+def _unattended_profile(state: TakeoverState, settings: Settings) -> bool:
+    profile = getattr(state, "autonomy_policy_profile", None)
+    if isinstance(profile, AutonomyPolicyProfile):
+        value = profile.value
+    else:
+        value = str(profile or getattr(settings, "takeover_autonomy_policy_default", "human_consultative"))
+    return value != AutonomyPolicyProfile.HUMAN_CONSULTATIVE.value
+
+
+def _capture_delivery_state_for(conn: sqlite3.Connection, *, auth: AuthContext, settings: Settings, now: datetime) -> str:
+    try:
+        return capture_delivery_state(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            stale_seconds=int(getattr(settings, "capture_delivery_stale_seconds", 21600)),
+            now=now,
+        )
+    except sqlite3.Error:
+        logger.warning("capture delivery state lookup failed", exc_info=True)
+        return "unknown"
+
+
+def _freeze_decision_opportunity_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    body: TakeoverStepRequest,
+    settings: Settings,
+    turn: int,
+    decision_family: str,
+    situation_type: str,
+    question_text: str,
+    alternatives: list[str],
+    objective_text: str,
+    objective_hash: str,
+    snapshot: dict[str, Any],
+    advice_visible: bool,
+    project_id: str | None,
+    cancel_epoch: int = 0,
+    turn_policy_request: DecisionRequest | None = None,
+    turn_policy_result: DecisionResult | None = None,
+) -> str | None:
+    """Freeze the pre-answer context and the decision (or abstention) BEFORE the human answers.
+
+    P4 changes what is frozen here, not when.  The site used to call ``predict_behavior``
+    directly on an unbounded 500-row corpus and store a prediction; it now stores a
+    ``DecisionResult`` from the one decision callable, together with everything a later
+    qualification run needs to decide whether that case is admissible evidence at all:
+
+    * ``request_fingerprint`` -- so replay can prove it rebuilt the same request rather than a
+      different one that happened to reach the same answer.
+    * ``decision_advice_shown`` -- whether the text the human is about to answer already names
+      one of the options they are choosing between.  This is the contamination the promotion
+      gate must exclude, and it is what the old ``advice_visible`` column was supposed to be.
+    * ``candidate_option_count`` -- the gate excludes cases offering fewer than two options.
+      The count is a *gate* input, not a replay input: the list itself is retained on the
+      opportunity this call writes in the same transaction (``insert_opportunity``'s
+      ``alternatives``), and ``policy_store.replay_candidate_options`` reads it back from
+      there.  ``query_json`` deliberately does not carry the options -- a second copy of the
+      same list is how the count and the set came to disagree on live rows.
+    * ``episode_key`` -- the unit a train/holdout split may not straddle.
+    * ``task_id`` -- this site used to hard-code ``None``, so no stored opportunity carried one.
+
+    The turn's own ``DecisionResult`` is reused when this site's family and candidate set match
+    the request it was built from; otherwise the site builds its own request, because a result
+    computed for a different family over a different candidate set is not this decision, and
+    persisting it would make the frozen row and the turn agree only by coincidence.
+
+    Never fails a takeover turn: any error is logged and the turn continues without an
+    opportunity.
+    """
+    try:
+        candidate_options = tuple(str(item) for item in alternatives if str(item).strip())
+        request = turn_policy_request
+        result = turn_policy_result
+        started = time.perf_counter()
+        if (
+            request is None
+            or result is None
+            or request.decision_family != decision_family
+            or request.candidate_options != candidate_options
+        ):
+            request = build_decision_request(
+                conn,
+                scope=scope,
+                settings=settings,
+                decision_family=decision_family,
+                situation_type=situation_type,
+                situation_summary=question_text[:500],
+                objective_text=objective_text,
+                constraints=body.constraints if isinstance(body.constraints, dict) else {},
+                context_snapshot=snapshot,
+                candidate_options=candidate_options,
+                decision_at=now_utc(),
+                session_id=state.session_id,
+                objective_hash=objective_hash or None,
+                cancel_epoch=cancel_epoch,
+            )
+            result = decide(request)
+        latency_ms = max(0, int((time.perf_counter() - started) * 1000))
+        query = {
+            "situation_type": situation_type,
+            "situation_summary": question_text[:500],
+            "objective_text": objective_text,
+            "constraints": body.constraints if isinstance(body.constraints, dict) else {},
+            "context_snapshot": snapshot,
+        }
+        prediction = {
+            "predicted_choice": result.selected_option,
+            "abstained": result.status is DecisionStatus.ABSTAINED,
+            "confidence": float(result.policy_score),
+            "citations": list(result.evidence_observation_ids),
+        }
+        revision = request.evidence_revision
+        cutoff = request.evidence_cutoff_at
+        now = now_utc()
+        opportunity_id = str(uuid.uuid4())
+        prediction_id = freeze_shadow_prediction(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            opportunity_id=opportunity_id,
+            session_id=state.session_id,
+            turn=turn,
+            decision_family=decision_family,
+            query=query,
+            prediction=prediction,
+            evidence_count=len(request.evidence_rows),
+            latency_ms=latency_ms,
+            evidence_cutoff_at=cutoff,
+            evidence_revision=revision,
+            advice_visible=advice_visible,
+            frozen_at=now,
+        )
+        persist_policy_decision(
+            conn,
+            prediction_id=prediction_id,
+            result=result,
+            # The request, not just the result: the evidence set the decision was OFFERED lives
+            # nowhere else, and without it a row with evidence cannot be replayed at all.
+            request=request,
+            project_id=project_id,
+            episode_key=request.episode_key,
+            decision_advice_shown=advice_names_a_candidate(
+                rendered_text=question_text,
+                candidate_options=candidate_options,
+            ),
+            candidate_option_count=len(candidate_options),
+        )
+        ttl_seconds = max(0, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600)))
+        insert_opportunity(
+            conn,
+            opportunity_id=opportunity_id,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            owner_id=auth.user_id,
+            session_id=state.session_id,
+            turn=turn,
+            objective_hash=objective_hash or None,
+            task_id=scope.task_id,
+            project_id=project_id,
+            decision_family=decision_family,
+            situation_type=situation_type,
+            question_text=question_text,
+            alternatives=list(alternatives),
+            pre_answer_snapshot={**snapshot, "final_response": question_text, "turn": turn},
+            evidence_cutoff_at=cutoff,
+            evidence_revision=revision,
+            # `prediction_shown` was the literal False at every site, which is one of the two
+            # reasons the deployed route and the evaluated route were disjoint sets. It is now
+            # the policy's own exposure flag: False for every family today, and True the moment
+            # a qualification record exists, with no further code change.
+            advice_exposure={"advice_visible": advice_visible, "prediction_shown": bool(result.exposed)},
+            shadow_prediction_id=prediction_id,
+            source_event_id=None,
+            expires_at=now + timedelta(seconds=ttl_seconds) if ttl_seconds else None,
+            created_at=now,
+            frozen_at=now,
+            episode_key=request.episode_key,
+        )
+        return opportunity_id
+    except Exception:
+        logger.warning("decision opportunity freeze failed", exc_info=True)
+        return None
+
+
+def _ensure_open_decision_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: TakeoverStepRequest,
+    settings: Settings,
+    turn: int,
+    family: str,
+    situation_type: str,
+    question_text: str,
+    alternatives: list[str],
+    snapshot: dict[str, Any],
+    advice_visible: bool,
+    project_id: str | None,
+    scope: ResolvedScope,
+    cancel_epoch: int = 0,
+    turn_policy_request: DecisionRequest | None = None,
+    turn_policy_result: DecisionResult | None = None,
+) -> str | None:
+    """Dedupe an open decision per (family, objective_hash) while its opportunity is still open."""
+    objective_hash_value = str(state.objective_hash or "")
+    current = state.takeover_context.get("open_decision")
+    if (
+        isinstance(current, dict)
+        and current.get("opportunity_id")
+        and str(current.get("family")) == family
+        and str(current.get("objective_hash") or "") == objective_hash_value
+    ):
+        try:
+            existing = open_opportunity_for_session(
+                conn,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                session_id=state.session_id,
+                decision_family=family,
+            )
+        except sqlite3.Error:
+            existing = None
+        if existing is not None and str(existing["id"]) == str(current["opportunity_id"]):
+            return str(current["opportunity_id"])
+    opportunity_id = _freeze_decision_opportunity_lite(
+        conn,
+        auth=auth,
+        scope=scope,
+        state=state,
+        body=body,
+        settings=settings,
+        turn=turn,
+        decision_family=family,
+        situation_type=situation_type,
+        question_text=question_text,
+        alternatives=alternatives,
+        objective_text=str(state.takeover_context.get("objective") or ""),
+        objective_hash=objective_hash_value,
+        snapshot=snapshot,
+        advice_visible=advice_visible,
+        project_id=project_id,
+        cancel_epoch=cancel_epoch,
+        turn_policy_request=turn_policy_request,
+        turn_policy_result=turn_policy_result,
+    )
+    if opportunity_id:
+        state.takeover_context["open_decision"] = {
+            "opportunity_id": opportunity_id,
+            "family": family,
+            "objective_hash": objective_hash_value,
+            "turn": int(turn),
+            "created_at": now_utc().isoformat(),
+        }
+    return opportunity_id
+
+
+def _relay_opportunity_answer(conn: sqlite3.Connection, opportunity_id: str | None, *, message: str, now: datetime) -> None:
+    """An executor-relayed answer is recorded on the opportunity but never resolves it (not a label)."""
+    if not opportunity_id:
+        return
+    try:
+        mark_opportunity_relayed(conn, str(opportunity_id), relayed_answer=str(message or "")[:500], relayed_at=now)
+    except sqlite3.Error:
+        logger.warning("opportunity relay update failed", exc_info=True)
+
+
+def _resolve_safety_opportunity_from_permit(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    session_id: str,
+    approved: bool,
+    permit_id: str,
+    now: datetime,
+) -> None:
+    """A USER-role permit resolution is an authenticated human answer to the open safety question.
+
+    Only a server-established identity counts: in compat mode ``X-TCE-Role: user`` on the executor's own
+    bearer would otherwise let the executor label its own frozen prediction. The unverified caller's answer is
+    still recorded for audit, tagged ``operator_unverified``: the question is left open, the frozen shadow row
+    is never scored from it, and nothing becomes confirmed evidence. Mirrors Full main.py's
+    ``resolve_execution_permit`` gate.
+    """
+    human_verified = human_origin_verified(auth)
+    try:
+        opportunity = open_opportunity_for_session(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=session_id,
+            decision_family="safety_confirmation",
+        )
+        if opportunity is None:
+            return
+        alternatives = [str(item) for item in (opportunity.get("alternatives") or [])]
+        if len(alternatives) >= 2:
+            actual = alternatives[0] if approved else alternatives[1]
+        else:
+            actual = "confirm" if approved else "abort"
+        insert_human_resolution(
+            conn,
+            resolution=HumanResolution(
+                opportunity_id=str(opportunity["id"]),
+                selected_choice=actual,
+                resolution_source="operator_permit" if human_verified else "operator_unverified",
+                human_source_ref=permit_id,
+                resolved_at=now,
+            ),
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            receipt_id=None,
+            source_event_id=None,
+            candidate_id=None,
+            observation_id=None,
+        )
+        if not human_verified:
+            return
+        if opportunity.get("shadow_prediction_id"):
+            resolve_shadow_prediction(
+                conn,
+                prediction_id=str(opportunity["shadow_prediction_id"]),
+                actual_choice=actual,
+                observation_id=None,
+                resolution_source="operator_permit",
+                human_source_ref=permit_id,
+                resolution_source_event_id=None,
+                resolved_at=now,
+            )
+        resolve_opportunity(conn, opportunity_id=str(opportunity["id"]), resolved_at=now)
+    except sqlite3.Error:
+        logger.warning("permit opportunity resolution failed", exc_info=True)
+
+
+def _safety_question_already_answered(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+) -> bool:
+    """True when the human already answered the safety question for this exact objective.
+
+    The safety gate re-fires on every later turn whose response still reads as high risk, so without this
+    the same question would be frozen again and again, each freeze minting a prospective shadow prediction
+    that nobody will ever answer (the human answered the first one).
+    """
+    objective_hash_value = str(state.objective_hash or "")
+    if not objective_hash_value:
+        return False
+    try:
+        answered = resolved_opportunity_for_objective(
+            conn,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=state.session_id,
+            decision_family="safety_confirmation",
+            objective_hash=objective_hash_value,
+        )
+    except sqlite3.Error:
+        return False
+    return answered is not None
+
+
+def human_origin_verified(auth: AuthContext) -> bool:
+    """True only when the human identity was established by the server, not asserted in a header.
+
+    In compat identity mode ``role`` comes from the caller-supplied ``X-TCE-Role`` header on the executor's
+    own bearer, so an executor can call itself a user. Human-origin promotion (a human_resolutions row, a
+    resolved shadow label, a receipt-bound 'explicit' observation) requires more than that assertion.
+    """
+    return bool(auth.role == AgentRole.USER and (auth.identity_verified or HOST_CAPTURE_CAPABILITY in auth.capabilities))
+
+
+def _feedback_target_opportunity(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: TakeoverFeedbackRequest,
+) -> dict[str, Any] | None:
+    requested = getattr(body, "opportunity_id", None)
+    candidate_ids: list[str] = []
+    if requested:
+        candidate_ids.append(str(requested))
+    current = state.takeover_context.get("open_decision")
+    if isinstance(current, dict) and current.get("opportunity_id"):
+        candidate_ids.append(str(current["opportunity_id"]))
+    for opportunity_id in candidate_ids:
+        opportunity = get_opportunity(
+            conn,
+            opportunity_id=opportunity_id,
+            workspace_id=auth.workspace_id,
+            subject_user_id=auth.behavior_subject_id,
+        )
+        if opportunity is not None and str(opportunity.get("status")) == "open":
+            return opportunity
+    if candidate_ids:
+        return None
+    # The takeover session state is keyed by the executor's user id, so a human operator's request never
+    # sees its open_decision; opportunities are subject-scoped, so fall back to the newest open one.
+    return open_opportunity_for_session(
+        conn,
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        session_id=body.session_id,
+    )
+
+
+def _resolve_opportunity_from_feedback(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    opportunity: dict[str, Any],
+    observation_id: str,
+    selected_choice: str,
+    now: datetime,
+) -> None:
+    insert_human_resolution(
+        conn,
+        resolution=HumanResolution(
+            opportunity_id=str(opportunity["id"]),
+            selected_choice=selected_choice,
+            resolution_source="operator_feedback",
+            human_source_ref=observation_id,
+            resolved_at=now,
+        ),
+        workspace_id=auth.workspace_id,
+        subject_user_id=auth.behavior_subject_id,
+        receipt_id=None,
+        source_event_id=None,
+        candidate_id=None,
+        observation_id=observation_id,
+    )
+    if opportunity.get("shadow_prediction_id"):
+        resolve_shadow_prediction(
+            conn,
+            prediction_id=str(opportunity["shadow_prediction_id"]),
+            actual_choice=selected_choice,
+            observation_id=observation_id,
+            resolution_source="operator_feedback",
+            human_source_ref=observation_id,
+            resolution_source_event_id=None,
+            resolved_at=now,
+        )
+    resolve_opportunity(conn, opportunity_id=str(opportunity["id"]), resolved_at=now)
+
+
+# §S3.6's plan id. The uuid5 namespace lives in tce_shared.task_state and nowhere else, so
+# Full, Lite and the worker cannot drift; this name is kept as Lite's local spelling.
+approved_plan_id = shared_approved_plan_id
+
+
+def _owner_objective_hash(
+    body: TakeoverStepRequest,
+    state: TakeoverState,
+    *,
+    pending_objective: str | None,
+) -> str | None:
+    """The hash of the objective THE OWNER stated, not the one the plan is currently walking.
+
+    Completing a step rewrites the objective pointer to the next step's title. Hashing that would
+    bump ``contract_revision`` on every step advance, invalidating the plan the step belongs to.
+    The owner's objective is: an explicit ``body.task``, else the pinned user objective, else the
+    caller-supplied pending objective, else nothing.
+    """
+    explicit = str(getattr(body, "task", "") or "").strip()
+    if explicit:
+        return objective_hash(explicit)
+    context = state.takeover_context if isinstance(state.takeover_context, dict) else {}
+    pinned = str(context.get("pinned_user_objective") or "").strip()
+    if pinned:
+        return objective_hash(pinned)
+    pending = str(pending_objective or "").strip()
+    if pending:
+        return objective_hash(pending)
+    return None
+
+
+def _task_scope_digest_for(scope: ResolvedScope) -> str:
+    return task_scope_digest(
+        workspace_id=scope.workspace_id,
+        executor_id=scope.executor_id,
+        owner_ids=scope.sql_owner_ids(),
+        subject_user_id=scope.subject_user_id,
+        project_id=scope.project_id,
+        project_binding=scope.project_binding,
+    )
+
+
+def _load_task_projection(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> TaskStateProjection | None:
+    """The session's folded projection, or ``None`` when it has no task row yet.
+
+    A plain read: no ``BEGIN IMMEDIATE``, no row lock. It is the pre-dispatch read of §4.5 item 5
+    and of the cancellation gate, both of which must happen BEFORE the turn's directive decision
+    and therefore long before the CAS section opens.
+    """
+    loaded = load_task_state(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        task_id=state.session_id,
+    )
+    return loaded[0] if loaded is not None else None
+
+
+def _load_task_projection_status(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> TaskStatus:
+    """The lifecycle status of the session's task, or AWAITING_OBJECTIVE when it has none yet."""
+    projection = _load_task_projection(conn, auth=auth, state=state)
+    if projection is None:
+        return TaskStatus.AWAITING_OBJECTIVE
+    return projection.status
+
+
+def _objective_set_needed_lite(
+    projection: TaskStateProjection,
+    *,
+    owner_objective_hash: str | None,
+    objective_asserted: bool,
+) -> bool:
+    """Must THIS turn append ``OBJECTIVE_SET``? The shared rule, plus one Lite-side qualifier.
+
+    ``objective_set_required`` says yes on two counts: the hash moved, or the projection is
+    CANCELLED and a same-hash set would revive it (RULING V1). The qualifier is
+    ``objective_asserted``: the owner objective a Lite turn computes falls back to the pinned
+    objective in ``takeover_context``, which survives every later turn, so keying revival on the
+    hash alone would revive a cancelled task on a bare "continue" — and the cancellation gate
+    below would then never fire. Revival needs the owner to actually restate the objective or
+    re-activate, which is what the ruling means by "an activation arrives".
+    """
+    if not objective_set_required(projection, new_objective_hash=owner_objective_hash):
+        return False
+    changed = (
+        objective_contract_revision(
+            projection.contract_revision, projection.objective_hash, owner_objective_hash
+        )
+        != projection.contract_revision
+    )
+    return changed or objective_asserted
+
+
+def _record_stand_down_lite(
+    conn: sqlite3.Connection,
+    *,
+    workspace_id: str,
+    user_id: str,
+    session_id: str,
+    now: datetime,
+) -> None:
+    """Append CANCELLATION_REQUESTED on a stand-down. Best effort, never fatal.
+
+    The Lite twin of ``main.py::_record_stand_down``, and it is called from the same two places:
+    the stand-down turn inside ``takeover_step`` and ``POST /v1/takeover/reset``. Without it the
+    two backends disagree about what a stand-down means to the projection — Full records it,
+    Lite silently did not.
+
+    ``task_states`` and ``task_state_events`` are deliberately NOT deleted, even though the
+    ``takeover_sessions`` row is: the projection is the durable record, and the next activation's
+    OBJECTIVE_SET revives the task by timestamp order (RULING V1). That is what makes the
+    documented stand-down -> reactivate cycle work on one stable session id.
+    """
+    if not bool(getattr(get_settings(), "task_state_enabled", True)):
+        return
+    try:
+        loaded = load_task_state(
+            conn, workspace_id=workspace_id, owner_id=user_id, task_id=session_id
+        )
+        if loaded is None:
+            return
+        contract_revision = int(loaded[0].contract_revision)
+
+        def _body() -> None:
+            apply_task_state_events(
+                conn,
+                workspace_id=workspace_id,
+                owner_id=user_id,
+                session_id=session_id,
+                task_id=session_id,
+                new_events=[
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.CANCELLATION_REQUESTED,
+                        contract_revision=contract_revision,
+                        payload={"reason": CANCEL_REASON_STAND_DOWN, "actor": SYSTEM_ACTOR},
+                        occurred_at=now,
+                        actor=SYSTEM_ACTOR,
+                    )
+                ],
+                now=now,
+                expected_revision=None,
+            )
+
+        run_cas_section(conn, _body)
+    except Exception:
+        logger.warning("stand-down task-state event failed", exc_info=True)
+
+
+def _plan_root_status_lite(projection: TaskStateProjection | None) -> str:
+    """``root_status`` over the projection's approved plan; ``absent`` when there is no plan."""
+    if projection is None or projection.plan is None:
+        return "absent"
+    return root_status(projection.plan.steps)
+
+
+def _nothing_left_to_do(
+    conn: sqlite3.Connection, *, auth: AuthContext, state: TakeoverState
+) -> bool:
+    """True when the task has reached a terminal lifecycle state."""
+    return _load_task_projection_status(conn, auth=auth, state=state) in (
+        TaskStatus.DONE,
+        TaskStatus.CANCELLED,
+    )
+
+
+def _select_next_plan_step_lite(
+    conn: sqlite3.Connection,
+    state: TakeoverState,
+    *,
+    contract_revision: int,
+) -> TakeoverGoal | None:
+    """The lowest open step of THIS contract's plan, or None.
+
+    The ``plan_contract_revision = ?`` predicate is what stops a turn after an objective change
+    from selecting a step of the superseded plan.
+
+    A BLOCKED step is fetched and then refused rather than skipped over in SQL (Full's twin does
+    the same): skipping it would hand back step 3 while step 2 is stalled, which is building the
+    next floor on an unfinished one. Returning ``None`` is what lets the callers consult
+    ``root_status`` and stop.
+    """
+    row = conn.execute(
+        """
+        SELECT id, session_id, workspace_id, user_id, title, description, source,
+               priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
+               goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+               step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
+               status, created_at, updated_at
+        FROM autonomy_goals
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+          AND parent_goal_id IS NOT NULL
+          AND step_index IS NOT NULL AND step_index > 0
+          AND plan_contract_revision = ?
+          AND status NOT IN (?, ?)
+        ORDER BY step_index ASC
+        LIMIT 1
+        """,
+        (
+            state.session_id,
+            state.workspace_id,
+            state.user_id,
+            int(contract_revision),
+            AutonomyGoalStatus.DONE.value,
+            AutonomyGoalStatus.DROPPED.value,
+        ),
+    ).fetchone()
+    if row is None:
+        return None  # every step terminal — ask root_status whether that means "done"
+    if str(row["status"]) == AutonomyGoalStatus.BLOCKED.value:
+        # Stalled, not skippable.
+        return None
+    return _goal_from_row(row)
+
+
+def _write_objective_plan_lite(
+    conn: sqlite3.Connection,
+    *,
+    scope: ResolvedScope,
+    session_id: str,
+    task_id: str,
+    steps: Sequence[PlanStepState],
+    producer: str,
+    contract_revision: int,
+    now: datetime,
+    objective_text: str = "",
+) -> str:
+    """Write the plan's goal rows. Thin wrapper so the call site reads the same as Full's."""
+    return write_plan_rows(
+        conn,
+        scope=scope,
+        session_id=session_id,
+        task_id=task_id,
+        steps=steps,
+        producer=producer,
+        contract_revision=contract_revision,
+        now=now,
+        objective_text=objective_text,
+    )
+
+
+def _advance_plan_after_completion_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    context: dict[str, Any],
+    contract_revision: int,
+) -> None:
+    """Point the session at the next open step of this contract's plan, if there is one.
+
+    When no step remains, the plan is finished ONLY when ``root_status`` says ``done`` (§4.5
+    item 4). ``_select_next_plan_step_lite`` returns ``None`` for two very different reasons —
+    every step terminal, and the lowest open step is blocked — and treating both as "plan
+    complete" is what let a blocked sibling, or an all-dropped plan, flip the root goal to done.
+    The projection is re-read here so the decision is made on the fold that already carries this
+    report's STEP_COMPLETED / STEP_BLOCKED.
+    """
+    nxt = _select_next_plan_step_lite(conn, state, contract_revision=contract_revision)
+    if nxt is not None:
+        context["plan_next_step_index"] = int(nxt.step_index or 0)
+        context["plan_next_step_title"] = nxt.title
+        # The point of a plan: finishing floor 1 tells you to build floor 2, rather than
+        # dropping the objective and waiting for a fresh one.
+        context["objective"] = nxt.title
+        context["awaiting_next_objective"] = False
+        context["awaiting_next_objective_turns"] = 0
+        context.pop("plan_blocked_reason", None)
+        state.active_goal_id = nxt.id
+        state.objective_hash = objective_hash(nxt.title)
+        conn.execute(
+            "UPDATE autonomy_goals SET status = ?, updated_at = ? WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?",
+            (
+                AutonomyGoalStatus.SELECTED.value,
+                now_utc().isoformat(),
+                str(nxt.id),
+                state.session_id,
+                auth.workspace_id,
+                auth.user_id,
+            ),
+        )
+        return
+
+    context.pop("plan_next_step_index", None)
+    context.pop("plan_next_step_title", None)
+    root = _plan_root_status_lite(_load_task_projection(conn, auth=auth, state=state))
+    if root != "done":
+        # Blocked, or a plan that finished nothing. Leave the root where it is and record why,
+        # so the next turn surfaces the block instead of planning around it.
+        context["plan_blocked_reason"] = root
+        return
+
+    context.pop("plan_blocked_reason", None)
+    conn.execute(
+        """
+        UPDATE autonomy_goals SET status = ?, updated_at = ?
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+          AND step_index = 0 AND plan_contract_revision = ?
+        """,
+        (
+            AutonomyGoalStatus.DONE.value,
+            now_utc().isoformat(),
+            state.session_id,
+            auth.workspace_id,
+            auth.user_id,
+            int(contract_revision),
+        ),
+    )
+    context["plan_completed_at"] = now_utc().isoformat()
+    # The final step's title is still sitting in context; leaving it there makes the next turn
+    # author a brand new plan FROM that step. Wait for a genuinely new objective instead.
+    context.pop("objective", None)
+    context["awaiting_next_objective"] = True
+    context["awaiting_next_objective_turns"] = 0
+    state.objective_hash = ""
+    state.active_goal_id = None
+
+
+def _plan_step_index_for_goal_lite(
+    conn: sqlite3.Connection,
+    *,
+    goal_id: str | None,
+    session_id: str,
+    workspace_id: str,
+    user_id: str,
+) -> int | None:
+    """The REAL ``autonomy_goals.step_index`` behind a directive's goal, or ``None``.
+
+    Never a placeholder. The fold keys STEP_COMPLETED / STEP_BLOCKED on ``step_index``, so a
+    missing or hardcoded index makes every step of every projection stay ``candidate`` and the
+    whole status table unreachable. ``None`` here is honest — the directive was not a plan step —
+    and the caller omits the field so the fold counts it as an unknown step rather than
+    mislabelling step -1.
+    """
+    if not goal_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT step_index FROM autonomy_goals
+        WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
+        LIMIT 1
+        """,
+        (str(goal_id), session_id, workspace_id, user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    value = _row_int_or_none(row, "step_index")
+    return value if value is not None and value > 0 else None
+
+
+def _verification_from_report_lite(body: ExecutionReportRequest) -> dict[str, Any] | None:
+    """Lift a verification out of the report's details map, or ``None``. Full's twin.
+
+    The report carries EVIDENCE, never a verdict -- see the note on Full's ``_verification_from_report``.
+    An agent must not be able to declare its own work verified, so the state is pinned to ``unverified``
+    and only the evidence-graded path may write anything else.
+    """
+
+    details = body.details if isinstance(body.details, dict) else {}
+    raw = details.get("verification")
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "verification_id": str(raw.get("verification_id") or uuid.uuid4()),
+        "directive_id": str(body.directive_id),
+        "state": "unverified",
+        "method": str(raw.get("method") or "none"),
+        "recorded_at": now_utc(),
+        "contract_revision": 0,
+        "plan_id": None,
+        "evidence_event_ids": [str(item) for item in (raw.get("evidence_event_ids") or [])][:40],
+        "summary": str(raw.get("summary") or "")[:500],
+    }
+
+
+def _insert_task_verification_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    task_id: str,
+    ref: dict[str, Any],
+    now: datetime,
+) -> None:
+    """The report path's binding of the one shared ``task_verifications`` writer.
+
+    The statement itself lives in ``task_state_store.insert_task_verification`` so that this path
+    and the evidence-graded path in ``verification_store`` cannot drift column-for-column.
+    """
+    insert_task_verification(
+        conn,
+        workspace_id=auth.workspace_id,
+        owner_id=auth.user_id,
+        task_id=task_id,
+        recorded_by=auth.consumer,
+        ref=ref,
+        now=now,
+    )
+
+
+def _record_execution_task_state_lite(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    state: TakeoverState,
+    body: ExecutionReportRequest,
+    directive_id: str,
+    goal_id: str | None,
+    effective_state: DirectiveExecutionState,
+    now: datetime,
+) -> int:
+    """Append this report's task-state events and return the contract revision they used.
+
+    The Lite twin of ``main.py::_record_execution_task_state``: without it Lite's
+    ``report_execution`` emitted nothing at all, so no Lite projection could ever leave
+    ``candidate`` and the whole §4.5 lifecycle was Full-only.
+
+    Returns ``0`` when the projection is disabled or unreadable, which is also the value the
+    goal predicate then matches: a plan written under contract 0 stays addressable.
+    """
+    if not bool(getattr(get_settings(), "task_state_enabled", True)):
+        return 0
+    try:
+        scope = auth.resolved_scope(
+            session_project=state.takeover_context.get("project_context")
+            if isinstance(state.takeover_context, dict)
+            else None,
+            task_id=state.session_id,
+        )
+        step_index = _plan_step_index_for_goal_lite(
+            conn,
+            goal_id=goal_id,
+            session_id=state.session_id,
+            workspace_id=state.workspace_id,
+            user_id=state.user_id,
+        )
+
+        def _body() -> int:
+            _task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                subject_user_id=auth.behavior_subject_id,
+                session_id=state.session_id,
+                task_id=state.session_id,
+                project_id=scope.project_id,
+                now=now,
+            )
+            events: list[TaskStateEvent] = []
+            if effective_state == DirectiveExecutionState.SUCCEEDED:
+                completed: dict[str, Any] = {"goal_id": goal_id, "directive_id": directive_id}
+                if step_index is not None:
+                    completed["step_index"] = step_index
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.STEP_COMPLETED,
+                        contract_revision=projection.contract_revision,
+                        payload=completed,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                        goal_id=goal_id,
+                    )
+                )
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.EFFECT_RESOLVED,
+                        contract_revision=projection.contract_revision,
+                        payload={
+                            "effect_id": directive_id,
+                            "kind": "directive",
+                            "description": "",
+                            "opened_at": now,
+                            "directive_id": directive_id,
+                            "paths": [],
+                        },
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                    )
+                )
+            elif effective_state in {
+                DirectiveExecutionState.FAILED,
+                DirectiveExecutionState.BLOCKED,
+                DirectiveExecutionState.ABANDONED,
+                DirectiveExecutionState.CANCELLED,
+            }:
+                blocked: dict[str, Any] = {
+                    "goal_id": goal_id,
+                    "blocked_reason": str(body.failure_reason or "")[:400],
+                }
+                if step_index is not None:
+                    blocked["step_index"] = step_index
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.STEP_BLOCKED,
+                        contract_revision=projection.contract_revision,
+                        payload=blocked,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                        goal_id=goal_id,
+                    )
+                )
+            verification = _verification_from_report_lite(body)
+            if verification is not None:
+                # S5 provenance, through the one shared stamper Full's report path and both
+                # evidence-graded paths also use. No ``work_contract_revision`` here on purpose:
+                # the report IS the end of the work, so the contract in force now is the contract
+                # the work happened under -- and this row's state is pinned to ``'unverified'``
+                # anyway, so it can never satisfy R9 whatever it is stamped with.
+                stamp_verification_provenance(
+                    verification, projection=projection, directive_id=directive_id
+                )
+                _insert_task_verification_lite(
+                    conn, auth=auth, task_id=state.session_id, ref=verification, now=now
+                )
+                events.append(
+                    TaskStateEvent(
+                        seq=0,
+                        kind=TaskStateEventKind.VERIFICATION_RECORDED,
+                        contract_revision=projection.contract_revision,
+                        payload=verification,
+                        occurred_at=now,
+                        actor=auth.consumer,
+                        directive_id=directive_id,
+                    )
+                )
+            if not events:
+                return int(projection.contract_revision)
+            write = apply_task_state_events(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                task_id=state.session_id,
+                new_events=events,
+                now=now,
+                expected_revision=None,
+                retry_once=False,
+            )
+            state.takeover_context["task_state_revision"] = int(write.next_revision)
+            return int(write.projection.contract_revision)
+
+        return run_cas_section(conn, _body)
+    except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+        raise
+    except Exception:
+        logger.warning("task-state execution report failed", exc_info=True)
+        return 0
+
+
+def _task_state_summary_for(
+    projection: TaskStateProjection, *, source_revision: str
+) -> TaskStateSummary:
+    fields = dict(task_state_summary_fields(projection, source_revision=source_revision))
+    fields["status"] = to_lifecycle_status(fields["status"])
+    fields["next_permitted_action"] = to_next_permitted_action(fields["next_permitted_action"])
+    return TaskStateSummary(**fields)
+
+
+def _run_task_state_cas_section(
+    conn: sqlite3.Connection,
+    *,
+    auth: AuthContext,
+    settings: Settings,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    objective_text: str,
+    owner_objective_hash: str | None,
+    objective_asserted: bool,
+    now: datetime,
+) -> tuple[TaskStateSummary, int, str | None]:
+    """The whole read-then-write CAS section for one turn (§5.2 rule 2).
+
+    Retrieval, classification and the advisor decision have ALREADY run, outside the write lock.
+    Everything below runs under one ``BEGIN IMMEDIATE`` and commits or rolls back together.
+
+    D2: planning is inline and deterministic, so this returns ``planning_job_id`` for wire parity
+    and the caller always reports ``planning_pending=False``.
+    """
+    task_id = state.session_id  # D4: the task identity for a takeover turn IS the session
+
+    def _body() -> tuple[TaskStateSummary, int, str | None]:
+        task_state_id, projection, _highest_seq, source_revision = ensure_task_state(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            subject_user_id=auth.behavior_subject_id,
+            session_id=state.session_id,
+            task_id=task_id,
+            project_id=scope.project_id,
+            now=now,
+        )
+        contract_revision = objective_contract_revision(
+            projection.contract_revision, projection.objective_hash, owner_objective_hash
+        )
+        objective_changed = contract_revision != projection.contract_revision
+        # RULING V1: a cancelled projection accepts a same-hash OBJECTIVE_SET, so the documented
+        # stand-down -> re-activate cycle on ONE session id revives the task instead of bricking
+        # it. Without this the last retained CANCELLATION_REQUESTED stays newer than the last
+        # OBJECTIVE_SET forever and R1 returns CANCELLED for the life of the session.
+        objective_set_needed = bool(owner_objective_hash) and _objective_set_needed_lite(
+            projection,
+            owner_objective_hash=owner_objective_hash,
+            objective_asserted=objective_asserted,
+        )
+        events: list[TaskStateEvent] = []
+        invalidation: InvalidationPlan | None = None
+        apply_side_effects: ApplySideEffectsLite | None = None
+        job_id: str | None = None
+
+        if objective_set_needed:
+            # The FIRST objective set is not an objective CHANGE. invalidation_for_objective_change
+            # keys purely on the revision moving, so on a task whose stored hash is still NULL it
+            # would cancel the session's already-pending directives and expire its permits — the
+            # exact opposite of what "the owner restated the objective" means. Only a task that
+            # already carried an objective hash has a previous contract to close out.
+            if objective_changed and projection.objective_hash:
+                invalidation = invalidation_for_objective_change(
+                    projection,
+                    new_objective_hash=owner_objective_hash,
+                    pending_directive_ids=pending_directive_ids(
+                        conn,
+                        workspace_id=auth.workspace_id,
+                        owner_id=auth.user_id,
+                        session_id=state.session_id,
+                    ),
+                    pending_planning_job_ids=pending_planning_job_ids(
+                        conn, workspace_id=auth.workspace_id, task_id=task_id
+                    ),
+                )
+                if invalidation is not None:
+                    apply_side_effects = _apply_invalidation_lite
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.OBJECTIVE_SET,
+                    contract_revision=contract_revision,
+                    payload={
+                        "objective_text": objective_text,
+                        "objective_hash": owner_objective_hash,
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                )
+            )
+
+        needs_plan = objective_changed or projection.plan is None or (
+            projection.plan is not None and projection.plan.contract_revision != contract_revision
+        )
+        if needs_plan and owner_objective_hash and objective_text.strip():
+            charter = charter_for_task(
+                max_steps=int(getattr(settings, "takeover_plan_max_steps", 8)),
+                reason="deterministic read-only diagnosis",
+            )
+            input_revision = plan_input_revision(
+                objective_hash=owner_objective_hash,
+                contract_revision=contract_revision,
+                policy_revision=TASK_STATE_POLICY_REVISION,
+                scope_digest=_task_scope_digest_for(scope),
+                cancel_epoch=int(projection.last_cancel_seq),
+            )
+            job_id, _created = enqueue_planning_job(
+                conn,
+                workspace_id=auth.workspace_id,
+                owner_id=auth.user_id,
+                session_id=state.session_id,
+                task_id=task_id,
+                task_state_id=task_state_id,
+                job_kind=PLANNING_JOB_KIND_DECOMPOSE,
+                input_revision=input_revision,
+                contract_revision=contract_revision,
+                objective_hash=owner_objective_hash,
+                objective_text=objective_text,
+                charter=charter,
+                scope=scope,
+                now=now,
+                max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+            )
+            steps = deterministic_plan(objective_text, charter=charter)
+            root_goal_id = _write_objective_plan_lite(
+                conn,
+                scope=scope,
+                session_id=state.session_id,
+                task_id=task_id,
+                steps=steps,
+                producer=PLANNING_PRODUCER_DETERMINISTIC,
+                contract_revision=contract_revision,
+                now=now,
+                objective_text=objective_text,
+            )
+            events.append(
+                TaskStateEvent(
+                    seq=0,
+                    kind=TaskStateEventKind.PLAN_APPROVED,
+                    contract_revision=contract_revision,
+                    payload={
+                        "producer": PLANNING_PRODUCER_DETERMINISTIC,
+                        "plan_id": approved_plan_id(task_id, contract_revision),
+                        "root_goal_id": root_goal_id,
+                        "steps": plan_steps_to_json(steps),
+                        "charter": charter_to_json(charter),
+                        "descriptive_sources": {},
+                    },
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    goal_id=root_goal_id,
+                )
+            )
+
+        if not events:
+            summary = _task_state_summary_for(projection, source_revision=source_revision)
+            return summary, int(projection.revision), job_id
+
+        write = apply_task_state_events(
+            conn,
+            workspace_id=auth.workspace_id,
+            owner_id=auth.user_id,
+            session_id=state.session_id,
+            task_id=task_id,
+            new_events=events,
+            now=now,
+            expected_revision=None,
+            invalidation=invalidation,
+            apply_side_effects=apply_side_effects,
+            retry_once=False,
+        )
+        summary = _task_state_summary_for(
+            write.projection, source_revision=write.source_revision
+        )
+        return summary, int(write.next_revision), job_id
+
+    return run_cas_section(conn, _body)
+
+
+def _apply_invalidation_lite(conn: sqlite3.Connection, plan: InvalidationPlan) -> None:
+    """The objective-change side effects, in §0.8 lock order: planning jobs, then directives,
+    then permits. Keyed on ``session_id`` throughout (S1)."""
+    stamp = now_utc().isoformat()
+    for job_id in plan.discard_planning_job_ids:
+        conn.execute(
+            "UPDATE planning_jobs SET state = 'discarded', cancel_requested = 1, last_error = ?, updated_at = ? WHERE id = ?",
+            (plan.reason, stamp, job_id),
+        )
+    for directive_id in plan.cancel_directive_ids:
+        conn.execute(
+            """
+            UPDATE directive_executions
+               SET state = ?, updated_at = ?, finished_at = ?, cancelled_at = ?,
+                   cancel_reason = COALESCE(cancel_reason, ?)
+             WHERE directive_id = ? AND state IN (?, ?)
+            """,
+            (
+                DirectiveExecutionState.CANCELLED.value,
+                stamp,
+                stamp,
+                stamp,
+                plan.reason,
+                directive_id,
+                DirectiveExecutionState.PENDING.value,
+                DirectiveExecutionState.IN_PROGRESS.value,
+            ),
+        )
+    if plan.expire_permits_for_session:
+        conn.execute(
+            "UPDATE execution_permits SET expires_at = ? WHERE session_id = ? AND (expires_at IS NULL OR expires_at > ?)",
+            (stamp, plan.expire_permits_for_session, stamp),
+        )
+
+
 def takeover_step(
     conn: sqlite3.Connection,
     body: TakeoverStepRequest,
     auth: AuthContext,
     settings: Settings,
 ) -> TakeoverStepResponse:
+    # The ONE turn deadline and the ONE ledger, created as the first two statements of the turn.
+    # Both are passed BY VALUE downstream and never re-created. The retrieval CHILD is built at
+    # the retrieval call site (_build_takeover_working_set), not here (S6).
+    turn_deadline = (
+        Deadline.start(
+            budget_ms=int(getattr(settings, "takeover_turn_budget_ms", 3500)),
+            backend_budget_ms=int(getattr(settings, "context_backend_timeout_ms", 60)),
+            floor_ms=int(getattr(settings, "retrieval_deadline_floor_ms", 5)),
+            label="turn",
+        )
+        if bool(getattr(settings, "retrieval_deadline_enabled", True))
+        else Deadline.unbounded()
+    )
+    retrieval_ledger = RetrievalLedger()
     started_total = time.perf_counter()
     state_started = time.perf_counter()
     state = takeover_state(
@@ -8168,10 +10693,20 @@ def takeover_step(
         if isinstance(state.takeover_context, dict)
         else None
     )
+    explicit_app_context = dict(body.app_context) if isinstance(body.app_context, dict) else {}
     project_context = canonical_project_context(body.app_context, previous_project)
     if project_context:
         body.app_context = {**body.app_context, **project_context}
         state.takeover_context["project_context"] = project_context
+    # Server-bound scope for this turn: explicit app_context identity => bound, session-inherited
+    # project => inherited, neither => unbound (no autonomous write may be minted while unbound).
+    request_scope = auth.resolved_scope(
+        project_hint=explicit_app_context,
+        session_project=previous_project if isinstance(previous_project, dict) else None,
+        task_id=body.session_id,
+    )
+    project_binding = request_scope.project_binding
+    state.takeover_context["project_binding"] = project_binding
     snapshot_rehydrated = False
     snapshot_age_hours: int | None = None
     now = now_utc()
@@ -8231,6 +10766,18 @@ def takeover_step(
             """,
             (now.isoformat(), state.session_id, state.workspace_id, state.user_id),
         )
+        try:
+            close_opportunities(
+                conn,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+                session_id=state.session_id,
+                status="abandoned",
+                resolved_at=now,
+            )
+        except sqlite3.Error:
+            logger.warning("stand-down opportunity close failed", exc_info=True)
+        state.takeover_context.pop("open_decision", None)
         _save_session_memory_snapshot_lite(
             conn,
             state=state,
@@ -8238,6 +10785,13 @@ def takeover_step(
             max_per_session=max(1, int(getattr(settings, "snapshot_max_per_session", 10))),
         )
         save_takeover_state(conn, state)
+        _record_stand_down_lite(
+            conn,
+            workspace_id=state.workspace_id,
+            user_id=state.user_id,
+            session_id=state.session_id,
+            now=now,
+        )
         return TakeoverStepResponse(
             state=state,
             action="stopped",
@@ -8255,6 +10809,7 @@ def takeover_step(
             ),
             needs_human=False,
             continuity_ok=continuity_ok,
+            project_binding=project_binding,
         )
 
     activation_hit = contains_phrase(normalized_message, state.activation_keywords)
@@ -8294,6 +10849,7 @@ def takeover_step(
             ),
             needs_human=False,
             continuity_ok=continuity_ok,
+            project_binding=project_binding,
         )
 
     classify_started = time.perf_counter()
@@ -8316,6 +10872,13 @@ def takeover_step(
         awaiting_next_objective = False
         state.takeover_context.pop("force_user_objective_refresh", None)
         state.takeover_context.pop("objective_needs_refresh", None)
+        open_decision_ctx = state.takeover_context.get("open_decision")
+        if isinstance(open_decision_ctx, dict) and str(open_decision_ctx.get("family")) == "next_objective":
+            # Relayed through the executor: recorded, not a label.
+            _relay_opportunity_answer(conn, str(open_decision_ctx.get("opportunity_id") or ""), message=message, now=now)
+            open_decision_ctx["relayed_at"] = now.isoformat()
+            # The question has been answered (relayed); it is no longer this turn's open decision.
+            state.takeover_context.pop("open_decision", None)
     elif awaiting_next_objective:
         state.takeover_context["awaiting_next_objective_turns"] = int(
             state.takeover_context.get("awaiting_next_objective_turns", 0)
@@ -8375,14 +10938,10 @@ def takeover_step(
             pinned_active = True
     if pinned_active and not pending_execution and not body.task:
         resolved_task = pinned_objective
-    classifier_input = body.executor_output if (body.executor_output or "").strip() else message
-    classifier_for_conf = classify_text(
-        classifier_input,
-        takeover_active=state.mode == TakeoverMode.TAKEOVER,
-        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
-        semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
-        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
-    )
+    # `classifier_for_conf` used to live here: a second classification of `body.executor_output`
+    # -- the system's own prior text -- whose only consumer was `decision_confidence`. That term is
+    # gone, and so is the call, so no path remains from the system's own words into the escalation
+    # gate. `classify_ms` keeps its meaning: the classification the turn actually decides on.
     classify_ms = int((time.perf_counter() - classify_started) * 1000)
 
     retrieval_started = time.perf_counter()
@@ -8395,6 +10954,7 @@ def takeover_step(
             SELECT id, session_id, workspace_id, user_id, title, description, source,
                    priority_score, risk_tier, confidence, reasoning, evidence_event_ids,
                    goal_kind, affective_scores, selection_score, cache_hit, cache_source,
+                   step_index, parent_goal_id, depends_on_json, attempt_count, mutating,
                    status, created_at, updated_at
             FROM autonomy_goals
             WHERE id = ? AND session_id = ? AND workspace_id = ? AND user_id = ?
@@ -8404,10 +10964,60 @@ def takeover_step(
         ).fetchone()
         if maybe_goal is not None:
             selected_goal = _goal_from_row(maybe_goal)
+        if selected_goal is not None and selected_goal.status in {
+            AutonomyGoalStatus.DONE,
+            AutonomyGoalStatus.DROPPED,
+        }:
+            # A pin left on a finished goal would be returned forever — the "propose the step
+            # you just completed" failure at the pin level.
+            selected_goal = None
+            state.active_goal_id = None
+
+    # --- the pre-dispatch task-state read (§4.5 item 5) --------------------------------------
+    # A PLAIN read. The CAS section is still hundreds of lines below and stays exactly as narrow
+    # as it was; this is the only way the turn's directive decision can see a cancelled task or
+    # a plan stalled on a blocked step, both of which must mint nothing.
+    task_owner_objective_hash = _owner_objective_hash(body, state, pending_objective=None)
+    task_objective_asserted = bool(has_new_objective_signal or activation_hit)
+    task_projection_pre = (
+        _load_task_projection(conn, auth=auth, state=state)
+        if bool(getattr(settings, "task_state_enabled", True))
+        else None
+    )
+    task_dispatch_blocked = False
+    plan_blocked = False
+    if task_projection_pre is not None:
+        task_dispatch_blocked = (
+            task_projection_pre.status is TaskStatus.CANCELLED
+            and not _objective_set_needed_lite(
+                task_projection_pre,
+                owner_objective_hash=task_owner_objective_hash,
+                objective_asserted=task_objective_asserted,
+            )
+        )
+        if (
+            selected_goal is None
+            and not task_dispatch_blocked
+            and task_projection_pre.plan is not None
+        ):
+            plan_step = _select_next_plan_step_lite(
+                conn, state, contract_revision=task_projection_pre.contract_revision
+            )
+            if plan_step is not None:
+                selected_goal = plan_step
+                state.active_goal_id = plan_step.id
+            elif _plan_root_status_lite(task_projection_pre) == "blocked":
+                # None here means "no open step", which is NOT the same as "plan complete".
+                # Short-circuit instead of falling through to discovery and authoring a fresh
+                # goal around the block.
+                plan_blocked = True
+    # --- end of the pre-dispatch read ---------------------------------------------------------
     goal_discovery_every_n_turns = max(6, int(getattr(settings, "takeover_goal_discovery_every_n_turns", 24)))
     periodic_goal_discovery_due = turn_count > 0 and (turn_count % goal_discovery_every_n_turns == 0)
     should_discover = bool(
         state.active
+        and not task_dispatch_blocked
+        and not plan_blocked
         and (not awaiting_next_objective or has_new_objective_signal)
         and (
             selected_goal is None
@@ -8501,6 +11111,8 @@ def takeover_step(
             task=resolved_task,
             app_context=body.app_context,
             constraints=body.constraints,
+            deadline=turn_deadline,
+            ledger=retrieval_ledger,
         )
         state.working_set_json = working_set
     retrieval_ms = int((time.perf_counter() - retrieval_started) * 1000)
@@ -8508,7 +11120,6 @@ def takeover_step(
     decision_confidence, confidence_components = compute_decision_confidence(
         objective=resolved_task,
         message=message,
-        classification=classifier_for_conf,
         working_set=working_set,
         recent_outcomes=state.recent_outcomes_json,
     )
@@ -8521,15 +11132,121 @@ def takeover_step(
         message=message,
     )
     evidence_count = int(working_set.get("evidence_count", 0) or 0)
-    evidence_strength_score = max(0.0, min(1.0, evidence_count / 6.0))
-    recency_coverage_score = 1.0 if evidence_count > 0 else 0.2
+    # ---- P4: the one decision-policy call on this turn -------------------------------
+    #
+    # It runs BEFORE anything reads it: before the two context-quality scores below, before
+    # `ensure_takeover_response`, and before the escalation causes. `decide()` is pure; the
+    # only I/O is one bounded evidence load (<= MAX_NEIGHBOURS * 8 rows) inside
+    # `build_decision_request`, which replaces up to three unbounded 500-row loads at the
+    # freeze sites. Net DB work per turn goes down.
+    #
+    # An ordinary takeover turn offers no candidate options, so this abstains with
+    # NO_CANDIDATE_MATCH. That is the normal case and not an error: with no qualified family
+    # -- the state of every family on every deployment measured so far -- `exposed` is False,
+    # `ensure_takeover_response` ignores the policy entirely, and the turn is byte-for-byte
+    # what it was before P4. The result is still fully recorded, which is the point of running
+    # the policy before it has permission to be used.
+    policy_cancel_epoch = int(getattr(task_projection_pre, "last_cancel_seq", 0) or 0) if task_projection_pre is not None else 0
+    policy_situation_type = classify_situation(
+        resolved_task or message,
+        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
+        semantic_threshold=float(getattr(settings, "semantic_classifier_situation_threshold", 0.61)),
+        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+    )
+    policy_result: DecisionResult | None = None
+    policy_request: DecisionRequest | None = None
+    try:
+        policy_request = build_decision_request(
+            conn,
+            scope=request_scope,
+            settings=settings,
+            decision_family="needs_human",
+            situation_type=policy_situation_type,
+            situation_summary=str(resolved_task or message or "")[:500],
+            objective_text=str(state.takeover_context.get("objective") or resolved_task or ""),
+            constraints=body.constraints if isinstance(body.constraints, dict) else {},
+            context_snapshot={"objective_hash": state.objective_hash, "turn": turn_count},
+            candidate_options=(),
+            decision_at=now,
+            session_id=state.session_id,
+            objective_hash=str(state.objective_hash or "") or None,
+            cancel_epoch=policy_cancel_epoch,
+        )
+        policy_result = decide(policy_request)
+    except Exception:
+        # A decision policy that cannot be computed must never fail a turn. It is recorded as
+        # absent, which under FN2 is indistinguishable from the unexposed case: the turn runs
+        # exactly as it does today.
+        logger.warning("decision policy assembly failed", exc_info=True)
+        policy_request = None
+        policy_result = None
+    # `evidence_count` is len(citations) -- timeline event ids, which are retrieval provenance
+    # and never the evidence for a choice. Reading them here put that number behind 0.25 of
+    # context_quality_score, which gates bounded retrieval and needs_human. It is now decision
+    # evidence above the similarity floor, which is what the name always claimed.
+    #
+    # Read from the REQUEST, not from `policy_result.adequacy`. `decide()` abstains at stage 2
+    # when a turn offers no candidate options, and an ordinary takeover turn offers none, so
+    # that adequacy is the empty one on every ordinary turn -- zero evidence, zero age, whatever
+    # the corpus holds. Scoring the context from it makes the score a constant that sits under
+    # the escalation line forever, which is "always ask the human", which is a shutdown rather
+    # than a gate. `context_evidence_snapshot` uses the policy's own adequacy whenever it
+    # reached stage 3, and otherwise measures the same evidence the request carries.
+    evidence_above_floor, evidence_median_age_days = (
+        context_evidence_snapshot(policy_request, policy_result)
+        if policy_request is not None
+        else (0, 0.0)
+    )
+    evidence_strength_score = (
+        max(0.0, min(1.0, evidence_above_floor / 6.0))
+        if policy_request is not None
+        else max(0.0, min(1.0, evidence_count / 6.0))
+    )
+    # And this was a field named for recency that read no clock: 1.0 for any non-empty corpus,
+    # 0.2 for an empty one, forever. Now it decays against the age of the evidence actually
+    # used, with the same 90-day half-life the similarity term uses.
+    #
+    # The empty-corpus guard is deliberate and is not in the design's one-line formula. With no
+    # eligible evidence the median age is 0.0, so a bare exp(-ln2 * 0 / 90) reports *perfect*
+    # recency coverage for a corpus that has nothing in it -- which is the same defect in a new
+    # costume. No evidence keeps the floor the old branch used, so the number only ever means
+    # "the evidence I actually have is this fresh".
+    recency_coverage_score = (
+        (
+            math.exp(-math.log(2) * max(0.0, evidence_median_age_days) / 90.0)
+            if evidence_above_floor > 0
+            else 0.2
+        )
+        if policy_request is not None
+        else (1.0 if evidence_count > 0 else 0.2)
+    )
     outcome_stability_score = max(0.0, 1.0 - min(1.0, recent_failures / 3.0))
-    context_quality_score = round(
-        (0.40 * float(decision_confidence))
-        + (0.25 * evidence_strength_score)
-        + (0.20 * recency_coverage_score)
-        + (0.15 * outcome_stability_score),
-        4,
+    # A score named for the quality of the CONTEXT must not be dominated by the confidence of
+    # the ANSWER. The old formula took 0.40 of its value from `decision_confidence`, one of
+    # whose four terms is `classifier_certainty` -- how the system classified its own response.
+    # So the reply fed the score, the score fed the retrieval trigger and the `needs_human`
+    # escalation, and a turn could talk itself past its own safety gate: the lowest-evidence
+    # turns produced the most assertive text, which scored as certainty, which raised the very
+    # gate that existed to catch them. The term is gone. What is left measures context only,
+    # and the weights are re-derived over the three surviving terms to sum to 1.
+    #
+    # Two of the inputs the ruling names are deliberately NOT terms here, because on this seam
+    # they would be constants rather than measurements:
+    #   * corroboration (`Adequacy.agreement_share`) is 0 whenever no neighbour maps onto an
+    #     offered candidate option, and an ordinary takeover turn offers none. Weighting it
+    #     would deflate every turn by the same amount and measure nothing. It belongs in this
+    #     score on the day the seam actually offers options.
+    #   * retrieval outcome is not available yet: this score is computed BEFORE retrieval and
+    #     is its trigger (`quality_gate`, below). Feeding the outcome back in would be a second
+    #     circularity of exactly the shape just removed.
+    #
+    # Full carries the identical formula (`tce_api/main.py`), and its recency term now carries
+    # the same empty-corpus floor this one always had -- without it Full scored a corpus with
+    # nothing in it as perfectly fresh, 0.16 of quality above Lite on the same inputs.
+    context_quality_score = compute_context_quality_score(
+        evidence_strength=evidence_strength_score,
+        recency_coverage=recency_coverage_score,
+        outcome_stability=outcome_stability_score,
     )
     profile_tuning = (
         autonomy_profile_tuning(state.autonomy_policy_profile)
@@ -8596,12 +11313,12 @@ def takeover_step(
         "do": working_set.get("do", []),
         "dont": working_set.get("dont", []),
         "confidence": decision_confidence,
+        # P4: derived from properties of the decision evidence -- above-floor neighbour count,
+        # effective sample size, agreement share, learning-eligible count -- and from no model
+        # number and no citation count. Both backends import the same function, so the old
+        # Full {strong, moderate, weak} / Lite {high, medium, low} fork cannot reappear.
         "evidence_strength": (
-            "strong"
-            if int(working_set.get("evidence_count", 0) or 0) >= 5
-            else "medium"
-            if int(working_set.get("evidence_count", 0) or 0) >= 2
-            else "weak"
+            evidence_strength_label(policy_result.adequacy) if policy_result is not None else "weak"
         ),
         "citations": citation_values,
         "citation_snippets": (
@@ -8676,8 +11393,8 @@ def takeover_step(
             fast_path_reason = "confidence_above_trigger"
         elif not run_deliberation:
             fast_path_reason = "run_deliberation_false"
+    advisor_call_succeeded = False
     if should_call_clone_advice:
-        advisor_call_succeeded = False
         deliberation_started = time.perf_counter()
         try:
             clone_advice = build_clone_advice(
@@ -8752,10 +11469,60 @@ def takeover_step(
                 state.takeover_context["advisor_last_error"] = advisor_failure_reason
                 if not fast_path_reason:
                     fast_path_reason = "advisor_error"
+    # Z2, the Lite twin. ABSENT and UNAVAILABLE are two different facts about the advisor and
+    # Lite has to be able to tell them apart even though it is permanently in the first one.
+    #
+    #   ABSENT      -- `advisor is None` -- the advisor was NEVER ATTEMPTED: no cadence, no
+    #                  deadline, switched off, or (here) no server-side advisor exists at all.
+    #                  The advisor is an optional input, so the policy proceeds without it.
+    #   UNAVAILABLE -- a contribution whose `parse_state != "parsed"` -- ATTEMPTED AND FAILED.
+    #                  It forces an abstention and must never be swallowed back to None, which
+    #                  is precisely the defect that made a dead advisor on Full look like an
+    #                  advisor nobody had called.
+    #
+    # `LITE_HAS_SERVER_SIDE_ADVISOR` is False, so today every Lite turn is ABSENT and this
+    # block re-decides nothing -- `build_clone_advice` here is deterministic timeline
+    # retrieval, not a model call. The seam is written out rather than assumed so that the day
+    # Lite grows a server-side advisor, a failed call reaches the policy as UNAVAILABLE by
+    # construction. A Lite deliberation failure keeps driving `advisor_fail_streak` ->
+    # `advisor_unhealthy` -> the safety gate either way; that path is below and is untouched.
+    lite_advisor_contribution: AdvisorContribution | None = None
+    if LITE_HAS_SERVER_SIDE_ADVISOR and should_call_clone_advice and not advisor_call_succeeded:
+        lite_advisor_contribution = failed_advisor_contribution(
+            advisor_failure_reason or fast_path_reason or "advisor_call_failed",
+            model_id=LITE_MODEL_ID,
+            runtime_version=LITE_RUNTIME_VERSION,
+        )
+    if lite_advisor_contribution is not None and policy_request is not None:
+        try:
+            policy_request = replace(policy_request, advisor=lite_advisor_contribution)
+            policy_result = decide(policy_request)
+        except Exception:
+            logger.warning("advisor contribution could not be folded into the policy", exc_info=True)
     if decision_source == TakeoverDecisionSource.DELIBERATION:
         fast_path_reason = ""
     clone_payload["fast_path_reason"] = fast_path_reason or None
     clone_payload["advisor_failure_reason"] = advisor_failure_reason
+    # P4: `advice_visible` stops being a constant. It used to be `bool(clone_payload)`, and
+    # `clone_payload` is an eight-key dict literal, so `bool()` of it is True at every site in
+    # both backends, always -- the live count of rows with advice_visible=false has been zero
+    # since the column was added, and the promotion clause that reads it could never move.
+    # It now means what its name says: the advisor ran, parsed, and its guidance replaced the
+    # fast-path payload. Lite has no server-side advisor, so this is False on every Lite turn.
+    # It is a report diagnostic only; the gate input is `decision_advice_shown`, which is
+    # computed per freeze site from the text the human actually read.
+    #
+    # On Lite the answer is False by construction, and that is the honest value rather than a
+    # placeholder: `build_clone_advice` here is deterministic timeline retrieval, not a model
+    # call, so no LLM advisor output ever replaces the fast-path payload. The conjunct is
+    # written out rather than collapsed to `False` so that the day Lite grows a server-side
+    # advisor, this flips by editing one constant instead of by rediscovering the rule.
+    advisor_output_rendered = bool(
+        LITE_HAS_SERVER_SIDE_ADVISOR
+        and decision_source == TakeoverDecisionSource.DELIBERATION
+        and not fast_path_reason
+        and advisor_failure_reason is None
+    )
     state.takeover_context["last_fast_path_reason"] = fast_path_reason or None
     policy_retrieval_meta: dict[str, Any] = {}
     policy_value = working_set.get("policy")
@@ -8824,6 +11591,10 @@ def takeover_step(
         semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
         semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
         semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+        # An EXPOSED abstention is the only thing the policy may do to this turn. With no
+        # qualified family it is unexposed, this argument changes nothing, and the four-tuple
+        # is identical to the one `policy=None` returns.
+        policy=policy_result,
     )
     final_response: str | None = response_text
     # If ensure_takeover_response returned empty (edge case), build a
@@ -8845,6 +11616,9 @@ def takeover_step(
         message=message,
         final_response=final_response,
         takeover_context=state.takeover_context,
+        # The resolved objective is screened directly.  It used to reach the gate only
+        # through the cold-start rewrite that P4 deleted; see evaluate_safety's docstring.
+        objective=resolved_task,
     )
     safety_ms = int((time.perf_counter() - safety_started) * 1000)
     if safety_decision != SafetyDecision.ALLOW:
@@ -8861,22 +11635,69 @@ def takeover_step(
             "mode": state.mode.value,
             "note": note,
         }
+    scoped_project_id = request_scope.project_id if project_binding != PROJECT_UNBOUND else None
     if safety_decision == SafetyDecision.CONFIRM_REQUIRED:
-        state.takeover_context["pending_safety"] = {
+        previous_pending = state.takeover_context.get("pending_safety")
+        prior_opportunity_id = (
+            str(previous_pending.get("opportunity_id"))
+            if isinstance(previous_pending, dict) and previous_pending.get("opportunity_id")
+            else None
+        )
+        pending_safety_payload: dict[str, Any] = {
             "reason": safety_reason or "high-risk-action",
             "pending_response": final_response,
         }
+        state.takeover_context["pending_safety"] = pending_safety_payload
         confirm_phrase = body.policy.confirm_keyword
         deny_phrase = body.policy.deny_keyword
         final_response = (
             f"Safety pause: high-risk action detected ({safety_reason or 'high-risk'}). "
             f"Type '{confirm_phrase}' to continue or '{deny_phrase}' to abort."
         )
+        if prior_opportunity_id:
+            # Re-ask turn: the same open opportunity travels with the rewritten pending_safety.
+            pending_safety_payload["opportunity_id"] = prior_opportunity_id
+        elif safety_reason != "awaiting_high_risk_confirmation" and not _safety_question_already_answered(
+            conn, auth=auth, state=state
+        ):
+            # Point A: freeze the pre-answer context and the shadow prediction before the human answers.
+            frozen_opportunity_id = _freeze_decision_opportunity_lite(
+                conn,
+                auth=auth,
+                scope=request_scope,
+                state=state,
+                body=body,
+                settings=settings,
+                turn=turn_count,
+                decision_family="safety_confirmation",
+                situation_type="approval_requested",
+                question_text=final_response,
+                alternatives=[confirm_phrase, deny_phrase],
+                objective_text=str(state.takeover_context.get("objective") or resolved_task or ""),
+                objective_hash=str(state.objective_hash or ""),
+                snapshot={
+                    "safety_reason": safety_reason,
+                    "pending_response": str(pending_safety_payload.get("pending_response") or "")[:1000],
+                    "objective": state.takeover_context.get("objective"),
+                    "citations": [str(item) for item in citations][:20],
+                },
+                advice_visible=advisor_output_rendered,
+                project_id=scoped_project_id,
+                cancel_epoch=policy_cancel_epoch,
+                turn_policy_request=policy_request,
+                turn_policy_result=policy_result,
+            )
+            if frozen_opportunity_id:
+                pending_safety_payload["opportunity_id"] = frozen_opportunity_id
     elif safety_decision == SafetyDecision.BLOCKED:
-        state.takeover_context.pop("pending_safety", None)
+        popped_pending = state.takeover_context.pop("pending_safety", None)
+        if isinstance(popped_pending, dict):
+            _relay_opportunity_answer(conn, popped_pending.get("opportunity_id"), message=message, now=now)
         final_response = "High-risk action aborted by operator decision."
     elif safety_reason == "confirmed_high_risk":
-        state.takeover_context.pop("pending_safety", None)
+        popped_pending = state.takeover_context.pop("pending_safety", None)
+        if isinstance(popped_pending, dict):
+            _relay_opportunity_answer(conn, popped_pending.get("opportunity_id"), message=message, now=now)
 
     autonomy_value = max(0.0, min(1.0, float(state.autonomy_score or 0.5)))
     low_threshold = max(0.0, min(1.0, float(settings.takeover_needs_human_threshold_cold)))
@@ -8924,8 +11745,20 @@ def takeover_step(
         and pending_execution is None
         and safety_decision == SafetyDecision.ALLOW
     )
+    # A cancelled task, or a plan stalled on a blocked step, mints NOTHING. The status was read
+    # at the top of the turn precisely so this decision can see it: reading it after the
+    # directive block (where the projection used to first appear) is the same as not reading it.
+    task_state_suppressed = bool(
+        (task_dispatch_blocked or plan_blocked) and pending_execution is None
+    )
+    if task_state_suppressed:
+        suppress_auto_directive = True
     if suppress_auto_directive:
-        if bool(state.takeover_context.get("force_user_objective_refresh")):
+        if task_state_suppressed and plan_blocked:
+            final_response = "The plan is blocked on an unfinished step. Clear the blocker or restate the objective before I continue."
+        elif task_state_suppressed:
+            final_response = "This task was cancelled. Re-state the objective to revive it."
+        elif bool(state.takeover_context.get("force_user_objective_refresh")):
             final_response = "Objective drift detected. Provide one concrete next objective so I can continue correctly."
             state.takeover_context["objective_needs_refresh"] = True
         else:
@@ -8933,16 +11766,55 @@ def takeover_step(
         takeover_enforcement = {}
         enforced = False
         enforcement_reason = None
-    execution_permit_required = (
+        # Point C: the next objective is an open-ended decision opportunity for the human.
+        _ensure_open_decision_lite(
+            conn,
+            auth=auth,
+            state=state,
+            body=body,
+            settings=settings,
+            turn=turn_count,
+            family="next_objective",
+            situation_type="prioritization_needed",
+            question_text=final_response,
+            alternatives=[],
+            snapshot={
+                "last_completed_directive_id": state.takeover_context.get("last_completed_directive_id"),
+                "objective_hash": state.objective_hash,
+                "objective_needs_refresh": bool(state.takeover_context.get("objective_needs_refresh")),
+                "objective": state.takeover_context.get("objective"),
+            },
+            advice_visible=advisor_output_rendered,
+            project_id=scoped_project_id,
+            scope=request_scope,
+            cancel_epoch=policy_cancel_epoch,
+            turn_policy_request=policy_request,
+            turn_policy_result=policy_result,
+        )
+    # A permit demand is a property of the DIRECTIVE, not of this turn's wording. Recomputing it purely
+    # from the current message meant a pending directive that genuinely needed a permit stopped being
+    # demanded as soon as a later turn happened not to contain a mutating verb -- so the executor could
+    # simply keep talking until the requirement went away. While a directive that was minted requiring a
+    # permit is still pending, the demand stands regardless of what this turn says.
+    _pending_requires_permit = bool(
+        pending_execution is not None
+        and getattr(pending_execution, "requires_permit", False)
+        and str(getattr(pending_execution, "state", "")) in {DirectiveExecutionState.PENDING.value, DirectiveExecutionState.IN_PROGRESS.value}
+    )
+    execution_permit_required = _pending_requires_permit or (
         (not suppress_auto_directive)
         and state.mode == TakeoverMode.TAKEOVER
-        and _is_mutating_intent(
-            message,
-            resolved_task,
-            final_response,
-        )
+        and _is_mutating_intent(message, resolved_task)
     )
     execution_permit_id: UUID | None = None
+    if execution_permit_required and project_binding == PROJECT_UNBOUND and pending_execution is None:
+        # Unbound project => no autonomous write. Surface the binding gap instead of minting a directive.
+        final_response = (
+            "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. "
+            "Provide app_context.project_root or repo remote."
+        )
+        safety_decision = SafetyDecision.CONFIRM_REQUIRED
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
     if execution_permit_required:
         permit_row = conn.execute(
             """
@@ -8950,6 +11822,8 @@ def takeover_step(
             FROM execution_permits
             WHERE session_id = ? AND workspace_id = ? AND decision = ?
               AND (expires_at IS NULL OR expires_at >= ?)
+              AND (user_id IS NULL OR user_id = ?)
+              AND (objective_hash IS NULL OR ? IS NULL OR objective_hash = ?)
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -8958,6 +11832,9 @@ def takeover_step(
                 state.workspace_id,
                 ExecutionPermitDecision.ALLOW.value,
                 now_utc().isoformat(),
+                state.user_id,
+                state.objective_hash or None,
+                state.objective_hash or None,
             ),
         ).fetchone()
         if permit_row:
@@ -8982,6 +11859,39 @@ def takeover_step(
                     "Fix dependency_plan and retry."
                 )
                 decision_source = TakeoverDecisionSource.SAFETY_GATE
+    # §9.3 -- the five charter/effect fields on TakeoverStepResponse. Without this block they are
+    # declared on the wire model and never populated, which means `charter_constraints()` has no
+    # production caller and the executor never receives the charter's machine-readable scope.
+    (
+        step_charter_active,
+        step_charter_version,
+        step_enforcement_tier,
+        step_unresolved_effects,
+        step_constraints,
+    ) = _charter_step_fields(
+        conn,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        now=now,
+    )
+    # §6.5 step 4, the LOAD-BEARING guard. This is where work actually restarts after a reap:
+    # _load_pending_directive reaps and returns None, and this block then mints a brand-new PENDING
+    # directive. Guarding only the retry ladder would never fire, because a reaped directive is
+    # ABANDONED and the ladder looks at FAILED/BLOCKED.
+    effect_paused, _effect_pause_reason, effect_pause_id = pause_guard_for_session(
+        conn,
+        workspace_id=state.workspace_id,
+        owner_id=state.user_id,
+        session_id=state.session_id,
+        settings=settings,
+    )
+    if effect_paused:
+        final_response = (
+            "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved and may be "
+            f"irreversible. Resolve effect {effect_pause_id} before continuing."
+        )
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
     directive_id: UUID | None = pending_execution.directive_id if pending_execution is not None else None
     directive_state: DirectiveExecutionState | None = pending_execution.state if pending_execution is not None else None
     retry_scheduled = False
@@ -8992,6 +11902,7 @@ def takeover_step(
         and safety_decision == SafetyDecision.ALLOW
         and pending_execution is None
         and not suppress_auto_directive
+        and not effect_paused
         and bool(dependency_preflight.get("valid", True))
     ):
         directive_id = uuid.uuid4()
@@ -9016,13 +11927,9 @@ def takeover_step(
                 except Exception:
                     pass
         conn.execute(
-            """
-            INSERT INTO directive_executions(
-                directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-                attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-                failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            f"""
+            INSERT INTO directive_executions({_DIRECTIVE_COLUMNS})
+            VALUES({_DIRECTIVE_INSERT_PLACEHOLDERS})
             """,
             (
                 str(directive_id),
@@ -9062,13 +11969,25 @@ def takeover_step(
                 ),
                 now_for_directive.isoformat(),
                 now_for_directive.isoformat(),
+                0,
+                None,
+                None,
+                "unverified",
+                None,
+                None,
+                None,
+                None,
             ),
         )
+        if execution_permit_id is not None:
+            # Bind the permit to this directive/attempt so it cannot be reused for another action.
+            conn.execute(
+                "UPDATE execution_permits SET directive_id = ?, attempt = 1 WHERE id = ? AND directive_id IS NULL",
+                (str(directive_id), str(execution_permit_id)),
+            )
         pending_execution = conn.execute(
-            """
-            SELECT directive_id, session_id, workspace_id, user_id, goal_id, objective_hash, action_kind,
-                   attempt, state, requires_permit, permit_id, claimed_by, started_at, finished_at, expires_at,
-                   failure_class, failure_reason, retry_strategy, meta, created_at, updated_at
+            f"""
+            SELECT {_DIRECTIVE_COLUMNS}
             FROM directive_executions
             WHERE directive_id = ?
             LIMIT 1
@@ -9084,10 +12003,20 @@ def takeover_step(
             execution_claim_required = True
             directive_id = pending_execution.directive_id
             directive_state = pending_execution.state
-    if execution_claim_required and safety_decision == SafetyDecision.ALLOW:
+    if execution_claim_required and safety_decision == SafetyDecision.ALLOW and not effect_paused:
         final_response = (
             "Execution claim required for this mutating directive. "
             "Call tce.claim_execution and then continue."
+        )
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+    if effect_paused:
+        # The pause outranks every later handoff line in this turn. Telling the executor to claim a
+        # new directive while an effect from the last run is unresolved is exactly the restart the
+        # pause exists to prevent, so it is re-asserted here, after the last writer of
+        # final_response above it.
+        final_response = (
+            "AUTONOMOUS MODE PAUSED: an effect from a previous run is unresolved and may be "
+            f"irreversible. Resolve effect {effect_pause_id} before continuing."
         )
         decision_source = TakeoverDecisionSource.SAFETY_GATE
     actionable_lifecycle_pause = (
@@ -9113,10 +12042,23 @@ def takeover_step(
             ),
         }
         behavior_gate_blocked = not bool(behavior_fidelity_gate.get("passed", False))
+    # P4: one new escalation cause, and only one. `family_not_qualified` is deliberately NOT
+    # a term here: permission-absence is a reason not to personalize, never a reason to ask a
+    # human. Adding it would turn every turn on a corpus with no qualified family -- which is
+    # every corpus today -- into an escalation, which is a product shutdown.
+    #
+    # The `policy.exposed` conjunct is what keeps that true. An unexposed abstention is the
+    # ordinary case (no candidate options were offered) and it must not move this boolean.
+    policy_abstained = bool(
+        policy_result is not None
+        and policy_result.exposed
+        and policy_result.status is DecisionStatus.ABSTAINED
+    )
     needs_human = (
         (decision_confidence < needs_human_threshold)
         or (retrieval_triggered and context_quality_score < float(settings.context_retrieval_escalate_score))
         or advisor_unhealthy
+        or policy_abstained
         or behavior_gate_blocked
         or (safety_decision != SafetyDecision.ALLOW)
     ) and not actionable_lifecycle_pause
@@ -9132,6 +12074,66 @@ def takeover_step(
         final_response = (
             "Behavior fidelity is not validated for autonomous continuation. "
             "Confirm the preferred choice or run a behavior fidelity evaluation."
+        )
+    if needs_human and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
+        # Point B: a question posed to the human is a decision opportunity; freeze before any answer.
+        if behavior_gate_blocked:
+            point_b_family = "behavior_gate"
+            point_b_situation = "choice_required"
+            raw_gate_choices = behavior_fidelity_gate.get("candidate_choices")
+            point_b_alternatives = (
+                [str(item) for item in raw_gate_choices if str(item).strip()] if isinstance(raw_gate_choices, list) else []
+            )
+        elif advisor_unhealthy:
+            point_b_family = "operator_action"
+            point_b_situation = "escalation_point"
+            point_b_alternatives = []
+        else:
+            point_b_family = "needs_human"
+            point_b_situation = "choice_required"
+            point_b_alternatives = []
+        _ensure_open_decision_lite(
+            conn,
+            auth=auth,
+            state=state,
+            body=body,
+            settings=settings,
+            turn=turn_count,
+            family=point_b_family,
+            situation_type=point_b_situation,
+            question_text=final_response or "Ask the user how to proceed on this objective.",
+            alternatives=point_b_alternatives,
+            snapshot={
+                "decision_confidence": float(round(decision_confidence, 4)),
+                "needs_human_threshold": float(needs_human_threshold),
+                "context_quality_score": float(round(context_quality_score, 4)),
+                "retrieval_triggered": bool(retrieval_triggered),
+                "objective": state.takeover_context.get("objective"),
+                "objective_hash": state.objective_hash,
+                "citations": [str(item) for item in citations][:20],
+            },
+            advice_visible=advisor_output_rendered,
+            project_id=scoped_project_id,
+            scope=request_scope,
+            cancel_epoch=policy_cancel_epoch,
+            turn_policy_request=policy_request,
+            turn_policy_result=policy_result,
+        )
+    # Capture-channel pause: unattended mutation requires the trusted human-input audit channel.
+    capture_state = _capture_delivery_state_for(conn, auth=auth, settings=settings, now=now_utc())
+    if (
+        state.mode == TakeoverMode.TAKEOVER
+        and safety_decision == SafetyDecision.ALLOW
+        and not actionable_lifecycle_pause
+        and _unattended_profile(state, settings)
+        and capture_state in {"gap", "unavailable"}
+    ):
+        needs_human = True
+        decision_source = TakeoverDecisionSource.SAFETY_GATE
+        final_response = (
+            f"AUTONOMOUS MODE PAUSED: capture channel unavailable (state={capture_state}). "
+            "Unattended mutation requires the trusted human-input audit channel. "
+            "Ask the user to restore the host capture hook or switch the autonomy profile to human_consultative."
         )
     quality_history = state.takeover_context.get("quality_history")
     if not isinstance(quality_history, list):
@@ -9173,8 +12175,76 @@ def takeover_step(
     state.last_safety_decision = safety_decision
     state.autonomy_score = round((0.8 * float(state.autonomy_score)) + (0.2 * decision_confidence), 4)
     state.enforcement_mode = settings.takeover_enforcement_mode
+    open_decision_opportunity_id: str | None = None
+    pending_safety_ctx = state.takeover_context.get("pending_safety")
+    open_decision_ctx = state.takeover_context.get("open_decision")
+
+    def _opportunity_still_open(candidate: str) -> bool:
+        # The answer can arrive out of band (host capture hook -> worker), which resolves the row without
+        # touching this session's context. Handing a resolved id back says "still waiting on the human"
+        # forever, so re-check the row's status before exposing it.
+        try:
+            row = get_opportunity(
+                conn,
+                opportunity_id=candidate,
+                workspace_id=auth.workspace_id,
+                subject_user_id=auth.behavior_subject_id,
+            )
+        except sqlite3.Error:
+            return False
+        return row is not None and str(row.get("status")) == "open"
+
+    if isinstance(pending_safety_ctx, dict) and pending_safety_ctx.get("opportunity_id"):
+        pending_candidate = str(pending_safety_ctx["opportunity_id"])
+        if _opportunity_still_open(pending_candidate):
+            open_decision_opportunity_id = pending_candidate
+        else:
+            # Keep the rest of pending_safety (it drives the confirm/deny flow); only the answered
+            # question's id must stop travelling with it.
+            pending_safety_ctx.pop("opportunity_id", None)
+    if (
+        open_decision_opportunity_id is None
+        and isinstance(open_decision_ctx, dict)
+        and open_decision_ctx.get("opportunity_id")
+    ):
+        if _opportunity_still_open(str(open_decision_ctx["opportunity_id"])):
+            open_decision_opportunity_id = str(open_decision_ctx["opportunity_id"])
+        else:
+            state.takeover_context.pop("open_decision", None)
     _sync_enforcement_counters(conn, state)
     save_takeover_state(conn, state)
+
+    # --- the CAS section (§5.2 rule 2) ------------------------------------------------------
+    # Everything above — retrieval, classification, the advisor decision — ran with NO write
+    # lock. Only the read-then-write task-state work below is bracketed by BEGIN IMMEDIATE, and
+    # the retry in run_cas_section re-runs only this section, never the turn.
+    task_state_summary = TaskStateSummary()
+    task_state_revision = 0
+    planning_job_id: str | None = None
+    if bool(getattr(settings, "task_state_enabled", True)):
+        try:
+            task_state_summary, task_state_revision, planning_job_id = _run_task_state_cas_section(
+                conn,
+                auth=auth,
+                settings=settings,
+                scope=request_scope,
+                state=state,
+                objective_text=resolved_task or "",
+                # NOT resolved_task: completing a step rewrites the objective pointer to the
+                # next step's title, and hashing that would bump contract_revision on every
+                # step advance — invalidating the plan the step belongs to and cancelling the
+                # directive that is executing it (R3-G3).
+                owner_objective_hash=task_owner_objective_hash,
+                objective_asserted=task_objective_asserted,
+                now=now_utc(),
+            )
+        except (TaskStateRevisionConflict, TaskStatePreconditionFailed):
+            raise
+        except Exception:
+            # A task-state failure must not take the turn down with it: the advisor answer is
+            # already computed and is the thing the caller needs.
+            logger.warning("task state CAS section failed", exc_info=True)
+    # --- end of the CAS section --------------------------------------------------------------
 
     total_ms = int((time.perf_counter() - started_total) * 1000)
     _record_takeover_action(
@@ -9185,6 +12255,8 @@ def takeover_step(
         result="needs_human" if needs_human else "success",
         latency_ms=total_ms,
         meta={
+            "opportunity_id": open_decision_opportunity_id,
+            "capture_delivery_state": capture_state,
             "decision_source": decision_source.value,
             "decision_confidence": decision_confidence,
             "needs_human_threshold": needs_human_threshold,
@@ -9233,6 +12305,18 @@ def takeover_step(
     ).fetchone()
     autonomy_notice = _notice_from_row(open_notice_row) if open_notice_row is not None else None
 
+    # P5: a COUNT, not a payload.  The proposals themselves are read through /v1/dreams, which
+    # runs the citation validation; putting proposal text on the turn response would put
+    # unvalidated quotes in front of the owner on every step.  A failure here is not a reason
+    # to fail the turn -- a missing count reads as "none pending", which is what it was before
+    # the feature existed.
+    dream_proposals_pending = 0
+    if bool(getattr(settings, "dream_proposals_enabled", True)):
+        try:
+            dream_proposals_pending = count_pending_proposals(conn, scope=request_scope)
+        except sqlite3.Error:
+            dream_proposals_pending = 0
+
     return TakeoverStepResponse(
         state=state,
         action="advisor_takeover" if state.mode == TakeoverMode.TAKEOVER else "advisor_suggest",
@@ -9263,6 +12347,21 @@ def takeover_step(
             total=total_ms,
         ),
         needs_human=needs_human,
+        charter_active=step_charter_active,
+        charter_version=step_charter_version,
+        enforcement_tier=step_enforcement_tier,
+        unresolved_effects=step_unresolved_effects,
+        constraints=step_constraints,
+        # P4: what the policy decided, and -- separately -- whether it was allowed to be used.
+        # There is no score on this block: an executor reading an uncalibrated number it cannot
+        # interpret is how four different fields came to be named some form of "confidence".
+        policy_decision=(
+            PolicyDecisionBlock.model_validate(policy_result.block_payload())
+            if policy_result is not None
+            else None
+        ),
+        # P5: how many proposals are waiting for an answer in this scope.
+        dream_proposals_pending=dream_proposals_pending,
         selected_goal=selected_goal,
         execution_permit_required=execution_permit_required,
         execution_permit_id=str(execution_permit_id) if execution_permit_id else None,
@@ -9297,6 +12396,16 @@ def takeover_step(
         episode_boost_applied=bool(working_set.get("episode_boost_applied", False)),
         activation_boost_applied=bool(working_set.get("activation_boost_applied", False)),
         behavior_fidelity_gate=behavior_fidelity_gate,
+        project_binding=project_binding,
+        capture_delivery_state=CaptureDeliveryState(capture_state),
+        open_decision_opportunity_id=UUID(open_decision_opportunity_id) if open_decision_opportunity_id else None,
+        # D2: Lite has no worker, no Redis and no gateway, so planning ran INLINE inside the CAS
+        # section above and planning_pending is always false. The wire shape is identical to Full.
+        planning_pending=False,
+        planning_job_id=UUID(planning_job_id) if planning_job_id else None,
+        planning_pending_hint_ms=int(getattr(settings, "planning_pending_hint_ms", 1500)),
+        task_state=task_state_summary,
+        task_state_revision=int(task_state_revision),
     )
 
 
@@ -9681,6 +12790,18 @@ def run_lifecycle_maintenance(
         )
         scopes_updated += 1
     summary["graph_health_scopes_updated"] = scopes_updated
+    if not effective_dry_run and bool(getattr(settings, "capture_extraction_enabled", True)):
+        summary["decision_extraction"] = extract_pending_inputs(
+            conn,
+            settings=settings,
+            limit=int(getattr(settings, "decision_extraction_batch_size", 100)),
+        )
+    if not effective_dry_run:
+        # Lite's second (operator-driven) planning-job hygiene trigger; the first is _lifespan.
+        try:
+            summary["planning_jobs"] = sweep_stale_planning_jobs(conn, settings=settings, now=now)
+        except Exception:
+            logger.warning("planning job sweep failed", exc_info=True)
     conn.execute(
         """
         INSERT INTO runtime_settings(key, value, updated_at)
@@ -9835,9 +12956,10 @@ def save_observation_lite(conn: sqlite3.Connection, obs: dict[str, Any]) -> str:
         INSERT INTO decision_observations(
             id, ts, consumer_id, workspace_id, situation_type, situation_summary,
             user_response, response_reasoning, outcome, outcome_sentiment,
-            confidence, source_event_ids, context_snapshot, embedding, superseded_by
+            confidence, source_event_ids, context_snapshot, embedding, superseded_by, origin_kind,
+            project_id, decision_family, task_id, episode_key
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
         """,
         (
             observation_id,
@@ -9854,6 +12976,13 @@ def save_observation_lite(conn: sqlite3.Connection, obs: dict[str, Any]) -> str:
             json_dumps(obs.get("source_event_ids", [])),
             json_dumps(obs.get("context_snapshot", {})),
             json_dumps(obs.get("embedding", [])) if obs.get("embedding") else None,
+            str(obs["origin_kind"]) if obs.get("origin_kind") else None,
+            # P4, same rule as save_behavior_evidence_lite: written when the caller knows them,
+            # NULL otherwise. Never guessed.
+            str(obs["project_id"]) if obs.get("project_id") else None,
+            str(obs["decision_family"]) if obs.get("decision_family") else None,
+            str(obs["task_id"]) if obs.get("task_id") else None,
+            str(obs["episode_key"]) if obs.get("episode_key") else None,
         ),
     )
     _mark_superseded_observations_lite(
@@ -9900,10 +13029,14 @@ def save_behavior_evidence_lite(
             action_taken, correction_text, memory_class, evidence_source,
             lifecycle_status, valid_from, valid_until, contradicts_ids_json,
             confirmed_at, behavior_schema_version, redaction_applied,
-            learning_eligible, storage_score, storage_decision
+            learning_eligible, storage_score, storage_decision,
+            opportunity_id, origin_kind, capture_receipt_id, extraction_version,
+            project_id, decision_family, task_id, episode_key
         ) VALUES(
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?
         )
         """,
         (
@@ -9939,6 +13072,19 @@ def save_behavior_evidence_lite(
             1 if storage_gate.get("learning_eligible") else 0,
             float(storage_gate.get("score", 0.0) or 0.0),
             str(storage_gate.get("decision") or "audit_only"),
+            str(evidence["opportunity_id"]) if evidence.get("opportunity_id") else None,
+            str(evidence["origin_kind"]) if evidence.get("origin_kind") else None,
+            str(evidence["capture_receipt_id"]) if evidence.get("capture_receipt_id") else None,
+            str(evidence["extraction_version"]) if evidence.get("extraction_version") else None,
+            # P4: the four columns the policy's scope predicate and the qualification split
+            # read. They stay NULL when the caller does not know them -- a pre-P4 row keeps NULL
+            # forever, which is exactly why NULL-project rows are admissible evidence that never
+            # counts toward adequacy on its own. Writing a guessed value here would be worse
+            # than writing none.
+            str(evidence["project_id"]) if evidence.get("project_id") else None,
+            str(evidence["decision_family"]) if evidence.get("decision_family") else None,
+            str(evidence["task_id"]) if evidence.get("task_id") else None,
+            str(evidence["episode_key"]) if evidence.get("episode_key") else None,
         ),
     )
     supersedes = evidence.get("supersedes_observation_id")
@@ -9963,7 +13109,8 @@ _BEHAVIOR_EVIDENCE_COLUMNS = """
     action_taken, correction_text, memory_class, evidence_source,
     lifecycle_status, valid_from, valid_until, contradicts_ids_json,
     confirmed_at, behavior_schema_version, redaction_applied,
-    learning_eligible, storage_score, storage_decision
+    learning_eligible, storage_score, storage_decision,
+    opportunity_id, origin_kind, capture_receipt_id, extraction_version
 """
 
 
@@ -10093,20 +13240,25 @@ def latest_fidelity_gate_lite(
     workspace_id: str,
     subject_user_id: str,
 ) -> dict[str, Any]:
-    row = conn.execute(
-        """
-        SELECT gate_json, metrics_json, created_at
-        FROM behavior_fidelity_runs
-        WHERE workspace_id = ? AND subject_user_id = ? AND status = 'completed'
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (workspace_id, subject_user_id),
-    ).fetchone()
-    if row is None:
-        return {"passed": False, "reason": "no_completed_fidelity_run"}
-    return {
-        **json_loads(row["gate_json"], {}),
-        "metrics": json_loads(row["metrics_json"], {}),
-        "evaluated_at": row["created_at"],
-    }
+    """Read-only adapter over ``policy_qualifications``.  Same name, same signature, same dict
+    shape, so ``TakeoverStepResponse.behavior_fidelity_gate`` does not move.
+
+    What it replaces was a global "the latest run passed" flag: ``ORDER BY created_at DESC
+    LIMIT 1`` over ``behavior_fidelity_runs``, keyed on workspace and subject only, with no
+    decision family, no bound keys and an ``evaluated_at`` that was returned and never read.
+    A single run that passed once granted autonomy to every family forever.
+
+    With no live ``QUALIFIED`` row this returns ``{"passed": False, "reason":
+    "no_qualification_recorded"}`` -- the same shape and the same truth value as the answer it
+    replaces (``no_completed_fidelity_run``) for the same corpus.  Returning
+    ``passed = all(families_qualified)`` instead would flip this to blocking on a corpus where
+    no family is qualified, which combined with removing the ``behavior_autonomy_gate_enabled``
+    guard is how an earlier draft escalated every turn.  That guard stays, and it defaults off,
+    so today nothing reads this at all.
+    """
+
+    return qualification_gate(
+        conn,
+        workspace_id=workspace_id,
+        subject_user_id=subject_user_id,
+    )

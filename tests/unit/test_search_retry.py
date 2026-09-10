@@ -5,15 +5,14 @@ from unittest.mock import patch
 from tce_api.search import (
     _dedupe_scored_events_for_mmr,
     _embed_cache_key,
-    _expand_owner_scope_from_rows,
     _is_embedding_timeout_cooldown_active,
     _is_retryable_error,
     _mark_embedding_timeout_cooldown,
-    _query_requests_cross_user_memory,
     _resolve_owner_scope,
     _run_with_retry,
     _should_skip_query_expansion,
 )
+from tce_shared.scope import SCOPE_POLICY_REVISION, ResolvedScope
 
 
 def test_retryable_error_detection() -> None:
@@ -117,87 +116,33 @@ def test_dedupe_scored_events_for_mmr_caps_and_dedupes() -> None:
     assert deduped[0][1]["id"] == "a"
 
 
-class _MappingsResult:
-    def __init__(self, rows: list[dict[str, str]]) -> None:
-        self._rows = rows
-
-    def mappings(self) -> _MappingsResult:
-        return self
-
-    def all(self) -> list[dict[str, str]]:
-        return self._rows
-
-
-class _FakeDb:
-    def __init__(self, rows: list[dict[str, str]]) -> None:
-        self._rows = rows
-
-    def execute(self, *_args, **_kwargs) -> _MappingsResult:
-        return _MappingsResult(self._rows)
-
-    def rollback(self) -> None:  # pragma: no cover - compatibility stub
-        return None
-
-
-def test_query_requests_cross_user_memory_trigger() -> None:
-    assert _query_requests_cross_user_memory("read codex memory from claude")
-    assert _query_requests_cross_user_memory("what did codex discuss recently")
-    assert _query_requests_cross_user_memory("show claude session history")
-    assert not _query_requests_cross_user_memory("is codex better than claude")
-    assert not _query_requests_cross_user_memory("summarize my latest memory")
-
-
-def test_resolve_owner_scope_expands_only_on_explicit_cross_user_query() -> None:
-    fake_db = _FakeDb(
-        [
-            {"owner_id": "codex-executor"},
-            {"owner_id": "claude-executor"},
-        ]
-    )
-    owner_scope, applied, owners = _resolve_owner_scope(
-        fake_db,  # type: ignore[arg-type]
+def _scope(*, owner_ids: frozenset[str], continuity_intent: bool) -> ResolvedScope:
+    return ResolvedScope(
         workspace_id="personal",
+        executor_id="claude-executor",
         owner_id="claude-executor",
-        query_text="read codex memory from claude",
+        subject_user_id="human",
+        project_id=None,
+        project_binding="unbound",
+        task_id=None,
+        owner_ids=owner_ids,
+        continuity_intent=continuity_intent,
     )
-    assert applied
-    assert "codex-executor" in owner_scope
-    assert "claude-executor" in owner_scope
-    assert "codex-executor" in owners
 
 
-def test_resolve_owner_scope_expands_on_executor_history_query() -> None:
-    fake_db = _FakeDb(
-        [
-            {"owner_id": "codex-executor"},
-            {"owner_id": "claude-executor"},
-        ]
-    )
-    owner_scope, applied, owners = _resolve_owner_scope(
-        fake_db,  # type: ignore[arg-type]
-        workspace_id="personal",
-        owner_id="claude-executor",
-        query_text="what did codex discuss recently",
-    )
-    assert applied
-    assert "codex-executor" in owner_scope
-    assert "claude-executor" in owner_scope
-    assert "codex-executor" in owners
+def test_resolve_owner_scope_uses_explicit_intent_only() -> None:
+    # No intent: the owner scope is exactly the authenticated owner, whatever the query says.
+    own_only = _resolve_owner_scope(scope=_scope(owner_ids=frozenset({"claude-executor"}), continuity_intent=False))
+    assert own_only == ({"claude-executor"}, False, ["claude-executor"])
 
+    # A second owner without intent (defensive: resolve_scope never produces this) is not "applied".
+    no_intent = _resolve_owner_scope(scope=_scope(owner_ids=frozenset({"claude-executor", "codex-executor"}), continuity_intent=False))
+    assert no_intent[1] is False
 
-def test_expand_owner_scope_from_rows_uses_workspace_owners() -> None:
-    rows = [
-        {"context": {"_tce_workspace": "personal", "_tce_owner": "codex-executor"}},
-        {"context": {"_tce_workspace": "personal", "_tce_owner": "claude-executor"}},
-        {"context": {"_tce_workspace": "other", "_tce_owner": "other-user"}},
-        {"context": {"_tce_workspace": "personal"}},
-    ]
-    expanded = _expand_owner_scope_from_rows(
-        rows,
-        workspace_id="personal",
-        current_scope={"joeljoseph"},
-    )
-    assert expanded == {"joeljoseph", "codex-executor", "claude-executor"}
+    # Explicit continuity intent with a target owner is the only path that widens the scope.
+    widened = _resolve_owner_scope(scope=_scope(owner_ids=frozenset({"claude-executor", "codex-executor"}), continuity_intent=True))
+    assert widened == ({"claude-executor", "codex-executor"}, True, ["claude-executor", "codex-executor"])
+    assert _scope(owner_ids=frozenset({"claude-executor"}), continuity_intent=False).policy_revision == SCOPE_POLICY_REVISION
 
 
 class _CooldownSettings:

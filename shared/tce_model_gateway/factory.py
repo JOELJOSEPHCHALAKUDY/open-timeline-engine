@@ -6,7 +6,10 @@ from typing import Any
 from .gateway import CachedGateway, ModelGateway, OllamaGateway
 
 _GATEWAY_CACHE: dict[str, ModelGateway] = {}
-_GATEWAY_CACHE_MAX = 16
+# Sized for the bucketed advisor clamp: a 3500 ms turn yields up to 14 distinct timeout
+# buckets, and each one mints a distinct settings signature. At 16 those alone evicted every
+# other consumer's gateway (and, with redis_url set, its Redis-backed wrapper) every turn.
+_GATEWAY_CACHE_MAX = 64
 
 
 def _settings_signature(settings: Any) -> str:
@@ -56,7 +59,9 @@ def create_gateway(settings: Any) -> ModelGateway:
         if value > 0:
             timeout_candidates.append(value)
     timeout_seconds = max(timeout_candidates) if timeout_candidates else 30.0
-    timeout_seconds = max(2.0, timeout_seconds)
+    # 0.2, not 2.0: a computed 900 ms advisor budget (or a deadline-clamped 250 ms) must be
+    # real rather than silently rounded up to two seconds.
+    timeout_seconds = max(0.2, timeout_seconds)
 
     if provider == "ollama":
         inner: ModelGateway = OllamaGateway(

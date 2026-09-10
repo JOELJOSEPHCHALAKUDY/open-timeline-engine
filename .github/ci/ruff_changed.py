@@ -13,6 +13,7 @@ CORE_ROOTS = [
     "services/tce_api",
     "services/tce_lite_api",
     "services/tce_mcp",
+    "services/tce_supervisor",
     "services/tce_worker",
     "tests",
 ]

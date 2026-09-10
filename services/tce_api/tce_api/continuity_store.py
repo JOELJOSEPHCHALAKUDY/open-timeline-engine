@@ -14,8 +14,56 @@ from tce_shared.continuity import progress_patch, summarize_attempts
 from tce_shared.handoff import normalize_objective_text
 from tce_shared.project_context import canonical_project_context
 from tce_shared.redaction import redact_payload, redact_text
+from tce_shared.task_state import (
+    TaskStateProjection,
+    effects_to_json,
+    verification_to_json,
+)
 
 from .models import ContinuityResumeAttempt, Event, HandoffOutbox, HandoffRecord
+
+
+def handoff_record_columns(
+    *,
+    record: Any,
+    projection: TaskStateProjection | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """The single P2 column/value mapping for ``handoff_records``.
+
+    Both writers — :func:`deliver_handoff` here and ``main.py::_persist_handoff_record`` — go
+    through this, so a future field cannot land in one and miss the other. It lives in this
+    module rather than in ``main.py`` because ``main.py`` already imports this one; the reverse
+    would be an import cycle.
+
+    With no projection every value is the column default, so a workspace with
+    ``task_state_enabled=False`` writes exactly what it wrote before P2.
+    """
+    _ = (record, now)
+    if projection is None:
+        return {
+            "task_id": None,
+            "task_state_revision": 0,
+            "contract_revision": 0,
+            "verification_refs_json": [],
+            "unresolved_effects_json": [],
+        }
+    verification = verification_to_json(projection.latest_verification)
+    return {
+        "task_id": projection.task_id,
+        "task_state_revision": int(projection.revision),
+        "contract_revision": int(projection.contract_revision),
+        "verification_refs_json": [verification] if verification is not None else [],
+        "unresolved_effects_json": effects_to_json(projection.unresolved_effects),
+    }
+
+
+class CompletionConflictError(ValueError):
+    """Same completion_key re-submitted with a different payload (idempotency conflict)."""
+
+    def __init__(self, outbox_id: uuid.UUID) -> None:
+        super().__init__(f"completion payload conflict for outbox {outbox_id}")
+        self.outbox_id = outbox_id
 
 
 def _safe_change_summary(raw: Any) -> tuple[dict[str, dict[str, Any]], bool]:
@@ -56,6 +104,8 @@ def enqueue_handoff(
     source: str,
     redaction_applied: bool,
     now: datetime | None = None,
+    executor_id: str | None = None,
+    payload_hash: str | None = None,
 ) -> HandoffOutbox:
     created_at = now or datetime.now(tz=UTC)
     event_id = uuid.uuid4()
@@ -80,6 +130,8 @@ def enqueue_handoff(
         redaction_applied=redaction_applied,
         created_at=created_at,
         updated_at=created_at,
+        executor_id=executor_id,
+        payload_hash=payload_hash,
     ).on_conflict_do_nothing(index_elements=["workspace_id", "owner_id", "completion_key"])
     db.execute(statement)
     row = db.execute(
@@ -89,10 +141,19 @@ def enqueue_handoff(
             HandoffOutbox.completion_key == str(completion_key)[:240],
         )
     ).scalar_one()
+    # Same key + different payload is a conflict, never a silent replay of the first receipt.
+    if row.payload_hash is not None and payload_hash is not None and row.payload_hash != payload_hash:
+        raise CompletionConflictError(row.id)
     return row
 
 
-def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -> HandoffOutbox:
+def deliver_handoff(
+    db: Session,
+    *,
+    outbox_id: uuid.UUID,
+    retention_days: int,
+    projection: TaskStateProjection | None = None,
+) -> HandoffOutbox:
     row = db.execute(
         select(HandoffOutbox).where(HandoffOutbox.id == outbox_id).with_for_update()
     ).scalar_one()
@@ -190,6 +251,7 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
     change_summary, summary_redacted = _safe_change_summary(
         milestone.get("change_summary_json") or milestone.get("change_summary")
     )
+    record_project = canonical_project_context(milestone.get("project_context"))
     if db.get(HandoffRecord, row.handoff_record_id) is None:
         db.add(
             HandoffRecord(
@@ -215,6 +277,10 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
                     row.redaction_applied or payload_redacted or title_redacted or objective_redacted or summary_redacted
                 ),
                 expires_at=row.created_at + timedelta(days=max(1, retention_days)),
+                project_id=str(record_project.get("project_id") or "").strip() or None,
+                git_remote=str(record_project.get("project_remote") or "").strip() or None,
+                executor_id=row.executor_id,
+                **handoff_record_columns(record=row, projection=projection, now=now),
             )
         )
     db.execute(
@@ -248,9 +314,17 @@ def deliver_handoff(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -
     return row
 
 
-def deliver_handoff_safely(db: Session, *, outbox_id: uuid.UUID, retention_days: int) -> HandoffOutbox:
+def deliver_handoff_safely(
+    db: Session,
+    *,
+    outbox_id: uuid.UUID,
+    retention_days: int,
+    projection: TaskStateProjection | None = None,
+) -> HandoffOutbox:
     try:
-        return deliver_handoff(db, outbox_id=outbox_id, retention_days=retention_days)
+        return deliver_handoff(
+            db, outbox_id=outbox_id, retention_days=retention_days, projection=projection
+        )
     except Exception as exc:
         db.rollback()
         row = db.get(HandoffOutbox, outbox_id)
@@ -264,6 +338,75 @@ def deliver_handoff_safely(db: Session, *, outbox_id: uuid.UUID, retention_days:
         row.updated_at = now
         db.commit()
         return row
+
+
+def drain_pending_handoffs(
+    db: Session,
+    *,
+    retention_days: int,
+    limit: int = 100,
+) -> dict[str, int]:
+    """Full's counterpart to the Lite function of the same name.
+
+    Until P3 the FULL backend had no drain at all: outbox rows whose inline enqueue_job was
+    swallowed by a bare except (Redis down) stayed pending forever, and a pending completion row
+    permanently blocks the session's next mutating capability grant.  Same key set as Lite's so
+    the two can be compared directly.  Sole caller: reconcile.startup_reconcile.
+    """
+    now = datetime.now(tz=UTC)
+    rows = db.execute(
+        text(
+            """
+            SELECT id FROM handoff_outbox
+            WHERE status = 'pending' AND next_attempt_at <= :now
+            ORDER BY created_at ASC
+            LIMIT :limit
+            """
+        ),
+        {"now": now, "limit": max(1, min(500, int(limit)))},
+    ).mappings().all()
+    counts = {"processed": 0, "delivered": 0, "pending": 0, "dead": 0}
+    for row in rows:
+        result = deliver_handoff_safely(db, outbox_id=row["id"], retention_days=retention_days)
+        status = str(result.status)
+        counts["processed"] += 1
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def requeue_dead_handoff(
+    db: Session,
+    *,
+    auth: Any,
+    outbox_id: uuid.UUID,
+    now: datetime,
+) -> dict[str, Any]:
+    """The operator escape hatch for a dead outbox row.
+
+    A row that reaches status='dead' after ten failed attempts is never retried and never clears
+    the completion obligation, which permanently blocks every future mutating grant in that
+    session with no path out.  Route auth is _require_verified_human; refuses 409 handoff_not_dead
+    for a row that is not actually dead, so this cannot be used to replay a live delivery.
+    """
+    row = db.get(HandoffOutbox, outbox_id)
+    if row is None:
+        raise LookupError("handoff_not_found")
+    if str(row.status) != "dead":
+        raise ValueError("handoff_not_dead")
+    row.status = "pending"
+    row.attempts = 0
+    row.last_error = ""
+    row.next_attempt_at = now
+    row.updated_at = now
+    db.commit()
+    return {
+        "outbox_id": str(row.id),
+        "status": row.status,
+        "attempts": int(row.attempts or 0),
+        "next_attempt_at": row.next_attempt_at,
+        "requeued_by": str(getattr(auth, "user_id", "") or ""),
+    }
 
 
 def record_resume_attempt(
@@ -281,10 +424,12 @@ def record_resume_attempt(
     requested_at: datetime,
     returned_at: datetime,
     handoff_ts: datetime,
+    source_session_id: str | None = None,
 ) -> None:
     db.add(
         ContinuityResumeAttempt(
             packet_id=packet_id,
+            source_session_id=(str(source_session_id)[:160] if source_session_id else None),
             workspace_id=workspace_id,
             requesting_owner_id=requesting_owner_id,
             target_owner_id=target_owner_id,

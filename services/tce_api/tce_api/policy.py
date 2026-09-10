@@ -5,6 +5,7 @@ from typing import Any
 
 from tce_shared.events import AgentRole
 from tce_shared.policy import ConsumerContext, PolicyDecision
+from tce_shared.scope import ResolvedScope
 
 from .config import get_settings
 
@@ -19,6 +20,7 @@ class PolicyEngine:
         role: AgentRole = AgentRole.USER,
         workspace_id: str = "personal",
         owner_id: str = "user",
+        scope: ResolvedScope | None = None,
     ) -> ConsumerContext:
         max_sensitivity = max(0, self.settings.block_sensitivity - 1)
         if role == AgentRole.ADVISOR:
@@ -29,6 +31,7 @@ class PolicyEngine:
             max_sensitivity=max_sensitivity,
             workspace_id=workspace_id,
             owner_id=owner_id,
+            scope=scope,
         )
 
     def evaluate(

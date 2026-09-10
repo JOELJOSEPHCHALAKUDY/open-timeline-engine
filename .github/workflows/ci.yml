@@ -1,5 +1,17 @@
 name: ci
 
+# What this workflow does and does not protect (P3 §10.6 — stated, not assumed away):
+#   * `push` is master-only, so pushes to a working branch run NOTHING. Opening a pull
+#     request is what runs these jobs.
+#   * "Lint (changed core paths)" and "Type check" report diagnostics only on lines the
+#     diff touched (.github/ci/ruff_changed.py, .github/ci/mypy_changed.py). A pre-existing
+#     violation on an untouched line is invisible to them; the "Repository quality
+#     baseline" step below is the only whole-tree lint/type gate, and it runs on
+#     ubuntu-latest only.
+#   * The coverage floor is 28%. It is a regression tripwire, not a coverage target.
+# Consequence, said plainly: the P3 exit gates (G1-G16, G-SUP) are ordinary pytest tests
+# and are only enforced when a PR is open. Nothing here enforces them on a branch.
+
 on:
   pull_request:
   push:
@@ -27,7 +39,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
+          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp -e services/tce_supervisor
           pip install pytest pytest-cov ruff mypy httpx pip-audit
       - name: Lint (changed core paths)
         run: python .github/ci/ruff_changed.py
@@ -47,6 +59,7 @@ jobs:
           --cov=services/tce_lite_api/tce_lite_api
           --cov=services/tce_mcp/tce_mcp
           --cov=services/tce_worker/tce_worker
+          --cov=services/tce_supervisor/tce_supervisor
           --cov-report=term
           --cov-fail-under=28
       - name: Dependency vulnerability gate
@@ -93,8 +106,23 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
+          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp -e services/tce_supervisor
           pip install alembic pytest
+      - name: Single migration head
+        # A second head is silent: `alembic upgrade head` then fails with "Multiple head
+        # revisions are present", and every migration run in every environment breaks at
+        # once. Two branches each adding a revision off the same down_revision is all it
+        # takes, so assert the count BEFORE the upgrade steps below, which would otherwise
+        # be the first thing to notice.
+        shell: bash
+        run: |
+          heads="$(alembic -c infra/alembic.ini heads)"
+          echo "$heads"
+          count="$(printf '%s\n' "$heads" | grep -c . || true)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly 1 alembic head, found ${count}" >&2
+            exit 1
+          fi
       - name: Migration smoke
         run: alembic -c infra/alembic.ini upgrade head
       - name: Latest migration round trip
