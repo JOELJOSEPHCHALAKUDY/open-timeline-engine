@@ -36,6 +36,7 @@ than they do:
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import socket
 import subprocess
@@ -154,9 +155,32 @@ _SUBPROCESS_MESSAGE = (
 )
 
 
-def _blocked_subprocess(name: str) -> Any:
+# Spawns the standard library performs on its own behalf, which no test asked for, which reach no
+# vendor binary and no credential, and which the caller cannot avoid. `ctypes.util.find_library`
+# resolves a shared object by running `gcc`, then `ld -t -o /dev/null -l<name>`, then `ldconfig -p`
+# -- on Linux only. macOS resolves without spawning, which is why this guard passed there and failed
+# every Ubuntu leg of CI.
+#
+# The test is on the CALLER, not on argv: enumerating binary names means guessing which of that
+# chain fires on a given distro, and being wrong looks exactly like a real failure. If the frame
+# that called subprocess belongs to ctypes/util.py, the spawn is the interpreter resolving a
+# library for us and blocking it protects nothing.
+_STDLIB_INTERNAL_CALLERS = ("ctypes/util.py", "ctypes\\util.py")
+
+
+def _is_stdlib_internal(_argv: Any) -> bool:
+    for frame in inspect.stack()[1:6]:
+        filename = frame.filename.replace("\\", "/")
+        if any(marker.replace("\\", "/") in filename for marker in _STDLIB_INTERNAL_CALLERS):
+            return True
+    return False
+
+
+def _blocked_subprocess(name: str, passthrough: Any) -> Any:
     def _blocked(*args: Any, **kwargs: Any) -> Any:
         argv = args[0] if args else kwargs.get("args")
+        if _is_stdlib_internal(argv):
+            return passthrough(*args, **kwargs)
         raise pytest.fail.Exception(_SUBPROCESS_MESSAGE.format(name=name, argv=argv))
 
     return _blocked
@@ -169,7 +193,9 @@ def _no_subprocess(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
         yield
         return
     for name in _SUBPROCESS_NAMES:
-        monkeypatch.setattr(subprocess, name, _blocked_subprocess(name), raising=True)
+        # Capture the real callable before patching, so a stdlib-internal spawn still works.
+        real = getattr(subprocess, name)
+        monkeypatch.setattr(subprocess, name, _blocked_subprocess(name, real), raising=True)
     yield
 
 

@@ -12,7 +12,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
 
-pytestmark = pytest.mark.e2e
+# Every test here drives a REAL `python -m tce_mcp.server` over stdio -- that is the point of the
+# module, and it is exactly the spawn tests/conftest.py::_no_subprocess exists to catch. The guard
+# is right; the spawn is intended, so it is declared rather than the guard weakened.
+pytestmark = [pytest.mark.e2e, pytest.mark.subprocess]
 
 
 def _text_payload(result: Any) -> dict[str, Any]:
@@ -203,16 +206,33 @@ def test_real_stdio_mcp_behavior_projection_resource() -> None:
         )
     )
     observation_id = recorded["result"]["observation_id"]
-    content = asyncio.run(
+
+    # An EXECUTOR asked for evidence_source "explicit" and the server stored it as "inferred":
+    # a caller cannot certify its own evidence (P1). current.md renders only eligible evidence --
+    # explicit, correction or calibration -- so the executor's row is deliberately absent from it.
+    # Asserting the absence is what proves the downgrade actually happened.
+    eligible_view = asyncio.run(
         _read_resource(
             codex_token,
             "codex-executor",
             "tce://workspace/e2e-workspace/behavior/e2e-human/current.md",
         )
     )
+    assert marker not in eligible_view
+    assert observation_id not in eligible_view
+
+    # The transport and the renderer are proved on the evidence view, which selects by id rather
+    # than by eligibility, so this still exercises exactly what the test exists for.
+    content = asyncio.run(
+        _read_resource(
+            codex_token,
+            "codex-executor",
+            f"tce://workspace/e2e-workspace/behavior/e2e-human/evidence/{observation_id}.json",
+        )
+    )
     assert marker in content
     assert observation_id in content
-    assert "projection_learning_eligible: false" in content
+    assert '"projection_learning_eligible": false' in content or "projection_learning_eligible: false" in content
 
 
 def test_real_stdio_mcp_behavior_projection_pilot_and_html_review() -> None:

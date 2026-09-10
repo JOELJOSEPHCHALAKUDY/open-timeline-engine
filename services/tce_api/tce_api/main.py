@@ -745,14 +745,21 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     409 ``reconcile_pending`` for as long as ``reconcile_complete()`` is False.
     """
     if get_settings().dispatch_startup_reconcile_enabled:
-        scope = get_db()
-        db = next(scope)
+        # Acquiring the session is inside the try on purpose. It used to sit outside it, so an
+        # unreachable database raised straight out of the lifespan and took app startup with it --
+        # contradicting the promise above, and breaking every test that builds a TestClient on a
+        # machine without Postgres. That is a real deployment case, not just a test artefact: the
+        # API must boot and refuse at POST /v1/dispatch rather than fail to start at all.
+        scope = None
         try:
+            scope = get_db()
+            db = next(scope)
             startup_reconcile(db, settings=get_settings())
         except Exception:
             logger.exception("startup reconcile failed")
         finally:
-            scope.close()
+            if scope is not None:
+                scope.close()
     yield
 
 
