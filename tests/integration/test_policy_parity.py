@@ -130,9 +130,14 @@ def capture_turns() -> list[dict[str, Any]]:
     a checkout of a different commit, which is exactly how the baseline is produced.
     """
 
+    from contextlib import closing
+
     from fastapi.testclient import TestClient
     from tce_lite_api.config import get_settings
+    from tce_lite_api.db import _connect, init_db
     from tce_lite_api.main import app
+    from tce_lite_api.store import set_runtime_mode
+    from tce_shared.events import OperationMode
 
     headers = {
         "Authorization": f"Bearer {Y1_TOKEN}",
@@ -144,7 +149,13 @@ def capture_turns() -> list[dict[str, Any]]:
     }
 
     settings = get_settings()
-    keys = ("lite_db_path", "api_tokens", "workspace_access_mode", "identity_claims_mode")
+    keys = (
+        "lite_db_path",
+        "api_tokens",
+        "workspace_access_mode",
+        "identity_claims_mode",
+        "clone_max_turns_per_interaction",
+    )
     original = {key: getattr(settings, key) for key in keys}
     captured: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +163,32 @@ def capture_turns() -> list[dict[str, Any]]:
         settings.api_tokens = Y1_TOKEN
         settings.workspace_access_mode = "compat"
         settings.identity_claims_mode = "compat"
+        # `clone_advice.loop_guard` reports `max(clone_max_turns_per_interaction,
+        # takeover_clone_max_turns_per_interaction)`, i.e. a configuration knob, straight onto the
+        # wire.  The recorder's `.env` set `TCE_CLONE_MAX_TURNS_PER_INTERACTION=100`, so the
+        # baseline says `max_turns: 100`; the shipped default is 8, which loses the `max()` to
+        # `takeover_clone_max_turns_per_interaction` (80), so a checkout without `.env` says 80
+        # and the gate reports a budget setting as a P4 behaviour change.  Pinned to the value the
+        # baseline was recorded at, for the same reason `api_tokens` and the two compat modes
+        # above are pinned: this gate compares two builds of the product, not two environments.
+        settings.clone_max_turns_per_interaction = 100
+        # The baseline was recorded with the runtime mode in `clone_advisor`, and the replay has
+        # to be driven in the same mode or it is not a replay.  `store.runtime_mode` reads the
+        # `runtime_mode` row of Lite's `runtime_settings` table and falls back to
+        # `Settings.default_operation_mode` only until that row exists -- and this function
+        # materialises the row on a database it has just created in a temporary directory.  A
+        # developer's `.env` sets `TCE_DEFAULT_OPERATION_MODE=clone_advisor`; a checkout without
+        # that file (every CI checkout, since `.env` is gitignored) says `timeline_only`, and
+        # then `build_clone_advice` raises `409 clone_mode_disabled` on every turn.  The whole
+        # `clone_advice` block then comes back stubbed -- `fast_path_reason='advisor_exception'`,
+        # no citations, no `clone_context`, no `loop_guard` -- which is reported as a P4
+        # behaviour change by a gate that is meant to compare two builds of the product, not two
+        # runtime modes.  Seeded through `set_runtime_mode`, the real writer behind
+        # `PUT /v1/runtime/mode`; the database is thrown away with `tmp`, so there is nothing to
+        # restore.
+        init_db()
+        with closing(_connect()) as conn:
+            set_runtime_mode(conn, OperationMode.CLONE_ADVISOR, updated_by="p4-y1-baseline-replay")
         try:
             with TestClient(app) as client:
                 for index, turn in enumerate(Y1_TURNS):

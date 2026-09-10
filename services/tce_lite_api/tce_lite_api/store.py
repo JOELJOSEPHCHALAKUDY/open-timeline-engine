@@ -12135,6 +12135,15 @@ def takeover_step(
             "Unattended mutation requires the trusted human-input audit channel. "
             "Ask the user to restore the host capture hook or switch the autonomy profile to human_consultative."
         )
+    # The same multiplicative penalty Full applies (tce_api/main.py, `if ledger.degraded()`).
+    # It landed Full-only in P2 with no stated reason for the asymmetry, and the cost was real:
+    # on identical inputs -- evidence 0.0, recency 0.2, stability 1.0 -> 0.31 -- a degraded Full
+    # turn scored 0.2325 and an identical Lite turn scored 0.31. Since this score gates the
+    # escalation line, that meant a degraded Full turn asked its owner where the same degraded
+    # Lite turn did not. Levelling up rather than down: a timed-out or skipped retrieval really
+    # is lower-confidence context, so the score should fall and the turn should be readier to ask.
+    if bool(policy_retrieval_meta.get("retrieval_degraded", False)):
+        context_quality_score = round(context_quality_score * 0.75, 4)
     quality_history = state.takeover_context.get("quality_history")
     if not isinstance(quality_history, list):
         quality_history = []

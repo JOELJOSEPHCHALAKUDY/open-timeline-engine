@@ -642,8 +642,13 @@ def test_the_route_runner_returns_a_failed_call_rather_than_dropping_it() -> Non
 
 @pytest.fixture()
 def lite_app(tmp_path: Path) -> Iterator[Any]:
+    from contextlib import closing
+
     from tce_lite_api.config import get_settings
+    from tce_lite_api.db import _connect, init_db
     from tce_lite_api.main import app
+    from tce_lite_api.store import runtime_mode, set_runtime_mode
+    from tce_shared.events import OperationMode
 
     settings = get_settings()
     keys = (
@@ -659,9 +664,28 @@ def lite_app(tmp_path: Path) -> Iterator[Any]:
     settings.charter_enforcement_enabled = False
     settings.takeover_advisor_fail_streak_escalate = 2
     settings.takeover_advisor_runtime_cooloff_turns = 0
+    # The Lite twin of `_clone_advisor_mode` above, needed for exactly the same reason and
+    # missing until now.  `store.runtime_mode` reads the `runtime_mode` row of Lite's
+    # `runtime_settings` table and falls back to `Settings.default_operation_mode` only until
+    # that row exists -- and this fixture materialises the row on a database it has just
+    # created.  A developer's `.env` sets `TCE_DEFAULT_OPERATION_MODE=clone_advisor`, so the row
+    # says `clone_advisor` here; a checkout without that file (which is every CI checkout, since
+    # `.env` is gitignored) says `timeline_only`, and then `build_clone_advice` raises
+    # `409 clone_mode_disabled` on **every** turn.  The turn records
+    # `fast_path_reason='advisor_exception'`, `advisor_fail_streak` climbs 1,2,3,4 and trips
+    # `advisor_unhealthy` -- for an advisor Lite does not have, which is the precise state
+    # `test_lite_consecutive_turns_carry_no_advisor_failure` exists to forbid.  So the mode is
+    # seeded through `set_runtime_mode`, the real writer behind `PUT /v1/runtime/mode`, and
+    # restored afterwards, on a temporary database and on a persistent one alike.
+    init_db()
+    with closing(_connect()) as conn:
+        previous_mode = runtime_mode(conn, settings).mode
+        set_runtime_mode(conn, OperationMode.CLONE_ADVISOR, updated_by="advisor-equivalence-test")
     try:
         yield app
     finally:
+        with closing(_connect()) as conn:
+            set_runtime_mode(conn, previous_mode, updated_by="advisor-equivalence-test-restore")
         for key, value in original.items():
             setattr(settings, key, value)
 
