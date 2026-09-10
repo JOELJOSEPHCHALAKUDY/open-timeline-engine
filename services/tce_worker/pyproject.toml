@@ -11,7 +11,9 @@ dependencies = [
   "rq>=1.16,<2",
   "pgvector>=0.2.5,<1",
   "requests>=2.33,<3",
-  "cryptography>=42,<45",
+  # PYSEC-2026-3552 is fixed in 50.0.0. The <45 ceiling was stale -- the AES-GCM use in
+  # crypto.py runs unchanged on 49 and 50, verified by the full suite.
+  "cryptography>=50,<51",
   "opentelemetry-api>=1.26,<2",
   "opentelemetry-sdk>=1.26,<2"
 ]

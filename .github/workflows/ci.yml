@@ -106,7 +106,7 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp
+          pip install -e shared -e services/tce_api -e services/tce_lite_api -e services/tce_worker -e services/tce_mcp -e services/tce_supervisor
           pip install alembic pytest
       - name: Single migration head
         # A second head is silent: `alembic upgrade head` then fails with "Multiple head
