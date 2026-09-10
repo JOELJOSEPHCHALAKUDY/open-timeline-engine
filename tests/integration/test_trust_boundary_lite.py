@@ -1464,3 +1464,38 @@ def test_executor_feedback_never_moves_the_behavioral_fingerprint(lite_client: T
     _feedback(lite_client, session_id, operator, f"operator second correction {uuid.uuid4().hex[:6]}")
     after_human = _fingerprints_snapshot()
     assert [row[-1] for row in after_human] != [row[-1] for row in before], "a human correction must still write the fingerprint"
+
+
+def test_permit_demand_survives_a_turn_whose_wording_is_not_mutating(lite_client: TestClient) -> None:
+    """A pending directive keeps demanding its permit however later turns are phrased.
+
+    The demand used to be recomputed from scratch each turn out of the message and objective, so an
+    executor holding a directive that required a permit could simply keep talking -- one turn whose
+    wording happened to carry no mutating verb and the requirement vanished, while the directive it
+    belonged to sat there still pending. The permit is a property of the directive, not of the prose.
+    """
+
+    session_id = _session()
+    headers = _headers()
+
+    opened = _step(lite_client, session_id, headers, message="beru take over", task=_MUTATING_TASK)
+    assert opened["execution_permit_required"] is True, opened
+    directive_id = (opened.get("state") or {}).get("pending_execution", {}).get("directive_id") or opened.get("directive_id")
+
+    # A follow-up carrying no mutating verb anywhere in the message or the objective.
+    quiet = _step(
+        lite_client,
+        session_id,
+        headers,
+        message="what does the current status look like",
+        task="summarise where things stand",
+    )
+    assert quiet["execution_permit_required"] is True, (
+        "the pending directive still requires a permit, so the demand must stand regardless of this "
+        f"turn's wording; got {quiet.get('execution_permit_required')!r}"
+    )
+    # The directive minted on the first turn is invalidated by the objective change, which is correct --
+    # what this pins is that the DEMAND did not evaporate on the way there. The directive-level lifecycle
+    # is covered by the fencing tests above.
+    if directive_id:
+        assert int(_directive_row(str(directive_id))["requires_permit"] or 0) == 1

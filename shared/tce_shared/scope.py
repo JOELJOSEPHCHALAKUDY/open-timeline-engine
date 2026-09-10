@@ -34,6 +34,7 @@ __all__ = [
     "goals_scope_predicate",
     "handoffs_scope_predicate",
     "is_bound",
+    "observations_scope_predicate",
     "normalize_owner_token",
     "resolve_scope",
 ]
@@ -353,4 +354,50 @@ def handoffs_scope_predicate(
     if scope.project_binding == PROJECT_BOUND and scope.project_id:
         project_column = _qualified("project_id", table_alias)
         builder.add(f"({project_column} = {builder.bind('scope_project', scope.project_id)} OR {project_column} IS NULL)")
+    return builder.build()
+
+
+def observations_scope_predicate(
+    scope: ResolvedScope,
+    *,
+    dialect: ScopeDialect,
+    table_alias: str | None = None,
+    include_project: bool = True,
+    allow_null_project: bool = True,
+) -> ScopePredicate:
+    """Scope predicate over ``decision_observations`` — the corpus a decision is made from.
+
+    A renderer is added to this module only when *both* backends will call it.  This one
+    qualifies: ``policy_store.load_policy_evidence`` exists in Full and in Lite, so it has two
+    callers and one definition of the rule.  A single-caller renderer would be indirection
+    with nothing to keep in step.
+
+    Why it exists at all.  Today the advisor's evidence query is scoped by
+    ``(workspace_id, subject_user_id, situation_type)`` and nothing else, its ``consumer_id``
+    parameter is accepted and never referenced in the SQL, and its semantic fallback arm drops
+    the ``situation_type`` filter entirely — returning cross-situation rows in precisely the
+    low-evidence cases where abstention matters most.  In the same handler the context bundle
+    is project-scoped and the observation query is not.
+
+    ``allow_null_project`` is a stated decision, not an implementation detail:
+    ``decision_observations`` had no ``project_id`` before P4, so every historical row keeps
+    ``NULL`` forever and a bare ``project_id = :project`` would silently become ``AND false``
+    for the entire existing corpus.  NULL-project rows are therefore admissible — they are the
+    same subject's decisions — but the policy does not count them toward
+    ``Adequacy.above_floor_count``, so they can inform a ranking and can never, alone, make a
+    family adequate.
+    """
+
+    builder = _PredicateBuilder(dialect)
+    builder.add(f"{_qualified('workspace_id', table_alias)} = {builder.bind('scope_workspace', scope.workspace_id)}")
+    builder.add(
+        f"{_qualified('subject_user_id', table_alias)} = {builder.bind('scope_subject', scope.subject_user_id)}"
+    )
+    if include_project and scope.is_bound() and scope.project_id:
+        project_column = _qualified("project_id", table_alias)
+        placeholder = builder.bind("scope_project", scope.project_id)
+        if allow_null_project:
+            builder.add(f"({project_column} = {placeholder} OR {project_column} IS NULL)")
+        else:
+            builder.add(f"{project_column} = {placeholder}")
     return builder.build()

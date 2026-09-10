@@ -398,6 +398,83 @@ class Settings(BaseSettings):
     # and no repo is bind-mounted).
     git_change_summary_repo_allowlist: str = ""
 
+    # ---- P4 decision policy ----
+    # Two settings, and neither is a threshold.  Every number that can move an abstention or a
+    # qualification verdict lives in ``tce_shared.policy_thresholds`` as a frozen constant
+    # hashed into ``THRESHOLDS_SHA``, because a threshold a caller can move is not a threshold:
+    # sweeping an env var until coverage clears and then reverting it is invisible to the
+    # exposure check.  Both of these are hashed into ``PolicyTuning.tuning_sha()``, which is
+    # itself a bound key on the qualification record, so even a scoping switch cannot be moved
+    # after a family qualifies without invalidating that qualification.
+    policy_allow_unscoped_project_evidence: bool = True
+    """Admit NULL-project observations as evidence.  Producer and reader:
+    ``policy_store.load_policy_evidence``.  Scoping, not a threshold — ``decision_observations``
+    had no ``project_id`` before P4, so every historical row keeps NULL forever."""
+
+    policy_advisor_required_families: str = ""
+    """CSV of decision families that refuse to decide without an advisor contribution.
+    Producer: ``policy_store._policy_tuning``; reader: ``decision_policy._advisor_stage``.
+    It governs only the *absent* advisor (Lite, replay).  A *failed* advisor call abstains
+    unconditionally, before this setting is consulted."""
+
+    @property
+    def policy_advisor_required_family_set(self) -> frozenset[str]:
+        return frozenset(
+            item.strip() for item in self.policy_advisor_required_families.split(",") if item.strip()
+        )
+
+    # ---- P5 dream proposals ----
+    # Every one of these has a named reader; a setting with no reader is a knob pretending to be
+    # a decision, and ``tests/unit/test_aspirations.py::test_every_setting_has_a_reader`` walks
+    # the tree to prove it.  ``takeover_dream_llm_enabled`` above is the existing model gate and
+    # is NOT redeclared here.
+    dream_proposals_enabled: bool = True
+    """Master switch for the four ``/v1/dreams`` routes.  Reader: ``main._require_dreams_enabled``."""
+
+    dream_message_limit: int = 60
+    """LIMIT on the candidate-message statement.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_min_messages: int = 10
+    """Below this the refresh route refuses ``insufficient_messages`` synchronously, before the
+    model gate, so a corpus that cannot support a proposal reads as a refusal rather than as a
+    quiet week.  Reader: ``main.refresh_dreams``."""
+
+    dream_min_message_chars: int = 25
+    """Acknowledgements are not intentions.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_max_message_chars: int = 1200
+    """Per-message truncation, for the prompt only; the persisted hash is always the receipt's
+    hash of the full original.  Reader: ``dream_store.select_candidate_messages``."""
+
+    dream_max_proposals_per_run: int = 3
+    dream_min_citations: int = 2
+    dream_max_citations: int = 6
+    dream_quote_max_chars: int = 200
+    dream_min_quote_overlap_tokens: int = 2
+    dream_min_citation_relevance_tokens: int = 1
+    dream_max_live_proposals: int = 20
+    dream_duplicate_similarity: float = 0.60
+    dream_material_new_citations: int = 2
+    dream_material_max_similarity: float = 0.60
+    dream_rejected_cooldown_days: int = 30
+    dream_rejected_lookback_days: int = 365
+    """Must be >= ``dream_rejected_cooldown_days``: a rejection that ages out of the scan window
+    before its cooldown expires lifts suppression by amnesia.  Reader:
+    ``dream_store.load_rejected_proposals``."""
+    dream_rejected_scan_limit: int = 200
+    dream_max_reproposals: int = 2
+    dream_nonresponse_after_surfaces: int = 3
+    dream_resurface_min_hours: int = 24
+    dream_resurface_ignored_hours: int = 168
+    """``NonresponseState.IGNORED``'s one functional effect: a longer re-surface interval.  It
+    never suppresses a theme and never counts as a rejection."""
+    dream_snooze_default_days: int = 7
+    dream_proposal_ttl_days: int = 45
+    dream_run_stale_minutes: int = 30
+    """A crashed run must not wedge a scope forever: ``dream_store.start_generation_run`` sweeps
+    ``running`` rows older than this to ``failed``/``run_abandoned`` before taking the slot."""
+    dream_list_limit: int = 10
+
     @property
     def git_change_summary_repos(self) -> list[str]:
         return [item.strip() for item in self.git_change_summary_repo_allowlist.split(",") if item.strip()]

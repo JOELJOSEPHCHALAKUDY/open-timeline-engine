@@ -13,12 +13,12 @@ import threading
 import time
 import uuid
 from collections import Counter as CollectionCounter
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +26,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ote_advisor_providers import get_provider, list_provider_metadata, resolve_fallback_chain
 from ote_advisor_providers.base import ProviderAttemptResult, ProviderRequest
@@ -62,6 +62,22 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import HTMLResponse, JSONResponse
 from tce_model_gateway.factory import get_gateway as get_model_gateway
+from tce_shared.aspirations import (
+    DISPLAY_ACTIONS,
+    HUMAN_VERDICT_ACTIONS,
+    LIVE_STATUSES,
+    SCOPE_KIND_PROJECT,
+    DreamCitation,
+    DreamProposalEvent,
+    DreamProposalEventKind,
+    DreamProposalProjection,
+    DreamProposalStatus,
+    DreamRevisionConflict,
+    DreamTransitionRefused,
+    PoolMessage,
+    dream_proposal_summary_fields,
+    transition_allowed,
+)
 from tce_shared.autonomy_context import (
     SUMMARY_VERSION,
     autonomy_profile_tuning,
@@ -83,7 +99,6 @@ from tce_shared.behavior_fidelity import (
     eligible_behavior_evidence,
     evaluate_behavior_fidelity,
     normalize_behavior_evidence,
-    predict_behavior,
 )
 from tce_shared.behavior_pilot import (
     assign_behavior_pilot_variant,
@@ -116,14 +131,18 @@ from tce_shared.decision_capture import (
     HUMAN_INPUT_TASK_TYPE,
     TRUSTED_ORIGINS,
     HumanResolution,
-    evidence_revision,
 )
-from tce_shared.dreams import (
-    DreamSeed,
-    DreamSignals,
-    cluster_recurring_asks,
-    derive_dream_seeds,
-    select_dream_to_pursue,
+from tce_shared.decision_policy import (
+    AdvisorContribution,
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    OodStatus,
+    advice_names_a_candidate,
+    context_evidence_snapshot,
+    decide,
+    evidence_strength_label,
+    failed_advisor_contribution,
 )
 from tce_shared.effect_journal import (
     DEFAULT_REVERSIBILITY_BY_KIND,
@@ -185,6 +204,12 @@ from tce_shared.events import (
     DispatchOpenRequest,
     DispatchReconcileRequest,
     DispatchResponse,
+    DreamProposal,
+    DreamProposalCitation,
+    DreamProposalListResponse,
+    DreamProposalTransitionRequest,
+    DreamRefreshRequest,
+    DreamRefreshResponse,
     EffectOpenRequest,
     EffectResolveRequest,
     EffectResponse,
@@ -211,6 +236,7 @@ from tce_shared.events import (
     OperationMode,
     PatternFeedbackRequest,
     PlanningJobStatusResponse,
+    PolicyDecisionBlock,
     ProcessMiningRequest,
     ProcessMiningResponse,
     ProcessModelItem,
@@ -318,6 +344,7 @@ from tce_shared.takeover import (
     build_decisive_response,
     build_next_action,
     classify_text,
+    compute_context_quality_score,
     compute_decision_confidence,
     contains_phrase,
     ensure_takeover_response,
@@ -445,13 +472,15 @@ from .charter_store import (
     revoke_charter,
 )
 from .clone import (
-    advisor_reason,
+    advisor_recommend,
     arbitrate,
+    bundle_provenance_strength,
     derive_clone_guidance,
     evaluate_loop_guard,
     normalize_interaction_id,
     write_agent_interaction,
 )
+from .clone_prompt import ADVISOR_PROMPT_SHA, build_advisor_prompt
 from .clone_store import (
     build_session_context_from_state,
     load_fingerprint,
@@ -479,6 +508,26 @@ from .dispatch_store import (
     open_dispatch,
     reconcile_dispatch,
     record_self_test,
+)
+from .dream_store import (
+    DreamRunInFlight,
+    append_surfaced,
+    apply_dream_events,
+    bind_generation_run,
+    count_pending_proposals,
+    finish_generation_run,
+    list_proposals,
+    load_live_proposals,
+    load_proposal,
+    pool_evidence_revision,
+    reconcile_dream_pursuit,
+    scope_kind_for,
+    select_candidate_messages,
+    start_generation_run,
+    subject_has_project_receipts,
+    sweep_dream_proposals,
+    validate_citations_cheap,
+    validate_citations_deep,
 )
 from .effect_store import (
     list_open_effects,
@@ -513,7 +562,7 @@ from .models import (
     WorkflowTemplate,
 )
 from .otel import setup_otel
-from .plan_rows import PLAN_DREAM_STEP_INDEX, write_dream_rows, write_plan_rows
+from .plan_rows import write_plan_rows
 from .planning_store import (
     enqueue_planning_job,
     mark_queue_state,
@@ -524,6 +573,11 @@ from .planning_store import (
     get_planning_job as load_planning_job,
 )
 from .policy import PolicyEngine
+from .policy_store import (
+    build_decision_request,
+    persist_policy_decision,
+    prediction_payload,
+)
 from .queue import enqueue_job, get_queue_depth, queue_name_for_job
 from .reconcile import (
     pause_guard_for_session,
@@ -685,6 +739,38 @@ def _task_state_conflict(request: Request, exc: TaskStateRevisionConflict) -> JS
             "task_id": exc.task_id,
             "expected_revision": exc.expected_revision,
             "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(DreamRevisionConflict)
+def _dream_revision_conflict(request: Request, exc: DreamRevisionConflict) -> JSONResponse:
+    """A lost CAS race on a proposal is a 409, never a 500.
+
+    The payload names the ``proposal_id`` rather than a task id, because a retrying client has
+    to know *which* row lost — a verdict the owner just recorded is the last thing that should
+    disappear into a stack trace.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_revision_conflict",
+            "proposal_id": exc.proposal_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(DreamTransitionRefused)
+def _dream_transition_refused(request: Request, exc: DreamTransitionRefused) -> JSONResponse:
+    """The closed transition table said no.  Nothing was applied."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_transition_refused",
+            "proposal_id": exc.proposal_id,
+            "detail": exc.reason,
         },
     )
 
@@ -1358,18 +1444,36 @@ def _advisor_runtime_reason_from_routes(
     config: dict[str, Any],
     health: dict[str, Any],
     routes: list[dict[str, Any]],
-    fingerprint: dict[str, Any],
     similar_observations: list[dict[str, Any]],
-    session_context: dict[str, Any],
+    candidate_options: Sequence[str],
+    constraints: Mapping[str, Any],
     current_situation: str,
     situation_type: str,
-    extra_context: str,
     persist_health: bool = True,
-) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+) -> tuple[AdvisorContribution | None, dict[str, Any]]:
+    """Route selection, failover and circuit breaking are unchanged; the payload is not.
+
+    Each attempt now produces an ``AdvisorContribution`` instead of a free-form ``decision``
+    dict, and a dead provider produces ``parse_state="call_failed"`` rather than a fabricated
+    answer with ``fallback: True`` that two call sites checked and one did not.  The behavioural
+    fingerprint and the session transcript are gone from the inputs: neither is evidence about
+    which of the offered options this evidence supports, and both were there to make the model
+    sound like the user.
+    """
+
     attempts: list[dict[str, Any]] = []
     selected_provider = ""
     selected_model = ""
-    decision_payload: dict[str, Any] | None = None
+    contribution: AdvisorContribution | None = None
+    # Z2. ABSENT and UNAVAILABLE are different states and must stay different. This loop used
+    # to return `None` whichever way it ended, so "no route was ever tried" and "every route
+    # was tried and every one of them failed" arrived at the policy as the same fact -- and the
+    # policy reads `advisor is None` as *never attempted*, proceeds without advisor input, and
+    # decides where it should abstain. A failed attempt is now carried out of the loop as a
+    # non-parsed contribution, which `_advisor_stage` reads as UNAVAILABLE and which forces the
+    # abstention. `metadata["used_llm"]` keeps its old meaning -- a PARSED contribution exists --
+    # so the legacy-fallback decision at the call site is unchanged by this.
+    failed_contribution: AdvisorContribution | None = None
     started_total = time.perf_counter()
     total_budget_ms = int(getattr(settings, "effective_advisor_total_budget_ms", settings.advisor_total_budget_ms))
     per_attempt_ms = int(getattr(settings, "effective_advisor_attempt_timeout_ms", settings.advisor_attempt_timeout_ms))
@@ -1483,7 +1587,7 @@ def _advisor_runtime_reason_from_routes(
         ok = False
         code = "provider_error"
         message = "advisor runtime inference failed"
-        result: dict[str, Any] | None = None
+        result: AdvisorContribution | None = None
         if _provider_requires_key(provider_id) and not (request.api_key or "").strip():
             code = "auth_failure"
             message = f"provider '{provider_id}' missing API key"
@@ -1501,29 +1605,31 @@ def _advisor_runtime_reason_from_routes(
                     )
                     clamped_settings, _was_clamped = _advisor_gateway_settings(gateway_settings)
                     gateway = get_model_gateway(clamped_settings)
-                    result = advisor_reason(
-                        gateway=gateway,
+                    result = advisor_recommend(
+                        gateway,
+                        model_id=str(request.model or ""),
+                        runtime_version=str(gateway_provider or provider_id),
                         user_name=settings.clone_user_name,
-                        fingerprint=fingerprint,
-                        similar_observations=similar_observations,
-                        session_context=session_context,
-                        current_situation=current_situation,
+                        candidate_options=list(candidate_options),
+                        constraints=dict(constraints or {}),
+                        observations=list(similar_observations),
+                        situation_summary=current_situation,
                         situation_type=situation_type,
-                        extra_context=extra_context,
                     )
-                    decision_text = str((result or {}).get("decision") or "").strip()
-                    is_fallback = bool((result or {}).get("fallback"))
-                    if decision_text and not is_fallback:
+                    if result.parse_state == "parsed":
                         ok = True
                         code = "ok"
                         message = "advisor runtime inference succeeded"
-                    elif is_fallback:
+                    elif result.parse_state == "call_failed":
                         ok = False
-                        code = "llm_unavailable_fallback"
-                        message = "advisor runtime unavailable; fallback response returned"
+                        code = "llm_unavailable"
+                        # No fabricated decision is produced here any more: an unreachable
+                        # advisor contributes an abstention, which the policy honours
+                        # unconditionally.
+                        message = "advisor runtime unavailable; the advisor abstains"
                     else:
                         code = "empty_output"
-                        message = "advisor runtime returned empty decision"
+                        message = "advisor runtime output could not be parsed"
                 except Exception as exc:
                     code = "provider_error"
                     message = f"{type(exc).__name__}: {exc}"
@@ -1550,24 +1656,40 @@ def _advisor_runtime_reason_from_routes(
             half_open_seconds=settings.advisor_circuit_half_open_seconds,
             close_successes=settings.advisor_circuit_close_successes,
         )
-        if ok and isinstance(result, dict):
-            decision_payload = result
+        if ok and result is not None:
+            contribution = result
             selected_provider = provider_id
             selected_model = str(request.model or "")
             break
+        # An attempt happened and it did not produce a parsed answer: that is UNAVAILABLE, not
+        # ABSENT. `result` is None when the route never reached a gateway at all (missing key,
+        # unsupported provider, raised adapter), so the state is synthesised from the attempt's
+        # own error code rather than invented.
+        failed_contribution = result if result is not None else failed_advisor_contribution(
+            code,
+            model_id=str(request.model or ""),
+            runtime_version=str(_gateway_provider_for_route(provider_id, adapter.metadata.protocol) or provider_id),
+        )
 
     if persist_health:
         _save_advisor_health(db, workspace_id=auth.workspace_id, user_id=auth.user_id, routes=health)
     elapsed_total_ms = int((time.perf_counter() - started_total) * 1000)
+    if contribution is None and failed_contribution is not None:
+        contribution = failed_contribution
     metadata = {
-        "used_llm": bool(decision_payload),
+        # Still "a PARSED contribution came back", which is the question every existing reader
+        # of this key is asking. `advisor_attempted` is the new one, and it is what separates
+        # ABSENT (no attempt) from UNAVAILABLE (an attempt that failed).
+        "used_llm": contribution is not None and contribution.parse_state == "parsed",
+        "advisor_attempted": bool(attempts),
+        "advisor_parse_state": contribution.parse_state if contribution is not None else "not_run",
         "selected_provider": selected_provider or None,
         "selected_model": selected_model or None,
         "elapsed_ms": elapsed_total_ms,
         "attempt_count": len(attempts),
         "attempts": attempts,
     }
-    return decision_payload, metadata
+    return contribution, metadata
 
 
 def _default_advisor_config() -> dict[str, Any]:
@@ -4272,6 +4394,111 @@ def _require_verified_human(auth: AuthContext, *, action: str) -> None:
         )
 
 
+# The advisor's parsed contribution, carried from `clone_advice` up to the turn that owns it.
+# `clone_advice` is called several frames below `takeover_step` in the same process, exactly as
+# `ADVISOR_TURN_DEADLINE` is carried down; the contribution deliberately does NOT travel on
+# `CloneAdviceResponse`, which is a published wire schema at OpenAPI parity with Lite, and Lite
+# has no server-side advisor to put in it.
+ADVISOR_CONTRIBUTION: ContextVar[AdvisorContribution | None] = ContextVar(
+    "tce_advisor_contribution", default=None
+)
+
+
+def _observation_uuids(values: Sequence[str]) -> list[UUID]:
+    """Decision-evidence ids as UUIDs, for a wire field typed that way.
+
+    An id that does not parse is dropped rather than coerced: a citation that does not resolve
+    to a stored observation is not a citation.
+    """
+
+    out: list[UUID] = []
+    for value in values:
+        try:
+            out.append(UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _advisor_candidate_options(body: CloneAdviceRequest) -> tuple[str, ...]:
+    """The options the advisor is allowed to answer with, from the request that named them.
+
+    An ordinary turn names none, and that is the normal case: with no options on the table the
+    policy abstains with NO_CANDIDATE_MATCH rather than returning a label nobody offered, which
+    is what `_map_choice` does when `allowed` is empty.
+    """
+
+    for holder in (body.constraints, body.takeover_context):
+        if not isinstance(holder, dict):
+            continue
+        raw = holder.get("candidate_options") or holder.get("alternatives")
+        if isinstance(raw, list):
+            options = tuple(str(item).strip() for item in raw if str(item).strip())
+            if options:
+                return options
+    return ()
+
+
+@dataclass(frozen=True, slots=True)
+class EscalationCauses:
+    """Why this turn asks the human, as named terms rather than one anonymous boolean.
+
+    ``needs_human`` was an OR of five unrelated conditions and three later blocks overwrote
+    ``final_response`` for different reasons, so "the turn escalated" carried no information
+    about which of the five fired.  The boolean survives as ``.any`` and no response field
+    moves; what is new is that ``primary()`` names the cause, and the freeze site uses that name
+    as its ``decision_family`` instead of re-deriving the precedence inline.
+
+    ``policy_abstained`` is the one term P4 adds, and it carries the ``exposed`` conjunct.
+    ``family_not_qualified`` is deliberately absent: a family that has not earned permission is
+    a reason not to personalize, never a reason to ask a human, and on a corpus where no family
+    has qualified -- every corpus measured so far -- a term like that fires on every turn and
+    the product stops.
+    """
+
+    low_decision_confidence: bool
+    poor_retrieval_quality: bool
+    advisor_unhealthy: bool
+    policy_abstained: bool
+    behavior_gate_blocked: bool
+    safety_not_allow: bool
+
+    @property
+    def any(self) -> bool:
+        return bool(
+            self.low_decision_confidence
+            or self.poor_retrieval_quality
+            or self.advisor_unhealthy
+            or self.policy_abstained
+            or self.behavior_gate_blocked
+            or self.safety_not_allow
+        )
+
+    def primary(self) -> str:
+        """Deterministic precedence.  Safety is always first and is never a function of the
+        policy.
+
+        ``behavior_gate_blocked`` sits above ``advisor_unhealthy`` because that is the order the
+        freeze site has always used, and Y1 requires a turn that succeeds today to keep
+        producing the same decision family.  ``policy_abstained`` slots in below both, above the
+        two quality terms.
+        """
+
+        if self.safety_not_allow:
+            return "safety_not_allow"
+        if self.behavior_gate_blocked:
+            return "behavior_gate_blocked"
+        if self.advisor_unhealthy:
+            return "advisor_unhealthy"
+        if self.policy_abstained:
+            return "policy_abstained"
+        if self.poor_retrieval_quality:
+            return "poor_retrieval_quality"
+        if self.low_decision_confidence:
+            return "low_decision_confidence"
+        return "none"
+
+
 _CAPTURE_PAUSE_PREFIX = "AUTONOMOUS MODE PAUSED: capture channel unavailable"
 
 
@@ -4287,6 +4514,7 @@ def _freeze_decision_opportunity(
     db: Session,
     *,
     auth: AuthContext,
+    scope: ResolvedScope,
     state: TakeoverState,
     body: TakeoverStepRequest,
     turn: int,
@@ -4299,22 +4527,65 @@ def _freeze_decision_opportunity(
     snapshot: dict[str, Any],
     advice_visible: bool,
     project_id: str | None,
+    cancel_epoch: int = 0,
+    turn_policy_request: DecisionRequest | None = None,
+    turn_policy_result: DecisionResult | None = None,
 ) -> UUID | None:
-    """Freeze the pre-answer context and a prospective prediction BEFORE the human answers.
+    """Freeze the pre-answer context and the decision (or abstention) BEFORE the human answers.
+
+    P4 changes what is frozen here, not when.  The site used to call ``predict_behavior``
+    directly on an unbounded 500-row corpus and store a prediction; it now stores a
+    ``DecisionResult`` from the one decision callable, together with everything a later
+    qualification run needs in order to decide whether the case is admissible evidence at all:
+
+    * ``request_fingerprint`` — so a replay can prove it rebuilt the same request rather than a
+      different one that happened to reach the same answer.
+    * ``decision_advice_shown`` — whether the text the human is about to answer already names
+      one of the options they are choosing between.  That is the contamination the promotion
+      gate must exclude, and it is what ``advice_visible`` was supposed to be before it was
+      written as ``bool(<dict literal>)`` and became ``True`` at every site forever.
+    * ``candidate_option_count`` — the gate excludes cases offering fewer than two options and
+      the option list is not retained on the shadow row.
+    * ``episode_key`` — the unit a train/holdout split may not straddle.
+    * ``task_id`` — this site hard-coded ``None``, so no stored opportunity ever carried one.
+
+    The turn's own ``DecisionResult`` is reused when this site's family and candidate set match
+    the request it was built from; otherwise the site builds its own, because a result computed
+    for a different family over a different candidate set is not this decision and persisting
+    it would make the frozen row and the turn agree only by coincidence.
 
     Never fails the takeover turn: any error is logged and returns None. No commit here —
     save_takeover_state commits the same transaction.
     """
     try:
         with db.begin_nested():
-            prior = load_behavior_evidence(
-                db,
-                workspace_id=auth.workspace_id,
-                subject_user_id=auth.behavior_subject_id,
-                limit=500,
-                eligible_only=True,
-            )
-            revision, cutoff = evidence_revision(prior)
+            candidate_options = tuple(str(item) for item in alternatives if str(item).strip())
+            request = turn_policy_request
+            result = turn_policy_result
+            started = time.perf_counter()
+            if (
+                request is None
+                or result is None
+                or request.decision_family != decision_family
+                or request.candidate_options != candidate_options
+            ):
+                request = build_decision_request(
+                    db,
+                    scope=scope,
+                    decision_family=decision_family,
+                    situation_type=situation_type,
+                    situation_summary=question_text[:500],
+                    objective_text=objective_text,
+                    constraints=dict(body.constraints or {}),
+                    context_snapshot=snapshot,
+                    candidate_options=candidate_options,
+                    decision_at=datetime.now(tz=UTC),
+                    session_id=state.session_id,
+                    objective_hash=objective_hash_value,
+                    cancel_epoch=cancel_epoch,
+                )
+                result = decide(request)
+            latency_ms = max(0, int((time.perf_counter() - started) * 1000))
             query = {
                 "situation_type": situation_type,
                 "situation_summary": question_text[:500],
@@ -4322,14 +4593,9 @@ def _freeze_decision_opportunity(
                 "constraints": dict(body.constraints or {}),
                 "context_snapshot": snapshot,
             }
-            started = time.perf_counter()
-            prediction = predict_behavior(
-                prior,
-                query,
-                candidate_choices=list(alternatives),
-                min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-            )
-            latency_ms = max(0, int((time.perf_counter() - started) * 1000))
+            prediction = prediction_payload(result)
+            revision = request.evidence_revision
+            cutoff = request.evidence_cutoff_at
             now = datetime.now(tz=UTC)
             opportunity_id = uuid.uuid4()
             prediction_id = freeze_shadow_prediction(
@@ -4342,12 +4608,25 @@ def _freeze_decision_opportunity(
                 decision_family=decision_family,
                 query=query,
                 prediction=prediction,
-                evidence_count=len(prior),
+                evidence_count=len(request.evidence_rows),
                 latency_ms=latency_ms,
                 evidence_cutoff_at=cutoff,
                 evidence_revision=revision,
                 advice_visible=advice_visible,
                 frozen_at=now,
+            )
+            persist_policy_decision(
+                db,
+                prediction_id=prediction_id,
+                result=result,
+                request=request,
+                project_id=project_id,
+                episode_key=request.episode_key,
+                decision_advice_shown=advice_names_a_candidate(
+                    rendered_text=question_text,
+                    candidate_options=candidate_options,
+                ),
+                candidate_option_count=len(candidate_options),
             )
             ttl = max(60, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600)))
             insert_opportunity(
@@ -4359,7 +4638,7 @@ def _freeze_decision_opportunity(
                 session_id=state.session_id,
                 turn=turn,
                 objective_hash=objective_hash_value,
-                task_id=None,
+                task_id=scope.task_id,
                 project_id=project_id,
                 decision_family=decision_family,
                 situation_type=situation_type,
@@ -4372,12 +4651,24 @@ def _freeze_decision_opportunity(
                 },
                 evidence_cutoff_at=cutoff,
                 evidence_revision=revision,
-                advice_exposure={"advice_visible": bool(advice_visible), "prediction_shown": False},
+                # `prediction_shown` was the literal False at every site, which is one of the
+                # two reasons the deployed route and the evaluated route were disjoint sets.
+                # It is now the policy's own exposure flag: False for every family today, and
+                # True the moment a qualification record exists, with no further code change.
+                advice_exposure={
+                    # Not `bool(clone_payload)`: that payload is a dict literal, so the old
+                    # expression was `True` at every site in both backends and the column never
+                    # measured the property its name claims.  This is the advisor-rendered flag
+                    # the caller computed.
+                    "advice_visible": advice_visible,
+                    "prediction_shown": result.exposed,
+                },
                 shadow_prediction_id=prediction_id,
                 source_event_id=None,
                 expires_at=now + timedelta(seconds=ttl),
                 created_at=now,
                 frozen_at=now,
+                episode_key=request.episode_key,
             )
         return opportunity_id
     except Exception:
@@ -8487,9 +8778,8 @@ def clone_advice(
                 consumer_ctx,
                 policy_engine,
             )
-            summary, recommended_actions, confidence, evidence_strength, conflict_flags = derive_clone_guidance(
-                bundle, body.executor_output
-            )
+            summary, recommended_actions, conflict_flags = derive_clone_guidance(bundle, body.executor_output)
+            confidence, evidence_strength = bundle_provenance_strength(bundle)
             conflict_flags = [*conflict_flags, "clone_mode_disabled_fallback_to_timeline"]
             response = CloneAdviceResponse(
                 interaction_id=interaction_id,
@@ -8612,8 +8902,12 @@ def clone_advice(
         )
         return blocked_response
 
+    # One scope for the whole handler. The context bundle was project-scoped and the
+    # observation query was not, in the same handler, so the advisor was shown one project's
+    # evidence for another project's question.
+    advice_scope = _request_scope(db, auth=auth, body=body)
     consumer_ctx = policy_engine.resolve_consumer(
-        auth.consumer, auth.role, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=_request_scope(db, auth=auth, body=body)
+        auth.consumer, auth.role, workspace_id=auth.workspace_id, owner_id=auth.user_id, scope=advice_scope
     )
     bundle, blocked_count, redactions = build_context_bundle(
         db,
@@ -8622,16 +8916,27 @@ def clone_advice(
         policy_engine,
     )
 
-    # --- Build clone context for whichever advisor execution path is configured ---
+    # --- Build advisor context for whichever advisor execution path is configured ---
     # Default path is client-side advisor reasoning via MCP.
     # Optional cloud/local advisor routing is configured through /v1/setup/advisor/*.
     # We always return prompt + context so external executors and advisors stay deterministic.
+    #
+    # What the advisor is now: an evidence contributor.  It sees the observations the
+    # deterministic layer scored, with their ids, plus the offered options and the constraints.
+    # It can agree, disagree, abstain, or name ids that conflict.  It cannot select an option
+    # the deterministic layer did not select and it cannot raise a score — the merge block that
+    # used to overwrite the summary, the actions and the confidence with the model's own output,
+    # and then re-derive `evidence_strength` from that self-reported number, is deleted.
     clone_context: dict[str, Any] | None = None
-    advisor_decision: dict[str, Any] | None = None
+    advisor_contribution: AdvisorContribution | None = None
+    # Z2. `advisor_contribution is None` no longer answers "did the runtime produce an answer?",
+    # because a failed attempt now travels as a non-parsed contribution. The legacy-fallback
+    # decision below asks that question and only that question, so it reads this flag instead
+    # and keeps exactly the behaviour it had.
+    advisor_runtime_parsed = False
+    advisor_candidate_options = _advisor_candidate_options(body)
     if settings.clone_reasoning_enabled:
         try:
-            from .clone_prompt import build_clone_prompt
-
             situation_type = classify_situation(
                 body.task,
                 semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
@@ -8640,9 +8945,7 @@ def clone_advice(
             )
             similar_obs = query_similar_observations(
                 db,
-                consumer_id=auth.consumer,
-                workspace_id=auth.workspace_id,
-                subject_user_id=auth.behavior_subject_id,
+                scope=advice_scope,
                 situation_type=situation_type,
                 situation_text=body.task,
             )
@@ -8652,21 +8955,25 @@ def clone_advice(
             session_ctx = build_session_context_from_state(
                 body.app_context if isinstance(body.app_context, dict) else {}
             )
-            clone_prompt = build_clone_prompt(
+            advisor_prompt = build_advisor_prompt(
                 user_name=settings.clone_user_name,
-                fingerprint=fingerprint,
-                similar_observations=similar_obs,
-                session_context=session_ctx,
-                current_situation=body.task,
+                candidate_options=advisor_candidate_options,
+                constraints=effective_constraints,
+                observations=similar_obs,
+                situation_summary=body.task,
                 situation_type=situation_type,
-                extra_context=body.executor_output or "",
             )
             clone_context = {
-                "clone_prompt": clone_prompt,
+                # The key keeps its name: it is the executor-facing contract and an MCP client
+                # reads it.  What it carries is the advisor prompt, which no longer tells a
+                # model it *is* the user.
+                "clone_prompt": advisor_prompt,
+                "advisor_prompt_sha256": ADVISOR_PROMPT_SHA,
                 "situation_type": situation_type,
                 "fingerprint": fingerprint,
                 "similar_observations": similar_obs,
                 "session_context": session_ctx,
+                "candidate_options": list(advisor_candidate_options),
             }
             if settings.advisor_router_v2_enabled:
                 advisor_cfg = _load_advisor_config(db, workspace_id=auth.workspace_id, user_id=auth.user_id)
@@ -8686,19 +8993,19 @@ def clone_advice(
                     min_remaining_ms=settings.advisor_failover_min_remaining_ms,
                 )
                 ordered_routes = [item for item in selected.get("ordered", []) if isinstance(item, dict)]
-                advisor_decision, inference_meta = _advisor_runtime_reason_from_routes(
+                advisor_contribution, inference_meta = _advisor_runtime_reason_from_routes(
                     db=db,
                     auth=auth,
                     config=advisor_cfg,
                     health=advisor_health,
                     routes=ordered_routes,
-                    fingerprint=fingerprint,
                     similar_observations=similar_obs,
-                    session_context=session_ctx,
+                    candidate_options=advisor_candidate_options,
+                    constraints=effective_constraints,
                     current_situation=body.task,
                     situation_type=situation_type,
-                    extra_context=body.executor_output or "",
                 )
+                advisor_runtime_parsed = bool(inference_meta.get("used_llm"))
                 clone_context["advisor_runtime"] = {
                     "profile_id": profile.get("profile_id"),
                     "routing_mode": profile.get("routing_mode"),
@@ -8706,7 +9013,7 @@ def clone_advice(
                     "route_scores": selected.get("scores"),
                     "inference": inference_meta,
                 }
-            if not advisor_decision and body.allow_fallback:
+            if not advisor_runtime_parsed and body.allow_fallback:
                 try:
                     legacy_settings, legacy_clamped = _advisor_gateway_settings(settings)
                     if legacy_clamped and isinstance(body.takeover_context, dict):
@@ -8714,21 +9021,21 @@ def clone_advice(
                         # as latency rather than as advisor ill-health.
                         body.takeover_context["_advisor_clamped_by_deadline"] = True
                     legacy_gateway = get_model_gateway(legacy_settings)
-                    legacy_decision = advisor_reason(
-                        gateway=legacy_gateway,
-                        user_name=settings.clone_user_name,
-                        fingerprint=fingerprint,
-                        similar_observations=similar_obs,
-                        session_context=session_ctx,
-                        current_situation=body.task,
-                        situation_type=situation_type,
-                        extra_context=body.executor_output or "",
+                    legacy_contribution = advisor_recommend(
+                        legacy_gateway,
+                        model_id=str(getattr(legacy_settings, "extract_model", "") or ""),
+                        runtime_version=str(getattr(legacy_settings, "model_provider", "ollama")),
+                        prompt=advisor_prompt,
+                        candidate_options=advisor_candidate_options,
+                        observations=similar_obs,
                     )
-                    if (
-                        str((legacy_decision or {}).get("decision") or "").strip()
-                        and not bool((legacy_decision or {}).get("fallback"))
-                    ):
-                        advisor_decision = legacy_decision
+                    # Parsed or not, the legacy call is the last thing that happened, so it is
+                    # the contribution this turn carries: a failed or unparseable legacy call is
+                    # still an input and forces an abstention rather than being discarded in
+                    # favour of the fast path, which is what "abstention is the failure mode"
+                    # means in practice.
+                    advisor_contribution = legacy_contribution
+                    advisor_runtime_parsed = legacy_contribution.parse_state == "parsed"
                     runtime_value = clone_context.get("advisor_runtime")
                     runtime_meta: dict[str, Any] = (
                         runtime_value if isinstance(runtime_value, dict) else {}
@@ -8736,48 +9043,41 @@ def clone_advice(
                     runtime_meta["legacy_fallback_used"] = True
                     runtime_meta["legacy_model_provider"] = str(getattr(settings, "model_provider", "ollama"))
                     clone_context["advisor_runtime"] = runtime_meta
-                except Exception:
+                except Exception as exc:
                     logging.getLogger(__name__).warning("Legacy advisor gateway fallback failed", exc_info=True)
-            elif not advisor_decision:
+                    # Attempted and failed -> UNAVAILABLE. Swallowing this back to `None` is
+                    # how a raising gateway used to look identical to an advisor nobody called.
+                    advisor_contribution = failed_advisor_contribution(
+                        f"legacy_gateway_error:{type(exc).__name__}",
+                        model_id=str(getattr(settings, "extract_model", "") or ""),
+                        runtime_version=str(getattr(settings, "model_provider", "ollama")),
+                    )
+            elif not advisor_runtime_parsed:
                 runtime_value = clone_context.get("advisor_runtime")
                 runtime_meta = runtime_value if isinstance(runtime_value, dict) else {}
                 runtime_meta["legacy_fallback_skipped"] = True
                 clone_context["advisor_runtime"] = runtime_meta
         except Exception:
-            logging.getLogger(__name__).warning("Clone context build failed", exc_info=True)
+            logging.getLogger(__name__).warning("Advisor context build failed", exc_info=True)
 
-    summary, recommended_actions, confidence, evidence_strength, conflict_flags = derive_clone_guidance(
-        bundle, body.executor_output
-    )
-    if advisor_decision:
-        llm_decision = str(advisor_decision.get("decision") or "").strip()
-        if llm_decision:
-            summary = llm_decision
-            if not recommended_actions:
-                recommended_actions = [llm_decision]
-        llm_actions = advisor_decision.get("recommended_actions")
-        if isinstance(llm_actions, list):
-            clean_actions = [str(item).strip() for item in llm_actions if str(item).strip()]
-            if clean_actions:
-                recommended_actions = clean_actions[:5]
-        llm_conf_raw = advisor_decision.get("confidence")
-        if llm_conf_raw is not None:
-            try:
-                llm_conf = float(llm_conf_raw)
-                if math.isfinite(llm_conf):
-                    confidence = _clamp_confidence(llm_conf, low=0.0, high=1.0)
-            except (TypeError, ValueError):
-                pass
-        citation_count = len(bundle.citations)
-        if citation_count >= 5 and confidence >= 0.65:
-            evidence_strength = "strong"
-        elif citation_count < 2 or confidence < 0.45:
-            evidence_strength = "weak"
-        else:
-            evidence_strength = "moderate"
-        if "advisor_runtime_llm" not in conflict_flags:
-            conflict_flags.append("advisor_runtime_llm")
+    # The contribution travels to the turn that owns it through a ContextVar, the same way the
+    # advisor deadline already reaches this handler several frames down.  It deliberately does
+    # not travel on CloneAdviceResponse: that is a published wire schema at OpenAPI parity with
+    # Lite, and Lite has no server-side advisor to put in it.
+    ADVISOR_CONTRIBUTION.set(advisor_contribution)
 
+    summary, recommended_actions, conflict_flags = derive_clone_guidance(bundle, body.executor_output)
+    confidence, evidence_strength = bundle_provenance_strength(bundle)
+    if advisor_contribution is not None and advisor_contribution.parse_state == "parsed":
+        # Provenance, not a conflict.  `advisor_runtime_llm` used to be appended to
+        # `conflict_flags`, which filed "an LLM answered" as a disagreement; the four cases it
+        # conflated — agreed, disagreed, abstained, unavailable — now travel as
+        # `policy_decision.advisor_agreement`.
+        conflict_flags = [*conflict_flags]
+    # Unconditional, and it must stay that way.  Indenting this into the branch above made it
+    # unbound on exactly the paths P4 exists to make safe -- a failed, timed-out or unparseable
+    # advisor call, and `clone_reasoning_enabled=False` -- so `/v1/clone/advice` raised
+    # UnboundLocalError and returned HTTP 500 instead of an advisor abstention.
     raw_evidence_observations = (clone_context or {}).get("similar_observations", [])
     evidence_observations = [
         dict(item)
@@ -8949,27 +9249,41 @@ def _store_behavior_evidence_full(
     prior_evidence: list[dict[str, Any]] = []
     shadow_prediction: dict[str, Any] | None = None
     shadow_latency_ms = 0
+    shadow_request: DecisionRequest | None = None
+    shadow_result: DecisionResult | None = None
     if bool(getattr(settings, "behavior_shadow_evaluation_enabled", True)):
-        prior_evidence = load_behavior_evidence(
-            db,
-            workspace_id=auth.workspace_id,
-            subject_user_id=auth.behavior_subject_id,
-            limit=500,
-            eligible_only=True,
-        )
+        # The retrospective shadow goes through the same callable the turn path uses, on its own
+        # request. `decision_at` is the observation's own timestamp, not "now": recency decayed
+        # against `max(row ts)` before P4, which made a 900-day-old corpus and a 5-day-old
+        # corpus produce byte-identical predictions and hid the train/serve skew in replay.
+        shadow_at = normalized.get("valid_from") or datetime.now(tz=UTC)
+        if not isinstance(shadow_at, datetime):
+            shadow_at = datetime.now(tz=UTC)
+        if shadow_at.tzinfo is None:
+            shadow_at = shadow_at.replace(tzinfo=UTC)
         shadow_started = time.perf_counter()
-        shadow_prediction = predict_behavior(
-            prior_evidence,
-            {
-                "situation_type": normalized["situation_type"],
-                "situation_summary": normalized["situation_summary"],
-                "objective_text": normalized["objective_text"],
-                "constraints": normalized["constraints"],
-                "context_snapshot": normalized["context_snapshot"],
-            },
-            candidate_choices=list(normalized.get("available_choices") or []),
-            min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        )
+        try:
+            shadow_request = build_decision_request(
+                db,
+                scope=auth.resolved_scope(),
+                decision_family=str(normalized.get("decision_family") or "behavior_evidence"),
+                situation_type=str(normalized["situation_type"]),
+                situation_summary=str(normalized["situation_summary"]),
+                objective_text=str(normalized["objective_text"]),
+                constraints=dict(normalized["constraints"] or {}),
+                context_snapshot=dict(normalized["context_snapshot"] or {}),
+                candidate_options=[str(item) for item in (normalized.get("available_choices") or [])],
+                decision_at=shadow_at,
+                session_id=str(normalized.get("session_id") or ""),
+            )
+            shadow_result = decide(shadow_request)
+            prior_evidence = [dict(row) for row in shadow_request.evidence_rows]
+            shadow_prediction = prediction_payload(shadow_result)
+        except Exception:
+            logger.warning("retrospective shadow decision failed", exc_info=True)
+            shadow_request = None
+            shadow_result = None
+            shadow_prediction = None
         shadow_latency_ms = max(0, int((time.perf_counter() - shadow_started) * 1000))
     mode = str(getattr(settings, "behavior_storage_gate_mode", "shadow") or "shadow").strip().lower()
     if mode not in {"shadow", "warn", "enforce"}:
@@ -9521,28 +9835,42 @@ def predict_behavior_choice(
     _enforce_workspace_access(auth, db)
     if not bool(getattr(settings, "behavior_prediction_enabled", True)):
         raise HTTPException(status_code=404, detail="behavior prediction is disabled")
-    evidence = load_behavior_evidence(
+    # A separate HTTP request, so this is its own decision on its own request -- "one decide()
+    # per turn" is about the takeover turn, not about the process.
+    now = datetime.now(tz=UTC)
+    request = build_decision_request(
         db,
-        workspace_id=auth.workspace_id,
-        subject_user_id=auth.behavior_subject_id,
-        limit=2000,
-        eligible_only=True,
+        scope=auth.resolved_scope(),
+        decision_family="behavior_predict",
+        situation_type=body.situation_type,
+        situation_summary=body.situation_summary,
+        objective_text=body.objective,
+        constraints=dict(body.constraints or {}),
+        context_snapshot=dict(body.context_snapshot or {}),
+        candidate_options=list(body.candidate_choices or []),
+        decision_at=now,
+        session_id="",
+        evidence_limit=2000,
     )
-    prediction = predict_behavior(
-        evidence,
-        {
-            "situation_type": body.situation_type,
-            "situation_summary": body.situation_summary,
-            "objective_text": body.objective,
-            "constraints": body.constraints,
-            "context_snapshot": body.context_snapshot,
-        },
-        candidate_choices=body.candidate_choices,
-        min_confidence=max(
-            body.min_confidence,
-            float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        ),
-    )
+    result = decide(request)
+    prediction: dict[str, Any] = {
+        "predicted_choice": result.selected_option,
+        "ranked_choices": [
+            {"choice": item.option, "share": item.share} for item in result.ranked_options
+        ],
+        # `confidence` is `policy_score`: an uncalibrated vote-share heuristic, not a
+        # probability, and nothing in this repo has ever been fit to an outcome.
+        "confidence": float(result.policy_score),
+        "abstained": result.status is DecisionStatus.ABSTAINED,
+        "needs_clarification": result.status is DecisionStatus.ABSTAINED,
+        "clarification_question": result.reason_for_asking,
+        "citations": _observation_uuids(result.evidence_observation_ids),
+        "neighbor_count": int(result.adequacy.neighbour_count),
+        "effective_neighbor_count": float(result.adequacy.effective_sample_size),
+        "out_of_distribution": result.ood_status is OodStatus.OUT_OF_DISTRIBUTION,
+        "ood_score": float(result.ood_score),
+        "predicted_action": result.suggested_action,
+    }
     gate = latest_fidelity_gate(db, workspace_id=auth.workspace_id, subject_user_id=auth.behavior_subject_id)
     if bool(getattr(settings, "behavior_autonomy_gate_enabled", False)) and not bool(gate.get("passed", False)):
         prediction.update(
@@ -9553,7 +9881,11 @@ def predict_behavior_choice(
                 "clarification_question": "Behavior fidelity is not validated yet. What choice should be made?",
             }
         )
-    return BehaviorPredictionResponse(**prediction, fidelity_gate=gate)
+    return BehaviorPredictionResponse(
+        **prediction,
+        fidelity_gate=gate,
+        policy_decision=PolicyDecisionBlock.model_validate(result.block_payload()),
+    )
 
 
 @app.post("/v1/behavior/evaluate", response_model=BehaviorEvaluationResponse)
@@ -11750,40 +12082,49 @@ def takeover_autonomy_tick(
             include_open_discovery=body.include_open_discovery,
         )
         goals_refreshed += 1
-        # Dream in the gap. With no plan in flight and nothing pinned, form aspirations
-        # from what the system can observe about itself and turn the strongest into an
-        # ordered plan. The plan machinery then walks it exactly as a user-given
-        # objective, so a dream is pursued the same way anything else is.
-        if bool(getattr(settings, "takeover_plan_enabled", False)) and not state.active_goal_id:
-            try:
-                pursued = _dream_and_pursue(db, auth=auth, state=state)
-                if pursued:
-                    dreams_pursued += 1
-                    # The tick dispatches with no user turn, so it loads the projection
-                    # itself rather than reading the takeover_context mirror (which is a
-                    # wire mirror and never an input to a decision).
-                    tick_projection = load_task_state(
-                        db,
-                        workspace_id=auth.workspace_id,
-                        owner_id=auth.user_id,
-                        task_id=session_id,
-                    )
-                    next_step = _select_next_plan_step(
-                        db,
-                        state,
-                        contract_revision=(
-                            tick_projection[0].contract_revision
-                            if tick_projection is not None
-                            else 0
-                        ),
-                    )
-                    if next_step is not None:
-                        state.active_goal_id = next_step.id
-                        save_takeover_state(db, state)
-                        db.commit()
-            except Exception:
-                # Dreaming is strictly optional; never let it break the tick.
-                logger.warning("dream pursuit failed", exc_info=True)
+        # P5: the tick no longer pursues anything.  It sweeps expiries and snoozes, reconciles
+        # accepted proposals against P2's own task projection, and — only when there is
+        # genuinely nothing left to do — asks the worker for a fresh reading of the owner's own
+        # messages.  What was here before observed row counts, minted a "dream" from them,
+        # turned it into a plan without anyone being asked, and marked it done the moment the
+        # plan rows were written.  The system proposes now; the owner decides.
+        # Savepointed for the same reason the turn-path count is: a missing table between
+        # deploy and migration must cost this block, not the whole tick.
+        dream_savepoint = db.begin_nested()
+        try:
+            dream_scope = auth.resolved_scope(
+                session_project=(
+                    state.takeover_context.get("project_context")
+                    if isinstance(state.takeover_context, dict)
+                    else None
+                ),
+                task_id=session_id,
+            )
+            swept = sweep_dream_proposals(db, scope=dream_scope, now=now)
+            reconciled = reconcile_dream_pursuit(
+                db, scope=dream_scope, session_id=session_id, now=now
+            )
+            # ``dreams_pursued`` keeps its name and finally has a real producer: the count of
+            # ``pursuit_started`` events the reconciler appended, i.e. proposals whose plan has
+            # actually begun to run.  It was previously incremented when a plan was CREATED.
+            dreams_pursued += int(reconciled.get("pursuit_started", 0))
+            if not state.active_goal_id:
+                _enqueue_dream_generation(
+                    db,
+                    auth=auth,
+                    scope=dream_scope,
+                    state=state,
+                    swept=swept,
+                    reconciled=reconciled,
+                )
+            dream_savepoint.commit()
+            db.commit()
+        except Exception:
+            # Proposals are strictly optional; never let them break the tick.  The difference
+            # from before is that a failure here now leaves a run row behind saying so, rather
+            # than reading as "no proposals today".
+            dream_savepoint.rollback()
+            logger.warning("dream proposal reconcile failed", exc_info=True)
         top_goal = goals[0] if goals else None
         if (
             top_goal is not None
@@ -11942,6 +12283,554 @@ def takeover_notice_ack(
     ).mappings().first()
     db.commit()
     return _notice_from_row(updated)
+
+
+# ---------------------------------------------------------------------------
+# P5 — aspiration proposals.  Four routes: two reads, one closed transition
+# vocabulary, and one refresh that decides everything a model is not needed for.
+# ---------------------------------------------------------------------------
+
+
+def _require_dreams_enabled() -> None:
+    if not bool(getattr(settings, "dream_proposals_enabled", True)):
+        raise HTTPException(status_code=503, detail="dream proposals are disabled")
+
+
+def _require_dream_verdict_human(auth: AuthContext, *, action: str) -> None:
+    """D7.  A verdict requires a verified human; a display record does not.
+
+    ``auth.py`` reads the role straight off ``X-TCE-Role`` in compat mode, so "role user" is
+    not authentication — the same laundering P1 closed for evidence promotion.  The MCP
+    executor is structurally barred from the host-capture credential
+    (``client.py::assert_executor_credential_is_not_host_capture``), which is exactly why
+    ``surfaced`` is NOT gated here: the thing that puts a proposal in front of the owner is the
+    executor's renderer, and requiring a human to attest that the executor displayed something
+    made the whole nonresponse axis unreachable.
+    """
+    is_human = auth.role == AgentRole.USER
+    verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and verified):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "dream_verdict_authority_required",
+                "message": f"a dream verdict requires a verified human identity ({action})",
+                "reasons": [
+                    "human_review_required",
+                    "non_human_caller" if not is_human else "identity_unverified",
+                ],
+            },
+        )
+
+
+def _dream_scope_for(
+    auth: AuthContext, *, db: Session, session_id: str, app_context: dict[str, Any] | None
+) -> ResolvedScope:
+    """Scope comes from the credential, never from the body.
+
+    ``app_context`` is a project *hint* fed through the same ``resolved_scope`` call
+    ``takeover_step`` makes.  It is never an identity: a project id is client-assertable
+    verbatim, so a project-scoped run is additionally entitlement-checked against the subject's
+    own receipts before it is allowed to bind.
+    """
+    session_project: dict[str, Any] | None = None
+    row = db.execute(
+        text(
+            """
+            SELECT takeover_context
+            FROM takeover_sessions
+            WHERE session_id = :session_id
+              AND workspace_id = :workspace_id
+              AND user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {
+            "session_id": session_id,
+            "workspace_id": auth.workspace_id,
+            "user_id": auth.user_id,
+        },
+    ).mappings().first()
+    if row is not None:
+        raw = row["takeover_context"]
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = None
+        if isinstance(raw, dict):
+            candidate = raw.get("project_context")
+            if isinstance(candidate, dict):
+                session_project = candidate
+    return auth.resolved_scope(
+        project_hint=app_context,
+        session_project=session_project,
+        task_id=session_id,
+    )
+
+
+def _dream_proposal_model(
+    projection: DreamProposalProjection,
+    *,
+    source_revision: str,
+    citations_verified: str,
+    citations: Sequence[DreamCitation],
+    created_at: datetime,
+    updated_at: datetime,
+) -> DreamProposal:
+    """One producer for the wire model, so the two GETs cannot disagree about a field."""
+    fields = dream_proposal_summary_fields(
+        projection, source_revision=source_revision, citations_verified=citations_verified
+    )
+    return DreamProposal(
+        id=UUID(projection.proposal_id),
+        workspace_id=projection.workspace_id,
+        project_id=projection.project_id,
+        scope_kind=projection.scope_kind,
+        status=projection.status,
+        nonresponse=projection.nonresponse,
+        surfaced_count=projection.surfaced_count,
+        surfaced_attested=projection.surfaced_attested,
+        title=projection.title,
+        connection=projection.connection_text,
+        benefit=projection.benefit_text,
+        first_step=projection.first_step,
+        citations=[
+            DreamProposalCitation(
+                event_id=UUID(item.event_id),
+                receipt_id=UUID(item.receipt_id),
+                origin_kind=item.origin_kind,
+                observed_at=item.observed_at,
+                quote=item.quote,
+            )
+            for item in citations
+        ],
+        citation_count=len(citations),
+        citations_verified=citations_verified,
+        evidence_basis=projection.evidence_basis,
+        evidence_revision=projection.evidence_revision,
+        attribution=str(fields["attribution"]),
+        supersedes_proposal_id=(
+            UUID(projection.supersedes_proposal_id)
+            if projection.supersedes_proposal_id
+            else None
+        ),
+        snooze_until=projection.snooze_until,
+        expires_at=projection.expires_at,
+        task_id=projection.task_id,
+        plan_root_goal_id=(
+            UUID(projection.plan_root_goal_id) if projection.plan_root_goal_id else None
+        ),
+        pursuit_started_at=projection.pursuit_started_at,
+        completed_at=projection.completed_at,
+        rejection_reason=projection.rejection_reason,
+        revision=projection.revision,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+def _dream_timestamps(db: Session, *, proposal_ids: Sequence[str]) -> dict[str, tuple[datetime, datetime]]:
+    """``created_at``/``updated_at`` are row bookkeeping, not projection fields, so they are
+    read separately rather than smuggled into the fold."""
+    identifiers = []
+    for value in proposal_ids:
+        try:
+            identifiers.append(UUID(str(value)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    if not identifiers:
+        return {}
+    rows = db.execute(
+        text("SELECT id, created_at, updated_at FROM dream_proposals WHERE id = ANY(:ids)"),
+        {"ids": identifiers},
+    ).mappings().all()
+    out: dict[str, tuple[datetime, datetime]] = {}
+    for row in rows:
+        created = row["created_at"]
+        updated = row["updated_at"]
+        if isinstance(created, datetime) and isinstance(updated, datetime):
+            out[str(row["id"])] = (created, updated)
+    return out
+
+
+@app.get("/v1/dreams", response_model=DreamProposalListResponse)
+def list_dreams(
+    session_id: str = "default",
+    status: list[str] | None = Query(default=None),
+    include_history: bool = False,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DreamProposalListResponse:
+    """Read-only.  Writes nothing, ever (D21).
+
+    It runs the cheap citation check and *filters* a proposal that can no longer prove its
+    evidence; withdrawing it is the sweep's job, because a GET with a side effect is the kind of
+    thing that gets "optimised" into a cache six months later — and the surfaced record is the
+    only thing standing between nonresponse and rejection.
+    """
+    REQUEST_COUNT.labels(endpoint="list_dreams", method="GET").inc()
+    _require_dreams_enabled()
+    _enforce_workspace_access(auth, db)
+    now = datetime.now(tz=UTC)
+    scope = _dream_scope_for(auth, db=db, session_id=session_id, app_context=None)
+    wanted = [item for item in (status or []) if str(item).strip()] or sorted(LIVE_STATUSES)
+    projections = list_proposals(
+        db,
+        scope=scope,
+        statuses=wanted,
+        include_history=include_history,
+        now=now,
+        limit=int(getattr(settings, "dream_list_limit", 10)),
+    )
+    stamps = _dream_timestamps(db, proposal_ids=[p.proposal_id for p in projections])
+    min_citations = int(getattr(settings, "dream_min_citations", 2))
+    out: list[DreamProposal] = []
+    for projection in projections:
+        surviving, _dropped = validate_citations_cheap(
+            db, scope=scope, citations=projection.citations
+        )
+        if len(surviving) < min_citations:
+            continue
+        created, updated = stamps.get(projection.proposal_id, (now, now))
+        out.append(
+            _dream_proposal_model(
+                projection,
+                source_revision="",
+                citations_verified="cheap",
+                citations=surviving,
+                created_at=created,
+                updated_at=updated,
+            )
+        )
+    return DreamProposalListResponse(proposals=out, total=len(out), citations_verified="cheap")
+
+
+@app.get("/v1/dreams/{proposal_id}", response_model=DreamProposal)
+def get_dream(
+    proposal_id: UUID,
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DreamProposal:
+    """Read-only, with the expensive validation arm: the bodies are decrypted and every quote
+    is re-found in the message it claims to come from."""
+    REQUEST_COUNT.labels(endpoint="get_dream", method="GET").inc()
+    _require_dreams_enabled()
+    _enforce_workspace_access(auth, db)
+    now = datetime.now(tz=UTC)
+    scope = _dream_scope_for(auth, db=db, session_id=session_id, app_context=None)
+    loaded = load_proposal(db, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal not found")
+    projection, _highest_seq, source_revision = loaded
+    if (
+        projection.status is DreamProposalStatus.WITHDRAWN
+        and projection.withdrawn_reason == "citations_unverifiable"
+    ):
+        raise HTTPException(status_code=410, detail="citations_unverifiable")
+    surviving, _dropped = validate_citations_deep(db, scope=scope, citations=projection.citations)
+    if len(surviving) < int(getattr(settings, "dream_min_citations", 2)):
+        raise HTTPException(status_code=410, detail="citations_unverifiable")
+    stamps = _dream_timestamps(db, proposal_ids=[projection.proposal_id])
+    created, updated = stamps.get(projection.proposal_id, (now, now))
+    return _dream_proposal_model(
+        projection,
+        source_revision=source_revision,
+        citations_verified="deep",
+        citations=surviving,
+        created_at=created,
+        updated_at=updated,
+    )
+
+
+@app.post("/v1/dreams/{proposal_id}/transition", response_model=DreamProposal)
+def dream_transition(
+    proposal_id: UUID,
+    body: DreamProposalTransitionRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DreamProposal:
+    """One route, one closed vocabulary.
+
+    ``accepted`` does not mint anything.  It writes one event and returns.  If accept minted a
+    plan root, accepting while a task was in flight would have to either clobber the owner's
+    current objective or 409 — and a 409 loses the owner's answer, which is the exact class of
+    loss this phase exists to prevent.  The answer is recorded first; the machinery catches up
+    on the next reconcile.
+    """
+    REQUEST_COUNT.labels(endpoint="dream_transition", method="POST").inc()
+    _require_dreams_enabled()
+    _enforce_workspace_access(auth, db)
+    _reject_advisor_writes(auth)
+    action = str(body.action or "").strip()
+    if action not in (HUMAN_VERDICT_ACTIONS | DISPLAY_ACTIONS):
+        raise HTTPException(status_code=422, detail=f"unknown dream action '{action}'")
+    if action in HUMAN_VERDICT_ACTIONS:
+        _require_dream_verdict_human(auth, action=action)
+    now = datetime.now(tz=UTC)
+    scope = _dream_scope_for(auth, db=db, session_id=body.session_id, app_context=None)
+    loaded = load_proposal(db, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal not found")
+    projection, _highest_seq, _source_revision = loaded
+    after_surfaces = int(getattr(settings, "dream_nonresponse_after_surfaces", 3))
+    actor = auth.consumer
+    actor_class = "human" if action in HUMAN_VERDICT_ACTIONS else (
+        "human"
+        if (auth.role == AgentRole.USER and (auth.identity_verified or HOST_CAPTURE_CAPABILITY in auth.capabilities))
+        else "executor"
+    )
+
+    if action == "surfaced":
+        append_surfaced(
+            db,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            actor=actor,
+            actor_class=actor_class,
+            now=now,
+            min_hours=int(getattr(settings, "dream_resurface_min_hours", 24)),
+            ignored_hours=int(getattr(settings, "dream_resurface_ignored_hours", 168)),
+            after_surfaces=after_surfaces,
+        )
+    else:
+        kind = DreamProposalEventKind(action)
+        allowed, why = transition_allowed(projection.status, kind)
+        if not allowed:
+            raise HTTPException(status_code=409, detail={"reason": "dream_transition_refused", "detail": why})
+        payload: dict[str, Any] = {}
+        if action == "rejected":
+            payload["reason"] = str(body.reason or "")[:400]
+        elif action == "snoozed":
+            until = body.snooze_until or (
+                now + timedelta(days=max(1, int(getattr(settings, "dream_snooze_default_days", 7))))
+            )
+            payload["snooze_until"] = until.astimezone(UTC).isoformat()
+        elif action == "unsnoozed":
+            payload["expires_at"] = (
+                now + timedelta(days=max(1, int(getattr(settings, "dream_proposal_ttl_days", 45))))
+            ).astimezone(UTC).isoformat()
+        apply_dream_events(
+            db,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            new_events=[
+                DreamProposalEvent(
+                    seq=0,
+                    kind=kind,
+                    payload=payload,
+                    occurred_at=now,
+                    actor=actor,
+                    actor_class="human",
+                )
+            ],
+            now=now,
+            after_surfaces=after_surfaces,
+        )
+    db.commit()
+    write_audit_log(
+        db,
+        consumer=auth.consumer,
+        action="dream_transition",
+        query={"proposal_id": str(proposal_id), "action": action, "session_id": body.session_id},
+        result_event_ids=[],
+        policy_decisions={"action": action, "actor_class": actor_class},
+        latency_ms=0,
+    )
+    refreshed = load_proposal(db, scope=scope, proposal_id=str(proposal_id))
+    if refreshed is None:  # pragma: no cover - the row was just written under lock
+        raise HTTPException(status_code=404, detail="dream proposal not found")
+    updated_projection, _seq, source_revision = refreshed
+    stamps = _dream_timestamps(db, proposal_ids=[updated_projection.proposal_id])
+    created, updated = stamps.get(updated_projection.proposal_id, (now, now))
+    return _dream_proposal_model(
+        updated_projection,
+        source_revision=source_revision,
+        citations_verified="cheap",
+        citations=updated_projection.citations,
+        created_at=created,
+        updated_at=updated,
+    )
+
+
+def _refresh_dreams_core(
+    db: Session,
+    *,
+    auth: AuthContext,
+    scope: ResolvedScope,
+    session_id: str,
+    now: datetime,
+    swept: dict[str, int] | None = None,
+    reconciled: dict[str, int] | None = None,
+) -> DreamRefreshResponse:
+    """R1-R9.  The route owns everything that does not need a model; the worker owns the call.
+
+    The run row is created **before** any refusal can happen.  With it created after the model
+    gate, the shipped default ``takeover_dream_llm_enabled = False`` returned before any row
+    existed, so a completely disabled generation path produced no row, no refusal and nothing
+    at all — which reads to the owner as "no proposals today".  Every refusal now lands in a
+    real row and in the response body.
+    """
+    kind = scope_kind_for(scope)
+    # The tick has usually just run both; passing its results in keeps the deep citation
+    # validation inside the sweep from decrypting every live proposal twice per tick.  They are
+    # idempotent either way — this is about not paying for the same answer twice.
+    if swept is None:
+        swept = sweep_dream_proposals(db, scope=scope, now=now)
+    if reconciled is None:
+        reconciled = reconcile_dream_pursuit(db, scope=scope, session_id=session_id, now=now)
+    try:
+        run_id = start_generation_run(
+            db,
+            scope=scope,
+            session_id=session_id,
+            scope_kind=kind,
+            stale_minutes=int(getattr(settings, "dream_run_stale_minutes", 30)),
+            now=now,
+        )
+    except DreamRunInFlight as exc:
+        # Two overlapping refreshes for one scope would each read "no duplicate live proposal"
+        # and each mint.  The loser is told so, and is handed the winner's run id so it can go
+        # and read what that run actually did rather than guessing.
+        return DreamRefreshResponse(
+            run_id=UUID(exc.run_id) if exc.run_id else None,
+            state="refused",
+            refusal_reason="run_already_in_flight",
+            proposals_written=0,
+            refusals={},
+            pool_size=0,
+            pool_drops={},
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    def _refuse(
+        reason: str, *, pool: Sequence[PoolMessage] = (), pool_drops: dict[str, int] | None = None
+    ) -> DreamRefreshResponse:
+        digest, cutoff = pool_evidence_revision(pool)
+        finish_generation_run(
+            db,
+            run_id=run_id,
+            state="refused",
+            refusal_reason=reason,
+            pool=pool,
+            evidence_revision=digest,
+            evidence_cutoff_at=cutoff,
+            candidates_returned=0,
+            proposals_written=0,
+            refusals={},
+            pool_drops=pool_drops or {},
+            prompt_hash="",
+            model_provider="",
+            now=now,
+        )
+        return DreamRefreshResponse(
+            run_id=UUID(run_id),
+            state="refused",
+            refusal_reason=reason,
+            proposals_written=0,
+            refusals={},
+            pool_size=len(pool),
+            pool_drops=pool_drops or {},
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    if kind == SCOPE_KIND_PROJECT and not subject_has_project_receipts(db, scope=scope):
+        return _refuse("unentitled_project")
+    live = load_live_proposals(
+        db, scope=scope, limit=int(getattr(settings, "dream_max_live_proposals", 20))
+    )
+    if len(live) >= int(getattr(settings, "dream_max_live_proposals", 20)):
+        return _refuse("too_many_open_proposals")
+    pool, pool_drops = select_candidate_messages(
+        db,
+        scope=scope,
+        scope_kind=kind,
+        limit=int(getattr(settings, "dream_message_limit", 60)),
+        min_chars=int(getattr(settings, "dream_min_message_chars", 25)),
+        max_chars=int(getattr(settings, "dream_max_message_chars", 1200)),
+        max_sensitivity=int(getattr(settings, "block_sensitivity", 3)) - 1,
+    )
+    if len(pool) < int(getattr(settings, "dream_min_messages", 10)):
+        # On today's corpus this is the answer for every scope, and it is the correct one.
+        # The 4,649 backfill events are executor-writable and cannot be quoted back to the
+        # owner as his own words; refusing to generate from them is the whole point of the
+        # receipt rule.  This must never be softened into a confident-sounding proposal.
+        return _refuse("insufficient_messages", pool=pool, pool_drops=pool_drops)
+    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
+        return _refuse("model_disabled", pool=pool, pool_drops=pool_drops)
+
+    task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+        db,
+        workspace_id=scope.workspace_id,
+        owner_id=scope.owner_id,
+        subject_user_id=scope.subject_user_id,
+        session_id=session_id,
+        task_id=session_id,
+        project_id=scope.project_id,
+        now=now,
+    )
+    job_id, created = enqueue_planning_job(
+        db,
+        workspace_id=scope.workspace_id,
+        owner_id=scope.owner_id,
+        session_id=session_id,
+        task_id=session_id,
+        task_state_id=task_state_id,
+        job_kind=PLANNING_JOB_KIND_DREAM,
+        input_revision=plan_input_revision(
+            objective_hash=projection.objective_hash,
+            contract_revision=projection.contract_revision,
+            policy_revision=TASK_STATE_POLICY_REVISION,
+            scope_digest=_task_scope_digest_for(scope),
+            cancel_epoch=projection.last_cancel_seq,
+        ),
+        contract_revision=projection.contract_revision,
+        objective_hash=projection.objective_hash,
+        objective_text=projection.objective_text,
+        charter=charter_for_task(max_steps=int(getattr(settings, "takeover_plan_max_steps", 8))),
+        scope=scope,
+        now=now,
+        max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+    )
+    bind_generation_run(db, run_id=run_id, planning_job_id=job_id)
+    if created and job_id:
+        rq_job_id = enqueue_job("tce_worker.jobs.dream_synthesis.run", job_id)
+        mark_queue_state(db, job_id=job_id, queue_state="queued", rq_job_id=rq_job_id)
+    return DreamRefreshResponse(
+        run_id=UUID(run_id),
+        state="running",
+        refusal_reason="",
+        proposals_written=0,
+        refusals={},
+        pool_size=len(pool),
+        pool_drops=pool_drops,
+        swept=swept,
+        reconciled=reconciled,
+    )
+
+
+@app.post("/v1/dreams/refresh", response_model=DreamRefreshResponse)
+def refresh_dreams(
+    body: DreamRefreshRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    db: Session = Depends(get_db),
+) -> DreamRefreshResponse:
+    REQUEST_COUNT.labels(endpoint="refresh_dreams", method="POST").inc()
+    _require_dreams_enabled()
+    _enforce_workspace_access(auth, db)
+    _reject_advisor_writes(auth)
+    now = datetime.now(tz=UTC)
+    scope = _dream_scope_for(
+        auth, db=db, session_id=body.session_id, app_context=body.app_context
+    )
+    response = _refresh_dreams_core(
+        db, auth=auth, scope=scope, session_id=body.session_id, now=now
+    )
+    db.commit()
+    return response
 
 
 @app.post("/v1/takeover/execution/claim", response_model=DirectiveExecution)
@@ -12818,8 +13707,9 @@ def _goal_step_index(db: Session, *, state: TakeoverState, goal_id: str | None) 
     at ``candidate`` forever, which is what let ``root_status`` never see a block.
 
     A missing index is **omitted**, never faked. ``0`` is not a free placeholder — it is the
-    plan ROOT's row (``write_plan_rows``: root 0, steps 1..N) — and ``-1`` is a stored dream
-    (``PLAN_DREAM_STEP_INDEX``). Omitting keeps the fold's ``unknown_step`` counter honest;
+    plan ROOT's row (``write_plan_rows``: root 0, steps 1..N) — and ``-1`` is a retired dream
+    row from before P5 (proposals now live in ``dream_proposals``, and the fourteen legacy rows
+    are simply no longer read). Omitting keeps the fold's ``unknown_step`` counter honest;
     faking would silently rewrite the status of a step nobody reported on.
     """
     if not goal_id:
@@ -15244,190 +16134,6 @@ def _write_objective_plan(
     )
 
 
-def _gather_dream_signals(
-    db: Session, *, auth: AuthContext, scope: ResolvedScope, state: TakeoverState
-) -> DreamSignals:
-    """Observe the system's own situation. Every number here becomes a rationale."""
-
-    if not scope.is_bound():
-        return DreamSignals()  # an unbound session cannot produce a project-specific dream
-    project = canonical_project_context(state.takeover_context.get("project_context"))
-    project_id = str(scope.project_id or project.get("project_id", "") or "")
-    if not project_id:
-        return DreamSignals()
-
-    def _count(sql: str, params: dict[str, Any] | None = None) -> int:
-        try:
-            return int(db.execute(text(sql), params or {}).scalar() or 0)
-        except Exception:
-            # Dreaming is best-effort: a missing table must not break the tick.
-            logger.warning("dream signal query failed", exc_info=True)
-            return 0
-
-    project_params = {"project_id": project_id, "workspace_id": scope.workspace_id, "owner_id": scope.owner_id}
-    total_events = _count(
-        """
-        SELECT count(*) FROM events
-        WHERE context->>'project_id' = :project_id
-          AND context->>'_tce_workspace' = :workspace_id
-          AND context->>'_tce_owner' = :owner_id
-        """,
-        project_params,
-    )
-    embedded = _count(
-        """
-        SELECT count(*) FROM event_embeddings ee
-        JOIN events e ON e.id = ee.event_id
-        WHERE e.context->>'project_id' = :project_id
-          AND e.context->>'_tce_workspace' = :workspace_id
-          AND e.context->>'_tce_owner' = :owner_id
-        """,
-        project_params,
-    )
-    failed = _count(
-        """
-        SELECT count(*) FROM directive_executions
-        WHERE workspace_id = :workspace_id AND session_id = :session_id AND state = 'failed'
-        """,
-        {"workspace_id": auth.workspace_id, "session_id": state.session_id},
-    )
-    stalled = _count(
-        """
-        SELECT count(*) FROM autonomy_goals
-        WHERE workspace_id = :workspace_id
-          AND session_id = :session_id
-          AND status = :candidate
-          AND step_index IS NULL
-          AND updated_at < :cutoff
-        """,
-        {
-            "workspace_id": auth.workspace_id,
-            "session_id": state.session_id,
-            "candidate": AutonomyGoalStatus.CANDIDATE.value,
-            "cutoff": datetime.now(tz=UTC) - timedelta(days=1),
-        },
-    )
-    asks: list[tuple[str, str]] = []
-    try:
-        rows = db.execute(
-            text(
-                """
-                SELECT id, payload #>> '{request,message}' AS message
-                FROM events
-                WHERE context->>'project_id' = :project_id
-                  AND context->>'_tce_workspace' = :workspace_id
-                  AND context->>'_tce_owner' = :owner_id
-                  AND source = 'api-auto-capture'
-                  AND task_type = 'interaction_takeover_step'
-                  AND context->>'input_origin' = 'executor_relay'
-                  AND COALESCE(payload #>> '{request,message}', '') <> ''
-                ORDER BY ts ASC
-                LIMIT 200
-                """
-            ),
-            project_params,
-        ).mappings().all()
-        asks = [(str(row["id"]), str(row["message"])) for row in rows]
-    except Exception:
-        logger.warning("dream project ask query failed", exc_info=True)
-
-    return DreamSignals(
-        failed_unretried_directives=failed,
-        unembedded_events=max(0, total_events - embedded),
-        recurring_domains=(),
-        stalled_goals=stalled,
-        total_events=total_events,
-        project_id=project_id,
-        project_name=project.get("project", ""),
-        recurring_asks=cluster_recurring_asks(asks),
-    )
-
-
-def _store_dreams(
-    db: Session,
-    *,
-    auth: AuthContext,
-    scope: ResolvedScope,
-    state: TakeoverState,
-    dreams: list[DreamSeed],
-    contract_revision: int = 0,
-) -> int:
-    """Persist aspirations, replacing any previous set for this session.
-
-    Row authoring is delegated to ``plan_rows.write_dream_rows`` so the request thread and the
-    worker's dream job write field-for-field identical rows.
-    """
-    now = datetime.now(tz=UTC)
-    db.execute(
-        text(
-            """
-            DELETE FROM autonomy_goals
-            WHERE session_id = :session_id
-              AND workspace_id = :workspace_id
-              AND user_id = :user_id
-              AND step_index = :dream_index
-            """
-        ),
-        {
-            "session_id": state.session_id,
-            "workspace_id": auth.workspace_id,
-            "user_id": auth.user_id,
-            "dream_index": PLAN_DREAM_STEP_INDEX,
-        },
-    )
-    written = write_dream_rows(
-        db,
-        scope=scope,
-        session_id=state.session_id,
-        seeds=dreams,
-        contract_revision=contract_revision,
-        now=now,
-    )
-    db.commit()
-    return len(written)
-
-
-def _load_stored_dreams(db: Session, *, state: TakeoverState) -> list[DreamSeed]:
-    project = canonical_project_context(state.takeover_context.get("project_context"))
-    project_id = project.get("project_id", "")
-    if not project_id:
-        return []
-    rows = db.execute(
-        text(
-            """
-            SELECT title, description, reasoning, selection_score, evidence_event_ids
-            FROM autonomy_goals
-            WHERE session_id = :session_id
-              AND workspace_id = :workspace_id
-              AND user_id = :user_id
-              AND step_index = :dream_index
-              AND status = :candidate
-              AND cache_source = :cache_source
-            ORDER BY selection_score DESC
-            """
-        ),
-        {
-            "session_id": state.session_id,
-            "workspace_id": state.workspace_id,
-            "user_id": state.user_id,
-            "dream_index": PLAN_DREAM_STEP_INDEX,
-            "candidate": AutonomyGoalStatus.CANDIDATE.value,
-            "cache_source": f"dream:{project_id}",
-        },
-    ).mappings().all()
-    return [
-        DreamSeed(
-            title=str(r["title"]),
-            description=str(r["description"]),
-            rationale=str(r["reasoning"] or ""),
-            weight=float(r["selection_score"] or 0.0),
-            evidence_event_ids=tuple(str(value) for value in (r["evidence_event_ids"] or [])),
-            project_id=project_id,
-        )
-        for r in rows
-    ]
-
-
 def _as_uuid_or_none(value: str | None) -> UUID | None:
     if not value:
         return None
@@ -16069,56 +16775,41 @@ def _nothing_left_to_do(db: Session, *, auth: AuthContext, state: TakeoverState)
     return _load_task_projection_status(db, auth=auth, state=state) is TaskStatus.DONE
 
 
-def _enqueue_dream_synthesis(
-    db: Session, *, auth: AuthContext, scope: ResolvedScope, state: TakeoverState
+def _enqueue_dream_generation(
+    db: Session,
+    *,
+    auth: AuthContext,
+    scope: ResolvedScope,
+    state: TakeoverState,
+    swept: dict[str, int] | None = None,
+    reconciled: dict[str, int] | None = None,
 ) -> None:
-    """Hand the model-authored dream reading to the worker. Best effort, never fatal.
+    """Ask for a fresh reading of the owner's own messages, but only when nothing else is
+    pending.  Best effort, never fatal — and never silent.
 
-    A queue that is down must not stop the tick: the arithmetic dreams above already ran.
+    The whole of the decision lives in ``_refresh_dreams_core``, which is the same code path
+    the route runs, so the tick cannot drift from the route.  In particular the run row is
+    written on every branch, including the shipped-default ``model_disabled`` one: a generation
+    path that is entirely broken must not read to the owner as "no proposals today".
     """
-    if not bool(getattr(settings, "takeover_dream_llm_enabled", False)):
-        return
+    if not _nothing_left_to_do(db, auth=auth, state=state):
+        return  # work or an open question outranks anything the system might propose
+    savepoint = db.begin_nested()
     try:
-        task_state_id, projection, _highest_seq, _source_revision = ensure_task_state(
+        _refresh_dreams_core(
             db,
-            workspace_id=auth.workspace_id,
-            owner_id=auth.user_id,
-            subject_user_id=auth.behavior_subject_id,
-            session_id=state.session_id,
-            task_id=state.session_id,
-            project_id=scope.project_id,
-            now=datetime.now(tz=UTC),
-        )
-        job_id, created = enqueue_planning_job(
-            db,
-            workspace_id=auth.workspace_id,
-            owner_id=auth.user_id,
-            session_id=state.session_id,
-            task_id=state.session_id,
-            task_state_id=task_state_id,
-            job_kind=PLANNING_JOB_KIND_DREAM,
-            input_revision=plan_input_revision(
-                objective_hash=projection.objective_hash,
-                contract_revision=projection.contract_revision,
-                policy_revision=TASK_STATE_POLICY_REVISION,
-                scope_digest=_task_scope_digest_for(scope),
-                cancel_epoch=projection.last_cancel_seq,
-            ),
-            contract_revision=projection.contract_revision,
-            objective_hash=projection.objective_hash,
-            objective_text=projection.objective_text,
-            charter=charter_for_task(
-                max_steps=int(getattr(settings, "takeover_plan_max_steps", 8))
-            ),
+            auth=auth,
             scope=scope,
+            session_id=state.session_id,
             now=datetime.now(tz=UTC),
-            max_attempts=int(getattr(settings, "planning_job_max_attempts", 3)),
+            swept=swept,
+            reconciled=reconciled,
         )
-        if created and job_id:
-            rq_job_id = enqueue_job("tce_worker.jobs.dream_synthesis.run", job_id)
-            mark_queue_state(db, job_id=job_id, queue_state="queued", rq_job_id=rq_job_id)
+        savepoint.commit()
     except Exception:
-        logger.warning("dream synthesis enqueue failed", exc_info=True)
+        # Its own savepoint, so a half-written run cannot be committed by the caller's commit.
+        savepoint.rollback()
+        logger.warning("dream generation enqueue failed", exc_info=True)
 
 
 def _task_scope_digest_for(scope: ResolvedScope) -> str:
@@ -16131,86 +16822,6 @@ def _task_scope_digest_for(scope: ResolvedScope) -> str:
         project_id=scope.project_id,
         project_binding=scope.project_binding,
     )
-
-
-def _dream_and_pursue(db: Session, *, auth: AuthContext, state: TakeoverState) -> str | None:
-    """Form aspirations when idle, then turn the strongest into an ordered plan.
-
-    This is the whole loop in one place: observe -> want -> plan -> (the existing
-    machinery then walks the plan to completion). Returns the pursued dream's title.
-    """
-    if not _nothing_left_to_do(db, auth=auth, state=state):
-        return None  # work or an open question outranks anything it might want
-    dreams = _load_stored_dreams(db, state=state)
-    if not dreams:
-        dream_scope = auth.resolved_scope(
-            session_project=state.takeover_context.get("project_context") if isinstance(state.takeover_context, dict) else None,
-            task_id=state.session_id,
-        )
-        # The model-authored reading of the person's own messages moved to the worker
-        # (tce_worker.jobs.dream_synthesis): it is a model call, and a model call has no
-        # business on a bounded request path. What stays here is the arithmetic producer.
-        dreams = derive_dream_seeds(
-            _gather_dream_signals(db, auth=auth, scope=dream_scope, state=state)
-        )
-        if dreams:
-            _store_dreams(db, auth=auth, scope=dream_scope, state=state, dreams=dreams)
-        _enqueue_dream_synthesis(db, auth=auth, scope=dream_scope, state=state)
-    chosen = select_dream_to_pursue(dreams, has_active_plan=False)
-    if chosen is None:
-        return None
-    dream_scope = auth.resolved_scope(
-        session_project=state.takeover_context.get("project_context")
-        if isinstance(state.takeover_context, dict)
-        else None,
-        task_id=state.session_id,
-    )
-    steps = deterministic_plan(
-        chosen.title,
-        charter=charter_for_task(max_steps=int(getattr(settings, "takeover_plan_max_steps", 8))),
-    )
-    if not steps:
-        return None
-    root_id = _write_objective_plan(
-        db,
-        scope=dream_scope,
-        session_id=state.session_id,
-        task_id=state.session_id,
-        steps=steps,
-        producer=PLANNING_PRODUCER_DETERMINISTIC,
-        contract_revision=0,
-        now=datetime.now(tz=UTC),
-        objective_text=chosen.title,
-    )
-    state.takeover_context["plan_root_goal_id"] = root_id
-    state.takeover_context["plan_step_count"] = len(steps)
-    state.takeover_context["pursued_dream"] = chosen.title
-    state.takeover_context["pursued_dream_rationale"] = chosen.rationale
-    # The dream has become a plan; retire it so it is not pursued twice.
-    db.execute(
-        text(
-            """
-            UPDATE autonomy_goals
-            SET status = :done, updated_at = :now
-            WHERE session_id = :session_id
-              AND workspace_id = :workspace_id
-              AND user_id = :user_id
-              AND step_index = :dream_index
-              AND title = :title
-            """
-        ),
-        {
-            "done": AutonomyGoalStatus.DONE.value,
-            "now": datetime.now(tz=UTC),
-            "session_id": state.session_id,
-            "workspace_id": auth.workspace_id,
-            "user_id": auth.user_id,
-            "dream_index": PLAN_DREAM_STEP_INDEX,
-            "title": sanitize_untrusted_objective(chosen.title, max_len=140),
-        },
-    )
-    db.commit()
-    return chosen.title
 
 
 def _advance_plan_after_completion(
@@ -16525,21 +17136,40 @@ def _find_valid_allow_permit(
     return row[0] if row else None
 
 
-def _is_mutating_intent(message: str, task: str | None, final_response: str | None) -> bool:
-    joined = " ".join([message or "", task or "", final_response or ""]).lower()
-    hints = (
-        "edit ",
-        "change ",
-        "fix ",
-        "implement ",
-        "update ",
-        "refactor ",
-        "rename ",
-        "delete ",
-        "write ",
-        "create ",
-    )
-    return any(token in joined for token in hints)
+# The verbs that mean "this turn intends to write something".  Matched on word boundaries, so
+# "fix" is found in `ship the stripe webhook fix` and not in `prefixed`.
+#
+# The list used to be matched as `"fix "` etc. -- verb plus a literal trailing space -- which
+# silently missed every verb at the end of a string.  `ship the stripe webhook fix` is a mutating
+# objective and scored as a non-mutating one, and the gate fired on those turns only because its
+# third input, the system's own reply, echoed the objective back with a space after it.  Removing
+# that input without fixing this would have dropped the permit requirement on exactly those turns.
+_MUTATING_VERBS: tuple[str, ...] = (
+    "edit",
+    "change",
+    "fix",
+    "implement",
+    "update",
+    "refactor",
+    "rename",
+    "delete",
+    "write",
+    "create",
+)
+_MUTATING_VERB_RE = re.compile(r"\b(?:" + "|".join(_MUTATING_VERBS) + r")\b", re.IGNORECASE)
+
+
+def _is_mutating_intent(message: str, task: str | None) -> bool:
+    """Does this turn intend a write?  A property of what the OWNER asked and what the objective is.
+
+    `final_response` -- the system's own reply for this turn -- used to be a third input, and on
+    the turns where the message and the objective carried no verb it decided the gate by itself.
+    A permit gate that reads the system's own words can be talked past by rewording the reply,
+    which is the anti-pattern this whole plan closes.  It is gone; never add an output of this
+    turn back as an input to it.
+    """
+
+    return bool(_MUTATING_VERB_RE.search(" ".join([message or "", task or ""])))
 
 
 def _clamp_confidence(value: float, low: float = 0.05, high: float = 0.98) -> float:
@@ -17873,14 +18503,10 @@ def takeover_step(
         resolved_task = selected_goal.description or selected_goal.title
     state.takeover_context["objective"] = resolved_task
     state.objective_hash = objective_hash(resolved_task)
-    classifier_input = body.executor_output if (body.executor_output or "").strip() else body.message
-    classifier_for_conf = classify_text(
-        classifier_input,
-        takeover_active=state.mode == TakeoverMode.TAKEOVER,
-        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
-        semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
-        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
-    )
+    # `classifier_for_conf` used to live here: a second classification of `body.executor_output`
+    # -- the system's own prior text -- whose only consumer was `decision_confidence`. That term is
+    # gone, and so is the call, so no path remains from the system's own words into the escalation
+    # gate. `classify_ms` keeps its meaning: the classification the turn actually decides on.
     classify_ms = int((time.perf_counter() - classify_started) * 1000)
 
     retrieval_started = time.perf_counter()
@@ -17935,7 +18561,6 @@ def takeover_step(
     decision_confidence, confidence_components = compute_decision_confidence(
         objective=resolved_task,
         message=body.message,
-        classification=classifier_for_conf,
         working_set=working_set,
         recent_outcomes=state.recent_outcomes_json,
     )
@@ -17950,15 +18575,118 @@ def takeover_step(
         message=body.message,
     )
     evidence_count = int(working_set.get("evidence_count", 0) or 0)
-    evidence_strength_score = max(0.0, min(1.0, evidence_count / 6.0))
-    recency_coverage_score = 1.0 if evidence_count > 0 else 0.2
+    # ---- P4: the one decision-policy call on this turn -------------------------------
+    #
+    # It runs BEFORE anything reads it: before the two context-quality scores below, before
+    # `ensure_takeover_response`, and before the escalation causes. `decide()` is pure; the
+    # only I/O is one bounded evidence load (<= MAX_NEIGHBOURS * 8 rows) inside
+    # `build_decision_request`, which replaces up to three unbounded 500-row loads at the
+    # freeze sites. Net DB work per turn goes down.
+    #
+    # An ordinary takeover turn offers no candidate options, so this abstains with
+    # NO_CANDIDATE_MATCH. That is the normal case and not an error: with no qualified family --
+    # the state of every family on every corpus measured so far -- `exposed` is False,
+    # `ensure_takeover_response` ignores the policy entirely, and the turn is byte-for-byte what
+    # it was before P4. The result is still fully recorded, which is the whole point of running
+    # the policy before it has permission to be used.
+    policy_cancel_epoch = int(getattr(task_projection, "last_cancel_seq", 0) or 0) if task_projection is not None else 0
+    policy_situation_type = classify_situation(
+        resolved_task or body.message,
+        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
+        semantic_threshold=float(getattr(settings, "semantic_classifier_situation_threshold", 0.61)),
+        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+    )
+    policy_request: DecisionRequest | None = None
+    policy_result: DecisionResult | None = None
+    try:
+        policy_request = build_decision_request(
+            db,
+            scope=scope,
+            decision_family="needs_human",
+            situation_type=policy_situation_type,
+            situation_summary=str(resolved_task or body.message or "")[:500],
+            objective_text=str(state.takeover_context.get("objective") or resolved_task or ""),
+            constraints=dict(body.constraints or {}),
+            context_snapshot={"objective_hash": state.objective_hash, "turn": turn_count},
+            candidate_options=(),
+            decision_at=now,
+            session_id=state.session_id,
+            objective_hash=str(state.objective_hash or "") or None,
+            cancel_epoch=policy_cancel_epoch,
+        )
+        policy_result = decide(policy_request)
+    except Exception:
+        # A decision policy that cannot be computed must never fail a turn. It is recorded as
+        # absent, which under the exposure rule is indistinguishable from the unexposed case:
+        # the turn runs exactly as it does today.
+        logger.warning("decision policy assembly failed", exc_info=True)
+        policy_request = None
+        policy_result = None
+    # `evidence_count` is len(citations) -- timeline event ids, which are retrieval provenance
+    # and never the evidence for a choice. Reading them here put that number behind 0.25 of
+    # context_quality_score, which gates bounded retrieval and needs_human. It is now decision
+    # evidence above the similarity floor, which is what the name always claimed.
+    #
+    # Read from the REQUEST, not from `policy_result.adequacy`. `decide()` abstains at stage 2
+    # when a turn offers no candidate options, and an ordinary takeover turn offers none, so
+    # that adequacy is the empty one on every ordinary turn -- zero evidence, zero age, whatever
+    # the corpus holds. Scoring the context from it makes the score a constant that sits under
+    # the escalation line forever, which is "always ask the human", which is a shutdown rather
+    # than a gate. `context_evidence_snapshot` uses the policy's own adequacy whenever it
+    # reached stage 3, and otherwise measures the same evidence the request carries.
+    evidence_above_floor, evidence_median_age_days = (
+        context_evidence_snapshot(policy_request, policy_result)
+        if policy_request is not None
+        else (0, 0.0)
+    )
+    evidence_strength_score = (
+        max(0.0, min(1.0, evidence_above_floor / 6.0))
+        if policy_request is not None
+        else max(0.0, min(1.0, evidence_count / 6.0))
+    )
+    # And this was a field named for recency that read no clock: 1.0 for any non-empty corpus,
+    # 0.2 for an empty one, forever. It now decays against the age of the evidence actually
+    # used, with the same 90-day half-life the similarity term uses.
+    #
+    # The empty-corpus guard is deliberate and is not in the design's one-line formula, and it
+    # is the input that was wrong. With no eligible evidence the median age is 0.0, so a bare
+    # exp(-ln2 * 0 / 90) reports *perfect* recency coverage for a corpus that has nothing in
+    # it -- the same defect in a new costume, and worth +0.16 of quality on every cold turn on
+    # Full while Lite (which carried the guard) scored the same corpus 0.16 lower. No evidence
+    # keeps the floor the old branch used, so the number only ever means "the evidence I
+    # actually have is this fresh".
+    recency_coverage_score = (
+        (
+            math.exp(-math.log(2) * max(0.0, evidence_median_age_days) / 90.0)
+            if evidence_above_floor > 0
+            else 0.2
+        )
+        if policy_request is not None
+        else (1.0 if evidence_count > 0 else 0.2)
+    )
     outcome_stability_score = max(0.0, 1.0 - min(1.0, recent_failures / 3.0))
-    context_quality_score = round(
-        (0.40 * float(decision_confidence))
-        + (0.25 * evidence_strength_score)
-        + (0.20 * recency_coverage_score)
-        + (0.15 * outcome_stability_score),
-        4,
+    # A score named for the quality of the CONTEXT must not be dominated by the confidence of
+    # the ANSWER. The old formula took 0.40 of its value from `decision_confidence`, one of
+    # whose four terms is `classifier_certainty` -- how the system classified its own response.
+    # So the reply fed the score, the score fed the retrieval trigger and the `needs_human`
+    # escalation, and a turn could talk itself past its own safety gate: the lowest-evidence
+    # turns produced the most assertive text, which scored as certainty, which raised the very
+    # gate that existed to catch them. The term is gone. What is left measures context only,
+    # and the weights are re-derived over the three surviving terms to sum to 1.
+    #
+    # Two of the inputs the ruling names are deliberately NOT terms here, because on this seam
+    # they would be constants rather than measurements:
+    #   * corroboration (`Adequacy.agreement_share`) is 0 whenever no neighbour maps onto an
+    #     offered candidate option, and an ordinary takeover turn offers none. Weighting it
+    #     would deflate every turn by the same amount and measure nothing. It belongs in this
+    #     score on the day the seam actually offers options.
+    #   * retrieval outcome is not available yet: this score is computed BEFORE retrieval and
+    #     is its trigger (`quality_gate`, below). Feeding the outcome back in would be a second
+    #     circularity of exactly the shape just removed.
+    context_quality_score = compute_context_quality_score(
+        evidence_strength=evidence_strength_score,
+        recency_coverage=recency_coverage_score,
+        outcome_stability=outcome_stability_score,
     )
     profile_tuning = (
         autonomy_profile_tuning(state.autonomy_policy_profile)
@@ -18045,12 +18773,12 @@ def takeover_step(
         "do": working_set.get("do", []),
         "dont": working_set.get("dont", []),
         "confidence": decision_confidence,
+        # P4: derived from properties of the decision evidence -- above-floor neighbour count,
+        # effective sample size, agreement share, learning-eligible count -- and from no model
+        # number and no citation count. Both backends import the same function, so the old
+        # Full {strong, moderate, weak} / Lite {high, medium, low} fork cannot reappear.
         "evidence_strength": (
-            "strong"
-            if int(working_set.get("evidence_count", 0) or 0) >= 5
-            else "medium"
-            if int(working_set.get("evidence_count", 0) or 0) >= 2
-            else "weak"
+            evidence_strength_label(policy_result.adequacy) if policy_result is not None else "weak"
         ),
         "citations": citation_values,
         "citation_snippets": (
@@ -18222,11 +18950,19 @@ def takeover_step(
                 ],
                 "refreshed_at": now.isoformat(),
             }
-            advisor_runtime_used = False
-            if isinstance(clone_payload, dict):
-                conflict_flags = clone_payload.get("conflict_flags")
-                if isinstance(conflict_flags, list) and "advisor_runtime_llm" in conflict_flags:
-                    advisor_runtime_used = True
+            # Z1. This used to ask whether the string "advisor_runtime_llm" was in the response's
+            # `conflict_flags`. P4 stopped appending it -- filing "an LLM answered" as a
+            # disagreement was the defect it removed -- so the flag was gone and this read was
+            # False on EVERY turn: a healthy advisor that ran and parsed cleanly was still
+            # reported as `advisor_runtime_unavailable`, forced to FAST_PATH, and counted into
+            # `advisor_fail_streak`, which reaches `advisor_unhealthy` and escalates the turn to
+            # a human from the second turn on. It now asks the advisor itself. The contribution
+            # is on the ContextVar `clone_advice` just set; this only peeks, the owning read and
+            # the reset stay where they are, below.
+            turn_contribution = ADVISOR_CONTRIBUTION.get()
+            advisor_runtime_used = (
+                turn_contribution is not None and turn_contribution.parse_state == "parsed"
+            )
             if advisor_required_in_takeover and not advisor_runtime_used:
                 advisor_call_succeeded = False
                 if not advisor_failure_reason:
@@ -18294,6 +19030,41 @@ def takeover_step(
         fast_path_reason = ""
     clone_payload["fast_path_reason"] = fast_path_reason or None
     clone_payload["advisor_failure_reason"] = advisor_failure_reason
+    # P4: `advice_visible` stops being a constant. It used to be `bool(clone_payload)`, and
+    # `clone_payload` is an eight-key dict literal, so `bool()` of it is True at every site in
+    # both backends, always -- the live count of rows with advice_visible=false has been zero
+    # since the column was added, and the promotion clause that reads it could never move.
+    # It now means what its name says: the advisor ran, parsed, and its guidance replaced the
+    # fast-path payload. It is a report diagnostic only; the gate input is
+    # `decision_advice_shown`, computed per freeze site from the text the human actually read.
+    advisor_output_rendered = bool(
+        decision_source == TakeoverDecisionSource.DELIBERATION
+        and not fast_path_reason
+        and advisor_failure_reason is None
+    )
+    # The advisor's parsed contribution, from the `clone_advice` call above. It is an input to
+    # the policy and never a selector: it can agree, disagree or abstain, and a disagreement or
+    # a failed call forces an abstention. It cannot pick an option the deterministic layer did
+    # not pick and it cannot raise a score.
+    #
+    # Folding it in re-runs `decide()` on the SAME request with one field filled. That is one
+    # decision, evaluated twice, not two decisions: `DecisionRequest` is frozen, the only change
+    # is `advisor=`, and `fingerprint()` includes advisor presence and the advisor's option, so
+    # a replay that reconstructs the contribution reproduces this result and one that does not
+    # reports an unequal fingerprint rather than a quietly different answer.
+    #
+    # It cannot be done in one pass: the advisor is only reachable through `clone_advice`, which
+    # runs after `context_quality_score` -- and `context_quality_score` reads the policy's own
+    # adequacy. The first pass is what those scores are computed from; the second is what the
+    # turn and the frozen row record. Lite has no server-side advisor and therefore decides once.
+    advisor_contribution = ADVISOR_CONTRIBUTION.get()
+    ADVISOR_CONTRIBUTION.set(None)
+    if advisor_contribution is not None and policy_request is not None:
+        try:
+            policy_request = replace(policy_request, advisor=advisor_contribution)
+            policy_result = decide(policy_request)
+        except Exception:
+            logger.warning("advisor contribution could not be folded into the policy", exc_info=True)
     state.takeover_context["last_fast_path_reason"] = fast_path_reason or None
     policy_retrieval_meta: dict[str, Any] = {}
     policy_value = working_set.get("policy")
@@ -18367,6 +19138,10 @@ def takeover_step(
         semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
         semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
         semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+        # An EXPOSED abstention is the only thing the policy may do to this turn. With no
+        # qualified family it is unexposed, this argument changes nothing, and the four-tuple is
+        # identical to the one `policy=None` returns.
+        policy=policy_result,
     )
     final_response: str | None = response_text
     if not final_response and state.active:
@@ -18386,6 +19161,9 @@ def takeover_step(
         message=body.message,
         final_response=final_response,
         takeover_context=state.takeover_context,
+        # The resolved objective is screened directly.  It used to reach the gate only
+        # through the cold-start rewrite that P4 deleted; see evaluate_safety's docstring.
+        objective=resolved_task,
     )
     safety_ms = int((time.perf_counter() - safety_started) * 1000)
     if safety_decision != SafetyDecision.ALLOW:
@@ -18424,6 +19202,7 @@ def takeover_step(
             frozen_id = _freeze_decision_opportunity(
                 db,
                 auth=auth,
+                scope=scope,
                 state=state,
                 body=body,
                 turn=turn_count,
@@ -18439,8 +19218,11 @@ def takeover_step(
                     "objective": state.takeover_context.get("objective"),
                     "citations": [str(item) for item in citations][:20],
                 },
-                advice_visible=bool(clone_payload),
+                advice_visible=advisor_output_rendered,
                 project_id=scope.project_id if scope.is_bound() else None,
+                cancel_epoch=policy_cancel_epoch,
+                turn_policy_request=policy_request,
+                turn_policy_result=policy_result,
             )
             if frozen_id is not None:
                 state.takeover_context["pending_safety"]["opportunity_id"] = str(frozen_id)
@@ -18541,6 +19323,7 @@ def takeover_step(
             frozen_id = _freeze_decision_opportunity(
                 db,
                 auth=auth,
+                scope=scope,
                 state=state,
                 body=body,
                 turn=turn_count,
@@ -18555,8 +19338,11 @@ def takeover_step(
                     "objective_hash": state.objective_hash,
                     "objective_needs_refresh": bool(state.takeover_context.get("objective_needs_refresh")),
                 },
-                advice_visible=bool(clone_payload),
+                advice_visible=advisor_output_rendered,
                 project_id=scope.project_id if scope.is_bound() else None,
+                cancel_epoch=policy_cancel_epoch,
+                turn_policy_request=policy_request,
+                turn_policy_result=policy_result,
             )
             if frozen_id is not None:
                 state.takeover_context["open_decision"] = {
@@ -18566,14 +19352,18 @@ def takeover_step(
                     "turn": turn_count,
                     "created_at": now.isoformat(),
                 }
-    execution_permit_required = (
+    # A permit demand is a property of the DIRECTIVE, not of this turn's wording -- see the note on the
+    # Lite twin. While a directive minted as requiring a permit is still pending, the demand stands
+    # regardless of what the current message happens to say.
+    _pending_requires_permit = bool(
+        pending_execution is not None
+        and getattr(pending_execution, "requires_permit", False)
+        and str(getattr(pending_execution, "state", "")) in {DirectiveExecutionState.PENDING.value, DirectiveExecutionState.IN_PROGRESS.value}
+    )
+    execution_permit_required = _pending_requires_permit or (
         (not suppress_auto_directive)
         and state.mode == TakeoverMode.TAKEOVER
-        and _is_mutating_intent(
-            body.message,
-            resolved_task,
-            final_response,
-        )
+        and _is_mutating_intent(body.message, resolved_task)
     )
     if execution_permit_required and scope.project_binding == PROJECT_UNBOUND and pending_execution is None:
         # Unbound project => no autonomous write: no directive is minted this turn.
@@ -18814,13 +19604,28 @@ def takeover_step(
             ),
         }
         behavior_gate_blocked = not bool(behavior_fidelity_gate.get("passed", False))
-    needs_human = (
-        (decision_confidence < needs_human_threshold)
-        or (retrieval_triggered and context_quality_score < float(settings.context_retrieval_escalate_score))
-        or advisor_unhealthy
-        or behavior_gate_blocked
-        or (safety_decision != SafetyDecision.ALLOW)
-    ) and not actionable_lifecycle_pause
+    # P4: one new escalation cause, and only one. `family_not_qualified` is deliberately NOT a
+    # term here: permission-absence is a reason not to personalize, never a reason to ask a
+    # human. Adding it would turn every turn on a corpus with no qualified family -- which is
+    # every corpus today -- into an escalation, which is a product shutdown rather than a gate.
+    #
+    # The `policy.exposed` conjunct is what keeps that true. An unexposed abstention is the
+    # ordinary case (no candidate options were offered) and it must not move this boolean.
+    causes = EscalationCauses(
+        low_decision_confidence=bool(decision_confidence < needs_human_threshold),
+        poor_retrieval_quality=bool(
+            retrieval_triggered and context_quality_score < float(settings.context_retrieval_escalate_score)
+        ),
+        advisor_unhealthy=bool(advisor_unhealthy),
+        policy_abstained=bool(
+            policy_result is not None
+            and policy_result.exposed
+            and policy_result.status is DecisionStatus.ABSTAINED
+        ),
+        behavior_gate_blocked=bool(behavior_gate_blocked),
+        safety_not_allow=bool(safety_decision != SafetyDecision.ALLOW),
+    )
+    needs_human = causes.any and not actionable_lifecycle_pause
     if advisor_unhealthy and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
         decision_source = TakeoverDecisionSource.SAFETY_GATE
         if not final_response:
@@ -18856,10 +19661,15 @@ def takeover_step(
     if needs_human and safety_decision == SafetyDecision.ALLOW and not actionable_lifecycle_pause:
         # Point B: a question is being posed to the human. Freeze the pre-answer context and the
         # prospective prediction now, before any answer can exist.
-        if behavior_gate_blocked:
+        # One new value, `policy_abstention`, and `behavior_gate` is unchanged. The precedence
+        # is EscalationCauses.primary()'s, stated once there rather than re-derived here.
+        primary_cause = causes.primary()
+        if primary_cause == "behavior_gate_blocked":
             decision_family = "behavior_gate"
-        elif advisor_unhealthy:
+        elif primary_cause == "advisor_unhealthy":
             decision_family = "operator_action"
+        elif primary_cause == "policy_abstained":
+            decision_family = "policy_abstention"
         else:
             decision_family = "needs_human"
         existing_decision = state.takeover_context.get("open_decision")
@@ -18884,6 +19694,7 @@ def takeover_step(
             frozen_id = _freeze_decision_opportunity(
                 db,
                 auth=auth,
+                scope=scope,
                 state=state,
                 body=body,
                 turn=turn_count,
@@ -18902,8 +19713,11 @@ def takeover_step(
                     "objective_hash": state.objective_hash,
                     "citations": [str(item) for item in citations][:20],
                 },
-                advice_visible=bool(clone_payload),
+                advice_visible=advisor_output_rendered,
                 project_id=scope.project_id if scope.is_bound() else None,
+                cancel_epoch=policy_cancel_epoch,
+                turn_policy_request=policy_request,
+                turn_policy_result=policy_result,
             )
             if frozen_id is not None:
                 state.takeover_context["open_decision"] = {
@@ -19069,6 +19883,21 @@ def takeover_step(
     ).mappings().first()
     autonomy_notice = _notice_from_row(open_notice_row) if open_notice_row is not None else None
 
+    # P5: a count, not a payload.  The proposals themselves are read through ``GET /v1/dreams``
+    # or ``tce.dreams``, which run the citation validation first; putting proposal text on the
+    # turn response would put unvalidated quotes in front of the owner on every single step.
+    # The savepoint is not padding: between a code deploy and the migration the dream_* tables
+    # do not exist, and in Postgres a failed statement poisons the whole transaction — so an
+    # unguarded count would turn every takeover turn into a 500 for the length of that window.
+    _dream_count_savepoint = db.begin_nested()
+    try:
+        dream_proposals_pending = count_pending_proposals(db, scope=scope)
+        _dream_count_savepoint.commit()
+    except Exception:
+        _dream_count_savepoint.rollback()
+        logger.warning("dream proposal count failed", exc_info=True)
+        dream_proposals_pending = 0
+
     response = TakeoverStepResponse(
         state=state,
         project_binding=scope.project_binding,
@@ -19099,6 +19928,14 @@ def takeover_step(
         enforcement_tier=step_enforcement_tier,
         unresolved_effects=step_unresolved_effects,
         constraints=step_constraints,
+        # P4: what the policy decided, and -- separately -- whether it was allowed to be used.
+        # There is no score on this block: an executor reading an uncalibrated number it cannot
+        # interpret is how four different fields came to be named some form of "confidence".
+        policy_decision=(
+            PolicyDecisionBlock.model_validate(policy_result.block_payload())
+            if policy_result is not None
+            else None
+        ),
         selected_goal=selected_goal,
         execution_permit_required=execution_permit_required,
         execution_permit_id=str(execution_permit_id) if execution_permit_id else None,
@@ -19108,6 +19945,7 @@ def takeover_step(
         pending_execution=pending_execution if isinstance(pending_execution, DirectiveExecution) else None,
         retry_scheduled=retry_scheduled,
         autonomy_notice=autonomy_notice,
+        dream_proposals_pending=dream_proposals_pending,
         goal_cache_hit=bool(state.takeover_context.get("_goal_cache_hit", False)),
         goal_cache_source=str(state.takeover_context.get("_goal_cache_source"))
         if state.takeover_context.get("_goal_cache_source") is not None

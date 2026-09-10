@@ -282,7 +282,14 @@ def _markdown_body(
             lines.extend(
                 [
                     f"- Evidence source: `{_markdown_escape(item.get('evidence_source'))}`",
-                    f"- Confidence: `{float(item.get('confidence', 0.0)):.3f}`",
+                    # Y8/Z4: this number is the WRITER's own claim about its own evidence, carried
+                    # through from `decision_observations.confidence`.  Nothing in this system
+                    # scores, calibrates or checks it.  It stays in the document because it is
+                    # auditable provenance, and it is labelled because an unlabelled "Confidence:
+                    # 0.983" beside the eligible/audit-only badge reads as the system's assessment
+                    # of the evidence -- in the one document whose entire purpose is evidence review.
+                    f"- Confidence (writer's self-report, not a system score): "
+                    f"`{float(item.get('confidence', 0.0)):.3f}`",
                     f"- Recorded: `{_markdown_escape(item.get('ts'))}`",
                     f"- Lifecycle: `{_markdown_escape(item.get('lifecycle_status'))}`",
                     f"- Citation: `{base_uri}/evidence/{quote(str(item.get('id') or ''), safe='')}.json`",
@@ -344,7 +351,10 @@ def _html_review_body(
                     f"<dl>{''.join(details)}</dl>",
                     '<footer class="provenance">',
                     f"Source: <strong>{escaped(item.get('evidence_source'))}</strong> · ",
-                    f"Confidence: <strong>{float(item.get('confidence', 0.0)):.3f}</strong> · ",
+                    # Same self-report as the markdown footer above, same reason for the label:
+                    # it sits beside the eligible/audit-only badge, which IS a system judgement.
+                    "Confidence <span class=\"self-report\">(writer's self-report)</span>: "
+                    f"<strong>{float(item.get('confidence', 0.0)):.3f}</strong> · ",
                     f"Recorded: <time>{escaped(item.get('ts'))}</time> · ",
                     f'<a href="{escaped(citation)}">Canonical evidence</a>',
                     "</footer>",
@@ -375,7 +385,8 @@ def _html_review_body(
             "padding:2px 9px;font:12px/1.5 ui-monospace,monospace}.lifecycle-rejected,.lifecycle-superseded{"
             "background:#f4ded7}dl{display:grid;grid-template-columns:minmax(90px,140px) 1fr;gap:7px 18px}"
             "dt{font-weight:700}dd{margin:0;overflow-wrap:anywhere}.provenance{border-top:1px solid var(--line);"
-            "padding-top:12px;color:var(--muted);font-size:.88rem}a{color:var(--accent)}"
+            "padding-top:12px;color:var(--muted);font-size:.88rem}"
+            ".self-report{font-style:italic;opacity:.85}a{color:var(--accent)}"
             "@media(max-width:620px){main{margin-top:28px}dl{grid-template-columns:1fr}dt{margin-top:8px}}",
             "</style></head><body><main>",
             "<h1>Behavior evidence review</h1>",
@@ -451,7 +462,10 @@ def build_behavior_projection(
     elif normalized_view == "review":
         selected_raw = [dict(item) for item in evidence_rows]
     else:
-        selected_raw = eligible_behavior_evidence(evidence_rows, at=at)
+        # eligible_behavior_evidence now returns Mapping rows, because the decision policy
+        # passes it an immutable tuple of Mappings.  This branch keeps the mutable dicts the
+        # other two branches produce.
+        selected_raw = [dict(item) for item in eligible_behavior_evidence(evidence_rows, at=at)]
     normalized_rows = _sort_rows([_normalize_row(item) for item in selected_raw])
     if normalized_view == "decisions":
         scored = [(_topic_score(item, safe_topic), item) for item in normalized_rows]

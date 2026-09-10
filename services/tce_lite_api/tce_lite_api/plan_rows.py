@@ -1,4 +1,4 @@
-"""Plan and dream goal rows for Lite (P2 §5.3, §0.7 S9/S12.5).
+"""Plan goal rows for Lite (P2 §5.3, §0.7 S9/S12.5).
 
 The Lite twin of `tce_api.plan_rows`. Same column list, same pinned values, so the two
 backends' `autonomy_goals` tables stay diffable — only the driver differs (`sqlite3.Connection`
@@ -22,7 +22,6 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
-from tce_shared.dreams import DreamSeed
 from tce_shared.events import (
     AutonomyGoalSource,
     AutonomyGoalStatus,
@@ -32,10 +31,6 @@ from tce_shared.events import (
 from tce_shared.scope import PROJECT_UNBOUND, SCOPE_POLICY_REVISION, ResolvedScope
 from tce_shared.takeover import sanitize_untrusted_objective
 from tce_shared.task_state import PlanStepState, canonical_json
-
-# A discovery row has no position in an ordered plan. The literal lives here so both writers
-# (the plan path and the dream path) use one value.
-PLAN_DREAM_STEP_INDEX = -1
 
 _PLAN_REASONING = "Ordered plan step derived from the user objective."
 
@@ -181,72 +176,6 @@ def write_plan_rows(
     return root_id
 
 
-def write_dream_rows(
-    conn: sqlite3.Connection,
-    *,
-    scope: ResolvedScope,
-    session_id: str,
-    seeds: Sequence[DreamSeed],
-    contract_revision: int,
-    now: datetime,
-) -> list[str]:
-    """Write discovery rows for dream seeds. Returns the new goal ids. NEVER commits.
-
-    Not ``write_plan_rows`` with a mode flag — the row shape genuinely differs: no root goal,
-    ``step_index = PLAN_DREAM_STEP_INDEX``, no parent, no dependencies. ``plan_contract_revision``
-    is stamped rather than left NULL, because the plan-step predicate
-    ``AND plan_contract_revision = ?`` can never match NULL.
-    """
-    stamp = now.isoformat()
-    created: list[str] = []
-    for seed in seeds:
-        goal_id = str(uuid.uuid4())
-        evidence = [str(item) for item in seed.evidence_event_ids if _is_uuid(item)]
-        conn.execute(
-            _GOAL_INSERT,
-            (
-                goal_id,
-                session_id,
-                scope.workspace_id,
-                scope.owner_id,
-                sanitize_untrusted_objective(seed.title, max_len=140),
-                sanitize_untrusted_objective(seed.description, max_len=240),
-                AutonomyGoalSource.OPEN_DISCOVERY.value,
-                float(seed.weight),
-                AutonomyRiskTier.MEDIUM.value,
-                0.85,
-                str(seed.rationale or ""),
-                canonical_json(evidence),
-                GoalKind.NORMAL.value,
-                canonical_json({}),
-                float(seed.weight),
-                _goal_signature("dream", session_id, seed.title),
-                0,
-                "dream",
-                AutonomyGoalStatus.CANDIDATE.value,
-                stamp,
-                stamp,
-                None,
-                PLAN_DREAM_STEP_INDEX,
-                int(contract_revision),
-                0,
-                "",
-                canonical_json([]),
-                0,
-            ),
-        )
-        created.append(goal_id)
-    return created
-
-
-def _is_uuid(value: object) -> bool:
-    try:
-        uuid.UUID(str(value))
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return True
-
-
 def resolved_scope_to_json(scope: ResolvedScope) -> dict[str, Any]:
     """Exactly thirteen keys, in this order. ``owner_ids`` is sorted (a frozenset is not JSON-safe)."""
     return {
@@ -313,10 +242,8 @@ def resolved_scope_from_json(raw: Any) -> ResolvedScope:
 
 
 __all__ = [
-    "PLAN_DREAM_STEP_INDEX",
     "resolved_scope_from_json",
     "resolved_scope_to_json",
-    "write_dream_rows",
     "write_plan_rows",
 ]
 

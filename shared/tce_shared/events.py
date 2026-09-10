@@ -7,6 +7,26 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# ``DreamProposalStatus`` and ``NonresponseState`` are declared in
+# ``tce_shared.aspirations`` and imported here, never mirrored.  Two StrEnums that must
+# agree is a drift waiting to happen, and the dependency only runs one way: this module
+# imports pydantic, ``aspirations`` must not, because the worker loads it.
+from .aspirations import DreamProposalStatus, NonresponseState
+
+# The seven decision-policy enums are declared in ``tce_shared.decision_policy`` and
+# re-exported here, never re-declared.  ``decision_policy`` must stay pydantic-free so the
+# worker can import it, and this module imports pydantic below, so the dependency can only
+# point one way.  ``QualificationState`` has no reader in this module; it is re-exported for
+# the two backends, which is why it carries the redundant alias.
+from .decision_policy import (
+    AbstainReason,
+    AdvisorAgreement,
+    ConflictStatus,
+    DecisionStatus,
+    ExposureState,
+    OodStatus,
+)
+from .decision_policy import QualificationState as QualificationState
 from .task_state import NextPermittedAction, TaskStatus
 from .version import SCHEMA_VERSION
 
@@ -842,6 +862,13 @@ class TakeoverStepResponse(BaseModel):
     enforcement_tier: str | None = None
     unresolved_effects: list[dict[str, Any]] = Field(default_factory=list)
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    # ---- P4 ----
+    policy_decision: PolicyDecisionBlock | None = None
+    # ---- P5 ----
+    # A count, not a payload.  The proposals themselves are read through ``tce.dreams``/
+    # ``GET /v1/dreams``, which run the citation validation; putting proposal text on the turn
+    # response would put unvalidated quotes in front of the owner on every step.
+    dream_proposals_pending: int = 0
 
 
 class TakeoverGoalsDiscoverRequest(BaseModel):
@@ -1417,6 +1444,8 @@ class BehaviorPredictionResponse(BaseModel):
     predicted_action: str | None = None
     fidelity_gate: dict[str, Any] = Field(default_factory=dict)
     schema_version: str = "v1"
+    # ---- P4 ----
+    policy_decision: PolicyDecisionBlock | None = None
 
 
 class BehaviorEvaluationRequest(BaseModel):
@@ -1650,14 +1679,27 @@ class CloneAdviceResponse(BaseModel):
     recommended_actions: list[str]
     do: list[str]
     dont: list[str]
-    confidence: float
+    confidence: float = Field(
+        default=0.0,
+        description=(
+            "Uncalibrated vote-share heuristic derived from the policy result. It is NOT a "
+            "probability and nothing in this system is calibrated; do not threshold on it."
+        ),
+    )
     evidence_strength: str
     citations: list[UUID]
     conflict_flags: list[str]
     loop_guard: dict[str, Any]
     policy: dict[str, Any]
     clone_context: dict[str, Any] | None = None
-    evidence_observations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_observations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Retrieval provenance for recall_source accounting; never the evidence for a "
+            "choice. The evidence for a choice is policy_decision.evidence_observation_ids, "
+            "which is bound to the option that was actually selected."
+        ),
+    )
 
 
 class TrustedInputCapture(BaseModel):
@@ -1995,4 +2037,173 @@ class SandboxSelfTestResponse(BaseModel):
     uid_separation: bool = False
     assertions: list[SandboxAssertionPayload] = Field(default_factory=list)
     ran_at: datetime
+    schema_version: str = "v1"
+
+
+# ---- P4 ----
+# The seven decision-policy enums are declared in ``tce_shared.decision_policy`` and imported
+# at the top of this module, never re-declared here.  ``decision_policy`` has to stay
+# pydantic-free so the worker can import it, and this module imports pydantic on line 8, so
+# the dependency can only point one way.
+
+class PolicyDecisionBlock(BaseModel):
+    """What one turn's decision policy decided, and whether it was allowed to be used.
+
+    ``status`` and ``exposed`` are separate on purpose.  "We abstained" and "we were not
+    allowed to speak" are different facts, and collapsing them into one wire value is what
+    turned an unqualified family into a human escalation in an earlier draft.
+
+    There is no score on this block.  ``policy_score`` is uncalibrated and an executor reading
+    a number it cannot interpret is how four different fields came to be named some form of
+    "confidence"; and there is no calibrated sibling to add, because nothing in this system is
+    calibrated.
+    """
+
+    status: DecisionStatus
+    selected_option: str | None = None
+    abstain_reason: AbstainReason | None = None
+    reason_for_asking: str | None = None
+    ood_status: OodStatus = OodStatus.UNKNOWN
+    conflict_status: ConflictStatus = ConflictStatus.NONE
+    evidence_observation_ids: list[str] = Field(default_factory=list, max_length=12)
+    decision_policy_revision: str = ""
+    exposed: bool = False
+    exposure_state: ExposureState = ExposureState.NO_QUALIFICATION
+    advisor_agreement: AdvisorAgreement = AdvisorAgreement.ABSENT
+
+
+# ``PolicyDecisionBlock`` is declared after the two responses that carry it, because this file
+# is append-only across phases and re-ordering it would rewrite another phase's block.  The
+# forward reference therefore has to be resolved explicitly, or the field stays an unbuilt
+# ForwardRef and the OpenAPI document silently loses the schema.
+TakeoverStepResponse.model_rebuild()
+BehaviorPredictionResponse.model_rebuild()
+
+
+# ---- P5 ----
+# Wire models for the four dream-proposal routes.  They live here, once, so that Full and Lite
+# import one definition and OpenAPI parity is mechanical rather than careful.
+#
+# There is no status enum declared in this block: ``DreamProposalStatus`` and
+# ``NonresponseState`` are imported from ``tce_shared.aspirations`` at the top of the module.
+
+
+class DreamProposalCitation(BaseModel):
+    """One quoted message behind a proposal.
+
+    ``receipt_id`` is required, not optional.  A message reaches a proposal only through a
+    ``trusted_input_receipts`` row binding it to the subject, so a citation without one could
+    not have been built — and a nullable field here would invite a future writer to build one.
+    The quote is a verbatim span of the cited message, checked against the decrypted body
+    before the proposal is written and again before it is shown.
+    """
+
+    event_id: UUID
+    receipt_id: UUID
+    origin_kind: str
+    observed_at: datetime
+    quote: str
+
+
+class DreamProposal(BaseModel):
+    """A proposal the owner can answer, and the evidence he can check it against.
+
+    Two fields carry the honesty of the whole surface.  ``citations_verified`` says whether the
+    citations behind this response were checked cheaply (existence, scope, sensitivity, receipt
+    binding) or deeply (the body decrypted and the quote re-found in it), so a reader is never
+    left guessing how much the system just proved.  ``attribution`` says whether these are words
+    the owner is receipted as having typed or lines from imported history — ``"you said"``
+    versus ``"from your imported history"`` — because a quote whose provenance is unclear is
+    worth less than no quote at all.
+
+    ``nonresponse`` is a separate axis from ``status`` and never becomes a verdict.  A proposal
+    nobody ever surfaced reads ``never_surfaced`` however old it is.
+    """
+
+    id: UUID
+    workspace_id: str
+    project_id: str | None = None
+    scope_kind: str
+    status: DreamProposalStatus
+    nonresponse: NonresponseState
+    surfaced_count: int = 0
+    surfaced_attested: bool = False
+    title: str
+    connection: str = ""
+    benefit: str = ""
+    first_step: str = ""
+    citations: list[DreamProposalCitation] = Field(default_factory=list)
+    citation_count: int = 0
+    citations_verified: str = "cheap"
+    evidence_basis: str
+    evidence_revision: str = ""
+    attribution: str = ""
+    supersedes_proposal_id: UUID | None = None
+    snooze_until: datetime | None = None
+    expires_at: datetime | None = None
+    task_id: str | None = None
+    plan_root_goal_id: UUID | None = None
+    pursuit_started_at: datetime | None = None
+    completed_at: datetime | None = None
+    rejection_reason: str = ""
+    revision: int = 0
+    created_at: datetime
+    updated_at: datetime
+    schema_version: str = "v1"
+
+
+class DreamProposalListResponse(BaseModel):
+    proposals: list[DreamProposal] = Field(default_factory=list)
+    total: int = 0
+    citations_verified: str = "cheap"
+    schema_version: str = "v1"
+
+
+class DreamProposalTransitionRequest(BaseModel):
+    """One route, one closed vocabulary.
+
+    The verb is in the body rather than the path so the vocabulary is closed on the wire: a
+    reader of the schema can see the five legal actions, and a sixth cannot arrive by someone
+    adding a route.  ``surfaced`` is a display record, not a verdict, and is the only action an
+    executor may post.
+    """
+
+    session_id: str = "default"
+    action: str
+    reason: str = ""
+    snooze_until: datetime | None = None
+
+
+class DreamRefreshRequest(BaseModel):
+    """``app_context`` is a project *hint*, resolved through the authenticated scope.
+
+    It is never an identity.  A project id is client-assertable, so the hint is entitlement-
+    checked against the subject's own receipts before a run is allowed to bind to it.  There is
+    no ``scope_kind`` field: the scope kind is derived from the resolved scope, and a body that
+    could assert it would be a second source of truth for the one thing that decides which
+    corpus a run reads.
+    """
+
+    session_id: str = "default"
+    app_context: dict[str, Any] | None = None
+
+
+class DreamRefreshResponse(BaseModel):
+    """What the refresh did, including — especially including — refusing to do anything.
+
+    A generation path that is entirely broken must not read as "no proposals today".  ``state``
+    and ``refusal_reason`` are always populated, and ``refusals``/``pool_drops`` carry the
+    per-reason counts, so an over-refusing system is visible in the response rather than looking
+    like a quiet week.
+    """
+
+    run_id: UUID | None = None
+    state: str = "refused"
+    refusal_reason: str = ""
+    proposals_written: int = 0
+    refusals: dict[str, int] = Field(default_factory=dict)
+    pool_size: int = 0
+    pool_drops: dict[str, int] = Field(default_factory=dict)
+    swept: dict[str, int] = Field(default_factory=dict)
+    reconciled: dict[str, int] = Field(default_factory=dict)
     schema_version: str = "v1"

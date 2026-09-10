@@ -1,4 +1,4 @@
-"""Goal-row authoring for plans and dreams, plus the ResolvedScope JSON boundary.
+"""Goal-row authoring for plans, plus the ResolvedScope JSON boundary.
 
 This module exists so the worker can write the same ``autonomy_goals`` rows the request
 thread writes, without importing ``main.py``. Every function here is transactional-neutral:
@@ -20,7 +20,6 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from tce_shared.dreams import DreamSeed
 from tce_shared.events import AutonomyGoalSource, AutonomyGoalStatus, AutonomyRiskTier, GoalKind
 from tce_shared.scope import (
     PROJECT_UNBOUND,
@@ -29,13 +28,6 @@ from tce_shared.scope import (
 )
 from tce_shared.takeover import sanitize_untrusted_objective
 from tce_shared.task_state import PlanStepState, canonical_json
-
-PLAN_DREAM_STEP_INDEX: int = -1
-"""Marks a stored aspiration. Plan roots are 0 and steps are 1..N, so a dream that gets
-pursued simply becomes a root; no separate table or wire field is needed.
-
-Moved here from ``main.py`` so the request thread and the worker share one literal."""
-
 
 _GOAL_INSERT = text(
     """
@@ -153,58 +145,6 @@ def write_plan_rows(
     return root_id
 
 
-def write_dream_rows(
-    db: Session,
-    *,
-    scope: ResolvedScope,
-    session_id: str,
-    seeds: Sequence[DreamSeed],
-    contract_revision: int,
-    now: datetime,
-) -> list[str]:
-    """Discovery rows for dream seeds; returns the new goal ids. **NEVER commits.**
-
-    A separate function rather than ``write_plan_rows`` with a mode flag, because the row
-    shape genuinely differs: no root goal, ``step_index = PLAN_DREAM_STEP_INDEX``,
-    ``parent_goal_id = None``, no dependencies and no attempts. ``mutating`` is always
-    ``False`` — a discovery row authorises nothing. ``plan_contract_revision`` is never
-    NULL, because the plan-step predicate ``AND plan_contract_revision = :contract_revision``
-    can never match NULL.
-    """
-    goal_ids: list[str] = []
-    for seed in seeds:
-        goal_id = str(uuid.uuid4())
-        title = str(seed.title or "")
-        _insert_goal_row(
-            db,
-            goal_id=goal_id,
-            scope=scope,
-            session_id=session_id,
-            title=title,
-            description=str(seed.description or title),
-            source=AutonomyGoalSource.OPEN_DISCOVERY.value,
-            priority_score=float(seed.weight),
-            selection_score=float(seed.weight),
-            risk_tier=AutonomyRiskTier.LOW.value,
-            confidence=float(seed.weight),
-            reasoning=str(seed.rationale or "")[:400],
-            evidence_event_ids=_uuid_list(seed.evidence_event_ids),
-            cache_source="dream",
-            status=AutonomyGoalStatus.CANDIDATE.value,
-            parent_goal_id=None,
-            step_index=PLAN_DREAM_STEP_INDEX,
-            contract_revision=contract_revision,
-            attempt_count=0,
-            blocked_reason="",
-            depends_on=(),
-            mutating=False,
-            signature_seed=f"dream|{session_id}|{title}",
-            now=now,
-        )
-        goal_ids.append(goal_id)
-    return goal_ids
-
-
 def _plan_objective_title(
     steps: Sequence[PlanStepState], task_id: str, objective_text: str = ""
 ) -> str:
@@ -224,16 +164,6 @@ def _plan_objective_title(
         if title:
             return title
     return str(task_id or "objective")
-
-
-def _uuid_list(values: Sequence[str]) -> list[uuid.UUID]:
-    out: list[uuid.UUID] = []
-    for value in values:
-        try:
-            out.append(uuid.UUID(str(value)))
-        except (ValueError, AttributeError, TypeError):
-            continue
-    return out
 
 
 def _insert_goal_row(

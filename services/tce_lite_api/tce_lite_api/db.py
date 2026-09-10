@@ -1003,6 +1003,343 @@ def _ensure_charter_effects_schema(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+def _ensure_decision_policy_schema(conn: sqlite3.Connection) -> None:
+    """P4 decision policy: qualification records, threshold registrations, and the columns a
+    decision needs.
+
+    Mirrors alembic revision ``20260909_0040`` (Full).  Additive and idempotent only; no
+    ``commit()`` here — ``init_db`` commits once at the end.  Table names, column names and
+    index names are identical to the Full revision so the two can be diffed line for line;
+    only the types are rendered in the house Lite mapping (``UUID``/``TIMESTAMPTZ`` -> ``TEXT``
+    holding ISO strings, ``JSONB`` -> ``TEXT`` holding JSON, ``BOOLEAN`` -> ``INTEGER`` 0/1,
+    ``REAL`` -> ``REAL``).
+
+    Two defaults are load-bearing and are the same in both backends:
+
+    * ``decision_advice_shown`` defaults to **1** (true), the conservative direction.  A row
+      written by a writer that has not been upgraded is *excluded* from the promotion gate
+      rather than silently admitted to it.  The column it replaces in that role,
+      ``advice_visible``, was produced as ``bool(<eight-key dict literal>)`` at three sites in
+      this file's callers, so it was ``True`` unconditionally and never measured anything.
+    * ``threshold_registrations.registered_at`` defaults to the **server** clock and takes no
+      client-supplied value.  That is tamper-evident, not tamper-proof, and the docstring in
+      ``policy_thresholds`` says so.
+    """
+
+    # Imported here rather than at module scope: `policy_store` is a P4 module and `db` is
+    # imported by everything, so the one name they share travels in the direction that cannot
+    # produce an import cycle. The physical column names are the Full revision's; this is the
+    # sqlite rendering of the same four -- see the constant's docstring.
+    from .policy_store import LITE_REPLAY_INPUT_DDL
+
+    # Full applies its twin exactly once, as an alembic revision. This guard runs on every
+    # boot, so the two statements at the bottom that are one-time DATA changes rather than
+    # idempotent schema changes must be fenced. Without the fence, the fidelity-run
+    # invalidation would re-fire on every restart and wipe the status of runs recorded after
+    # P4 landed -- a migration that keeps migrating.
+    first_migration_pass = not _column_exists(conn, "behavior_shadow_predictions", "policy_json")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS policy_qualifications (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL,
+            project_id TEXT,
+            decision_family TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'not_qualified',
+            decision_policy_revision TEXT NOT NULL,
+            model_id TEXT NOT NULL DEFAULT '',
+            runtime_version TEXT NOT NULL DEFAULT '',
+            prompt_sha256 TEXT NOT NULL DEFAULT '',
+            retrieval_version TEXT NOT NULL DEFAULT '',
+            evidence_revision TEXT,
+            evidence_cutoff_at TEXT,
+            learning_eligible_at_qualification INTEGER NOT NULL DEFAULT 0,
+            thresholds_sha TEXT NOT NULL,
+            thresholds_version TEXT NOT NULL DEFAULT '',
+            tuning_sha TEXT NOT NULL,
+            split_sha256 TEXT,
+            split_json TEXT NOT NULL DEFAULT '{}',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            gate_json TEXT NOT NULL DEFAULT '{}',
+            shortfalls_json TEXT NOT NULL DEFAULT '[]',
+            adjudicated_count INTEGER NOT NULL DEFAULT 0,
+            non_abstained_count INTEGER NOT NULL DEFAULT 0,
+            coverage REAL NOT NULL DEFAULT 0,
+            precision_lower_bound REAL NOT NULL DEFAULT 0,
+            distinct_episodes INTEGER NOT NULL DEFAULT 0,
+            duplicate_context_ratio REAL NOT NULL DEFAULT 0,
+            baselines_json TEXT NOT NULL DEFAULT '{}',
+            exclusions_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_policy_qualifications_attempt "
+        "ON policy_qualifications (workspace_id, subject_user_id, project_id, decision_family, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_policy_qualifications_live "
+        "ON policy_qualifications (workspace_id, subject_user_id, decision_family, state, created_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS threshold_registrations (
+            id TEXT PRIMARY KEY,
+            thresholds_sha TEXT NOT NULL,
+            tuning_sha TEXT NOT NULL,
+            thresholds_json TEXT NOT NULL DEFAULT '{}',
+            registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_threshold_registrations_sha "
+        "ON threshold_registrations (thresholds_sha, tuning_sha)"
+    )
+
+    # Same names, same order as _OBSERVATION_COLUMNS / _SHADOW_COLUMNS in the Full revision.
+    observation_columns = {
+        "project_id": "TEXT",
+        "decision_family": "TEXT",
+        "task_id": "TEXT",
+        "episode_key": "TEXT",
+    }
+    for name, ddl in observation_columns.items():
+        if not _column_exists(conn, "decision_observations", name):
+            conn.execute(f"ALTER TABLE decision_observations ADD COLUMN {name} {ddl}")
+    shadow_columns = {
+        "decision_policy_revision": "TEXT",
+        "model_id": "TEXT",
+        "runtime_version": "TEXT",
+        "prompt_sha256": "TEXT",
+        "retrieval_version": "TEXT",
+        "episode_key": "TEXT",
+        "project_id": "TEXT",
+        "abstain_reason": "TEXT",
+        "ood_status": "TEXT",
+        "conflict_status": "TEXT",
+        "policy_score": "REAL NOT NULL DEFAULT 0",
+        "exposed": "INTEGER NOT NULL DEFAULT 0",
+        "decision_advice_shown": "INTEGER NOT NULL DEFAULT 1",
+        "candidate_option_count": "INTEGER NOT NULL DEFAULT 0",
+        "request_fingerprint": "TEXT",
+        "policy_json": "TEXT NOT NULL DEFAULT '{}'",
+        # ---- alembic 20260909_0041's four, same names, same order ------------------------
+        # The inputs a replay needs and could not previously get: the OFFERED evidence set (as
+        # opposed to the cited subset `policy_json` already carries), the decision's own
+        # timestamp (the freeze site takes a second `now_utc()`, so `frozen_at` is later), and
+        # the two advisor terms `DecisionRequest.fingerprint()` hashes. Without them a row with
+        # non-empty evidence could not be reconstructed at all: replay had to re-retrieve, and a
+        # re-retrieval answers a different question.
+        **LITE_REPLAY_INPUT_DDL,
+    }
+    for name, ddl in shadow_columns.items():
+        if not _column_exists(conn, "behavior_shadow_predictions", name):
+            conn.execute(f"ALTER TABLE behavior_shadow_predictions ADD COLUMN {name} {ddl}")
+    if not _column_exists(conn, "decision_opportunities", "episode_key"):
+        conn.execute("ALTER TABLE decision_opportunities ADD COLUMN episode_key TEXT")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decision_obs_policy_scope "
+        "ON decision_observations (workspace_id, subject_user_id, decision_family, situation_type)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_behavior_shadow_episode "
+        "ON behavior_shadow_predictions (workspace_id, subject_user_id, decision_family, episode_key)"
+    )
+
+    if not first_migration_pass:
+        return
+
+    # ---- one-time data changes, fenced above -----------------------------------------
+
+    # Backfill from the opportunity that promoted the observation, exactly as the Full
+    # revision does. Reaches P1-era promoted rows only; everything older keeps NULL and is
+    # handled by the NULL-project rule in observations_scope_predicate (admissible evidence,
+    # never sufficient on its own).
+    conn.execute(
+        """
+        UPDATE decision_observations
+           SET project_id = (
+                   SELECT d.project_id FROM decision_opportunities d WHERE d.id = decision_observations.opportunity_id
+               ),
+               decision_family = (
+                   SELECT d.decision_family FROM decision_opportunities d WHERE d.id = decision_observations.opportunity_id
+               ),
+               task_id = (
+                   SELECT d.task_id FROM decision_opportunities d WHERE d.id = decision_observations.opportunity_id
+               )
+         WHERE project_id IS NULL
+           AND opportunity_id IS NOT NULL
+           AND EXISTS (SELECT 1 FROM decision_opportunities d WHERE d.id = decision_observations.opportunity_id)
+        """
+    )
+
+    # Every stored fidelity run was computed under corpus-relative recency and a row-index
+    # split, so none is comparable with anything measured after this revision. Invalidated
+    # rather than migrated; the qualification reporter refuses to read them.
+    conn.execute("UPDATE behavior_fidelity_runs SET status = 'invalidated_by_p4'")
+
+
+def _ensure_dream_proposal_schema(conn: sqlite3.Connection) -> None:
+    """P5 aspirations: an append-only proposal log, the human transition vocabulary, and the
+    record of every generation attempt — including the ones that refused to generate anything.
+
+    Mirrors alembic revision ``20260909_0042`` (Full), column for column and index name for
+    index name, so the two schemas can be diffed rather than reasoned about.  Type mapping is
+    the house one: ``UUID`` -> ``TEXT``, ``TIMESTAMPTZ`` -> ``TEXT`` (ISO-8601 strings),
+    ``JSONB`` -> ``TEXT`` with a ``'[]'`` / ``'{}'`` string default, ``BOOLEAN`` -> ``INTEGER``.
+
+    Additive and idempotent only.  Like the Full revision, this guard never drops or recreates
+    a table that exists, and it touches no ``autonomy_goals`` row: these tables hold the
+    owner's own accept/reject answers, and Lite has no downgrade path that could put them back.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dream_proposals (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,
+            scope_kind TEXT NOT NULL DEFAULT 'project',
+            session_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            highest_seq INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            nonresponse_state TEXT NOT NULL DEFAULT 'never_surfaced',
+            surfaced_count INTEGER NOT NULL DEFAULT 0,
+            surfaced_attested INTEGER NOT NULL DEFAULT 0,
+            first_surfaced_at TEXT,
+            last_surfaced_at TEXT,
+            title TEXT NOT NULL,
+            connection_text TEXT NOT NULL DEFAULT '',
+            benefit_text TEXT NOT NULL DEFAULT '',
+            first_step TEXT NOT NULL DEFAULT '',
+            citations_json TEXT NOT NULL DEFAULT '[]',
+            citation_count INTEGER NOT NULL DEFAULT 0,
+            evidence_basis TEXT NOT NULL DEFAULT 'trusted_current',
+            evidence_revision TEXT NOT NULL DEFAULT '',
+            evidence_cutoff_at TEXT,
+            theme_tokens_json TEXT NOT NULL DEFAULT '[]',
+            supersedes_proposal_id TEXT,
+            repropose_depth INTEGER NOT NULL DEFAULT 0,
+            snooze_until TEXT,
+            expires_at TEXT,
+            accepted_at TEXT,
+            rejected_at TEXT,
+            rejection_reason TEXT NOT NULL DEFAULT '',
+            task_id TEXT,
+            objective_hash TEXT,
+            plan_root_goal_id TEXT,
+            pursuit_started_at TEXT,
+            completed_at TEXT,
+            abandoned_at TEXT,
+            abandon_reason TEXT NOT NULL DEFAULT '',
+            withdrawn_reason TEXT NOT NULL DEFAULT '',
+            source_revision TEXT NOT NULL DEFAULT '',
+            policy_revision TEXT NOT NULL DEFAULT 'p5-2026-09',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_proposals_scope_status "
+        "ON dream_proposals (workspace_id, owner_id, subject_user_id, scope_kind, project_id, status, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_proposals_task ON dream_proposals (workspace_id, owner_id, task_id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dream_proposals_run ON dream_proposals (run_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_proposals_supersedes ON dream_proposals (supersedes_proposal_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dream_proposal_events (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            actor TEXT NOT NULL DEFAULT '',
+            actor_class TEXT NOT NULL DEFAULT 'system',
+            source_event_id TEXT,
+            run_id TEXT,
+            occurred_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    # The uniqueness that makes the append idempotent, exactly as in the Full revision: an
+    # INSERT ... ON CONFLICT DO NOTHING on (proposal_id, seq) is what lets a retried CAS
+    # re-issue its events without doubling them.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_proposal_events_seq ON dream_proposal_events (proposal_id, seq)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_proposal_events_kind "
+        "ON dream_proposal_events (workspace_id, owner_id, kind, occurred_at DESC)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dream_generation_runs (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            subject_user_id TEXT NOT NULL DEFAULT '',
+            project_id TEXT,
+            scope_kind TEXT NOT NULL DEFAULT 'project',
+            scope_key TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            planning_job_id TEXT,
+            state TEXT NOT NULL DEFAULT 'running',
+            refusal_reason TEXT NOT NULL DEFAULT '',
+            pool_size INTEGER NOT NULL DEFAULT 0,
+            pool_json TEXT NOT NULL DEFAULT '[]',
+            pool_drops_json TEXT NOT NULL DEFAULT '{}',
+            evidence_revision TEXT NOT NULL DEFAULT '',
+            evidence_cutoff_at TEXT,
+            candidates_returned INTEGER NOT NULL DEFAULT 0,
+            proposals_written INTEGER NOT NULL DEFAULT 0,
+            refusals_json TEXT NOT NULL DEFAULT '{}',
+            model_provider TEXT NOT NULL DEFAULT '',
+            prompt_hash TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            schema_version TEXT NOT NULL DEFAULT 'v1'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_generation_runs_scope "
+        "ON dream_generation_runs (workspace_id, owner_id, scope_kind, project_id, started_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dream_generation_runs_job ON dream_generation_runs (planning_job_id)"
+    )
+    # At most one in-flight run per scope, enforced by the database rather than by a read
+    # followed by a write.  SQLite supports partial unique indexes, so this is the same
+    # predicate the Full revision writes rather than a Lite-shaped approximation.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_dream_generation_runs_inflight "
+        "ON dream_generation_runs (workspace_id, owner_id, scope_key) WHERE state = 'running'"
+    )
+
+
 def _ensure_takeover_v3_schema(conn: sqlite3.Connection) -> None:
     if not _column_exists(conn, "takeover_sessions", "objective_hash"):
         conn.execute("ALTER TABLE takeover_sessions ADD COLUMN objective_hash TEXT")
@@ -2185,6 +2522,8 @@ def init_db() -> None:
         _ensure_trusted_capture_schema(conn)
         _ensure_task_state_schema(conn)
         _ensure_charter_effects_schema(conn)
+        _ensure_decision_policy_schema(conn)
+        _ensure_dream_proposal_schema(conn)
         _seed_lifecycle_defaults(conn)
         conn.commit()
     finally:

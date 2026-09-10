@@ -189,7 +189,6 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "completions": [],
         "complete_returns": True,
         "plan_rows": [],
-        "dream_rows": [],
         "applied": [],
         "gateway": _Gateway(),
         "revalidate_projection": None,
@@ -224,12 +223,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         db.execute("INSERT INTO autonomy_goals (...) VALUES (...)", {})
         return str(kwargs.get("root_goal_id") or "root")
 
-    def _write_dreams(db: Any, **kwargs: Any) -> list[str]:
-        state["dream_rows"].append(kwargs)
-        db.execute("INSERT INTO autonomy_goals (...) VALUES (...)", {})
-        return ["dream-1"]
-
-    for module in (planning, dream_synthesis):
+    for module in (planning,):
         monkeypatch.setattr(module, "get_settings", lambda: _Settings())
         monkeypatch.setattr(module, "get_session_factory", _factory)
         monkeypatch.setattr(module, "claim_planning_job", _claim)
@@ -238,7 +232,6 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         monkeypatch.setattr(module, "apply_task_state_events", _apply)
         monkeypatch.setattr(module, "get_gateway", lambda _settings: state["gateway"])
     monkeypatch.setattr(planning, "write_plan_rows", _write_plan)
-    monkeypatch.setattr(dream_synthesis, "write_dream_rows", _write_dreams)
     return state
 
 
@@ -461,53 +454,3 @@ def test_replay_is_idempotent(harness: dict[str, Any]) -> None:
     assert planning.run(JOB_ID)["status"] == "succeeded"
     harness["claimed"] = []  # the row is no longer claimable
     assert planning.run(JOB_ID)["status"] == "skipped"
-
-
-# --------------------------------------------------------------------------- dream synthesis
-
-
-def test_dream_prompt_moved_intact() -> None:
-    assert dream_synthesis.DREAM_PROMPT.count("__MESSAGES__") == 1
-    assert "Reply with JSON only" in dream_synthesis.DREAM_PROMPT
-
-
-def test_dream_seeds_require_citations() -> None:
-    messages = [(f"evt-{i}", f"message {i}") for i in range(1, 6)]
-    payload = {
-        "dreams": [
-            {"title": "get it in front of someone", "why": "you keep saying so", "message_numbers": [1, 3]},
-            {"title": "no citation", "why": "nothing", "message_numbers": []},
-            {"title": "bad citation", "why": "nothing", "message_numbers": [99]},
-        ]
-    }
-    seeds = dream_synthesis._dream_seeds_from_payload(payload, messages=messages, project_id="p1")
-    assert len(seeds) == 1
-    assert seeds[0].evidence_event_ids == ("evt-1", "evt-3")
-    assert seeds[0].project_id == "p1"
-    assert dream_synthesis._dream_seeds_from_payload({"dreams": "nope"}, messages=messages) == []
-
-
-def test_dream_job_writes_discovery_rows(monkeypatch: pytest.MonkeyPatch, harness: dict[str, Any]) -> None:
-    harness["claimed"] = [_job_row(job_kind=PLANNING_JOB_KIND_DREAM)]
-    harness["gateway"] = _Gateway(
-        {"dreams": [{"title": "ship it", "why": "you keep saying so", "message_numbers": [1, 2]}]}
-    )
-    monkeypatch.setattr(
-        dream_synthesis,
-        "_recent_messages_for_dreaming",
-        lambda _db, **_kwargs: [(f"evt-{i}", f"message {i}") for i in range(1, 15)],
-    )
-    result = dream_synthesis.run(JOB_ID)
-    assert result["status"] == "succeeded"
-    assert harness["dream_rows"], "no discovery rows were written"
-    kinds = [str(event.kind) for event in harness["applied"][0]["new_events"]]
-    assert kinds == ["plan_requested"], "a dream is a candidate, never an approved plan"
-
-
-def test_dream_job_needs_enough_messages(monkeypatch: pytest.MonkeyPatch, harness: dict[str, Any]) -> None:
-    harness["claimed"] = [_job_row(job_kind=PLANNING_JOB_KIND_DREAM)]
-    monkeypatch.setattr(dream_synthesis, "_recent_messages_for_dreaming", lambda _db, **_kwargs: [])
-    result = dream_synthesis.run(JOB_ID)
-    assert result["status"] == "succeeded"
-    assert result["reason"] == "insufficient_messages"
-    assert not harness["dream_rows"]

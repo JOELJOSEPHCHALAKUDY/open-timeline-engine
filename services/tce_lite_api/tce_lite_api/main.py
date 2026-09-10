@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
@@ -21,7 +21,7 @@ from typing import Any, Literal, cast
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from ote_advisor_providers import get_provider, list_provider_metadata, resolve_fallback_chain
 from ote_advisor_providers.base import ProviderAttemptResult, ProviderRequest
@@ -49,6 +49,19 @@ from ote_advisor_providers.router import (
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from tce_shared.aspirations import (
+    DISPLAY_ACTIONS,
+    HUMAN_VERDICT_ACTIONS,
+    SCOPE_KIND_PROJECT,
+    DreamCitation,
+    DreamProposalEvent,
+    DreamProposalEventKind,
+    DreamProposalProjection,
+    DreamRevisionConflict,
+    DreamTransitionRefused,
+    PoolMessage,
+    dream_proposal_summary_fields,
+)
 from tce_shared.behavior_control import normalize_counterfactual, redact_control_text
 from tce_shared.behavior_fidelity import (
     CALIBRATION_SCENARIOS,
@@ -56,7 +69,6 @@ from tce_shared.behavior_fidelity import (
     eligible_behavior_evidence,
     evaluate_behavior_fidelity,
     normalize_behavior_evidence,
-    predict_behavior,
 )
 from tce_shared.behavior_pilot import (
     assign_behavior_pilot_variant,
@@ -73,7 +85,20 @@ from tce_shared.charter import (
     resolved_charter_to_json,
 )
 from tce_shared.dashboard import timeline_dashboard_html
-from tce_shared.decision_capture import HOST_CAPTURE_CAPABILITY, HOST_CAPTURE_SOURCE, HUMAN_INPUT_TASK_TYPE, TRUSTED_ORIGINS
+from tce_shared.decision_capture import (
+    HOST_CAPTURE_CAPABILITY,
+    HOST_CAPTURE_SOURCE,
+    HUMAN_INPUT_TASK_TYPE,
+    TRUSTED_ORIGINS,
+    evidence_revision,
+)
+from tce_shared.decision_policy import (
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    OodStatus,
+    decide,
+)
 from tce_shared.effect_journal import (
     EFFECT_ACTOR_OWNER,
     EFFECT_REOPENABLE_TRANSITIONS,
@@ -128,6 +153,12 @@ from tce_shared.events import (
     DispatchOpenRequest,
     DispatchReconcileRequest,
     DispatchResponse,
+    DreamProposal,
+    DreamProposalCitation,
+    DreamProposalListResponse,
+    DreamProposalTransitionRequest,
+    DreamRefreshRequest,
+    DreamRefreshResponse,
     EffectOpenRequest,
     EffectResolveRequest,
     EffectResponse,
@@ -146,6 +177,7 @@ from tce_shared.events import (
     MemoryReviewResolveRequest,
     PatternFeedbackRequest,
     PlanningJobStatusResponse,
+    PolicyDecisionBlock,
     ProcessMiningRequest,
     ProcessMiningResponse,
     ProcessModelItem,
@@ -193,7 +225,7 @@ from tce_shared.handoff import normalize_milestone_v1
 from tce_shared.project_context import canonical_project_context, project_context_from_payload
 from tce_shared.rate_limit import InMemoryRateLimiter
 from tce_shared.redaction import redact_project_hint, redact_text
-from tce_shared.scope import PROJECT_BOUND
+from tce_shared.scope import PROJECT_BOUND, ResolvedScope
 from tce_shared.task_state import (
     TaskStatePreconditionFailed,
     TaskStateProjection,
@@ -264,7 +296,25 @@ from .continuity_store import (
     requeue_dead_handoff,
 )
 from .db import get_db, init_db
+from .dream_store import (
+    append_surfaced,
+    apply_dream_events,
+    dream_scope_kind,
+    finish_generation_run,
+    list_proposals,
+    load_live_proposals,
+    load_proposal,
+    load_proposal_stamps,
+    reconcile_dream_pursuit,
+    select_candidate_messages,
+    start_generation_run,
+    subject_has_project_receipts,
+    sweep_dream_proposals,
+    validate_citations_cheap,
+    validate_citations_deep,
+)
 from .planning_store import get_planning_job, sweep_stale_planning_jobs
+from .policy_store import build_decision_request, persist_policy_decision
 from .store import (
     acknowledge_takeover_notice as store_acknowledge_takeover_notice,
 )
@@ -481,6 +531,39 @@ settings = get_settings()
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_evidence_ts(raw: Any) -> datetime | None:
+    """Decision time for a retrospective shadow: the observation's own timestamp.
+
+    Returns ``None`` rather than ``datetime.now()`` on a value it cannot read, so the caller
+    makes the substitution explicitly.  A silent now() fallback is exactly the train/serve skew
+    ``decision_at`` exists to remove, and it would be invisible in replay.
+    """
+
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _uuid_citations(values: Sequence[str]) -> list[UUID]:
+    """Observation ids that are real UUIDs, as UUIDs.  Anything else is dropped rather than
+    coerced: a citation that does not resolve is not a citation."""
+
+    output: list[UUID] = []
+    for value in values:
+        try:
+            output.append(UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return output
 
 
 @asynccontextmanager
@@ -5350,27 +5433,46 @@ def _store_behavior_evidence_lite_api(
     prior_evidence: list[dict[str, Any]] = []
     shadow_prediction: dict[str, Any] | None = None
     shadow_latency_ms = 0
+    shadow_result: DecisionResult | None = None
+    shadow_request: DecisionRequest | None = None
     if bool(getattr(settings, "behavior_shadow_evaluation_enabled", True)):
-        prior_evidence = load_behavior_evidence_lite(
-            conn,
-            workspace_id=auth.workspace_id,
-            subject_user_id=auth.behavior_subject_id,
-            limit=500,
-            eligible_only=True,
-        )
+        # R6: the retrospective shadow decides at the OBSERVATION's time, not at now(). The
+        # recency term used to be anchored on the newest row in the corpus, which made a
+        # 900-day-old corpus and a 5-day-old corpus produce byte-identical predictions -- a
+        # replay could not tell them apart, so nothing the harness measured was about time.
+        shadow_scope = auth.resolved_scope()
+        observation_at = _parse_evidence_ts(normalized.get("ts")) or datetime.now(tz=UTC)
         shadow_started = time.perf_counter()
-        shadow_prediction = predict_behavior(
-            prior_evidence,
-            {
-                "situation_type": normalized["situation_type"],
-                "situation_summary": normalized["situation_summary"],
-                "objective_text": normalized["objective_text"],
-                "constraints": normalized["constraints"],
-                "context_snapshot": normalized["context_snapshot"],
-            },
-            candidate_choices=list(normalized.get("available_choices") or []),
-            min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        )
+        try:
+            shadow_request = build_decision_request(
+                conn,
+                scope=shadow_scope,
+                settings=settings,
+                decision_family=str(normalized.get("decision_family") or "behavior_evidence"),
+                situation_type=str(normalized["situation_type"]),
+                situation_summary=str(normalized["situation_summary"]),
+                objective_text=str(normalized["objective_text"]),
+                constraints=normalized["constraints"] if isinstance(normalized.get("constraints"), dict) else {},
+                context_snapshot=normalized["context_snapshot"] if isinstance(normalized.get("context_snapshot"), dict) else {},
+                candidate_options=[str(item) for item in (normalized.get("available_choices") or [])],
+                decision_at=observation_at,
+                session_id=str(normalized.get("session_id") or ""),
+                objective_hash=None,
+            )
+            shadow_result = decide(shadow_request)
+            prior_evidence = [dict(row) for row in shadow_request.evidence_rows]
+            shadow_prediction = {
+                "predicted_choice": shadow_result.selected_option,
+                "abstained": shadow_result.status is DecisionStatus.ABSTAINED,
+                "confidence": float(shadow_result.policy_score),
+                "citations": list(shadow_result.evidence_observation_ids),
+            }
+        except Exception:
+            # A shadow that cannot be computed is recorded as absent. It must never fail the
+            # write of the human's own evidence, which is the thing this endpoint exists for.
+            _LOGGER.warning("retrospective shadow decision failed", exc_info=True)
+            shadow_result = None
+            shadow_prediction = None
         shadow_latency_ms = max(0, int((time.perf_counter() - shadow_started) * 1000))
     mode = str(getattr(settings, "behavior_storage_gate_mode", "shadow") or "shadow").strip().lower()
     if mode not in {"shadow", "warn", "enforce"}:
@@ -5463,6 +5565,22 @@ def _store_behavior_evidence_lite_api(
             evidence_count=len(prior_evidence),
             latency_ms=shadow_latency_ms,
         )
+        if shadow_result is not None and shadow_request is not None:
+            persist_policy_decision(
+                conn,
+                prediction_id=shadow_prediction_id,
+                result=shadow_result,
+                request=shadow_request,
+                project_id=auth.resolved_scope().project_id,
+                episode_key="",
+                # A retrospective row is scored after the fact and never gates anything, but it
+                # is still marked contaminated rather than clean: the answer already existed
+                # when the decision was computed, which is a stronger contamination than any the
+                # promotion gate is testing for.
+                decision_advice_shown=True,
+                candidate_option_count=len([str(item) for item in (normalized.get("available_choices") or [])]),
+            )
+            conn.commit()
     if storage_gate["learning_eligible"]:
         fingerprint_data = load_fingerprint_lite(
             conn,
@@ -5912,33 +6030,54 @@ def predict_behavior_choice(
     _enforce_workspace_access(auth, conn)
     if not bool(getattr(settings, "behavior_prediction_enabled", True)):
         raise HTTPException(status_code=404, detail="behavior prediction is disabled")
-    evidence = load_behavior_evidence_lite(
+    # R4: this route no longer calls the kNN primitive directly. `decide()` is the only
+    # function in this repo that may select a decision option or abstain from selecting one,
+    # and this route is one of its deployed callers -- which is the whole point of P4: before
+    # it, every route marked "deployed" was marked "not evaluated" and vice versa.
+    now = datetime.now(tz=UTC)
+    request = build_decision_request(
         conn,
-        workspace_id=auth.workspace_id,
-        subject_user_id=auth.behavior_subject_id,
-        limit=2000,
-        eligible_only=True,
+        scope=auth.resolved_scope(),
+        settings=settings,
+        decision_family=str(getattr(body, "decision_family", "") or "behavior_predict"),
+        situation_type=body.situation_type,
+        situation_summary=body.situation_summary,
+        objective_text=body.objective,
+        constraints=body.constraints if isinstance(body.constraints, dict) else {},
+        context_snapshot=body.context_snapshot if isinstance(body.context_snapshot, dict) else {},
+        candidate_options=[str(item) for item in (body.candidate_choices or [])],
+        decision_at=now,
+        session_id="",
+        objective_hash=None,
     )
-    prediction = predict_behavior(
-        evidence,
-        {
-            "situation_type": body.situation_type,
-            "situation_summary": body.situation_summary,
-            "objective_text": body.objective,
-            "constraints": body.constraints,
-            "context_snapshot": body.context_snapshot,
-        },
-        candidate_choices=body.candidate_choices,
-        min_confidence=max(
-            body.min_confidence,
-            float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        ),
-    )
+    result = decide(request)
+    abstained = result.status is DecisionStatus.ABSTAINED
+    prediction: dict[str, Any] = {
+        "predicted_choice": result.selected_option,
+        "ranked_choices": [
+            {"choice": item.option, "share": item.share} for item in result.ranked_options
+        ],
+        # UNCALIBRATED, and the field description on the model now says so. Nothing in this
+        # system has ever been fit to or checked against an outcome.
+        "confidence": float(result.policy_score),
+        "abstained": abstained,
+        "needs_clarification": abstained,
+        "clarification_question": result.reason_for_asking if abstained else None,
+        "citations": _uuid_citations(result.evidence_observation_ids),
+        "neighbor_count": result.adequacy.neighbour_count,
+        "effective_neighbor_count": result.adequacy.effective_sample_size,
+        "out_of_distribution": result.ood_status is OodStatus.OUT_OF_DISTRIBUTION,
+        "ood_score": result.ood_score,
+        "predicted_action": result.suggested_action,
+    }
     gate = latest_fidelity_gate_lite(
         conn,
         workspace_id=auth.workspace_id,
         subject_user_id=auth.behavior_subject_id,
     )
+    # FN4: this guard and its False default are untouched by P4. Removing it is one of the two
+    # routes by which an earlier draft escalated every turn on a corpus where no family is
+    # qualified. With the default off, nothing reads `gate` at all.
     if bool(getattr(settings, "behavior_autonomy_gate_enabled", False)) and not bool(gate.get("passed", False)):
         prediction.update(
             {
@@ -5948,7 +6087,11 @@ def predict_behavior_choice(
                 "clarification_question": "Behavior fidelity is not validated yet. What choice should be made?",
             }
         )
-    return BehaviorPredictionResponse(**prediction, fidelity_gate=gate)
+    return BehaviorPredictionResponse(
+        **prediction,
+        fidelity_gate=gate,
+        policy_decision=PolicyDecisionBlock.model_validate(result.block_payload()),
+    )
 
 
 @app.post("/v1/behavior/evaluate", response_model=BehaviorEvaluationResponse)
@@ -8026,6 +8169,511 @@ def handoff_outbox_requeue(
     payload = requeue_dead_handoff(conn, auth=auth, outbox_id=str(outbox_id), now=now_utc())
     _charter_audit(conn, auth=auth, action="outbox_requeue", query={"outbox_id": str(outbox_id)})
     return payload
+
+
+# ---------------------------------------------------------------------------
+# P5 — dream proposals (§4.1).  Four routes, the same four Full exposes, sharing the
+# request and response models declared once in ``tce_shared.events`` so wire parity is
+# mechanical rather than careful.
+#
+# What Lite cannot do is generate: there is no model gateway here, so
+# ``POST /v1/dreams/refresh`` runs every step that does not need a model and then refuses
+# ``model_unavailable`` in a real ``dream_generation_runs`` row.  Every other route —
+# storage, the fold, the transitions, both validators, the sweep and the pursuit
+# reconciler — is backend-neutral and fully functional.
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(DreamRevisionConflict)
+def _dream_revision_conflict(request: Request, exc: DreamRevisionConflict) -> JSONResponse:
+    """A lost compare-and-swap is a 409, not a 500.
+
+    Without this handler the exception escapes as an unhandled error and a retrying client
+    is told the server broke rather than that it lost a race it can simply repeat.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_revision_conflict",
+            "proposal_id": exc.proposal_id,
+            "expected_revision": exc.expected_revision,
+            "actual_revision": exc.actual_revision,
+        },
+    )
+
+
+@app.exception_handler(DreamTransitionRefused)
+def _dream_transition_refused(request: Request, exc: DreamTransitionRefused) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "reason": "dream_transition_refused",
+            "proposal_id": exc.proposal_id,
+            "detail": exc.reason,
+        },
+    )
+
+
+def _dreams_enabled() -> None:
+    if not bool(getattr(settings, "dream_proposals_enabled", True)):
+        raise HTTPException(status_code=503, detail="dream proposals are disabled")
+
+
+def _dream_verdict_gate(auth: AuthContext, action: str) -> None:
+    """D7 — a verdict requires a verified human; a display record does not.
+
+    ``surfaced`` is not a verdict.  It is the statement "this was put in front of the owner",
+    and the thing that puts it in front of him is the executor's renderer, so requiring a
+    human to attest that the executor displayed something would make the field unreachable.
+    The abuse ceiling is bounded and worth stating: an executor spamming ``surfaced`` can only
+    drive the nonresponse axis to ``ignored``, whose sole effect is a *longer* re-surface
+    interval.  It cannot reject, suppress, expire anything early, or appear as the owner's
+    answer.
+    """
+    if action not in HUMAN_VERDICT_ACTIONS:
+        return
+    is_human = auth.role == AgentRole.USER
+    verified = bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities
+    if not (is_human and verified):
+        raise HTTPException(status_code=403, detail="a dream verdict requires a verified human identity")
+
+
+def _dream_actor_class(auth: AuthContext) -> str:
+    if auth.role == AgentRole.USER and (bool(auth.identity_verified) or HOST_CAPTURE_CAPABILITY in auth.capabilities):
+        return "human"
+    return "executor"
+
+
+def _dream_proposal_model(
+    projection: DreamProposalProjection,
+    *,
+    source_revision: str,
+    citations_verified: str,
+    citations: Sequence[DreamCitation],
+    created_at: datetime | None,
+    updated_at: datetime | None,
+) -> DreamProposal:
+    """One projection -> one wire model, derived through the shared helper.
+
+    ``citations`` is passed in rather than read off the projection because what crosses the
+    wire is the set that just re-validated, not the set that was stored — a proposal is never
+    shown with evidence the request could not prove.  The hashes stay off the wire: they are
+    how the system checks a quote, not something a reader needs.
+    """
+    fields = dict(
+        dream_proposal_summary_fields(
+            projection, source_revision=source_revision, citations_verified=citations_verified
+        )
+    )
+    fields["citations"] = [
+        DreamProposalCitation(
+            event_id=UUID(citation.event_id),
+            receipt_id=UUID(citation.receipt_id),
+            origin_kind=citation.origin_kind,
+            observed_at=citation.observed_at,
+            quote=citation.quote,
+        )
+        for citation in citations
+        if _is_uuid_text(citation.event_id) and _is_uuid_text(citation.receipt_id)
+    ]
+    fields["citation_count"] = len(fields["citations"])
+    stamp = updated_at or created_at or now_utc()
+    fields["created_at"] = created_at or stamp
+    fields["updated_at"] = updated_at or stamp
+    return DreamProposal(**fields)
+
+
+def _is_uuid_text(value: str) -> bool:
+    try:
+        UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+def _dream_session_project(
+    conn: sqlite3.Connection, *, auth: AuthContext, session_id: str
+) -> dict[str, Any] | None:
+    """The project this session is already working in, read from the session row itself.
+
+    The lookup is keyed on ``(session_id, workspace_id, user_id)`` from the credential, so a
+    caller cannot borrow another principal's session to inherit their project binding.
+    """
+    if not session_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT takeover_context FROM takeover_sessions
+        WHERE session_id = ? AND workspace_id = ? AND user_id = ?
+        """,
+        (session_id, auth.workspace_id, auth.user_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        takeover_context = json.loads(str(row["takeover_context"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(takeover_context, dict):
+        return None
+    candidate = takeover_context.get("project_context")
+    return dict(candidate) if isinstance(candidate, dict) and candidate else None
+
+
+def _dream_scope_for(
+    auth: AuthContext,
+    app_context: dict[str, Any] | None,
+    session_id: str,
+    conn: sqlite3.Connection | None = None,
+) -> ResolvedScope:
+    """Scope comes from the authenticated caller.  ``app_context`` is a hint, never an identity.
+
+    The session's own project context is the second hint, and it is what makes the read and
+    transition routes able to reach a project-scoped proposal at all: those routes take no
+    ``app_context``, so without it every one of them resolved to workspace scope and a
+    proposal minted under a project could be written and then never read back.  Full resolves
+    scope the same way (``main.py::_session_project_context``); this keeps the two backends
+    answering the same question.
+    """
+    return auth.resolved_scope(
+        project_hint=app_context if isinstance(app_context, dict) else None,
+        session_project=(
+            _dream_session_project(conn, auth=auth, session_id=session_id)
+            if conn is not None
+            else None
+        ),
+        task_id=session_id or None,
+    )
+
+
+@app.get("/v1/dreams", response_model=DreamProposalListResponse)
+def list_dreams(
+    session_id: str = "default",
+    status: list[str] | None = Query(default=None),
+    include_history: bool = False,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposalListResponse:
+    """Read-only.  Writes nothing, ever.
+
+    A GET with a side effect is the kind of thing that gets "optimised" into a cache six
+    months later, and the surfaced record is the only thing standing between nonresponse and
+    rejection.  Proposals whose citations no longer clear the floor are FILTERED here and
+    withdrawn by the sweep, which is the named producer of ``withdrawn``.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dreams_list", method="GET").inc()
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    now = now_utc()
+    projections = list_proposals(
+        conn,
+        scope=scope,
+        statuses=[str(item) for item in (status or []) if str(item)],
+        include_history=bool(include_history),
+        now=now,
+        limit=int(getattr(settings, "dream_list_limit", 10)),
+    )
+    stamps = load_proposal_stamps(
+        conn, scope=scope, proposal_ids=[item.proposal_id for item in projections]
+    )
+    min_citations = int(getattr(settings, "dream_min_citations", 2))
+    out: list[DreamProposal] = []
+    for projection in projections:
+        surviving, _dropped = validate_citations_cheap(
+            conn, scope=scope, citations=projection.citations
+        )
+        if len(surviving) < min_citations:
+            continue
+        created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+        out.append(
+            _dream_proposal_model(
+                projection,
+                source_revision="",
+                citations_verified="cheap",
+                citations=surviving,
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        )
+    return DreamProposalListResponse(proposals=out, total=len(out), citations_verified="cheap")
+
+
+@app.post("/v1/dreams/refresh", response_model=DreamRefreshResponse)
+def refresh_dreams(
+    body: DreamRefreshRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamRefreshResponse:
+    """Sweep, reconcile, take the run slot, then refuse for a named reason.
+
+    The route owns everything that does not need a model, so every refusal is observable in
+    the response body and in a real run row.  A generation path that is entirely broken must
+    not read as "no proposals today": that silence is the failure mode this whole surface
+    exists to remove.
+
+    Lite has no model gateway, so the last refusal is always ``model_unavailable`` and the
+    branches above it are the ones a caller can actually move.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dreams_refresh", method="POST").inc()
+    now = now_utc()
+    scope = _dream_scope_for(auth, body.app_context, body.session_id, conn)
+    scope_kind = dream_scope_kind(scope)
+
+    swept = sweep_dream_proposals(
+        conn,
+        scope=scope,
+        now=now,
+        ttl_days=int(getattr(settings, "dream_proposal_ttl_days", 45)),
+        min_citations=int(getattr(settings, "dream_min_citations", 2)),
+        quote_max_chars=int(getattr(settings, "dream_quote_max_chars", 200)),
+        after_surfaces=int(getattr(settings, "dream_nonresponse_after_surfaces", 3)),
+    )
+    reconciled = reconcile_dream_pursuit(
+        conn,
+        scope=scope,
+        session_id=body.session_id,
+        now=now,
+        after_surfaces=int(getattr(settings, "dream_nonresponse_after_surfaces", 3)),
+    )
+
+    try:
+        run_id = start_generation_run(
+            conn,
+            scope=scope,
+            session_id=body.session_id,
+            scope_kind=scope_kind,
+            stale_minutes=int(getattr(settings, "dream_run_stale_minutes", 30)),
+            now=now,
+        )
+    except sqlite3.IntegrityError:
+        # The unique partial index refused a second in-flight run for this scope.  That is the
+        # slot doing its job, not an error: two concurrent refreshes cannot both mint.
+        conn.commit()
+        return DreamRefreshResponse(
+            run_id=None,
+            state="refused",
+            refusal_reason="run_already_in_flight",
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    def _refuse(reason: str, *, pool: Sequence[PoolMessage] = (), pool_drops: dict[str, int] | None = None) -> DreamRefreshResponse:
+        revision, cutoff = evidence_revision(
+            [{"id": message.event_id, "ts": message.observed_at} for message in pool]
+        )
+        finish_generation_run(
+            conn,
+            run_id=run_id,
+            state="refused",
+            refusal_reason=reason,
+            pool=pool,
+            evidence_revision=revision,
+            evidence_cutoff_at=cutoff,
+            candidates_returned=0,
+            proposals_written=0,
+            refusals={},
+            pool_drops=pool_drops or {},
+            prompt_hash="",
+            model_provider="",
+            now=now,
+        )
+        conn.commit()
+        return DreamRefreshResponse(
+            run_id=UUID(run_id),
+            state="refused",
+            refusal_reason=reason,
+            proposals_written=0,
+            refusals={},
+            pool_size=len(pool),
+            pool_drops=pool_drops or {},
+            swept=swept,
+            reconciled=reconciled,
+        )
+
+    if scope_kind == SCOPE_KIND_PROJECT and not subject_has_project_receipts(conn, scope=scope):
+        # A project id is client-assertable, so a run may not bind to a project the subject has
+        # never spoken into.  Without this the attribution would be whatever the caller claimed.
+        return _refuse("unentitled_project")
+
+    live = load_live_proposals(
+        conn, scope=scope, limit=int(getattr(settings, "dream_max_live_proposals", 20))
+    )
+    if len(live) >= int(getattr(settings, "dream_max_live_proposals", 20)):
+        return _refuse("too_many_open_proposals")
+
+    pool, pool_drops = select_candidate_messages(
+        conn,
+        scope=scope,
+        scope_kind=scope_kind,
+        limit=int(getattr(settings, "dream_message_limit", 60)),
+        min_chars=int(getattr(settings, "dream_min_message_chars", 25)),
+        max_chars=int(getattr(settings, "dream_max_message_chars", 1200)),
+        max_sensitivity=int(getattr(settings, "block_sensitivity", 3)) - 1,
+    )
+    if len(pool) < int(getattr(settings, "dream_min_messages", 10)):
+        # The honest answer on a corpus that cannot support a proposal.  It is reported rather
+        # than hidden precisely because the failure it replaces looked identical to a quiet week.
+        return _refuse("insufficient_messages", pool=pool, pool_drops=pool_drops)
+
+    # D15: Lite has no worker, no Redis and no model gateway, so there is nothing to enqueue.
+    # The response model is identical to Full's and the run row is real; only the reason differs.
+    return _refuse("model_unavailable", pool=pool, pool_drops=pool_drops)
+
+
+@app.get("/v1/dreams/{proposal_id}", response_model=DreamProposal)
+def get_dream(
+    proposal_id: UUID,
+    session_id: str = "default",
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposal:
+    """Read-only, and the deep validation runs here: the body is read and the quote re-found.
+
+    ``410`` when the proposal has already been withdrawn because its citations stopped
+    verifying — a reader who followed a link deserves the reason, not a bare 404.  ``404``
+    when the one scope predicate does not match, which is also the answer for another
+    subject's or another project's proposal.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    REQUEST_COUNT.labels(endpoint="dreams_detail", method="GET").inc()
+    scope = _dream_scope_for(auth, None, session_id, conn)
+    loaded = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    projection, _highest_seq, source_revision = loaded
+    if projection.withdrawn_reason == "citations_unverifiable":
+        raise HTTPException(status_code=410, detail="dream proposal was withdrawn: citations_unverifiable")
+    surviving, _dropped = validate_citations_deep(
+        conn,
+        scope=scope,
+        citations=projection.citations,
+        quote_max_chars=int(getattr(settings, "dream_quote_max_chars", 200)),
+    )
+    if len(surviving) < int(getattr(settings, "dream_min_citations", 2)):
+        raise HTTPException(status_code=410, detail="dream proposal was withdrawn: citations_unverifiable")
+    stamps = load_proposal_stamps(conn, scope=scope, proposal_ids=[projection.proposal_id])
+    created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+    return _dream_proposal_model(
+        projection,
+        source_revision=source_revision,
+        citations_verified="deep",
+        citations=surviving,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+
+@app.post("/v1/dreams/{proposal_id}/transition", response_model=DreamProposal)
+def dream_transition(
+    proposal_id: UUID,
+    body: DreamProposalTransitionRequest,
+    auth: AuthContext = Depends(get_auth_context),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> DreamProposal:
+    """One route, one closed vocabulary: ``surfaced``, ``accepted``, ``rejected``, ``snoozed``,
+    ``unsnoozed``.
+
+    Accept mints nothing.  It writes one event and returns.  If accept minted a plan root then
+    accepting while a task was in flight would have to either clobber the owner's current
+    objective or 409 — and a 409 loses the owner's answer, which is the exact class of loss
+    this vocabulary exists to prevent.  The answer is recorded first; the machinery catches up
+    in ``reconcile_dream_pursuit``.
+    """
+    _dreams_enabled()
+    _enforce_workspace_access(auth, conn)
+    _reject_advisor_writes(auth)
+    REQUEST_COUNT.labels(endpoint="dreams_transition", method="POST").inc()
+    action = str(body.action or "").strip().lower()
+    if action not in HUMAN_VERDICT_ACTIONS | DISPLAY_ACTIONS:
+        raise HTTPException(status_code=422, detail=f"unknown dream transition action: {action}")
+    _dream_verdict_gate(auth, action)
+
+    scope = _dream_scope_for(auth, None, body.session_id, conn)
+    loaded = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if loaded is None:
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    now = now_utc()
+    after_surfaces = int(getattr(settings, "dream_nonresponse_after_surfaces", 3))
+    actor_class = _dream_actor_class(auth)
+
+    if action == "surfaced":
+        append_surfaced(
+            conn,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            actor=auth.consumer,
+            actor_class=actor_class,
+            now=now,
+            min_hours=int(getattr(settings, "dream_resurface_min_hours", 24)),
+            ignored_hours=int(getattr(settings, "dream_resurface_ignored_hours", 168)),
+            after_surfaces=after_surfaces,
+        )
+    else:
+        payload: dict[str, Any] = {"reason": str(body.reason or "")[:400]}
+        if action == "accepted":
+            kind = DreamProposalEventKind.ACCEPTED
+            payload["accepted_at"] = now.isoformat()
+        elif action == "rejected":
+            kind = DreamProposalEventKind.REJECTED
+            payload["rejected_at"] = now.isoformat()
+        elif action == "snoozed":
+            kind = DreamProposalEventKind.SNOOZED
+            until = body.snooze_until or (
+                now + timedelta(days=int(getattr(settings, "dream_snooze_default_days", 7)))
+            )
+            payload["snooze_until"] = until.isoformat()
+        else:
+            kind = DreamProposalEventKind.UNSNOOZED
+            payload["expires_at"] = (
+                now + timedelta(days=int(getattr(settings, "dream_proposal_ttl_days", 45)))
+            ).isoformat()
+        apply_dream_events(
+            conn,
+            scope=scope,
+            proposal_id=str(proposal_id),
+            new_events=[
+                DreamProposalEvent(
+                    seq=0,
+                    kind=kind,
+                    payload=payload,
+                    occurred_at=now,
+                    actor=auth.consumer,
+                    actor_class=actor_class,
+                )
+            ],
+            now=now,
+            after_surfaces=after_surfaces,
+        )
+
+    write_audit(
+        conn,
+        consumer=auth.consumer,
+        action="dream_transition",
+        query={"proposal_id": str(proposal_id), "dream_action": action, "actor_class": actor_class},
+        result_event_ids=[],
+        policy_decisions={"role": auth.role.value, "identity_verified": bool(auth.identity_verified)},
+        latency_ms=0,
+    )
+
+    refreshed = load_proposal(conn, scope=scope, proposal_id=str(proposal_id))
+    if refreshed is None:  # pragma: no cover - the row cannot vanish inside one request
+        raise HTTPException(status_code=404, detail="dream proposal was not found")
+    projection, _highest_seq, source_revision = refreshed
+    stamps = load_proposal_stamps(conn, scope=scope, proposal_ids=[projection.proposal_id])
+    created_at, updated_at = stamps.get(projection.proposal_id, (None, None))
+    return _dream_proposal_model(
+        projection,
+        source_revision=source_revision,
+        citations_verified="cheap",
+        citations=projection.citations,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 # ---------------------------------------------------------------------------

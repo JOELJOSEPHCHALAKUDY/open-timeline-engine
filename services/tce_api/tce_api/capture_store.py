@@ -17,6 +17,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from tce_shared.decision_capture import HumanResolution
 
+from .policy_store import policy_columns_available
+
 _RECEIPT_COLUMNS = """
     id, workspace_id, owner_id, subject_user_id, host_session_id, sequence, prompt_id,
     delivery_key, content_sha256, origin_kind, capture_principal, host_client, event_id,
@@ -289,21 +291,35 @@ def insert_opportunity(
     expires_at: datetime | None,
     created_at: datetime,
     frozen_at: datetime,
+    episode_key: str | None = None,
 ) -> None:
+    """Freeze one decision opportunity.
+
+    ``episode_key`` is the unit a train/holdout split may not straddle, and it is written here
+    because this is where the session, the objective hash and the cancel epoch are all in scope
+    at once.  It is optional in the signature and skipped entirely when the column is absent:
+    the column arrives with alembic ``20260909_0040``, and issuing SQL the database will reject
+    aborts the surrounding transaction on the turn path.
+    """
+    episode_column = ""
+    episode_value = ""
+    if episode_key and policy_columns_available(db):
+        episode_column = ", episode_key"
+        episode_value = ", :episode_key"
     db.execute(
         text(
-            """
+            f"""
             INSERT INTO decision_opportunities (
                 id, workspace_id, subject_user_id, owner_id, session_id, turn, objective_hash, task_id,
                 project_id, decision_family, situation_type, question_text, alternatives_json,
                 pre_answer_snapshot_json, evidence_cutoff_at, evidence_revision, advice_exposure_json,
-                shadow_prediction_id, source_event_id, status, expires_at, created_at, frozen_at, schema_version
+                shadow_prediction_id, source_event_id, status, expires_at, created_at, frozen_at, schema_version{episode_column}
             ) VALUES (
                 :id, :workspace_id, :subject_user_id, :owner_id, :session_id, :turn, :objective_hash, :task_id,
                 :project_id, :decision_family, :situation_type, :question_text, CAST(:alternatives_json AS jsonb),
                 CAST(:pre_answer_snapshot_json AS jsonb), :evidence_cutoff_at, :evidence_revision,
                 CAST(:advice_exposure_json AS jsonb), :shadow_prediction_id, :source_event_id, 'open',
-                :expires_at, :created_at, :frozen_at, 'v1'
+                :expires_at, :created_at, :frozen_at, 'v1'{episode_value}
             )
             """
         ),
@@ -330,6 +346,7 @@ def insert_opportunity(
             "expires_at": expires_at,
             "created_at": created_at,
             "frozen_at": frozen_at,
+            **({"episode_key": str(episode_key)} if episode_column else {}),
         },
     )
 

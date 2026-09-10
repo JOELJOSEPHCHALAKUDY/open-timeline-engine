@@ -31,6 +31,7 @@ CONTINUITY_TOOLS = CORE_TOOLS | {
 
 AUTONOMY_TOOLS = CONTINUITY_TOOLS | {
     "tce.ack_takeover_notice",
+    "tce.dreams",
     "tce.arbitrate_with_clone",
     "tce.claim_execution",
     "tce.consume_capability_grant",

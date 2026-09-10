@@ -53,6 +53,8 @@ This is the canonical documentation index for Open Timeline Engine.
 - Dual-AI behavior, setup, and troubleshooting: [clone-advisor.md](clone-advisor.md)
 - Takeover behavior notes: [takeover-scenarios.md](takeover-scenarios.md)
 - Durable task state, planning jobs and turn deadlines: [task-state.md](task-state.md)
+- Aspiration proposals, the accept/reject/snooze vocabulary and why the system currently refuses to generate: [dreams.md](dreams.md)
+- How a decision is selected, when it abstains, and what is never calibrated: [decision-policy.md](decision-policy.md)
 - Retrieval status endpoint: `GET /v1/context/retrieval/status`
 - Retrieval policy visibility:
   - default: `policy_profile=user-only`

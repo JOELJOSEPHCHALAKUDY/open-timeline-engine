@@ -477,6 +477,51 @@ PLANNING_PENDING_CONSTRAINT: dict[str, Any] = {
     ),
 }
 
+# ---- P4 ----
+# Conditional constraint: composed onto the per-turn list _merge_constraints returns, on the
+# turns where the decision policy abstained AND was allowed to speak.  Same rule as the
+# planning constraint above and for the same reason: HARD_CONSTRAINTS is process-global and
+# assigned by reference on every active turn, so a static append would tell every executor in
+# this process never to mutate anything for the life of the process.
+#
+# The ``exposed`` conjunct is load-bearing, not defensive.  Today ZERO decision families are
+# qualified, so every turn abstains and every turn carries exposed=false; without the conjunct
+# this rule would fire on every single turn and forbid all work.  ``exposed=true`` means a
+# family earned permission to use personalization AND the policy still declined to choose --
+# which is the only state in which "wait for the human" is the right instruction.
+POLICY_ABSTENTION_CONSTRAINT: dict[str, Any] = {
+    "directive_type": "hard_constraint",
+    "rule_id": "no-execute-on-policy-abstention",
+    "polarity": "deny",
+    "scope": {"actions": ["edit", "write", "delete", "execute"]},
+    "enforcement": "block_and_escalate",
+    "reason": (
+        "policy_decision.status='abstained' with exposed=true means the decision policy "
+        "declined to select an option for this turn. Show reason_for_asking and wait for the "
+        "human; do not mutate anything."
+    ),
+}
+
+# The eleven keys of ``PolicyDecisionBlock`` (shared/tce_shared/events.py), which is what
+# ``DecisionResult.block_payload()`` emits.  This is a firewall, not a convenience: the full
+# ``DecisionResult.to_payload()`` also carries ``policy_score``, an UNCALIBRATED vote share,
+# and an executor reading a number it cannot interpret is how four different fields in this
+# system came to be named some form of "confidence".  Projecting here means a backend that
+# hands the wide payload to the wire still cannot get a score past this process.
+POLICY_DECISION_KEYS: tuple[str, ...] = (
+    "status",
+    "selected_option",
+    "abstain_reason",
+    "reason_for_asking",
+    "ood_status",
+    "conflict_status",
+    "evidence_observation_ids",
+    "decision_policy_revision",
+    "exposed",
+    "exposure_state",
+    "advisor_agreement",
+)
+
 
 # ---------------------------------------------------------------------------
 # The constraint floor (P3 §9.3, §0.9I).
@@ -561,6 +606,47 @@ def _merge_constraints(backend: Any) -> list[dict[str, Any]]:
         seen.add(rule_id)
         merged.append(_normalize_constraint(item))
     return merged
+
+
+# ---- P4 ----
+def _slim_policy_decision(value: Any) -> dict[str, Any] | None:
+    """Project the backend's ``policy_decision`` onto exactly ``POLICY_DECISION_KEYS``.
+
+    Returns ``None`` when the backend sent nothing, or sent something that is not a dict —
+    an absent policy block and a malformed one are the same fact to an executor, and neither
+    is a reason to invent a decision.
+
+    Keys the backend did not send are absent from the projection rather than defaulted.  A
+    missing ``exposed`` must not read as ``false``-that-we-checked, because the two consumers
+    below (``_policy_abstention_applies`` and the executor) both treat absence as "no
+    permission", and defaulting here would hide a producer that forgot the field.
+
+    Anything not in ``POLICY_DECISION_KEYS`` is dropped, ``policy_score`` first among them.
+    """
+    if not isinstance(value, dict):
+        return None
+    projected: dict[str, Any] = {key: value[key] for key in POLICY_DECISION_KEYS if key in value}
+    if not projected:
+        return None
+    ids = projected.get("evidence_observation_ids")
+    if isinstance(ids, list):
+        projected["evidence_observation_ids"] = [str(item) for item in ids][:12]
+    elif "evidence_observation_ids" in projected:
+        projected["evidence_observation_ids"] = []
+    return projected
+
+
+def _policy_abstention_applies(policy_decision: dict[str, Any] | None) -> bool:
+    """True only when the policy abstained AND the family had permission to speak.
+
+    Both conjuncts are required.  ``status == "abstained"`` alone is the state of every turn
+    on today's corpus (an ordinary takeover turn offers no candidate options, so the policy
+    abstains with ``no_candidate_match``), and a rule that fires on every turn forbids all
+    work.  ``exposed is True`` -- identity, not truthiness -- is the permission half.
+    """
+    if not policy_decision:
+        return False
+    return policy_decision.get("exposed") is True and str(policy_decision.get("status") or "") == "abstained"
 
 
 def _unknown_effect_ids(unresolved_effects: Any) -> list[str]:
@@ -1929,6 +2015,12 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
     # without flooding the tool result.  Keep it tight (~300 chars).
     clone_hints = _extract_clone_hints(result.get("clone_advice"))
 
+    # ---- P4 ----  What the decision policy decided this turn, and whether it was allowed to
+    # be used.  ``status`` and ``exposed`` are separate on purpose: "we abstained" and "we were
+    # not allowed to speak" are different facts.  No score crosses this line (see
+    # POLICY_DECISION_KEYS).
+    policy_decision = _slim_policy_decision(result.get("policy_decision"))
+
     slim = {
         "state": slim_state,
         "action": result.get("action"),
@@ -1968,6 +2060,19 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         "task_state_revision": int(result.get("task_state_revision", 0) or 0),
         "task_state": result.get("task_state", {}),
         "citations": [str(item) for item in (result.get("citations") or [])][:12],
+        # ---- P4 ----  An explicit whitelist drops any key not named here, so this line is
+        # what makes policy_decision reach the executor at all.  A stale MCP process keeps
+        # dropping it after the API upgrades: this module is loaded at process start, so the
+        # MCP client (Claude Desktop, Codex, Cursor) must be restarted after a TCE upgrade.
+        "policy_decision": policy_decision,
+        # ---- P5 ----  How many aspiration proposals are waiting for the owner right now.
+        # One integer and nothing else: P5 contributes no constraint rule (p45_shared.md
+        # §3.2 clause 5) and forwards no proposal text through this path.  The executor
+        # calls tce.dreams to read them, which is also what records that they were shown.
+        # Same whitelist caveat as policy_decision: this module is loaded at MCP process
+        # start, so a stale MCP client keeps dropping this key after the API upgrades and
+        # must be restarted.
+        "dream_proposals_pending": int(result.get("dream_proposals_pending") or 0),
     }
     if clone_hints:
         slim["clone_hints"] = clone_hints
@@ -1989,6 +2094,11 @@ def _slim_takeover_result(result: dict[str, Any]) -> dict[str, Any]:
         constraints: list[dict[str, Any]] = _merge_constraints(result.get("constraints"))
         if planning_pending:
             constraints.append(_normalize_constraint(PLANNING_PENDING_CONSTRAINT))
+        # ---- P4 ----  Last in the order, and conditional on BOTH halves of the policy block.
+        # Order is floor rules, the rest of HARD_CONSTRAINTS, charter-derived rules, the
+        # planning rule, then this one; tests/mcp/test_policy_contract.py pins it.
+        if _policy_abstention_applies(policy_decision):
+            constraints.append(_normalize_constraint(POLICY_ABSTENTION_CONSTRAINT))
         slim["constraints"] = constraints
 
         # Charter provenance, forwarded only while takeover is active.  These say WHICH
@@ -2139,3 +2249,215 @@ def reset_takeover_state(
         payload["final_response"] = ack
 
     return with_schema(payload)
+
+
+# ---------------------------------------------------------------------------
+# ---- P5 ----  Aspiration proposals.
+#
+# This tool is the READ-AND-RECORD half of the proposal surface, and only that half.
+# Listing a proposal is what puts it in front of the owner, so listing is also what
+# records ``surfaced`` — that record is the only thing that keeps *nonresponse* (the
+# owner never answered) distinguishable from *rejection* (the owner said no).  A GET
+# that silently marks nothing would make the two indistinguishable again, which is the
+# defect P5 exists to remove.
+#
+# The tool deliberately does NOT offer accept / reject / snooze / unsnooze.  Those are
+# verdicts, a verdict requires a verified human identity, and this process authenticates
+# as an executor: ``config.py`` pins ``mcp_role = "executor"`` and
+# ``client.assert_executor_credential_is_not_host_capture`` raises if the process is ever
+# handed the host-capture credential.  A tool that offered an action it would always be
+# 403'd on would be worse than one that does not offer it, so the refusal is explicit and
+# names the client that can do it.
+#
+# P5 adds NO constraint rule and touches no line of ``_merge_constraints``
+# (p45_shared.md §3.2 clause 5).  Its only additive slim-result key is the integer
+# ``dream_proposals_pending``.
+# ---------------------------------------------------------------------------
+
+DREAM_TOOL_ACTIONS: tuple[str, ...] = ("list", "surfaced")
+
+# Every spelling of a verdict an executor might try.  Matched only to produce a useful
+# refusal — this process cannot authenticate for any of them.
+DREAM_VERDICT_ACTION_NAMES: frozenset[str] = frozenset(
+    {"accept", "accepted", "reject", "rejected", "snooze", "snoozed", "unsnooze", "unsnoozed"}
+)
+
+DREAM_VERDICT_REFUSAL: str = (
+    "A dream verdict (accept, reject, snooze, unsnooze) requires a verified human identity. "
+    "This MCP process authenticates as an executor and is structurally barred from holding the "
+    "host-capture credential, so it cannot record one. Ask the owner to run "
+    "`tce dreams accept --id <proposal_id>` (or reject / snooze / unsnooze) from the CLI. "
+    "Do not re-try this through any other tool."
+)
+
+DREAM_UNKNOWN_ACTION_REFUSAL: str = (
+    "tce.dreams accepts action='list' (read the open proposals, which also records that they "
+    "were shown) or action='surfaced' with proposal_id (record that one proposal was shown)."
+)
+
+
+def _dream_citation_summary(raw: Any) -> dict[str, Any]:
+    """One citation, reduced to what an executor needs to render it.
+
+    The ``quote`` is passed through unaltered: it is a verbatim span of a message the owner
+    is receipted as having typed, and truncating it here would make the thing on screen no
+    longer the thing that was verified.  Length is already bounded server-side by
+    ``dream_quote_max_chars``.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "event_id": str(raw.get("event_id") or ""),
+        "origin_kind": str(raw.get("origin_kind") or ""),
+        "observed_at": raw.get("observed_at"),
+        "quote": str(raw.get("quote") or ""),
+    }
+
+
+def _dream_proposal_summary(raw: Any) -> dict[str, Any]:
+    """One proposal, reduced to the fields that carry meaning to a reader.
+
+    ``attribution`` is carried because it is load-bearing, not decorative: a proposal built
+    from imported history reads "from your imported history" and must never be rendered as
+    "you said".  ``nonresponse`` is carried for the same reason it exists — so a reader can
+    see that "no answer yet" is not "no".
+    """
+    if not isinstance(raw, dict):
+        return {}
+    citations = [
+        summary
+        for summary in (_dream_citation_summary(item) for item in (raw.get("citations") or []))
+        if summary
+    ]
+    return {
+        "id": str(raw.get("id") or ""),
+        "title": str(raw.get("title") or ""),
+        "connection": str(raw.get("connection") or ""),
+        "benefit": str(raw.get("benefit") or ""),
+        "first_step": str(raw.get("first_step") or ""),
+        "status": str(raw.get("status") or ""),
+        "nonresponse": str(raw.get("nonresponse") or ""),
+        "surfaced_count": int(raw.get("surfaced_count") or 0),
+        "attribution": str(raw.get("attribution") or ""),
+        "evidence_basis": str(raw.get("evidence_basis") or ""),
+        "citations_verified": str(raw.get("citations_verified") or ""),
+        "citation_count": int(raw.get("citation_count") or len(citations)),
+        "citations": citations,
+        "snooze_until": raw.get("snooze_until"),
+        "expires_at": raw.get("expires_at"),
+        "project_id": raw.get("project_id"),
+        "scope_kind": str(raw.get("scope_kind") or ""),
+    }
+
+
+def _record_dream_surfaced(*, session_id: str, proposal_id: str) -> bool:
+    """Record that one proposal was put in front of the owner.  Best effort, by design.
+
+    A refusal here must never fail the read.  The transition route rate-limits re-surfacing
+    (a second ``surfaced`` inside the re-surface interval appends nothing), so a non-2xx or
+    a transport error is an ordinary outcome and is reported as a count, not raised.
+    """
+    if not proposal_id:
+        return False
+    try:
+        response = client._post(
+            f"/v1/dreams/{quote(str(proposal_id), safe='')}/transition",
+            {"session_id": session_id, "action": "surfaced"},
+        )
+    except Exception:
+        return False
+    return 200 <= int(response.status_code) < 300
+
+
+def dreams(
+    session_id: str = "default",
+    action: str = "list",
+    proposal_id: str = "",
+) -> dict[str, Any]:
+    """Read open aspiration proposals, and record that they were shown.
+
+    ``action="list"``     — fetch the open proposals, then post ``surfaced`` for exactly the
+                            ones returned.  The ids marked are reported back in
+                            ``surfaced_recorded``.
+    ``action="surfaced"`` — record that a single proposal (``proposal_id``) was shown.
+    """
+    normalized = str(action or "list").strip().lower()
+
+    if normalized in DREAM_VERDICT_ACTION_NAMES:
+        return with_schema(
+            {
+                "kind": "dream_action_refused",
+                "action": normalized,
+                "refused": True,
+                "reason": "verdict_requires_verified_human",
+                "next_step": DREAM_VERDICT_REFUSAL,
+                "citations": [],
+            }
+        )
+
+    if normalized == "surfaced":
+        recorded = _record_dream_surfaced(session_id=session_id, proposal_id=str(proposal_id or "").strip())
+        return with_schema(
+            {
+                "kind": "dream_surfaced",
+                "proposal_id": str(proposal_id or "").strip(),
+                "surfaced_recorded": [str(proposal_id).strip()] if recorded else [],
+                "citations": [],
+            }
+        )
+
+    if normalized != "list":
+        return with_schema(
+            {
+                "kind": "dream_action_refused",
+                "action": normalized,
+                "refused": True,
+                "reason": "unknown_action",
+                "next_step": DREAM_UNKNOWN_ACTION_REFUSAL,
+                "citations": [],
+            }
+        )
+
+    # The route decides how many rows to return (``dream_list_limit``).  The tool asserts no
+    # page size: a client-chosen limit is a second source of truth for how much of the owner's
+    # own history he is allowed to see.
+    response = client._get("/v1/dreams", params={"session_id": session_id})
+    response.raise_for_status()
+    payload: Any = response.json()
+    body: dict[str, Any] = payload if isinstance(payload, dict) else {}
+    proposals = [
+        summary
+        for summary in (_dream_proposal_summary(item) for item in (body.get("proposals") or []))
+        if summary.get("id")
+    ]
+
+    # Record the display for exactly what was rendered, and nothing else.
+    surfaced_recorded = [
+        item["id"]
+        for item in proposals
+        if _record_dream_surfaced(session_id=session_id, proposal_id=str(item["id"]))
+    ]
+
+    citations: list[str] = []
+    for item in proposals:
+        for citation in item.get("citations") or []:
+            event_id = str(citation.get("event_id") or "")
+            if event_id and event_id not in citations:
+                citations.append(event_id)
+
+    result: dict[str, Any] = {
+        "kind": "dream_proposals",
+        "proposals": proposals,
+        "proposal_count": len(proposals),
+        "surfaced_recorded": surfaced_recorded,
+        "citations": citations[:12],
+        "verdicts_require": DREAM_VERDICT_REFUSAL,
+    }
+    # ``citations_verified`` says how much the list route actually proved before returning
+    # these rows ("cheap": existence, scope, sensitivity ceiling and receipt binding; the
+    # detail route re-checks the quotes themselves).  Forwarding it means the reader is never
+    # left guessing, and an empty list stays legible as an empty list rather than as silence.
+    for key in ("total", "citations_verified"):
+        if key in body:
+            result[key] = body[key]
+    return with_schema(result)

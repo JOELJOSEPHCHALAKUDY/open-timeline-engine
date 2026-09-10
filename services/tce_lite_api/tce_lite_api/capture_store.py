@@ -436,16 +436,24 @@ def insert_opportunity(
     expires_at: datetime | None,
     created_at: datetime,
     frozen_at: datetime,
+    episode_key: str = "",
 ) -> None:
-    """Immutable after insert except status/relayed_*/resolved_at. No commit."""
+    """Immutable after insert except status/relayed_*/resolved_at. No commit.
+
+    ``episode_key`` (P4) is the unit a train/holdout split may not straddle.  It is stored here
+    rather than derived later because the three inputs that make it -- session, objective hash
+    and the task's cancel epoch -- are all live at freeze time and one of them (the cancel
+    epoch) is not recoverable from the row afterwards.  Defaulted so an un-upgraded caller
+    keeps compiling; such a row simply carries no episode and is excluded from a split.
+    """
     conn.execute(
         """
         INSERT INTO decision_opportunities (
             id, workspace_id, subject_user_id, owner_id, session_id, turn, objective_hash, task_id, project_id,
             decision_family, situation_type, question_text, alternatives_json, pre_answer_snapshot_json,
             evidence_cutoff_at, evidence_revision, advice_exposure_json, shadow_prediction_id, source_event_id,
-            status, expires_at, created_at, frozen_at, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 'v1')
+            status, expires_at, created_at, frozen_at, episode_key, schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, 'v1')
         """,
         (
             opportunity_id,
@@ -470,6 +478,7 @@ def insert_opportunity(
             _iso(expires_at),
             _iso(created_at),
             _iso(frozen_at),
+            str(episode_key or ""),
         ),
     )
 

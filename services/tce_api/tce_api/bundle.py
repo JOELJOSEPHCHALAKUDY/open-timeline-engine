@@ -349,8 +349,14 @@ def build_context_bundle(
             ]
         )[:500]
     if cold_start:
+        # The wording is deliberately not a marker another module can pattern-match on.  The
+        # string this replaces was read two modules away as a trigger for a *more* decisive
+        # rewrite, so the lowest-evidence turns produced the most confident text.  A shortage
+        # of evidence now travels as policy_decision.abstain_reason, which is a field, not a
+        # sentence smuggled into a summary.
         summary = (
-            "Cold start mode: limited historical signal. Acting as high-quality timeline log/search with cautious suggestions."
+            "Limited historical signal so far: timeline log and search are fully available, and "
+            "suggestions stay cautious until more of your decisions are captured."
         )
         do_rules = [
             "Use event capture and search immediately; personalization improves after more timeline data.",

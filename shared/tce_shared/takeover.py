@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from typing import Any
 
+from .decision_policy import DecisionResult, DecisionStatus
 from .events import (
     SafetyDecision,
     TakeoverClassification,
@@ -946,6 +947,21 @@ def build_decisive_response(
     return " ".join(parts)
 
 
+def _default_ask(task: str) -> str:
+    """The escalation text used when the policy abstained and named no reason.
+
+    Deliberately built from the task and nothing else.  There is a separate field carrying
+    the advisor's prose, and it has one reader that writes it to a diagnostic column; wiring
+    a model's sentence into the one surface the human reads as a question is the failure this
+    module exists to prevent.
+    """
+
+    objective = " ".join(str(task or "").split()).strip()
+    if objective:
+        return f"I do not have enough to decide this one on {objective}. Which way do you want to go?"
+    return "I do not have enough to decide this one. Which way do you want to go?"
+
+
 def ensure_takeover_response(
     mode: TakeoverMode,
     text: str | None,
@@ -956,7 +972,20 @@ def ensure_takeover_response(
     semantic_enabled: bool | None = None,
     semantic_threshold: float | None = None,
     semantic_margin: float | None = None,
+    policy: DecisionResult | None = None,
 ) -> tuple[str, bool, str | None, TakeoverClassification]:
+    # An EXPOSED abstention is the only thing the decision policy may do to a turn.  With no
+    # qualified family - the state of every family today - `exposed` is False, this branch is
+    # unreachable, and the turn below is byte-for-byte what it was before P4.  That is a gate
+    # and not a promise: `policy=<unexposed>` must return exactly what `policy=None` returns.
+    if policy is not None and policy.exposed and policy.status is DecisionStatus.ABSTAINED:
+        return (
+            policy.reason_for_asking or _default_ask(task),
+            True,
+            "policy_abstention",
+            TakeoverClassification.HANDOFF,
+        )
+
     is_takeover = mode == TakeoverMode.TAKEOVER
     classification = classify_text(
         text,
@@ -969,28 +998,19 @@ def ensure_takeover_response(
     if not is_takeover:
         return candidate, False, None, classification
 
-    # DECISIVE with real content — pass through as-is.
-    normalized_candidate = normalize_text(candidate)
+    # DECISIVE with real content — pass through as-is, with no string inspection.
+    #
+    # What used to be here was exactly inverted.  Text carrying either of two cold-start
+    # marker phrases failed this pass-through and was rewritten through
+    # build_decisive_response, so the LOWEST-evidence turns produced the MOST confident text,
+    # and the resulting DECISIVE classification then scored 0.92 in the certainty heuristic
+    # against 0.58 for HANDOFF — raising the very decision_confidence that gates needs_human.
+    # The suppression fed the gate that would have caught the suppression.
+    #
+    # Both string checks and the weak-evidence rewrite are gone.  Weak evidence is the
+    # decision policy's job now, and its answer is an abstention, not a louder directive.
     if classification == TakeoverClassification.DECISIVE and candidate:
-        if "no strong prior found" not in normalized_candidate and "cold start mode" not in normalized_candidate:
-            return candidate, False, None, classification
-
-    # Weak/cold-start evidence — use build_decisive_response which now
-    # leverages clone_context (fingerprint, situation type, observations)
-    # to produce task-specific directives instead of generic boilerplate.
-    evidence_strength = ""
-    if isinstance(advice, dict):
-        evidence_strength = str(advice.get("evidence_strength", "")).strip().lower()
-    if evidence_strength == "weak" or (
-        normalized_candidate
-        and ("no strong prior found" in normalized_candidate or "cold start mode" in normalized_candidate)
-    ):
-        directive = build_decisive_response(
-            task=task,
-            takeover_context=takeover_context,
-            advice=advice,
-        )
-        return directive, True, "weak_evidence_decisive", TakeoverClassification.DECISIVE
+        return candidate, False, None, classification
 
     suggested_actions = extract_action_lines(candidate) if classification == TakeoverClassification.SUGGESTION else None
     final = build_decisive_response(task=task, takeover_context=takeover_context, advice=advice, suggested_actions=suggested_actions)
@@ -1132,41 +1152,101 @@ def _outcome_stability_score(recent_outcomes: list[dict[str, Any]] | None) -> fl
     return max(0.0, min(1.0, (success + 0.5 * blocked) / total))
 
 
-def _classifier_certainty_score(classification: TakeoverClassification) -> float:
-    if classification == TakeoverClassification.DECISIVE:
-        return 0.92
-    if classification == TakeoverClassification.EMPTY:
-        return 0.5
-    if classification in {TakeoverClassification.SUGGESTION, TakeoverClassification.QUESTION}:
-        return 0.62
-    if classification == TakeoverClassification.HANDOFF:
-        return 0.58
-    return 0.55
+# The weights of `context_quality_score`, in one place because both backends read them and a
+# fork between them is a divergence in when the system asks its owner before acting.
+#
+# There is no `decision_confidence` weight here and there is no parameter for one, which is the
+# point.  The score used to take 0.40 of its value from `decision_confidence`, and one of that
+# number's four terms is `classifier_certainty` -- how the system classified its OWN response.
+# The reply therefore fed the score, and the score gates bounded retrieval and the `needs_human`
+# escalation, so a turn could talk itself past its own safety gate: the lowest-evidence turns
+# produced the most assertive text, the text classified as DECISIVE, DECISIVE scored 0.92 against
+# HANDOFF's 0.58, and the gate that existed to catch exactly those turns went up instead of down.
+#
+# What is left measures context and nothing else.  Two inputs a reader might expect are absent on
+# purpose:
+#   * corroboration (`Adequacy.agreement_share`) is 0 unless a neighbour maps onto an offered
+#     candidate option, and an ordinary takeover turn offers none, so weighting it would deflate
+#     every turn by a constant and measure nothing.
+#   * retrieval outcome is not knowable here: this score is computed before retrieval runs and is
+#     what triggers it.  Feeding the outcome back would be the same circularity again.
+CONTEXT_QUALITY_WEIGHTS: dict[str, float] = {
+    "evidence_strength": 0.45,
+    "recency_coverage": 0.30,
+    "outcome_stability": 0.25,
+}
+
+
+def compute_context_quality_score(
+    *,
+    evidence_strength: float,
+    recency_coverage: float,
+    outcome_stability: float,
+) -> float:
+    """How good is the CONTEXT for this decision -- never how confident the answer sounds.
+
+    Each argument is a 0..1 context measurement:
+
+    ``evidence_strength``
+        prior decisions close enough to be evidence (``Adequacy.above_floor_count``), not the
+        citation count -- citations are timeline event ids, i.e. retrieval provenance.
+    ``recency_coverage``
+        half-life decay on the age of that evidence, floored when there is none.  A corpus with
+        nothing in it has a median evidence age of zero, and must not read as perfectly fresh.
+    ``outcome_stability``
+        how recent execution attempts actually went.
+    """
+
+    weights = CONTEXT_QUALITY_WEIGHTS
+    score = (
+        (weights["evidence_strength"] * max(0.0, min(1.0, float(evidence_strength))))
+        + (weights["recency_coverage"] * max(0.0, min(1.0, float(recency_coverage))))
+        + (weights["outcome_stability"] * max(0.0, min(1.0, float(outcome_stability))))
+    )
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+# The weights of `decision_confidence`, in one place because both backends read them.
+#
+# There is no `classifier_certainty` weight here and there is no `classification` parameter on the
+# function, which is the point.  The score used to take 0.15 of its value from how the system had
+# classified its OWN prior text (`body.executor_output`): DECISIVE scored 0.92 against HANDOFF's
+# 0.58.  `decision_confidence < needs_human_threshold` is the `low_decision_confidence` escalation
+# cause, so a turn that sounded sure of itself lowered its own bar for asking its owner -- the same
+# circularity `CONTEXT_QUALITY_WEIGHTS` above exists to keep out, in the last place it survived.
+# How confident an answer sounds is not evidence about whether to ask.
+#
+# The three remaining terms are the previous 0.40/0.25/0.20 rescaled over their own sum (0.85), so
+# their ratios to each other are untouched and only the removed term's mass is redistributed.
+DECISION_CONFIDENCE_WEIGHTS: dict[str, float] = {
+    "objective_clarity": 0.47,
+    "evidence_strength": 0.29,
+    "outcome_stability": 0.24,
+}
 
 
 def compute_decision_confidence(
     objective: str,
     message: str,
-    classification: TakeoverClassification,
     working_set: dict[str, Any] | None = None,
     recent_outcomes: list[dict[str, Any]] | None = None,
 ) -> tuple[float, dict[str, float]]:
+    """How well-founded is this decision -- never how assertive the system's own text sounded."""
+
     objective_clarity = _objective_clarity_score(objective, message)
     evidence_strength = _evidence_strength_score(working_set)
     outcome_stability = _outcome_stability_score(recent_outcomes)
-    classifier_certainty = _classifier_certainty_score(classification)
+    weights = DECISION_CONFIDENCE_WEIGHTS
     confidence = (
-        (0.40 * objective_clarity)
-        + (0.25 * evidence_strength)
-        + (0.20 * outcome_stability)
-        + (0.15 * classifier_certainty)
+        (weights["objective_clarity"] * objective_clarity)
+        + (weights["evidence_strength"] * evidence_strength)
+        + (weights["outcome_stability"] * outcome_stability)
     )
     confidence = max(0.0, min(1.0, round(confidence, 4)))
     components = {
         "objective_clarity": round(objective_clarity, 4),
         "evidence_strength": round(evidence_strength, 4),
         "outcome_stability": round(outcome_stability, 4),
-        "classifier_certainty": round(classifier_certainty, 4),
     }
     return confidence, components
 
@@ -1306,7 +1386,21 @@ def evaluate_safety(
     message: str,
     final_response: str | None,
     takeover_context: dict[str, Any],
+    objective: str | None = None,
 ) -> tuple[SafetyDecision, str | None]:
+    """Screen a turn for a high-risk action.
+
+    ``objective`` is the resolved task the turn is working on, and it is read directly.
+    Before P4 the objective reached this gate only by accident: a cold-start marker in the
+    candidate text failed the DECISIVE pass-through in ``ensure_takeover_response``, was
+    rewritten by ``build_decisive_response`` -- which embeds the task -- and the task text
+    then arrived here inside ``final_response``.  Removing that inverted rewrite (correctly)
+    removed the only route by which ``rm -rf`` in a ``task`` field ever reached a risk check,
+    so a high-risk objective returned ALLOW and froze no safety opportunity.  A safety gate
+    must not depend on a prose-rewrite side effect for its input, so it now reads the
+    objective itself.
+    """
+
     if policy.safety_policy != "high-risk-pause":
         return SafetyDecision.ALLOW, None
     pending = takeover_context.get("pending_safety")
@@ -1321,7 +1415,7 @@ def evaluate_safety(
         if confirm_keyword and _confirmation_is_affirmative(normalized_message, confirm_keyword):
             return SafetyDecision.ALLOW, "confirmed_high_risk"
         return SafetyDecision.CONFIRM_REQUIRED, "awaiting_high_risk_confirmation"
-    risk = high_risk_reason(message) or high_risk_reason(final_response)
+    risk = high_risk_reason(message) or high_risk_reason(objective) or high_risk_reason(final_response)
     if not risk:
         return SafetyDecision.ALLOW, None
     return SafetyDecision.CONFIRM_REQUIRED, risk

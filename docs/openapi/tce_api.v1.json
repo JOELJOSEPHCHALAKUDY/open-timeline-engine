@@ -1,6 +1,18 @@
 {
   "components": {
     "schemas": {
+      "AbstainReason": {
+        "enum": [
+          "no_eligible_evidence",
+          "no_candidate_match",
+          "inadequate_evidence",
+          "out_of_distribution",
+          "conflicting_evidence",
+          "advisor_forced"
+        ],
+        "title": "AbstainReason",
+        "type": "string"
+      },
       "AcceptanceCheckPayload": {
         "properties": {
           "argv": {
@@ -283,6 +295,17 @@
         ],
         "title": "ActivitySummaryResponse",
         "type": "object"
+      },
+      "AdvisorAgreement": {
+        "enum": [
+          "absent",
+          "agreed",
+          "disagreed",
+          "abstained",
+          "unavailable"
+        ],
+        "title": "AdvisorAgreement",
+        "type": "string"
       },
       "AdvisorConfigResponse": {
         "properties": {
@@ -2949,6 +2972,16 @@
             "title": "Out Of Distribution",
             "type": "boolean"
           },
+          "policy_decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDecisionBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "predicted_action": {
             "anyOf": [
               {
@@ -4208,6 +4241,8 @@
             "title": "Clone Context"
           },
           "confidence": {
+            "default": 0.0,
+            "description": "Uncalibrated vote-share heuristic derived from the policy result. It is NOT a probability and nothing in this system is calibrated; do not threshold on it.",
             "title": "Confidence",
             "type": "number"
           },
@@ -4233,6 +4268,7 @@
             "type": "array"
           },
           "evidence_observations": {
+            "description": "Retrieval provenance for recall_source accounting; never the evidence for a choice. The evidence for a choice is policy_decision.evidence_observation_ids, which is bound to the option that was actually selected.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -4276,7 +4312,6 @@
           "recommended_actions",
           "do",
           "dont",
-          "confidence",
           "evidence_strength",
           "citations",
           "conflict_flags",
@@ -4568,6 +4603,15 @@
         ],
         "title": "CompletionCaptureResponse",
         "type": "object"
+      },
+      "ConflictStatus": {
+        "enum": [
+          "none",
+          "split_vote",
+          "explicit_contradiction"
+        ],
+        "title": "ConflictStatus",
+        "type": "string"
       },
       "ContextBriefRequest": {
         "properties": {
@@ -6063,6 +6107,15 @@
         "title": "DatabaseStatusInfo",
         "type": "object"
       },
+      "DecisionStatus": {
+        "enum": [
+          "selected",
+          "abstained",
+          "rule_applied"
+        ],
+        "title": "DecisionStatus",
+        "type": "string"
+      },
       "DirectiveExecution": {
         "properties": {
           "action_kind": {
@@ -6771,6 +6824,435 @@
           "generated_at"
         ],
         "title": "DispatchResponse",
+        "type": "object"
+      },
+      "DreamProposal": {
+        "description": "A proposal the owner can answer, and the evidence he can check it against.\n\nTwo fields carry the honesty of the whole surface.  ``citations_verified`` says whether the\ncitations behind this response were checked cheaply (existence, scope, sensitivity, receipt\nbinding) or deeply (the body decrypted and the quote re-found in it), so a reader is never\nleft guessing how much the system just proved.  ``attribution`` says whether these are words\nthe owner is receipted as having typed or lines from imported history \u2014 ``\"you said\"``\nversus ``\"from your imported history\"`` \u2014 because a quote whose provenance is unclear is\nworth less than no quote at all.\n\n``nonresponse`` is a separate axis from ``status`` and never becomes a verdict.  A proposal\nnobody ever surfaced reads ``never_surfaced`` however old it is.",
+        "properties": {
+          "attribution": {
+            "default": "",
+            "title": "Attribution",
+            "type": "string"
+          },
+          "benefit": {
+            "default": "",
+            "title": "Benefit",
+            "type": "string"
+          },
+          "citation_count": {
+            "default": 0,
+            "title": "Citation Count",
+            "type": "integer"
+          },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/DreamProposalCitation"
+            },
+            "title": "Citations",
+            "type": "array"
+          },
+          "citations_verified": {
+            "default": "cheap",
+            "title": "Citations Verified",
+            "type": "string"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "connection": {
+            "default": "",
+            "title": "Connection",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "evidence_basis": {
+            "title": "Evidence Basis",
+            "type": "string"
+          },
+          "evidence_revision": {
+            "default": "",
+            "title": "Evidence Revision",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "first_step": {
+            "default": "",
+            "title": "First Step",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "nonresponse": {
+            "$ref": "#/components/schemas/NonresponseState"
+          },
+          "plan_root_goal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Root Goal Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
+          "pursuit_started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pursuit Started At"
+          },
+          "rejection_reason": {
+            "default": "",
+            "title": "Rejection Reason",
+            "type": "string"
+          },
+          "revision": {
+            "default": 0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "scope_kind": {
+            "title": "Scope Kind",
+            "type": "string"
+          },
+          "snooze_until": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snooze Until"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DreamProposalStatus"
+          },
+          "supersedes_proposal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Proposal Id"
+          },
+          "surfaced_attested": {
+            "default": false,
+            "title": "Surfaced Attested",
+            "type": "boolean"
+          },
+          "surfaced_count": {
+            "default": 0,
+            "title": "Surfaced Count",
+            "type": "integer"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "workspace_id": {
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "workspace_id",
+          "scope_kind",
+          "status",
+          "nonresponse",
+          "title",
+          "evidence_basis",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "DreamProposal",
+        "type": "object"
+      },
+      "DreamProposalCitation": {
+        "description": "One quoted message behind a proposal.\n\n``receipt_id`` is required, not optional.  A message reaches a proposal only through a\n``trusted_input_receipts`` row binding it to the subject, so a citation without one could\nnot have been built \u2014 and a nullable field here would invite a future writer to build one.\nThe quote is a verbatim span of the cited message, checked against the decrypted body\nbefore the proposal is written and again before it is shown.",
+        "properties": {
+          "event_id": {
+            "format": "uuid",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "origin_kind": {
+            "title": "Origin Kind",
+            "type": "string"
+          },
+          "quote": {
+            "title": "Quote",
+            "type": "string"
+          },
+          "receipt_id": {
+            "format": "uuid",
+            "title": "Receipt Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "receipt_id",
+          "origin_kind",
+          "observed_at",
+          "quote"
+        ],
+        "title": "DreamProposalCitation",
+        "type": "object"
+      },
+      "DreamProposalListResponse": {
+        "properties": {
+          "citations_verified": {
+            "default": "cheap",
+            "title": "Citations Verified",
+            "type": "string"
+          },
+          "proposals": {
+            "items": {
+              "$ref": "#/components/schemas/DreamProposal"
+            },
+            "title": "Proposals",
+            "type": "array"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "title": "DreamProposalListResponse",
+        "type": "object"
+      },
+      "DreamProposalStatus": {
+        "enum": [
+          "proposed",
+          "surfaced",
+          "accepted",
+          "rejected",
+          "snoozed",
+          "pursued",
+          "completed",
+          "abandoned",
+          "withdrawn",
+          "expired"
+        ],
+        "title": "DreamProposalStatus",
+        "type": "string"
+      },
+      "DreamProposalTransitionRequest": {
+        "description": "One route, one closed vocabulary.\n\nThe verb is in the body rather than the path so the vocabulary is closed on the wire: a\nreader of the schema can see the five legal actions, and a sixth cannot arrive by someone\nadding a route.  ``surfaced`` is a display record, not a verdict, and is the only action an\nexecutor may post.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "reason": {
+            "default": "",
+            "title": "Reason",
+            "type": "string"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "snooze_until": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snooze Until"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "DreamProposalTransitionRequest",
+        "type": "object"
+      },
+      "DreamRefreshRequest": {
+        "description": "``app_context`` is a project *hint*, resolved through the authenticated scope.\n\nIt is never an identity.  A project id is client-assertable, so the hint is entitlement-\nchecked against the subject's own receipts before a run is allowed to bind to it.  There is\nno ``scope_kind`` field: the scope kind is derived from the resolved scope, and a body that\ncould assert it would be a second source of truth for the one thing that decides which\ncorpus a run reads.",
+        "properties": {
+          "app_context": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Context"
+          },
+          "session_id": {
+            "default": "default",
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "title": "DreamRefreshRequest",
+        "type": "object"
+      },
+      "DreamRefreshResponse": {
+        "description": "What the refresh did, including \u2014 especially including \u2014 refusing to do anything.\n\nA generation path that is entirely broken must not read as \"no proposals today\".  ``state``\nand ``refusal_reason`` are always populated, and ``refusals``/``pool_drops`` carry the\nper-reason counts, so an over-refusing system is visible in the response rather than looking\nlike a quiet week.",
+        "properties": {
+          "pool_drops": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Pool Drops",
+            "type": "object"
+          },
+          "pool_size": {
+            "default": 0,
+            "title": "Pool Size",
+            "type": "integer"
+          },
+          "proposals_written": {
+            "default": 0,
+            "title": "Proposals Written",
+            "type": "integer"
+          },
+          "reconciled": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Reconciled",
+            "type": "object"
+          },
+          "refusal_reason": {
+            "default": "",
+            "title": "Refusal Reason",
+            "type": "string"
+          },
+          "refusals": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Refusals",
+            "type": "object"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "schema_version": {
+            "default": "v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "state": {
+            "default": "refused",
+            "title": "State",
+            "type": "string"
+          },
+          "swept": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Swept",
+            "type": "object"
+          }
+        },
+        "title": "DreamRefreshResponse",
         "type": "object"
       },
       "EffectOpenRequest": {
@@ -8350,6 +8832,19 @@
         "title": "ExecutionStatusResponse",
         "type": "object"
       },
+      "ExposureState": {
+        "description": "Why personalization was or was not applied.  Reported, never an abstention.",
+        "enum": [
+          "exposed",
+          "no_qualification",
+          "qualification_expired",
+          "binding_mismatch",
+          "evidence_drift",
+          "rule_layer"
+        ],
+        "title": "ExposureState",
+        "type": "string"
+      },
       "FailureClass": {
         "enum": [
           "tool_error",
@@ -9212,6 +9707,15 @@
         "title": "MemoryRuleUpsertRequest",
         "type": "object"
       },
+      "NonresponseState": {
+        "enum": [
+          "never_surfaced",
+          "awaiting_response",
+          "ignored"
+        ],
+        "title": "NonresponseState",
+        "type": "string"
+      },
       "ObservationItem": {
         "properties": {
           "confidence": {
@@ -9322,6 +9826,15 @@
         ],
         "title": "ObservationListResponse",
         "type": "object"
+      },
+      "OodStatus": {
+        "enum": [
+          "in_distribution",
+          "out_of_distribution",
+          "unknown"
+        ],
+        "title": "OodStatus",
+        "type": "string"
       },
       "OperationMode": {
         "enum": [
@@ -9512,6 +10025,85 @@
           "job_id"
         ],
         "title": "PlanningJobStatusResponse",
+        "type": "object"
+      },
+      "PolicyDecisionBlock": {
+        "description": "What one turn's decision policy decided, and whether it was allowed to be used.\n\n``status`` and ``exposed`` are separate on purpose.  \"We abstained\" and \"we were not\nallowed to speak\" are different facts, and collapsing them into one wire value is what\nturned an unqualified family into a human escalation in an earlier draft.\n\nThere is no score on this block.  ``policy_score`` is uncalibrated and an executor reading\na number it cannot interpret is how four different fields came to be named some form of\n\"confidence\"; and there is no calibrated sibling to add, because nothing in this system is\ncalibrated.",
+        "properties": {
+          "abstain_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AbstainReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "advisor_agreement": {
+            "$ref": "#/components/schemas/AdvisorAgreement",
+            "default": "absent"
+          },
+          "conflict_status": {
+            "$ref": "#/components/schemas/ConflictStatus",
+            "default": "none"
+          },
+          "decision_policy_revision": {
+            "default": "",
+            "title": "Decision Policy Revision",
+            "type": "string"
+          },
+          "evidence_observation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 12,
+            "title": "Evidence Observation Ids",
+            "type": "array"
+          },
+          "exposed": {
+            "default": false,
+            "title": "Exposed",
+            "type": "boolean"
+          },
+          "exposure_state": {
+            "$ref": "#/components/schemas/ExposureState",
+            "default": "no_qualification"
+          },
+          "ood_status": {
+            "$ref": "#/components/schemas/OodStatus",
+            "default": "unknown"
+          },
+          "reason_for_asking": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason For Asking"
+          },
+          "selected_option": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Option"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DecisionStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "PolicyDecisionBlock",
         "type": "object"
       },
       "ProcessMiningRequest": {
@@ -11840,6 +12432,11 @@
               }
             ]
           },
+          "dream_proposals_pending": {
+            "default": 0,
+            "title": "Dream Proposals Pending",
+            "type": "integer"
+          },
           "enforced": {
             "default": false,
             "title": "Enforced",
@@ -11990,6 +12587,16 @@
             "default": 0,
             "title": "Planning Pending Hint Ms",
             "type": "integer"
+          },
+          "policy_decision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyDecisionBlock"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "project_binding": {
             "default": "unbound",
@@ -21880,6 +22487,666 @@
           }
         },
         "summary": "Dispatch Reconcile"
+      }
+    },
+    "/v1/dreams": {
+      "get": {
+        "description": "Read-only.  Writes nothing, ever (D21).\n\nIt runs the cheap citation check and *filters* a proposal that can no longer prove its\nevidence; withdrawing it is the sweep's job, because a GET with a side effect is the kind of\nthing that gets \"optimised\" into a cache six months later \u2014 and the surfaced record is the\nonly thing standing between nonresponse and rejection.",
+        "operationId": "list_dreams_v1_dreams_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_history",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include History",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DreamProposalListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Dreams"
+      }
+    },
+    "/v1/dreams/refresh": {
+      "post": {
+        "operationId": "refresh_dreams_v1_dreams_refresh_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DreamRefreshRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DreamRefreshResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Dreams"
+      }
+    },
+    "/v1/dreams/{proposal_id}": {
+      "get": {
+        "description": "Read-only, with the expensive validation arm: the bodies are decrypted and every quote\nis re-found in the message it claims to come from.",
+        "operationId": "get_dream_v1_dreams__proposal_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "session_id",
+            "required": false,
+            "schema": {
+              "default": "default",
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DreamProposal"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Dream"
+      }
+    },
+    "/v1/dreams/{proposal_id}/transition": {
+      "post": {
+        "description": "One route, one closed vocabulary.\n\n``accepted`` does not mint anything.  It writes one event and returns.  If accept minted a\nplan root, accepting while a task was in flight would have to either clobber the owner's\ncurrent objective or 409 \u2014 and a 409 loses the owner's answer, which is the exact class of\nloss this phase exists to prevent.  The answer is recorded first; the machinery catches up\non the next reconcile.",
+        "operationId": "dream_transition_v1_dreams__proposal_id__transition_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Proposal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-mtls-subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Mtls-Subject"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-consumer",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Consumer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Role"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-workspace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Workspace"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tce-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-User"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-TCE-Behavior-Subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Tce-Behavior-Subject"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DreamProposalTransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DreamProposal"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dream Transition"
       }
     },
     "/v1/effects": {

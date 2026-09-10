@@ -43,6 +43,7 @@ from tce_shared.decision_capture import (
     promotion_decision,
     resolve_prediction_fields,
 )
+from tce_shared.policy_evaluation import episode_key
 from tce_shared.situation import classify_situation
 
 from ..config import get_settings
@@ -583,6 +584,104 @@ def _persist_candidate(
     return "pending_review"
 
 
+def _opt_text(value: Any) -> str | None:
+    """Coerce a DB cell to `str | None` — never pass a row value through (mypy `warn_return_any`)."""
+
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _cancel_epoch(db: Session, *, workspace_id: str, session_id: str) -> int:
+    """P2's `task_states.last_cancel_seq` for this session, or 0 when the session has no task state.
+
+    This is the component of `episode_key` that distinguishes a re-run after a cancel from a
+    continuation of the same work, so two runs of one objective either side of a cancel land in
+    different episodes and `freeze_split` may cut between them.
+    """
+
+    if not workspace_id or not session_id:
+        return 0
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT last_cancel_seq
+                FROM task_states
+                WHERE workspace_id = :workspace_id AND session_id = :session_id
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {"workspace_id": workspace_id, "session_id": session_id},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return 0
+    try:
+        return int(row.get("last_cancel_seq") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _observation_attribution(db: Session, *, receipt: dict[str, Any], opportunity_id: UUID | None) -> dict[str, str | None]:
+    """Resolve `project_id` / `decision_family` / `task_id` / `episode_key` for one observation.
+
+    P4 §8.1 gives those four `decision_observations` columns six producers. This is the only one
+    that already holds an `opportunity_id`, so it is the only one that can fill them by joining
+    `decision_opportunities` rather than guessing. An observation with no opportunity — a
+    pending-review write, or a promotion whose target vanished — keeps all four `NULL`: it has no
+    decision family and belongs to no episode, and a fabricated key would put it in one.
+
+    `episode_key` prefers the value the freeze site stored on the opportunity, so the split sees
+    the same key the decision saw. It is recomputed from the same components only when the
+    opportunity predates that column.
+    """
+
+    empty: dict[str, str | None] = {"project_id": None, "decision_family": None, "task_id": None, "episode_key": None}
+    if opportunity_id is None:
+        return empty
+    row = (
+        db.execute(
+            text(
+                """
+                SELECT session_id, objective_hash, task_id, project_id, decision_family, episode_key
+                FROM decision_opportunities
+                WHERE id = :opportunity_id
+                """
+            ),
+            {"opportunity_id": opportunity_id},
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return empty
+    workspace_id = str(receipt.get("workspace_id") or "")
+    subject_user_id = str(receipt.get("subject_user_id") or "")
+    project_id = _opt_text(row.get("project_id"))
+    session_id = str(row.get("session_id") or "")
+    key = _opt_text(row.get("episode_key"))
+    if key is None:
+        key = episode_key(
+            workspace_id=workspace_id,
+            subject_user_id=subject_user_id,
+            project_id=project_id,
+            session_id=session_id,
+            objective_hash=_opt_text(row.get("objective_hash")),
+            cancel_epoch=_cancel_epoch(db, workspace_id=workspace_id, session_id=session_id),
+        )
+    return {
+        "project_id": project_id,
+        "decision_family": _opt_text(row.get("decision_family")),
+        "task_id": _opt_text(row.get("task_id")),
+        "episode_key": key,
+    }
+
+
 def _save_evidence(
     db: Session,
     *,
@@ -646,12 +745,15 @@ def _save_evidence(
         evidence=normalized,
         storage_gate=gate,
     )
+    attribution = _observation_attribution(db, receipt=receipt, opportunity_id=opportunity_id)
     db.execute(
         text(
             """
             UPDATE decision_observations
             SET opportunity_id = :opportunity_id, origin_kind = :origin_kind,
-                capture_receipt_id = :capture_receipt_id, extraction_version = :extraction_version
+                capture_receipt_id = :capture_receipt_id, extraction_version = :extraction_version,
+                project_id = :project_id, decision_family = :decision_family,
+                task_id = :task_id, episode_key = :episode_key
             WHERE id = :id
             """
         ),
@@ -661,6 +763,7 @@ def _save_evidence(
             "origin_kind": candidate.origin_kind.value,
             "capture_receipt_id": receipt["id"],
             "extraction_version": knobs.version,
+            **attribution,
         },
     )
     db.execute(

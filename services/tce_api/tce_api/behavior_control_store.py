@@ -755,7 +755,10 @@ def freeze_shadow_prediction(
             "frozen_at": frozen_at,
             "evidence_cutoff_at": evidence_cutoff_at,
             "evidence_revision": evidence_revision,
-            "advice_visible": bool(advice_visible),
+            # Passed through, never re-derived. The caller decides what "the advisor's output
+            # was rendered" means for its site; a `bool(<payload>)` here is how this column came
+            # to be True on every row ever written.
+            "advice_visible": advice_visible,
         },
     )
     return prediction_id

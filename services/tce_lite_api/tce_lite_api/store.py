@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
@@ -38,7 +38,7 @@ from tce_shared.autonomy_goals import (
     evaluate_execution_permit,
     score_goal,
 )
-from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence, predict_behavior
+from tce_shared.behavior_fidelity import behavior_storage_gate, normalize_behavior_evidence
 from tce_shared.charter import (
     CharterRequired,
     charter_constraints,
@@ -58,7 +58,17 @@ from tce_shared.decision_capture import (
     HUMAN_INPUT_TASK_TYPE,
     TRUSTED_ORIGINS,
     HumanResolution,
-    evidence_revision,
+)
+from tce_shared.decision_policy import (
+    AdvisorContribution,
+    DecisionRequest,
+    DecisionResult,
+    DecisionStatus,
+    advice_names_a_candidate,
+    context_evidence_snapshot,
+    decide,
+    evidence_strength_label,
+    failed_advisor_contribution,
 )
 from tce_shared.events import (
     AgentRole,
@@ -90,6 +100,7 @@ from tce_shared.events import (
     GoalKind,
     OperationMode,
     PatternFeedbackRequest,
+    PolicyDecisionBlock,
     ResumePacketAnchor,
     ResumePacketChangeSummary,
     ResumePacketFileItem,
@@ -177,6 +188,7 @@ from tce_shared.takeover import (
     build_decisive_response,
     build_next_action,
     classify_text,
+    compute_context_quality_score,
     compute_decision_confidence,
     contains_phrase,
     ensure_takeover_response,
@@ -247,12 +259,20 @@ from .deadline_sqlite import (
     begin_sqlite_deadline,
     finish_sqlite_deadline,
 )
+from .dream_store import count_pending_proposals
 from .plan_rows import write_plan_rows
 from .planning_store import (
     enqueue_planning_job,
     pending_directive_ids,
     pending_planning_job_ids,
     sweep_stale_planning_jobs,
+)
+from .policy_store import (
+    LITE_MODEL_ID,
+    LITE_RUNTIME_VERSION,
+    build_decision_request,
+    persist_policy_decision,
+    qualification_gate,
 )
 from .reconcile import pause_guard_for_session, resolve_effects_for_directive
 from .store_graph import (
@@ -391,6 +411,11 @@ class _LiteMMRCandidate(TypedDict):
     row: sqlite3.Row
     tokens: set[str]
 
+
+
+# Lite runs no server-side model gateway, and P4 does not add one (design §9.2). Named here
+# so the one place that depends on it says which fact it depends on.
+LITE_HAS_SERVER_SIDE_ADVISOR = False
 
 logger = logging.getLogger(__name__)
 
@@ -3205,10 +3230,20 @@ def context_bundle(
                 ],
             ]
         )[:500]
-    if cold_start:
-        summary = (
-            "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance."
-        )
+    # P4 (G17): the cold-start summary rewrite is deleted, producer and all.
+    #
+    # It was one of two magic strings that another module then pattern-matched on:
+    # `ensure_takeover_response` read this text back out of the advice payload and rewrote the
+    # turn through `build_decisive_response`, so the LOWEST-evidence turns produced the MOST
+    # confident output, and the resulting DECISIVE classification scored 0.92 against 0.58 for
+    # a handoff -- raising the very decision_confidence that gates needs_human. Builder A
+    # deleted both reads; leaving the producer alive only means the same string finds a new
+    # reader later.
+    #
+    # The fact itself is not lost. It already travels structurally as `policy["cold_start"]`
+    # below, and thin evidence now travels as `policy_decision.abstain_reason` and
+    # `reason_for_asking` -- a named field a caller can branch on, rather than a sentence
+    # smuggled into a summary.
 
     bundle = ContextBundleResponse(
         summary=summary,
@@ -4968,12 +5003,17 @@ def _query_similar_observations_lite(
     query_tokens = _tokenize_text(situation_text)
     if not query_tokens:
         return results[:limit]
+    # P4: the semantic arm keeps its situation_type filter.  It used to drop it entirely,
+    # which returned cross-situation rows in precisely the low-evidence cases where abstaining
+    # matters most -- the fallback was widest exactly where the evidence was thinnest.  Full's
+    # ANN arm regains the same filter for the same reason.
     candidate_rows = conn.execute(
-        """
+        f"""
         SELECT id, ts, situation_type, situation_summary, user_response, response_reasoning,
                outcome, outcome_sentiment, confidence, source_event_ids, context_snapshot
         FROM decision_observations
         WHERE workspace_id = ? AND subject_user_id = ? AND superseded_by IS NULL
+          AND situation_type IN ({placeholders})
           AND learning_eligible = 1
           AND lifecycle_status = 'active'
           AND (valid_from = '' OR valid_from <= ?)
@@ -4981,7 +5021,7 @@ def _query_similar_observations_lite(
         ORDER BY ts DESC
         LIMIT 200
         """,
-        (workspace_id, subject_user_id, current_ts, current_ts),
+        (workspace_id, subject_user_id, *candidates, current_ts, current_ts),
     ).fetchall()
     scored: list[tuple[float, sqlite3.Row]] = []
     for row in candidate_rows:
@@ -5132,11 +5172,16 @@ def build_clone_advice(
     pattern_conf = [pattern.confidence for pattern in bundle.top_patterns]
     confidence = sum(pattern_conf) / len(pattern_conf) if pattern_conf else 0.45
     citation_count = len(bundle.citations)
-    evidence_strength = "medium"
+    # P4: one vocabulary across both backends.  Full emitted {strong, moderate, weak} and Lite
+    # emitted {high, medium, low}, so any branch keyed on the label could never fire on Lite --
+    # a silent policy fork hiding inside a string.  The labels here are now the shared ones
+    # ``decision_policy.evidence_strength_label`` returns.  Nothing reads this field to steer a
+    # turn any more (the read in ``ensure_takeover_response`` is gone), so it is provenance.
+    evidence_strength = "moderate"
     if citation_count >= 5 and confidence >= 0.65:
-        evidence_strength = "high"
+        evidence_strength = "strong"
     elif citation_count < 2 or confidence < 0.45:
-        evidence_strength = "low"
+        evidence_strength = "weak"
 
     conflict_flags: list[str] = []
     if fallback_used:
@@ -5671,21 +5716,40 @@ def _record_takeover_action(
     conn.commit()
 
 
-def _is_mutating_intent(message: str, task: str | None, final_response: str | None) -> bool:
-    joined = " ".join([message or "", task or "", final_response or ""]).lower()
-    hints = (
-        "edit ",
-        "change ",
-        "fix ",
-        "implement ",
-        "update ",
-        "refactor ",
-        "rename ",
-        "delete ",
-        "write ",
-        "create ",
-    )
-    return any(token in joined for token in hints)
+# The verbs that mean "this turn intends to write something".  Matched on word boundaries, so
+# "fix" is found in `ship the stripe webhook fix` and not in `prefixed`.
+#
+# The list used to be matched as `"fix "` etc. -- verb plus a literal trailing space -- which
+# silently missed every verb at the end of a string.  `ship the stripe webhook fix` is a mutating
+# objective and scored as a non-mutating one, and the gate fired on those turns only because its
+# third input, the system's own reply, echoed the objective back with a space after it.  Removing
+# that input without fixing this would have dropped the permit requirement on exactly those turns.
+_MUTATING_VERBS: tuple[str, ...] = (
+    "edit",
+    "change",
+    "fix",
+    "implement",
+    "update",
+    "refactor",
+    "rename",
+    "delete",
+    "write",
+    "create",
+)
+_MUTATING_VERB_RE = re.compile(r"\b(?:" + "|".join(_MUTATING_VERBS) + r")\b", re.IGNORECASE)
+
+
+def _is_mutating_intent(message: str, task: str | None) -> bool:
+    """Does this turn intend a write?  A property of what the OWNER asked and what the objective is.
+
+    `final_response` -- the system's own reply for this turn -- used to be a third input, and on
+    the turns where the message and the objective carried no verb it decided the gate by itself.
+    A permit gate that reads the system's own words can be talked past by rewording the reply,
+    which is the anti-pattern this whole plan closes.  It is gone; never add an output of this
+    turn back as an input to it.
+    """
+
+    return bool(_MUTATING_VERB_RE.search(" ".join([message or "", task or ""])))
 
 
 def _clamp_confidence_lite(value: float, low: float = 0.05, high: float = 0.98) -> float:
@@ -9390,6 +9454,7 @@ def _freeze_decision_opportunity_lite(
     conn: sqlite3.Connection,
     *,
     auth: AuthContext,
+    scope: ResolvedScope,
     state: TakeoverState,
     body: TakeoverStepRequest,
     settings: Settings,
@@ -9403,19 +9468,68 @@ def _freeze_decision_opportunity_lite(
     snapshot: dict[str, Any],
     advice_visible: bool,
     project_id: str | None,
+    cancel_epoch: int = 0,
+    turn_policy_request: DecisionRequest | None = None,
+    turn_policy_result: DecisionResult | None = None,
 ) -> str | None:
-    """Freeze the pre-answer context and the shadow prediction (or abstention) BEFORE the human answers.
+    """Freeze the pre-answer context and the decision (or abstention) BEFORE the human answers.
 
-    Never fails a takeover turn: any error is logged and the turn continues without an opportunity."""
+    P4 changes what is frozen here, not when.  The site used to call ``predict_behavior``
+    directly on an unbounded 500-row corpus and store a prediction; it now stores a
+    ``DecisionResult`` from the one decision callable, together with everything a later
+    qualification run needs to decide whether that case is admissible evidence at all:
+
+    * ``request_fingerprint`` -- so replay can prove it rebuilt the same request rather than a
+      different one that happened to reach the same answer.
+    * ``decision_advice_shown`` -- whether the text the human is about to answer already names
+      one of the options they are choosing between.  This is the contamination the promotion
+      gate must exclude, and it is what the old ``advice_visible`` column was supposed to be.
+    * ``candidate_option_count`` -- the gate excludes cases offering fewer than two options.
+      The count is a *gate* input, not a replay input: the list itself is retained on the
+      opportunity this call writes in the same transaction (``insert_opportunity``'s
+      ``alternatives``), and ``policy_store.replay_candidate_options`` reads it back from
+      there.  ``query_json`` deliberately does not carry the options -- a second copy of the
+      same list is how the count and the set came to disagree on live rows.
+    * ``episode_key`` -- the unit a train/holdout split may not straddle.
+    * ``task_id`` -- this site used to hard-code ``None``, so no stored opportunity carried one.
+
+    The turn's own ``DecisionResult`` is reused when this site's family and candidate set match
+    the request it was built from; otherwise the site builds its own request, because a result
+    computed for a different family over a different candidate set is not this decision, and
+    persisting it would make the frozen row and the turn agree only by coincidence.
+
+    Never fails a takeover turn: any error is logged and the turn continues without an
+    opportunity.
+    """
     try:
-        prior = load_behavior_evidence_lite(
-            conn,
-            workspace_id=auth.workspace_id,
-            subject_user_id=auth.behavior_subject_id,
-            limit=500,
-            eligible_only=True,
-        )
-        revision, cutoff = evidence_revision(prior)
+        candidate_options = tuple(str(item) for item in alternatives if str(item).strip())
+        request = turn_policy_request
+        result = turn_policy_result
+        started = time.perf_counter()
+        if (
+            request is None
+            or result is None
+            or request.decision_family != decision_family
+            or request.candidate_options != candidate_options
+        ):
+            request = build_decision_request(
+                conn,
+                scope=scope,
+                settings=settings,
+                decision_family=decision_family,
+                situation_type=situation_type,
+                situation_summary=question_text[:500],
+                objective_text=objective_text,
+                constraints=body.constraints if isinstance(body.constraints, dict) else {},
+                context_snapshot=snapshot,
+                candidate_options=candidate_options,
+                decision_at=now_utc(),
+                session_id=state.session_id,
+                objective_hash=objective_hash or None,
+                cancel_epoch=cancel_epoch,
+            )
+            result = decide(request)
+        latency_ms = max(0, int((time.perf_counter() - started) * 1000))
         query = {
             "situation_type": situation_type,
             "situation_summary": question_text[:500],
@@ -9423,14 +9537,14 @@ def _freeze_decision_opportunity_lite(
             "constraints": body.constraints if isinstance(body.constraints, dict) else {},
             "context_snapshot": snapshot,
         }
-        started = time.perf_counter()
-        prediction = predict_behavior(
-            prior,
-            query,
-            candidate_choices=list(alternatives),
-            min_confidence=float(getattr(settings, "behavior_prediction_min_confidence", 0.55)),
-        )
-        latency_ms = max(0, int((time.perf_counter() - started) * 1000))
+        prediction = {
+            "predicted_choice": result.selected_option,
+            "abstained": result.status is DecisionStatus.ABSTAINED,
+            "confidence": float(result.policy_score),
+            "citations": list(result.evidence_observation_ids),
+        }
+        revision = request.evidence_revision
+        cutoff = request.evidence_cutoff_at
         now = now_utc()
         opportunity_id = str(uuid.uuid4())
         prediction_id = freeze_shadow_prediction(
@@ -9443,12 +9557,27 @@ def _freeze_decision_opportunity_lite(
             decision_family=decision_family,
             query=query,
             prediction=prediction,
-            evidence_count=len(prior),
+            evidence_count=len(request.evidence_rows),
             latency_ms=latency_ms,
             evidence_cutoff_at=cutoff,
             evidence_revision=revision,
             advice_visible=advice_visible,
             frozen_at=now,
+        )
+        persist_policy_decision(
+            conn,
+            prediction_id=prediction_id,
+            result=result,
+            # The request, not just the result: the evidence set the decision was OFFERED lives
+            # nowhere else, and without it a row with evidence cannot be replayed at all.
+            request=request,
+            project_id=project_id,
+            episode_key=request.episode_key,
+            decision_advice_shown=advice_names_a_candidate(
+                rendered_text=question_text,
+                candidate_options=candidate_options,
+            ),
+            candidate_option_count=len(candidate_options),
         )
         ttl_seconds = max(0, int(getattr(settings, "capture_opportunity_ttl_seconds", 3600)))
         insert_opportunity(
@@ -9460,7 +9589,7 @@ def _freeze_decision_opportunity_lite(
             session_id=state.session_id,
             turn=turn,
             objective_hash=objective_hash or None,
-            task_id=None,
+            task_id=scope.task_id,
             project_id=project_id,
             decision_family=decision_family,
             situation_type=situation_type,
@@ -9469,12 +9598,17 @@ def _freeze_decision_opportunity_lite(
             pre_answer_snapshot={**snapshot, "final_response": question_text, "turn": turn},
             evidence_cutoff_at=cutoff,
             evidence_revision=revision,
-            advice_exposure={"advice_visible": bool(advice_visible), "prediction_shown": False},
+            # `prediction_shown` was the literal False at every site, which is one of the two
+            # reasons the deployed route and the evaluated route were disjoint sets. It is now
+            # the policy's own exposure flag: False for every family today, and True the moment
+            # a qualification record exists, with no further code change.
+            advice_exposure={"advice_visible": advice_visible, "prediction_shown": bool(result.exposed)},
             shadow_prediction_id=prediction_id,
             source_event_id=None,
             expires_at=now + timedelta(seconds=ttl_seconds) if ttl_seconds else None,
             created_at=now,
             frozen_at=now,
+            episode_key=request.episode_key,
         )
         return opportunity_id
     except Exception:
@@ -9497,6 +9631,10 @@ def _ensure_open_decision_lite(
     snapshot: dict[str, Any],
     advice_visible: bool,
     project_id: str | None,
+    scope: ResolvedScope,
+    cancel_epoch: int = 0,
+    turn_policy_request: DecisionRequest | None = None,
+    turn_policy_result: DecisionResult | None = None,
 ) -> str | None:
     """Dedupe an open decision per (family, objective_hash) while its opportunity is still open."""
     objective_hash_value = str(state.objective_hash or "")
@@ -9522,6 +9660,7 @@ def _ensure_open_decision_lite(
     opportunity_id = _freeze_decision_opportunity_lite(
         conn,
         auth=auth,
+        scope=scope,
         state=state,
         body=body,
         settings=settings,
@@ -9535,6 +9674,9 @@ def _ensure_open_decision_lite(
         snapshot=snapshot,
         advice_visible=advice_visible,
         project_id=project_id,
+        cancel_epoch=cancel_epoch,
+        turn_policy_request=turn_policy_request,
+        turn_policy_result=turn_policy_result,
     )
     if opportunity_id:
         state.takeover_context["open_decision"] = {
@@ -10796,14 +10938,10 @@ def takeover_step(
             pinned_active = True
     if pinned_active and not pending_execution and not body.task:
         resolved_task = pinned_objective
-    classifier_input = body.executor_output if (body.executor_output or "").strip() else message
-    classifier_for_conf = classify_text(
-        classifier_input,
-        takeover_active=state.mode == TakeoverMode.TAKEOVER,
-        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
-        semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
-        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
-    )
+    # `classifier_for_conf` used to live here: a second classification of `body.executor_output`
+    # -- the system's own prior text -- whose only consumer was `decision_confidence`. That term is
+    # gone, and so is the call, so no path remains from the system's own words into the escalation
+    # gate. `classify_ms` keeps its meaning: the classification the turn actually decides on.
     classify_ms = int((time.perf_counter() - classify_started) * 1000)
 
     retrieval_started = time.perf_counter()
@@ -10982,7 +11120,6 @@ def takeover_step(
     decision_confidence, confidence_components = compute_decision_confidence(
         objective=resolved_task,
         message=message,
-        classification=classifier_for_conf,
         working_set=working_set,
         recent_outcomes=state.recent_outcomes_json,
     )
@@ -10995,15 +11132,121 @@ def takeover_step(
         message=message,
     )
     evidence_count = int(working_set.get("evidence_count", 0) or 0)
-    evidence_strength_score = max(0.0, min(1.0, evidence_count / 6.0))
-    recency_coverage_score = 1.0 if evidence_count > 0 else 0.2
+    # ---- P4: the one decision-policy call on this turn -------------------------------
+    #
+    # It runs BEFORE anything reads it: before the two context-quality scores below, before
+    # `ensure_takeover_response`, and before the escalation causes. `decide()` is pure; the
+    # only I/O is one bounded evidence load (<= MAX_NEIGHBOURS * 8 rows) inside
+    # `build_decision_request`, which replaces up to three unbounded 500-row loads at the
+    # freeze sites. Net DB work per turn goes down.
+    #
+    # An ordinary takeover turn offers no candidate options, so this abstains with
+    # NO_CANDIDATE_MATCH. That is the normal case and not an error: with no qualified family
+    # -- the state of every family on every deployment measured so far -- `exposed` is False,
+    # `ensure_takeover_response` ignores the policy entirely, and the turn is byte-for-byte
+    # what it was before P4. The result is still fully recorded, which is the point of running
+    # the policy before it has permission to be used.
+    policy_cancel_epoch = int(getattr(task_projection_pre, "last_cancel_seq", 0) or 0) if task_projection_pre is not None else 0
+    policy_situation_type = classify_situation(
+        resolved_task or message,
+        semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
+        semantic_threshold=float(getattr(settings, "semantic_classifier_situation_threshold", 0.61)),
+        semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+    )
+    policy_result: DecisionResult | None = None
+    policy_request: DecisionRequest | None = None
+    try:
+        policy_request = build_decision_request(
+            conn,
+            scope=request_scope,
+            settings=settings,
+            decision_family="needs_human",
+            situation_type=policy_situation_type,
+            situation_summary=str(resolved_task or message or "")[:500],
+            objective_text=str(state.takeover_context.get("objective") or resolved_task or ""),
+            constraints=body.constraints if isinstance(body.constraints, dict) else {},
+            context_snapshot={"objective_hash": state.objective_hash, "turn": turn_count},
+            candidate_options=(),
+            decision_at=now,
+            session_id=state.session_id,
+            objective_hash=str(state.objective_hash or "") or None,
+            cancel_epoch=policy_cancel_epoch,
+        )
+        policy_result = decide(policy_request)
+    except Exception:
+        # A decision policy that cannot be computed must never fail a turn. It is recorded as
+        # absent, which under FN2 is indistinguishable from the unexposed case: the turn runs
+        # exactly as it does today.
+        logger.warning("decision policy assembly failed", exc_info=True)
+        policy_request = None
+        policy_result = None
+    # `evidence_count` is len(citations) -- timeline event ids, which are retrieval provenance
+    # and never the evidence for a choice. Reading them here put that number behind 0.25 of
+    # context_quality_score, which gates bounded retrieval and needs_human. It is now decision
+    # evidence above the similarity floor, which is what the name always claimed.
+    #
+    # Read from the REQUEST, not from `policy_result.adequacy`. `decide()` abstains at stage 2
+    # when a turn offers no candidate options, and an ordinary takeover turn offers none, so
+    # that adequacy is the empty one on every ordinary turn -- zero evidence, zero age, whatever
+    # the corpus holds. Scoring the context from it makes the score a constant that sits under
+    # the escalation line forever, which is "always ask the human", which is a shutdown rather
+    # than a gate. `context_evidence_snapshot` uses the policy's own adequacy whenever it
+    # reached stage 3, and otherwise measures the same evidence the request carries.
+    evidence_above_floor, evidence_median_age_days = (
+        context_evidence_snapshot(policy_request, policy_result)
+        if policy_request is not None
+        else (0, 0.0)
+    )
+    evidence_strength_score = (
+        max(0.0, min(1.0, evidence_above_floor / 6.0))
+        if policy_request is not None
+        else max(0.0, min(1.0, evidence_count / 6.0))
+    )
+    # And this was a field named for recency that read no clock: 1.0 for any non-empty corpus,
+    # 0.2 for an empty one, forever. Now it decays against the age of the evidence actually
+    # used, with the same 90-day half-life the similarity term uses.
+    #
+    # The empty-corpus guard is deliberate and is not in the design's one-line formula. With no
+    # eligible evidence the median age is 0.0, so a bare exp(-ln2 * 0 / 90) reports *perfect*
+    # recency coverage for a corpus that has nothing in it -- which is the same defect in a new
+    # costume. No evidence keeps the floor the old branch used, so the number only ever means
+    # "the evidence I actually have is this fresh".
+    recency_coverage_score = (
+        (
+            math.exp(-math.log(2) * max(0.0, evidence_median_age_days) / 90.0)
+            if evidence_above_floor > 0
+            else 0.2
+        )
+        if policy_request is not None
+        else (1.0 if evidence_count > 0 else 0.2)
+    )
     outcome_stability_score = max(0.0, 1.0 - min(1.0, recent_failures / 3.0))
-    context_quality_score = round(
-        (0.40 * float(decision_confidence))
-        + (0.25 * evidence_strength_score)
-        + (0.20 * recency_coverage_score)
-        + (0.15 * outcome_stability_score),
-        4,
+    # A score named for the quality of the CONTEXT must not be dominated by the confidence of
+    # the ANSWER. The old formula took 0.40 of its value from `decision_confidence`, one of
+    # whose four terms is `classifier_certainty` -- how the system classified its own response.
+    # So the reply fed the score, the score fed the retrieval trigger and the `needs_human`
+    # escalation, and a turn could talk itself past its own safety gate: the lowest-evidence
+    # turns produced the most assertive text, which scored as certainty, which raised the very
+    # gate that existed to catch them. The term is gone. What is left measures context only,
+    # and the weights are re-derived over the three surviving terms to sum to 1.
+    #
+    # Two of the inputs the ruling names are deliberately NOT terms here, because on this seam
+    # they would be constants rather than measurements:
+    #   * corroboration (`Adequacy.agreement_share`) is 0 whenever no neighbour maps onto an
+    #     offered candidate option, and an ordinary takeover turn offers none. Weighting it
+    #     would deflate every turn by the same amount and measure nothing. It belongs in this
+    #     score on the day the seam actually offers options.
+    #   * retrieval outcome is not available yet: this score is computed BEFORE retrieval and
+    #     is its trigger (`quality_gate`, below). Feeding the outcome back in would be a second
+    #     circularity of exactly the shape just removed.
+    #
+    # Full carries the identical formula (`tce_api/main.py`), and its recency term now carries
+    # the same empty-corpus floor this one always had -- without it Full scored a corpus with
+    # nothing in it as perfectly fresh, 0.16 of quality above Lite on the same inputs.
+    context_quality_score = compute_context_quality_score(
+        evidence_strength=evidence_strength_score,
+        recency_coverage=recency_coverage_score,
+        outcome_stability=outcome_stability_score,
     )
     profile_tuning = (
         autonomy_profile_tuning(state.autonomy_policy_profile)
@@ -11070,12 +11313,12 @@ def takeover_step(
         "do": working_set.get("do", []),
         "dont": working_set.get("dont", []),
         "confidence": decision_confidence,
+        # P4: derived from properties of the decision evidence -- above-floor neighbour count,
+        # effective sample size, agreement share, learning-eligible count -- and from no model
+        # number and no citation count. Both backends import the same function, so the old
+        # Full {strong, moderate, weak} / Lite {high, medium, low} fork cannot reappear.
         "evidence_strength": (
-            "strong"
-            if int(working_set.get("evidence_count", 0) or 0) >= 5
-            else "medium"
-            if int(working_set.get("evidence_count", 0) or 0) >= 2
-            else "weak"
+            evidence_strength_label(policy_result.adequacy) if policy_result is not None else "weak"
         ),
         "citations": citation_values,
         "citation_snippets": (
@@ -11150,8 +11393,8 @@ def takeover_step(
             fast_path_reason = "confidence_above_trigger"
         elif not run_deliberation:
             fast_path_reason = "run_deliberation_false"
+    advisor_call_succeeded = False
     if should_call_clone_advice:
-        advisor_call_succeeded = False
         deliberation_started = time.perf_counter()
         try:
             clone_advice = build_clone_advice(
@@ -11226,10 +11469,60 @@ def takeover_step(
                 state.takeover_context["advisor_last_error"] = advisor_failure_reason
                 if not fast_path_reason:
                     fast_path_reason = "advisor_error"
+    # Z2, the Lite twin. ABSENT and UNAVAILABLE are two different facts about the advisor and
+    # Lite has to be able to tell them apart even though it is permanently in the first one.
+    #
+    #   ABSENT      -- `advisor is None` -- the advisor was NEVER ATTEMPTED: no cadence, no
+    #                  deadline, switched off, or (here) no server-side advisor exists at all.
+    #                  The advisor is an optional input, so the policy proceeds without it.
+    #   UNAVAILABLE -- a contribution whose `parse_state != "parsed"` -- ATTEMPTED AND FAILED.
+    #                  It forces an abstention and must never be swallowed back to None, which
+    #                  is precisely the defect that made a dead advisor on Full look like an
+    #                  advisor nobody had called.
+    #
+    # `LITE_HAS_SERVER_SIDE_ADVISOR` is False, so today every Lite turn is ABSENT and this
+    # block re-decides nothing -- `build_clone_advice` here is deterministic timeline
+    # retrieval, not a model call. The seam is written out rather than assumed so that the day
+    # Lite grows a server-side advisor, a failed call reaches the policy as UNAVAILABLE by
+    # construction. A Lite deliberation failure keeps driving `advisor_fail_streak` ->
+    # `advisor_unhealthy` -> the safety gate either way; that path is below and is untouched.
+    lite_advisor_contribution: AdvisorContribution | None = None
+    if LITE_HAS_SERVER_SIDE_ADVISOR and should_call_clone_advice and not advisor_call_succeeded:
+        lite_advisor_contribution = failed_advisor_contribution(
+            advisor_failure_reason or fast_path_reason or "advisor_call_failed",
+            model_id=LITE_MODEL_ID,
+            runtime_version=LITE_RUNTIME_VERSION,
+        )
+    if lite_advisor_contribution is not None and policy_request is not None:
+        try:
+            policy_request = replace(policy_request, advisor=lite_advisor_contribution)
+            policy_result = decide(policy_request)
+        except Exception:
+            logger.warning("advisor contribution could not be folded into the policy", exc_info=True)
     if decision_source == TakeoverDecisionSource.DELIBERATION:
         fast_path_reason = ""
     clone_payload["fast_path_reason"] = fast_path_reason or None
     clone_payload["advisor_failure_reason"] = advisor_failure_reason
+    # P4: `advice_visible` stops being a constant. It used to be `bool(clone_payload)`, and
+    # `clone_payload` is an eight-key dict literal, so `bool()` of it is True at every site in
+    # both backends, always -- the live count of rows with advice_visible=false has been zero
+    # since the column was added, and the promotion clause that reads it could never move.
+    # It now means what its name says: the advisor ran, parsed, and its guidance replaced the
+    # fast-path payload. Lite has no server-side advisor, so this is False on every Lite turn.
+    # It is a report diagnostic only; the gate input is `decision_advice_shown`, which is
+    # computed per freeze site from the text the human actually read.
+    #
+    # On Lite the answer is False by construction, and that is the honest value rather than a
+    # placeholder: `build_clone_advice` here is deterministic timeline retrieval, not a model
+    # call, so no LLM advisor output ever replaces the fast-path payload. The conjunct is
+    # written out rather than collapsed to `False` so that the day Lite grows a server-side
+    # advisor, this flips by editing one constant instead of by rediscovering the rule.
+    advisor_output_rendered = bool(
+        LITE_HAS_SERVER_SIDE_ADVISOR
+        and decision_source == TakeoverDecisionSource.DELIBERATION
+        and not fast_path_reason
+        and advisor_failure_reason is None
+    )
     state.takeover_context["last_fast_path_reason"] = fast_path_reason or None
     policy_retrieval_meta: dict[str, Any] = {}
     policy_value = working_set.get("policy")
@@ -11298,6 +11591,10 @@ def takeover_step(
         semantic_enabled=bool(getattr(settings, "semantic_classifier_enabled", False)),
         semantic_threshold=float(getattr(settings, "semantic_classifier_intent_threshold", 0.67)),
         semantic_margin=float(getattr(settings, "semantic_classifier_margin", 0.06)),
+        # An EXPOSED abstention is the only thing the policy may do to this turn. With no
+        # qualified family it is unexposed, this argument changes nothing, and the four-tuple
+        # is identical to the one `policy=None` returns.
+        policy=policy_result,
     )
     final_response: str | None = response_text
     # If ensure_takeover_response returned empty (edge case), build a
@@ -11319,6 +11616,9 @@ def takeover_step(
         message=message,
         final_response=final_response,
         takeover_context=state.takeover_context,
+        # The resolved objective is screened directly.  It used to reach the gate only
+        # through the cold-start rewrite that P4 deleted; see evaluate_safety's docstring.
+        objective=resolved_task,
     )
     safety_ms = int((time.perf_counter() - safety_started) * 1000)
     if safety_decision != SafetyDecision.ALLOW:
@@ -11364,6 +11664,7 @@ def takeover_step(
             frozen_opportunity_id = _freeze_decision_opportunity_lite(
                 conn,
                 auth=auth,
+                scope=request_scope,
                 state=state,
                 body=body,
                 settings=settings,
@@ -11380,8 +11681,11 @@ def takeover_step(
                     "objective": state.takeover_context.get("objective"),
                     "citations": [str(item) for item in citations][:20],
                 },
-                advice_visible=bool(clone_payload),
+                advice_visible=advisor_output_rendered,
                 project_id=scoped_project_id,
+                cancel_epoch=policy_cancel_epoch,
+                turn_policy_request=policy_request,
+                turn_policy_result=policy_result,
             )
             if frozen_opportunity_id:
                 pending_safety_payload["opportunity_id"] = frozen_opportunity_id
@@ -11480,17 +11784,27 @@ def takeover_step(
                 "objective_needs_refresh": bool(state.takeover_context.get("objective_needs_refresh")),
                 "objective": state.takeover_context.get("objective"),
             },
-            advice_visible=bool(clone_payload),
+            advice_visible=advisor_output_rendered,
             project_id=scoped_project_id,
+            scope=request_scope,
+            cancel_epoch=policy_cancel_epoch,
+            turn_policy_request=policy_request,
+            turn_policy_result=policy_result,
         )
-    execution_permit_required = (
+    # A permit demand is a property of the DIRECTIVE, not of this turn's wording. Recomputing it purely
+    # from the current message meant a pending directive that genuinely needed a permit stopped being
+    # demanded as soon as a later turn happened not to contain a mutating verb -- so the executor could
+    # simply keep talking until the requirement went away. While a directive that was minted requiring a
+    # permit is still pending, the demand stands regardless of what this turn says.
+    _pending_requires_permit = bool(
+        pending_execution is not None
+        and getattr(pending_execution, "requires_permit", False)
+        and str(getattr(pending_execution, "state", "")) in {DirectiveExecutionState.PENDING.value, DirectiveExecutionState.IN_PROGRESS.value}
+    )
+    execution_permit_required = _pending_requires_permit or (
         (not suppress_auto_directive)
         and state.mode == TakeoverMode.TAKEOVER
-        and _is_mutating_intent(
-            message,
-            resolved_task,
-            final_response,
-        )
+        and _is_mutating_intent(message, resolved_task)
     )
     execution_permit_id: UUID | None = None
     if execution_permit_required and project_binding == PROJECT_UNBOUND and pending_execution is None:
@@ -11728,10 +12042,23 @@ def takeover_step(
             ),
         }
         behavior_gate_blocked = not bool(behavior_fidelity_gate.get("passed", False))
+    # P4: one new escalation cause, and only one. `family_not_qualified` is deliberately NOT
+    # a term here: permission-absence is a reason not to personalize, never a reason to ask a
+    # human. Adding it would turn every turn on a corpus with no qualified family -- which is
+    # every corpus today -- into an escalation, which is a product shutdown.
+    #
+    # The `policy.exposed` conjunct is what keeps that true. An unexposed abstention is the
+    # ordinary case (no candidate options were offered) and it must not move this boolean.
+    policy_abstained = bool(
+        policy_result is not None
+        and policy_result.exposed
+        and policy_result.status is DecisionStatus.ABSTAINED
+    )
     needs_human = (
         (decision_confidence < needs_human_threshold)
         or (retrieval_triggered and context_quality_score < float(settings.context_retrieval_escalate_score))
         or advisor_unhealthy
+        or policy_abstained
         or behavior_gate_blocked
         or (safety_decision != SafetyDecision.ALLOW)
     ) and not actionable_lifecycle_pause
@@ -11785,8 +12112,12 @@ def takeover_step(
                 "objective_hash": state.objective_hash,
                 "citations": [str(item) for item in citations][:20],
             },
-            advice_visible=bool(clone_payload),
+            advice_visible=advisor_output_rendered,
             project_id=scoped_project_id,
+            scope=request_scope,
+            cancel_epoch=policy_cancel_epoch,
+            turn_policy_request=policy_request,
+            turn_policy_result=policy_result,
         )
     # Capture-channel pause: unattended mutation requires the trusted human-input audit channel.
     capture_state = _capture_delivery_state_for(conn, auth=auth, settings=settings, now=now_utc())
@@ -11974,6 +12305,18 @@ def takeover_step(
     ).fetchone()
     autonomy_notice = _notice_from_row(open_notice_row) if open_notice_row is not None else None
 
+    # P5: a COUNT, not a payload.  The proposals themselves are read through /v1/dreams, which
+    # runs the citation validation; putting proposal text on the turn response would put
+    # unvalidated quotes in front of the owner on every step.  A failure here is not a reason
+    # to fail the turn -- a missing count reads as "none pending", which is what it was before
+    # the feature existed.
+    dream_proposals_pending = 0
+    if bool(getattr(settings, "dream_proposals_enabled", True)):
+        try:
+            dream_proposals_pending = count_pending_proposals(conn, scope=request_scope)
+        except sqlite3.Error:
+            dream_proposals_pending = 0
+
     return TakeoverStepResponse(
         state=state,
         action="advisor_takeover" if state.mode == TakeoverMode.TAKEOVER else "advisor_suggest",
@@ -12009,6 +12352,16 @@ def takeover_step(
         enforcement_tier=step_enforcement_tier,
         unresolved_effects=step_unresolved_effects,
         constraints=step_constraints,
+        # P4: what the policy decided, and -- separately -- whether it was allowed to be used.
+        # There is no score on this block: an executor reading an uncalibrated number it cannot
+        # interpret is how four different fields came to be named some form of "confidence".
+        policy_decision=(
+            PolicyDecisionBlock.model_validate(policy_result.block_payload())
+            if policy_result is not None
+            else None
+        ),
+        # P5: how many proposals are waiting for an answer in this scope.
+        dream_proposals_pending=dream_proposals_pending,
         selected_goal=selected_goal,
         execution_permit_required=execution_permit_required,
         execution_permit_id=str(execution_permit_id) if execution_permit_id else None,
@@ -12603,9 +12956,10 @@ def save_observation_lite(conn: sqlite3.Connection, obs: dict[str, Any]) -> str:
         INSERT INTO decision_observations(
             id, ts, consumer_id, workspace_id, situation_type, situation_summary,
             user_response, response_reasoning, outcome, outcome_sentiment,
-            confidence, source_event_ids, context_snapshot, embedding, superseded_by, origin_kind
+            confidence, source_event_ids, context_snapshot, embedding, superseded_by, origin_kind,
+            project_id, decision_family, task_id, episode_key
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
         """,
         (
             observation_id,
@@ -12623,6 +12977,12 @@ def save_observation_lite(conn: sqlite3.Connection, obs: dict[str, Any]) -> str:
             json_dumps(obs.get("context_snapshot", {})),
             json_dumps(obs.get("embedding", [])) if obs.get("embedding") else None,
             str(obs["origin_kind"]) if obs.get("origin_kind") else None,
+            # P4, same rule as save_behavior_evidence_lite: written when the caller knows them,
+            # NULL otherwise. Never guessed.
+            str(obs["project_id"]) if obs.get("project_id") else None,
+            str(obs["decision_family"]) if obs.get("decision_family") else None,
+            str(obs["task_id"]) if obs.get("task_id") else None,
+            str(obs["episode_key"]) if obs.get("episode_key") else None,
         ),
     )
     _mark_superseded_observations_lite(
@@ -12670,10 +13030,12 @@ def save_behavior_evidence_lite(
             lifecycle_status, valid_from, valid_until, contradicts_ids_json,
             confirmed_at, behavior_schema_version, redaction_applied,
             learning_eligible, storage_score, storage_decision,
-            opportunity_id, origin_kind, capture_receipt_id, extraction_version
+            opportunity_id, origin_kind, capture_receipt_id, extraction_version,
+            project_id, decision_family, task_id, episode_key
         ) VALUES(
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
             ?, ?, ?, ?
         )
         """,
@@ -12714,6 +13076,15 @@ def save_behavior_evidence_lite(
             str(evidence["origin_kind"]) if evidence.get("origin_kind") else None,
             str(evidence["capture_receipt_id"]) if evidence.get("capture_receipt_id") else None,
             str(evidence["extraction_version"]) if evidence.get("extraction_version") else None,
+            # P4: the four columns the policy's scope predicate and the qualification split
+            # read. They stay NULL when the caller does not know them -- a pre-P4 row keeps NULL
+            # forever, which is exactly why NULL-project rows are admissible evidence that never
+            # counts toward adequacy on its own. Writing a guessed value here would be worse
+            # than writing none.
+            str(evidence["project_id"]) if evidence.get("project_id") else None,
+            str(evidence["decision_family"]) if evidence.get("decision_family") else None,
+            str(evidence["task_id"]) if evidence.get("task_id") else None,
+            str(evidence["episode_key"]) if evidence.get("episode_key") else None,
         ),
     )
     supersedes = evidence.get("supersedes_observation_id")
@@ -12869,20 +13240,25 @@ def latest_fidelity_gate_lite(
     workspace_id: str,
     subject_user_id: str,
 ) -> dict[str, Any]:
-    row = conn.execute(
-        """
-        SELECT gate_json, metrics_json, created_at
-        FROM behavior_fidelity_runs
-        WHERE workspace_id = ? AND subject_user_id = ? AND status = 'completed'
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (workspace_id, subject_user_id),
-    ).fetchone()
-    if row is None:
-        return {"passed": False, "reason": "no_completed_fidelity_run"}
-    return {
-        **json_loads(row["gate_json"], {}),
-        "metrics": json_loads(row["metrics_json"], {}),
-        "evaluated_at": row["created_at"],
-    }
+    """Read-only adapter over ``policy_qualifications``.  Same name, same signature, same dict
+    shape, so ``TakeoverStepResponse.behavior_fidelity_gate`` does not move.
+
+    What it replaces was a global "the latest run passed" flag: ``ORDER BY created_at DESC
+    LIMIT 1`` over ``behavior_fidelity_runs``, keyed on workspace and subject only, with no
+    decision family, no bound keys and an ``evaluated_at`` that was returned and never read.
+    A single run that passed once granted autonomy to every family forever.
+
+    With no live ``QUALIFIED`` row this returns ``{"passed": False, "reason":
+    "no_qualification_recorded"}`` -- the same shape and the same truth value as the answer it
+    replaces (``no_completed_fidelity_run``) for the same corpus.  Returning
+    ``passed = all(families_qualified)`` instead would flip this to blocking on a corpus where
+    no family is qualified, which combined with removing the ``behavior_autonomy_gate_enabled``
+    guard is how an earlier draft escalated every turn.  That guard stays, and it defaults off,
+    so today nothing reads this at all.
+    """
+
+    return qualification_gate(
+        conn,
+        workspace_id=workspace_id,
+        subject_user_id=subject_user_id,
+    )

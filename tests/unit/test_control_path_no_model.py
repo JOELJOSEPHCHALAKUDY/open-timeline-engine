@@ -32,6 +32,9 @@ FORBIDDEN: frozenset[str] = frozenset(
         "extract_structured",  # the only gateway method the plan/dream path ever called
         "_plan_gateway_settings",
         "_write_objective_plan_model",
+        # The advisor's new entry point.  It runs a model, and it may only ever be reached
+        # through `clone_advice`, which is the one deadline-gated exception in STOP_SET.
+        "advisor_recommend",
     }
 )
 
@@ -98,6 +101,7 @@ def test_stop_set_and_forbidden_set_are_pinned() -> None:
             "extract_structured",
             "_plan_gateway_settings",
             "_write_objective_plan_model",
+            "advisor_recommend",
         }
     )
     # _dreams_from_own_words is deliberately NOT in FORBIDDEN: the symbol no longer exists, and

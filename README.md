@@ -868,6 +868,8 @@ Automatically captured observations still support continuity and the existing he
 
 See [Behavior Fidelity v1](docs/behavior-fidelity.md) for the evidence contract, metrics, feature flags, and rollout requirements.
 
+See [The decision policy](docs/decision-policy.md) for what actually decides a takeover turn, when it abstains, and why no decision family is currently permitted to use personalization. Short version: zero families are qualified, so personalization is not used on any decision and every turn behaves as it did before. Nothing in this system is calibrated.
+
 Next time a similar task appears, the clone advice system surfaces these past decisions as hints:
 
 ```json

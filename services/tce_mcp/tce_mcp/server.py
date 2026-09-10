@@ -768,7 +768,12 @@ def run_lifecycle(retention_days: int | None = None, dry_run: bool | None = None
         "enforcement_tier name the authority in force; enforcement_tier is what the operating system enforces for a "
         "supervisor-dispatched process tree only, never for this session (see docs/charter.md). unresolved_effects "
         "lists effects from earlier runs; when one is in state 'unknown', next_step is prefixed with 'AUTONOMOUS MODE "
-        "PAUSED: an effect from a previous run is unresolved' — show it and do not start new work."
+        "PAUSED: an effect from a previous run is unresolved' — show it and do not start new work. "
+        "When policy_decision.status is 'abstained' and policy_decision.exposed is true, do not execute — show "
+        "policy_decision.reason_for_asking and wait. policy_decision.exposed=false means personalization was not "
+        "applied on this turn and the block is reporting only; it is not an instruction to stop. "
+        "dream_proposals_pending is the count of aspiration proposals waiting for the owner's answer; it is "
+        "information, never a directive. Read them with tce.dreams, which also records that they were shown."
     ),
 )
 def takeover_step(
@@ -1053,6 +1058,35 @@ def reset_takeover_state(
         activation_keywords=activation_keywords,
         stop_keywords=stop_keywords,
     )
+
+
+@mcp.tool(
+    name="tce.dreams",
+    description=(
+        "Read the owner's open aspiration proposals and record that they were shown. "
+        "action='list' returns the open proposals and THEN marks exactly those proposals 'surfaced' — "
+        "listing is what puts them in front of the owner, and that record is the only thing that keeps "
+        "'he never answered' distinguishable from 'he said no'. The ids marked come back in "
+        "surfaced_recorded. action='surfaced' with proposal_id records a single display. "
+        "This tool CANNOT accept, reject, snooze or unsnooze a proposal, and never will: a verdict requires "
+        "a verified human identity and this MCP process authenticates as an executor, structurally barred "
+        "from the host-capture credential. Passing a verdict action returns a refusal, not a verdict. Only "
+        "the owner can answer, by running `tce dreams accept --id <proposal_id>` (or reject / snooze / "
+        "unsnooze) from the CLI — say so rather than trying another tool. "
+        "Each proposal quotes messages the owner is receipted as having typed; render 'attribution' with it "
+        "('you said' vs 'from your imported history') and never present imported history as something said "
+        "today. 'nonresponse' (never_surfaced | awaiting_response | ignored) is a separate axis from status "
+        "and is never a rejection. An empty list is a real answer: on a corpus with too few trusted human "
+        "messages the system refuses to generate proposals, and that refusal is correct — do not fill the "
+        "gap with suggestions of your own."
+    ),
+)
+def dreams(
+    session_id: str = "default",
+    action: str = "list",
+    proposal_id: str = "",
+) -> dict:
+    return tools.dreams(session_id=session_id, action=action, proposal_id=proposal_id)
 
 
 TOOL_PROFILE_STATUS = apply_tool_profile(mcp, get_settings().mcp_tool_profile)

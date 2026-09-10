@@ -9,6 +9,8 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .policy_store import annotate_observation, qualification_gate
+
 _BEHAVIOR_EVIDENCE_COLUMNS = """
     id, consumer_id, workspace_id, subject_user_id, ts, situation_type, situation_summary,
     context_snapshot, user_response, response_reasoning, outcome,
@@ -142,6 +144,18 @@ def save_behavior_evidence(
                 "subject_user_id": subject_user_id,
             },
         )
+    # The four P4 columns.  Written as a separate additive statement rather than folded into
+    # the INSERT above so the write is a no-op on a database that has not taken alembic
+    # 20260909_0040 yet: this runs on the evidence path, and a rejected statement aborts the
+    # surrounding transaction.
+    annotate_observation(
+        db,
+        observation_id=observation_id,
+        project_id=(str(evidence.get("project_id")) if evidence.get("project_id") else None),
+        decision_family=(str(evidence.get("decision_family")) if evidence.get("decision_family") else None),
+        task_id=(str(evidence.get("task_id")) if evidence.get("task_id") else None),
+        episode_key=(str(evidence.get("episode_key")) if evidence.get("episode_key") else None),
+    )
     db.commit()
     return observation_id
 
@@ -287,25 +301,25 @@ def list_fidelity_runs(
 
 
 def latest_fidelity_gate(db: Session, *, workspace_id: str, subject_user_id: str) -> dict[str, Any]:
-    row = db.execute(
-        text(
-            """
-            SELECT gate_json, metrics_json, created_at
-            FROM behavior_fidelity_runs
-            WHERE workspace_id = :workspace_id
-              AND subject_user_id = :subject_user_id
-              AND status = 'completed'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """
-        ),
-        {"workspace_id": workspace_id, "subject_user_id": subject_user_id},
-    ).mappings().first()
-    if not row:
-        return {"passed": False, "reason": "no_completed_fidelity_run"}
-    evaluated_at = row.get("created_at")
-    return {
-        **dict(row.get("gate_json") or {}),
-        "metrics": dict(row.get("metrics_json") or {}),
-        "evaluated_at": evaluated_at.isoformat() if isinstance(evaluated_at, datetime) else None,
-    }
+    """Read-only adapter over ``policy_qualifications``.  Same name, same signature, same dict
+    shape, so ``TakeoverStepResponse.behavior_fidelity_gate`` does not move.
+
+    What it replaces was a global "the latest run passed" flag: ``ORDER BY created_at DESC
+    LIMIT 1`` over ``behavior_fidelity_runs``, keyed on workspace and subject only, with no
+    decision family, no bound keys and an ``evaluated_at`` that was returned and never read.
+    One run that passed once granted autonomy to every family forever.
+
+    With no live QUALIFIED row this returns ``{"passed": False, "reason":
+    "no_qualification_recorded"}`` — the same shape and the same truth value as the answer it
+    replaces (``no_completed_fidelity_run``) for the same corpus.  Returning
+    ``passed = all(families_qualified)`` instead would flip this to blocking on a corpus where
+    no family is qualified, which combined with removing the ``behavior_autonomy_gate_enabled``
+    guard is how an earlier draft escalated every turn.  That guard stays and defaults off, so
+    today nothing reads this at all.
+
+    It reads no row of ``behavior_fidelity_runs``: every stored metric there was computed under
+    corpus-relative recency and a row-index split, and the migration marks them
+    ``invalidated_by_p4`` rather than migrating them.
+    """
+
+    return qualification_gate(db, workspace_id=workspace_id, subject_user_id=subject_user_id)

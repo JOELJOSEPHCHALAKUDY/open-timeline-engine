@@ -672,6 +672,12 @@ class DecisionObservation(Base):
     origin_kind: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     capture_receipt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     extraction_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    # ---- P4 ---- all nullable: every pre-P4 row keeps NULL forever, which is why the scope
+    # predicate treats a NULL project as admissible evidence rather than as no match.
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    decision_family: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    episode_key: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class BehaviorFidelityRun(Base):
@@ -1009,6 +1015,37 @@ class BehaviorShadowPrediction(Base):
     human_source_ref: Mapped[str | None] = mapped_column(TEXT, nullable=True)
     resolution_source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     corrections_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # ---- P4 ---- what the decision policy decided, and under which bound keys.
+    decision_policy_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    model_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    runtime_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    prompt_sha256: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    retrieval_version: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    episode_key: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    abstain_reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    ood_status: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    conflict_status: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    policy_score: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    exposed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Defaults TRUE on purpose: a row written by a writer that has not been upgraded is
+    # excluded from the promotion gate rather than silently admitted to it.
+    decision_advice_shown: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    candidate_option_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_fingerprint: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    policy_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # ---- P4 replay inputs (alembic 20260909_0041) ----
+    # The four fingerprint terms that were not recoverable from anything else on this row.
+    # `offered_evidence_ids_json` is the evidence set the decision was OFFERED; `policy_json`
+    # carries only the ids it CITED, and `DecisionRequest.fingerprint()` hashes the offered set.
+    # `decision_at` is not `created_at`: the write path calls `datetime.now()` twice, once for
+    # the request and once for the freeze, so replaying against `created_at` diverges by
+    # construction.  The two advisor terms are constant today only because no call site passes
+    # an advisor yet -- storing them now is what keeps earlier rows replayable once one does.
+    offered_evidence_ids_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    decision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    advisor_present: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    advisor_recommended_option: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class TrustedInputReceipt(Base):
@@ -1085,6 +1122,8 @@ class DecisionOpportunity(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+    # ---- P4 ----
+    episode_key: Mapped[str | None] = mapped_column(TEXT, nullable=True)
 
 
 class DecisionCandidate(Base):
@@ -1472,3 +1511,266 @@ class TaskVerification(Base):
     schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
     contract_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     plan_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+
+
+# ---- P4 ----
+
+
+class PolicyQualification(Base):
+    """One attempt to qualify a ``(project, decision_family)`` pair, passed or failed.
+
+    A failed attempt is a first-class row.  Absence of a qualification *is* refusal, so
+    "we ran the gate and it fell short, here is each clause" and "nobody has ever run it" must
+    not look the same from the outside.
+
+    ``state`` is what the run concluded.  EXPIRED, INVALIDATED and EVIDENCE_DRIFT are computed
+    at read time from this row plus the bound keys currently in force, never written back:
+    the record is immutable, which is what stops "a run that passed once unlocks autonomy
+    forever" without needing a sweeper to walk the table.
+
+    There are no calibration columns.  Nothing in this system is calibrated.
+    """
+
+    __tablename__ = "policy_qualifications"
+    __table_args__ = (
+        Index(
+            "uq_policy_qualifications_attempt",
+            "workspace_id",
+            "subject_user_id",
+            "project_id",
+            "decision_family",
+            "created_at",
+            unique=True,
+        ),
+        Index(
+            "idx_policy_qualifications_live",
+            "workspace_id",
+            "subject_user_id",
+            "decision_family",
+            "state",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    decision_family: Mapped[str] = mapped_column(TEXT, nullable=False)
+    state: Mapped[str] = mapped_column(TEXT, nullable=False, default="not_qualified")
+    decision_policy_revision: Mapped[str] = mapped_column(TEXT, nullable=False)
+    model_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    runtime_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    prompt_sha256: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    retrieval_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    evidence_revision: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    evidence_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    learning_eligible_at_qualification: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    thresholds_sha: Mapped[str] = mapped_column(TEXT, nullable=False)
+    thresholds_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    tuning_sha: Mapped[str] = mapped_column(TEXT, nullable=False)
+    split_sha256: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    split_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    metrics_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    gate_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    shortfalls_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    adjudicated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    non_abstained_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    coverage: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    precision_lower_bound: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    distinct_episodes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duplicate_context_ratio: Mapped[float] = mapped_column(REAL, nullable=False, default=0.0)
+    baselines_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    exclusions_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class ThresholdRegistration(Base):
+    """When a set of thresholds was first registered, on the server's clock.
+
+    The threshold digest is a change *detector*: it proves two runs used different numbers.
+    It cannot prove the numbers preceded the data, because it is computed from a module
+    constant that anyone can edit.  This row is the anchor that moves outside that file.
+
+    Stated plainly, because this is tamper-evident and not tamper-proof: anyone with database
+    access can update ``registered_at``.  What it buys is that backdating becomes an explicit,
+    separate, auditable act rather than a one-character edit to the constant being checked.
+    ``registered_at`` has no client-supplied value.
+    """
+
+    __tablename__ = "threshold_registrations"
+    __table_args__ = (Index("uq_threshold_registrations_sha", "thresholds_sha", "tuning_sha", unique=True),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    thresholds_sha: Mapped[str] = mapped_column(TEXT, nullable=False)
+    tuning_sha: Mapped[str] = mapped_column(TEXT, nullable=False)
+    thresholds_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+# ---- P5 ----
+# Three tables for the aspiration path.  ``DreamProposalRow`` is a *fold* of
+# ``DreamProposalEventRow`` — the events are the truth, the row is a cache of them that a list
+# query can filter on without replaying every log.  Nothing here creates a table; the shape is
+# alembic revision 20260909_0042, and these classes exist so a reader has one place to see it.
+#
+# The ``*Row`` suffix avoids colliding with the pydantic ``DreamProposal`` in
+# ``tce_shared.events``, which is imported into the same modules.
+
+
+class DreamProposalRow(Base):
+    """One aspiration, with the owner's answer to it and the evidence behind it.
+
+    Two columns are worth reading twice.  ``nonresponse_state`` is a *separate axis* from
+    ``status`` and never takes a value meaning "rejected": a proposal nobody surfaced stays
+    ``never_surfaced`` however old it gets, which is what stops the passage of time turning into
+    a decision the owner never made.  ``revision`` is the compare-and-swap target — the only
+    ``UPDATE`` in the tree that touches this table carries ``AND revision = :expected_revision``,
+    and there is no ``DELETE`` anywhere, which is what makes "refresh never deletes" a property
+    of the schema rather than of a code review.
+    """
+
+    __tablename__ = "dream_proposals"
+    __table_args__ = (
+        Index(
+            "idx_dream_proposals_scope_status",
+            "workspace_id",
+            "owner_id",
+            "subject_user_id",
+            "scope_kind",
+            "project_id",
+            "status",
+            "updated_at",
+        ),
+        Index("idx_dream_proposals_task", "workspace_id", "owner_id", "task_id"),
+        Index("idx_dream_proposals_run", "run_id"),
+        Index("idx_dream_proposals_supersedes", "supersedes_proposal_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    scope_kind: Mapped[str] = mapped_column(TEXT, nullable=False, default="project")
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    highest_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(TEXT, nullable=False, default="proposed")
+    nonresponse_state: Mapped[str] = mapped_column(TEXT, nullable=False, default="never_surfaced")
+    surfaced_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    surfaced_attested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    first_surfaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_surfaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    title: Mapped[str] = mapped_column(TEXT, nullable=False)
+    connection_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    benefit_text: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    first_step: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    citations_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    citation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evidence_basis: Mapped[str] = mapped_column(TEXT, nullable=False, default="trusted_current")
+    evidence_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    evidence_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    theme_tokens_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    supersedes_proposal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    repropose_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    snooze_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    task_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    objective_hash: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    plan_root_goal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    pursuit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    abandon_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    withdrawn_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    source_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    policy_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="p5-2026-09")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class DreamProposalEventRow(Base):
+    """One immutable fact about a proposal.  Append-only; nothing updates or deletes a row here.
+
+    ``actor_class`` separates a display record an executor wrote from a verdict a verified human
+    gave.  Both are legitimate rows; only one of them is an answer, and collapsing them is how a
+    system starts treating "we showed it three times" as "he said no".
+    """
+
+    __tablename__ = "dream_proposal_events"
+    __table_args__ = (
+        Index("uq_dream_proposal_events_seq", "proposal_id", "seq", unique=True),
+        Index("idx_dream_proposal_events_kind", "workspace_id", "owner_id", "kind", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    actor: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    actor_class: Mapped[str] = mapped_column(TEXT, nullable=False, default="system")
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")
+
+
+class DreamGenerationRunRow(Base):
+    """Every generation attempt, including the ones that refused.
+
+    ``refusal_reason``, ``refusals_json`` and ``pool_drops_json`` exist so that a path which is
+    entirely broken cannot read as "no proposals today".  ``pool_json`` records the numbered
+    mapping the model was shown — ids, hashes and timestamps, and deliberately **no message
+    text**, so a citation number stays auditable months later without the run row becoming a
+    second unencrypted copy of the owner's words.
+    """
+
+    __tablename__ = "dream_generation_runs"
+    __table_args__ = (
+        Index(
+            "idx_dream_generation_runs_scope",
+            "workspace_id",
+            "owner_id",
+            "scope_kind",
+            "project_id",
+            "started_at",
+        ),
+        Index("idx_dream_generation_runs_job", "planning_job_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    owner_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    subject_user_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    project_id: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    scope_kind: Mapped[str] = mapped_column(TEXT, nullable=False, default="project")
+    scope_key: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    session_id: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    planning_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    state: Mapped[str] = mapped_column(TEXT, nullable=False, default="running")
+    refusal_reason: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    pool_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pool_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    pool_drops_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    evidence_revision: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    evidence_cutoff_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    candidates_returned: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    proposals_written: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    refusals_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    model_provider: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    prompt_hash: Mapped[str] = mapped_column(TEXT, nullable=False, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    schema_version: Mapped[str] = mapped_column(TEXT, nullable=False, default="v1")

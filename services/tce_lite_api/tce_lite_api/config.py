@@ -357,6 +357,61 @@ class Settings(BaseSettings):
     redaction_zone_paths: str = Field(default="")
     cors_allow_origins: str = "http://localhost:4200,http://127.0.0.1:4200"
     cors_allow_credentials: bool = False
+    # ---- P4: the decision policy adds exactly two settings, and neither is a threshold ------
+    # Every number that can move an abstention or a qualification verdict lives in
+    # shared/tce_shared/policy_thresholds.py as a frozen module constant, hashed into
+    # THRESHOLDS_SHA, which is a bound key on the qualification record. A threshold a caller
+    # can move is not a threshold: set the floor low, run the report, write a QUALIFIED record
+    # with an unchanged digest, put the floor back, and nothing downstream can tell.
+    #
+    # These two are scoping and advisor-presence switches, not floors, and even they are
+    # hashed into PolicyTuning.tuning_sha() -- also a bound key -- so moving one after a
+    # qualification is written invalidates it rather than silently re-using it.
+    # Same names and same defaults as services/tce_api/tce_api/config.py.
+    policy_allow_unscoped_project_evidence: bool = True
+    # CSV. Governs only the ABSENT advisor (which on Lite is every turn: Lite has no
+    # server-side model gateway). A FAILED advisor forces an abstention regardless of this
+    # setting -- abstention on a dead model is the default, not a knob.
+    policy_advisor_required_families: str = ""
+    # ---- P5: dream proposals -----------------------------------------------------------
+    # Same names and same defaults as services/tce_api/tce_api/config.py, so a reader can diff
+    # the two files and a setting cannot mean one thing on Full and another on Lite.
+    #
+    # ``takeover_dream_llm_enabled`` stays DELETED from Lite (see the note above): Lite has no
+    # model gateway, so ``POST /v1/dreams/refresh`` refuses ``model_unavailable`` on every call
+    # and there is no gate for the flag to open.  ``dream_proposals_enabled`` IS present,
+    # because every other dream route — storage, the fold, the transitions, the validators, the
+    # sweep and the pursuit reconciler — is backend-neutral and fully functional here.
+    dream_proposals_enabled: bool = True
+    dream_message_limit: int = 60
+    dream_min_messages: int = 10
+    dream_min_message_chars: int = 25
+    dream_max_message_chars: int = 1200
+    dream_max_proposals_per_run: int = 3
+    dream_min_citations: int = 2
+    dream_max_citations: int = 6
+    dream_quote_max_chars: int = 200
+    dream_min_quote_overlap_tokens: int = 2
+    dream_min_citation_relevance_tokens: int = 1
+    dream_max_live_proposals: int = 20
+    dream_duplicate_similarity: float = 0.60
+    dream_material_new_citations: int = 2
+    dream_material_max_similarity: float = 0.60
+    dream_rejected_cooldown_days: int = 30
+    # Must be >= dream_rejected_cooldown_days, or a rejection ages out of the scan window
+    # before its cooldown expires and suppression lifts by amnesia rather than by evidence.
+    dream_rejected_lookback_days: int = 365
+    dream_rejected_scan_limit: int = 200
+    dream_max_reproposals: int = 2
+    dream_nonresponse_after_surfaces: int = 3
+    dream_resurface_min_hours: int = 24
+    # Strictly greater than dream_resurface_min_hours: slowing re-surfacing down is the ONLY
+    # functional effect NonresponseState.IGNORED has.
+    dream_resurface_ignored_hours: int = 168
+    dream_snooze_default_days: int = 7
+    dream_proposal_ttl_days: int = 45
+    dream_run_stale_minutes: int = 30
+    dream_list_limit: int = 10
 
     @property
     def token_set(self) -> set[str]:

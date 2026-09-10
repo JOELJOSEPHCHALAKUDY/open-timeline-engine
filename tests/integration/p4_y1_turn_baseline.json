@@ -1,0 +1,1697 @@
+{
+ "baseline_commit": "e805df6",
+ "recorded_from": "tests/integration/test_policy_parity.py::capture_turns",
+ "turns": [
+  {
+   "body": {
+    "action": "advisor_takeover",
+    "activation_boost_applied": false,
+    "auto_handoff": {},
+    "autonomy_notice": null,
+    "behavior_fidelity_gate": {
+     "enabled": false,
+     "passed": true,
+     "reason": "gate_disabled"
+    },
+    "capture_delivery_state": "unavailable",
+    "charter_active": false,
+    "charter_version": "",
+    "citations": [],
+    "classification": "decisive",
+    "clone_advice": {
+     "advisor_failure_reason": null,
+     "citations": [],
+     "clone_context": {
+      "current_task": "ship the stripe webhook fix",
+      "similar_observations": [],
+      "situation_type": "routine_task"
+     },
+     "confidence": 0.45,
+     "conflict_flags": [],
+     "do": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ],
+     "dont": [
+      "Do not treat low-evidence suggestions as hard constraints."
+     ],
+     "evidence_observations": [],
+     "evidence_strength": "low",
+     "fast_path_reason": null,
+     "guidance_summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+     "interaction_id": "p4-y1-0",
+     "loop_guard": {
+      "max_turns": 100,
+      "turns_remaining": 99,
+      "turns_used": 1
+     },
+     "objective_contract": {
+      "completion_state": "in_progress",
+      "created_at": "<volatile:created_at>",
+      "definition_of_done": [
+       {
+        "id": "scope",
+        "label": "Scope accepted",
+        "status": "done"
+       },
+       {
+        "id": "implementation",
+        "label": "Implementation completed",
+        "status": "pending"
+       },
+       {
+        "id": "verification",
+        "label": "Build/test/lint verification passed",
+        "status": "pending"
+       },
+       {
+        "id": "docs",
+        "label": "Docs or handoff notes updated",
+        "status": "pending"
+       }
+      ],
+      "objective": "ship the stripe webhook fix",
+      "updated_at": "<volatile:updated_at>",
+      "verification": {
+       "failed_checks": [],
+       "last_run_at": "<volatile:last_run_at>",
+       "passed_checks": [],
+       "required": [
+        "build",
+        "test",
+        "lint"
+       ],
+       "status": "pending"
+      }
+     },
+     "policy": {
+      "blocked": 0,
+      "fallback_used": false,
+      "mode": "clone_advisor",
+      "observation_recall_count": 0,
+      "semantic_recall_used": false
+     },
+     "recommended_actions": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ]
+    },
+    "constraints": [],
+    "context_quality_score": 0.4672,
+    "context_tier_used": "l2",
+    "continuity_ok": true,
+    "decision_confidence": 0.693,
+    "decision_source": "safety_gate",
+    "directive_id": null,
+    "directive_state": null,
+    "enforced": true,
+    "enforcement_reason": "weak_evidence_decisive",
+    "enforcement_tier": null,
+    "episode_boost_applied": false,
+    "execution_permit_id": null,
+    "execution_permit_required": true,
+    "feedback_adjustment_applied": false,
+    "final_response": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "goal_cache_hit": false,
+    "goal_cache_source": null,
+    "latency_breakdown_ms": "<volatile:latency_breakdown_ms>",
+    "needs_human": true,
+    "next_action": {
+     "kind": "confirm",
+     "rationale": "high-risk action detected; confirmation required",
+     "target": "ship the stripe webhook fix"
+    },
+    "note": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "open_decision_opportunity_id": null,
+    "pending_execution": null,
+    "planner_used": false,
+    "planning_job_id": "<volatile:planning_job_id>",
+    "planning_pending": false,
+    "planning_pending_hint_ms": "<volatile:planning_pending_hint_ms>",
+    "project_binding": "unbound",
+    "query_expansion_terms": [],
+    "query_expansion_used": false,
+    "rerank_strategy": "none",
+    "retrieval_hit_count": 0,
+    "retrieval_latency_ms": "<volatile:retrieval_latency_ms>",
+    "retrieval_reason": "low_context_quality",
+    "retrieval_source": "hybrid_fallback",
+    "retrieval_triggered": true,
+    "retry_scheduled": false,
+    "safety_decision": "confirm_required",
+    "selected_goal": null,
+    "selected_goal_score_breakdown": {},
+    "snapshot_age_hours": null,
+    "snapshot_rehydrated": false,
+    "state": {
+     "activated_at": "<volatile:activated_at>",
+     "activation_keywords": "hey igris take over,hey beru take over",
+     "active": true,
+     "active_goal_id": null,
+     "autonomy_policy_profile": "human_consultative",
+     "autonomy_score": 0.5386,
+     "continuity_violation_count": 0,
+     "enforcement_mode": "strict_takeover",
+     "expires_at": "<volatile:expires_at>",
+     "goal_queue_size": 0,
+     "last_classification": "decisive",
+     "last_deliberation_at": "<volatile:last_deliberation_at>",
+     "last_discovery_at": "<volatile:last_discovery_at>",
+     "last_message_at": "<volatile:last_message_at>",
+     "last_safety_decision": "confirm_required",
+     "last_tick_at": "<volatile:last_tick_at>",
+     "mode": "takeover",
+     "objective_hash": "4f8e0384a77e9e026e48",
+     "pending_directive_count": 0,
+     "persona_mode": "shadow",
+     "recent_outcomes_json": [],
+     "retry_backlog_count": 0,
+     "session_id": "p4-y1-session",
+     "stop_keywords": "shadow stand down,beru stand down,igris stand down",
+     "takeover_context": {
+      "advisor_fail_streak": 0,
+      "last_fast_path_reason": null,
+      "last_retrieval_trigger_turn": 1,
+      "last_user_message": "beru take over",
+      "objective": "ship the stripe webhook fix",
+      "objective_contract": {
+       "completion_state": "in_progress",
+       "created_at": "<volatile:created_at>",
+       "definition_of_done": [
+        {
+         "id": "scope",
+         "label": "Scope accepted",
+         "status": "done"
+        },
+        {
+         "id": "implementation",
+         "label": "Implementation completed",
+         "status": "pending"
+        },
+        {
+         "id": "verification",
+         "label": "Build/test/lint verification passed",
+         "status": "pending"
+        },
+        {
+         "id": "docs",
+         "label": "Docs or handoff notes updated",
+         "status": "pending"
+        }
+       ],
+       "objective": "ship the stripe webhook fix",
+       "updated_at": "<volatile:updated_at>",
+       "verification": {
+        "failed_checks": [],
+        "last_run_at": "<volatile:last_run_at>",
+        "passed_checks": [],
+        "required": [
+         "build",
+         "test",
+         "lint"
+        ],
+        "status": "pending"
+       }
+      },
+      "pinned_user_objective": "ship the stripe webhook fix",
+      "pinned_user_objective_hash": "4f8e0384a77e9e026e48",
+      "pinned_user_objective_turn": 1,
+      "pinned_user_objective_until_turn": 201,
+      "project_binding": "unbound",
+      "quality_history": [
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": true,
+        "ts": "<ts>",
+        "turn": 1
+       }
+      ],
+      "quality_rollup": {
+       "avg_context_quality": 0.4672,
+       "avg_decision_confidence": 0.693,
+       "needs_human_rate": 1.0,
+       "updated_at": "<volatile:updated_at>",
+       "window": 1
+      },
+      "turn_count": 1
+     },
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "working_set_json": {
+      "activation_boost_applied": false,
+      "citation_snippets": [],
+      "citations": [],
+      "context_tier_used": "l2",
+      "do": [
+       "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+       "Use timeline search immediately while patterns are still warming up."
+      ],
+      "dont": [
+       "Do not treat low-evidence suggestions as hard constraints."
+      ],
+      "episode_boost_applied": false,
+      "evidence_count": 0,
+      "graph_entities": 0,
+      "planner_used": false,
+      "refreshed_at": "<volatile:refreshed_at>",
+      "subquery_count": 1,
+      "subquery_labels": [
+       "objective"
+      ],
+      "summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+      "summary_coverage": 0.0,
+      "top_patterns": []
+     },
+     "workspace_id": "p4-y1-workspace"
+    },
+    "subquery_count": 1,
+    "subquery_labels": [
+     "objective"
+    ],
+    "summary_coverage": 0.0,
+    "takeover_enforcement": {
+     "mode": "takeover",
+     "note": "weak evidence \u2014 enforced explore-and-implement directive",
+     "trigger": "weak_evidence_decisive"
+    },
+    "task_state": {
+     "contract_revision": 1,
+     "next_permitted_action": "execute_step",
+     "open_decision_count": 0,
+     "open_step_index": 1,
+     "plan_producer": "deterministic",
+     "plan_state": "approved",
+     "revision": 1,
+     "source_revision": "<volatile:source_revision>",
+     "status": "active",
+     "task_id": "p4-y1-session",
+     "unresolved_effect_count": 0
+    },
+    "task_state_revision": 1,
+    "unresolved_effects": []
+   },
+   "message": "beru take over",
+   "status_code": 200
+  },
+  {
+   "body": {
+    "action": "advisor_takeover",
+    "activation_boost_applied": false,
+    "auto_handoff": {},
+    "autonomy_notice": null,
+    "behavior_fidelity_gate": {
+     "enabled": false,
+     "passed": true,
+     "reason": "gate_disabled"
+    },
+    "capture_delivery_state": "unavailable",
+    "charter_active": false,
+    "charter_version": "",
+    "citations": [
+     "<uuid>"
+    ],
+    "classification": "decisive",
+    "clone_advice": {
+     "advisor_failure_reason": null,
+     "citations": [
+      "<uuid>"
+     ],
+     "clone_context": {
+      "current_task": "ship the stripe webhook fix",
+      "similar_observations": [],
+      "situation_type": "routine_task"
+     },
+     "confidence": 0.45,
+     "conflict_flags": [],
+     "do": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ],
+     "dont": [
+      "Do not treat low-evidence suggestions as hard constraints."
+     ],
+     "evidence_observations": [],
+     "evidence_strength": "low",
+     "fast_path_reason": null,
+     "guidance_summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+     "interaction_id": "p4-y1-1",
+     "loop_guard": {
+      "max_turns": 100,
+      "turns_remaining": 99,
+      "turns_used": 1
+     },
+     "objective_contract": {
+      "completion_state": "in_progress",
+      "created_at": "<volatile:created_at>",
+      "definition_of_done": [
+       {
+        "id": "scope",
+        "label": "Scope accepted",
+        "status": "done"
+       },
+       {
+        "id": "implementation",
+        "label": "Implementation completed",
+        "status": "pending"
+       },
+       {
+        "id": "verification",
+        "label": "Build/test/lint verification passed",
+        "status": "pending"
+       },
+       {
+        "id": "docs",
+        "label": "Docs or handoff notes updated",
+        "status": "pending"
+       }
+      ],
+      "objective": "ship the stripe webhook fix",
+      "updated_at": "<volatile:updated_at>",
+      "verification": {
+       "failed_checks": [],
+       "last_run_at": "<volatile:last_run_at>",
+       "passed_checks": [],
+       "required": [
+        "build",
+        "test",
+        "lint"
+       ],
+       "status": "pending"
+      }
+     },
+     "policy": {
+      "blocked": 0,
+      "fallback_used": false,
+      "mode": "clone_advisor",
+      "observation_recall_count": 0,
+      "semantic_recall_used": false
+     },
+     "recommended_actions": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ]
+    },
+    "constraints": [],
+    "context_quality_score": 0.4672,
+    "context_tier_used": "l2",
+    "continuity_ok": true,
+    "decision_confidence": 0.693,
+    "decision_source": "safety_gate",
+    "directive_id": null,
+    "directive_state": null,
+    "enforced": true,
+    "enforcement_reason": "weak_evidence_decisive",
+    "enforcement_tier": null,
+    "episode_boost_applied": false,
+    "execution_permit_id": null,
+    "execution_permit_required": true,
+    "feedback_adjustment_applied": false,
+    "final_response": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "goal_cache_hit": false,
+    "goal_cache_source": null,
+    "latency_breakdown_ms": "<volatile:latency_breakdown_ms>",
+    "needs_human": true,
+    "next_action": {
+     "kind": "confirm",
+     "rationale": "high-risk action detected; confirmation required",
+     "target": "ship the stripe webhook fix"
+    },
+    "note": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "open_decision_opportunity_id": null,
+    "pending_execution": null,
+    "planner_used": false,
+    "planning_job_id": "<volatile:planning_job_id>",
+    "planning_pending": false,
+    "planning_pending_hint_ms": "<volatile:planning_pending_hint_ms>",
+    "project_binding": "unbound",
+    "query_expansion_terms": [],
+    "query_expansion_used": false,
+    "rerank_strategy": "none",
+    "retrieval_hit_count": 0,
+    "retrieval_latency_ms": "<volatile:retrieval_latency_ms>",
+    "retrieval_reason": "cooldown_suppressed",
+    "retrieval_source": "none",
+    "retrieval_triggered": false,
+    "retry_scheduled": false,
+    "safety_decision": "confirm_required",
+    "selected_goal": {
+     "affective_scores": {},
+     "attempts": 0,
+     "cache_hit": false,
+     "cache_source": "plan",
+     "confidence": 0.85,
+     "created_at": "<volatile:created_at>",
+     "depends_on": [],
+     "description": "Read the files and recent events that describe 'ship the stripe webhook fix' without changing anything.",
+     "evidence_event_ids": [],
+     "goal_kind": "normal",
+     "id": "<uuid>",
+     "mutating": false,
+     "parent_goal_id": "<uuid>",
+     "priority_score": 0.9,
+     "reasoning": "Ordered plan step derived from the user objective.",
+     "risk_tier": "medium",
+     "selection_score": 0.9,
+     "session_id": "p4-y1-session",
+     "source": "user_objective",
+     "status": "candidate",
+     "step_index": 1,
+     "title": "Read the current state",
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "workspace_id": "p4-y1-workspace"
+    },
+    "selected_goal_score_breakdown": {
+     "confidence": 0.85,
+     "priority_score": 0.9,
+     "selection_score": 0.9
+    },
+    "snapshot_age_hours": null,
+    "snapshot_rehydrated": false,
+    "state": {
+     "activated_at": "<volatile:activated_at>",
+     "activation_keywords": "hey igris take over,hey beru take over",
+     "active": true,
+     "active_goal_id": "<uuid>",
+     "autonomy_policy_profile": "human_consultative",
+     "autonomy_score": 0.5695,
+     "continuity_violation_count": 0,
+     "enforcement_mode": "strict_takeover",
+     "expires_at": "<volatile:expires_at>",
+     "goal_queue_size": 0,
+     "last_classification": "decisive",
+     "last_deliberation_at": "<volatile:last_deliberation_at>",
+     "last_discovery_at": "<volatile:last_discovery_at>",
+     "last_message_at": "<volatile:last_message_at>",
+     "last_safety_decision": "confirm_required",
+     "last_tick_at": "<volatile:last_tick_at>",
+     "mode": "takeover",
+     "objective_hash": "4f8e0384a77e9e026e48",
+     "pending_directive_count": 0,
+     "persona_mode": "shadow",
+     "recent_outcomes_json": [],
+     "retry_backlog_count": 0,
+     "session_id": "p4-y1-session",
+     "stop_keywords": "shadow stand down,beru stand down,igris stand down",
+     "takeover_context": {
+      "advisor_fail_streak": 0,
+      "last_fast_path_reason": null,
+      "last_retrieval_trigger_turn": 1,
+      "last_user_message": "the stripe webhook is failing, do i force push the fix to prod",
+      "objective": "ship the stripe webhook fix",
+      "objective_contract": {
+       "completion_state": "in_progress",
+       "created_at": "<volatile:created_at>",
+       "definition_of_done": [
+        {
+         "id": "scope",
+         "label": "Scope accepted",
+         "status": "done"
+        },
+        {
+         "id": "implementation",
+         "label": "Implementation completed",
+         "status": "pending"
+        },
+        {
+         "id": "verification",
+         "label": "Build/test/lint verification passed",
+         "status": "pending"
+        },
+        {
+         "id": "docs",
+         "label": "Docs or handoff notes updated",
+         "status": "pending"
+        }
+       ],
+       "objective": "ship the stripe webhook fix",
+       "updated_at": "<volatile:updated_at>",
+       "verification": {
+        "failed_checks": [],
+        "last_run_at": "<volatile:last_run_at>",
+        "passed_checks": [],
+        "required": [
+         "build",
+         "test",
+         "lint"
+        ],
+        "status": "pending"
+       }
+      },
+      "pinned_user_objective": "ship the stripe webhook fix",
+      "pinned_user_objective_hash": "4f8e0384a77e9e026e48",
+      "pinned_user_objective_turn": 2,
+      "pinned_user_objective_until_turn": 202,
+      "project_binding": "unbound",
+      "quality_history": [
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": true,
+        "ts": "<ts>",
+        "turn": 1
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 2
+       }
+      ],
+      "quality_rollup": {
+       "avg_context_quality": 0.4672,
+       "avg_decision_confidence": 0.693,
+       "needs_human_rate": 1.0,
+       "updated_at": "<volatile:updated_at>",
+       "window": 2
+      },
+      "selected_goal_title": "Read the current state",
+      "turn_count": 2
+     },
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "working_set_json": {
+      "activation_boost_applied": false,
+      "citation_snippets": [
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       }
+      ],
+      "citations": [
+       "<uuid>"
+      ],
+      "context_tier_used": "l2",
+      "do": [
+       "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+       "Use timeline search immediately while patterns are still warming up."
+      ],
+      "dont": [
+       "Do not treat low-evidence suggestions as hard constraints."
+      ],
+      "episode_boost_applied": false,
+      "evidence_count": 1,
+      "graph_entities": 0,
+      "planner_used": false,
+      "refreshed_at": "<volatile:refreshed_at>",
+      "subquery_count": 1,
+      "subquery_labels": [
+       "objective"
+      ],
+      "summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+      "summary_coverage": 0.0,
+      "top_patterns": []
+     },
+     "workspace_id": "p4-y1-workspace"
+    },
+    "subquery_count": 1,
+    "subquery_labels": [
+     "objective"
+    ],
+    "summary_coverage": 0.0,
+    "takeover_enforcement": {
+     "mode": "takeover",
+     "note": "weak evidence \u2014 enforced explore-and-implement directive",
+     "trigger": "weak_evidence_decisive"
+    },
+    "task_state": {
+     "contract_revision": 1,
+     "next_permitted_action": "execute_step",
+     "open_decision_count": 0,
+     "open_step_index": 1,
+     "plan_producer": "deterministic",
+     "plan_state": "approved",
+     "revision": 1,
+     "source_revision": "<volatile:source_revision>",
+     "status": "active",
+     "task_id": "p4-y1-session",
+     "unresolved_effect_count": 0
+    },
+    "task_state_revision": 1,
+    "unresolved_effects": []
+   },
+   "message": "the stripe webhook is failing, do i force push the fix to prod",
+   "status_code": 200
+  },
+  {
+   "body": {
+    "action": "advisor_takeover",
+    "activation_boost_applied": false,
+    "auto_handoff": {},
+    "autonomy_notice": null,
+    "behavior_fidelity_gate": {
+     "enabled": false,
+     "passed": true,
+     "reason": "gate_disabled"
+    },
+    "capture_delivery_state": "unavailable",
+    "charter_active": false,
+    "charter_version": "",
+    "citations": [
+     "<uuid>",
+     "<uuid>"
+    ],
+    "classification": "decisive",
+    "clone_advice": {
+     "advisor_failure_reason": null,
+     "citations": [
+      "<uuid>",
+      "<uuid>"
+     ],
+     "clone_context": {
+      "current_task": "ship the stripe webhook fix",
+      "similar_observations": [],
+      "situation_type": "routine_task"
+     },
+     "confidence": 0.45,
+     "conflict_flags": [],
+     "do": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ],
+     "dont": [
+      "Do not treat low-evidence suggestions as hard constraints."
+     ],
+     "evidence_observations": [],
+     "evidence_strength": "medium",
+     "fast_path_reason": null,
+     "guidance_summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+     "interaction_id": "p4-y1-2",
+     "loop_guard": {
+      "max_turns": 100,
+      "turns_remaining": 99,
+      "turns_used": 1
+     },
+     "objective_contract": {
+      "completion_state": "in_progress",
+      "created_at": "<volatile:created_at>",
+      "definition_of_done": [
+       {
+        "id": "scope",
+        "label": "Scope accepted",
+        "status": "done"
+       },
+       {
+        "id": "implementation",
+        "label": "Implementation completed",
+        "status": "pending"
+       },
+       {
+        "id": "verification",
+        "label": "Build/test/lint verification passed",
+        "status": "pending"
+       },
+       {
+        "id": "docs",
+        "label": "Docs or handoff notes updated",
+        "status": "pending"
+       }
+      ],
+      "objective": "ship the stripe webhook fix",
+      "updated_at": "<volatile:updated_at>",
+      "verification": {
+       "failed_checks": [],
+       "last_run_at": "<volatile:last_run_at>",
+       "passed_checks": [],
+       "required": [
+        "build",
+        "test",
+        "lint"
+       ],
+       "status": "pending"
+      }
+     },
+     "policy": {
+      "blocked": 0,
+      "fallback_used": false,
+      "mode": "clone_advisor",
+      "observation_recall_count": 0,
+      "semantic_recall_used": false
+     },
+     "recommended_actions": [
+      "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+      "Use timeline search immediately while patterns are still warming up."
+     ]
+    },
+    "constraints": [],
+    "context_quality_score": 0.6819,
+    "context_tier_used": "l2",
+    "continuity_ok": true,
+    "decision_confidence": 0.7255,
+    "decision_source": "safety_gate",
+    "directive_id": null,
+    "directive_state": null,
+    "enforced": true,
+    "enforcement_reason": "weak_evidence_decisive",
+    "enforcement_tier": null,
+    "episode_boost_applied": false,
+    "execution_permit_id": null,
+    "execution_permit_required": true,
+    "feedback_adjustment_applied": false,
+    "final_response": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "goal_cache_hit": false,
+    "goal_cache_source": null,
+    "latency_breakdown_ms": "<volatile:latency_breakdown_ms>",
+    "needs_human": true,
+    "next_action": {
+     "kind": "confirm",
+     "rationale": "high-risk action detected; confirmation required",
+     "target": "ship the stripe webhook fix"
+    },
+    "note": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "open_decision_opportunity_id": null,
+    "pending_execution": null,
+    "planner_used": false,
+    "planning_job_id": "<volatile:planning_job_id>",
+    "planning_pending": false,
+    "planning_pending_hint_ms": "<volatile:planning_pending_hint_ms>",
+    "project_binding": "unbound",
+    "query_expansion_terms": [],
+    "query_expansion_used": false,
+    "rerank_strategy": "none",
+    "retrieval_hit_count": 1,
+    "retrieval_latency_ms": "<volatile:retrieval_latency_ms>",
+    "retrieval_reason": null,
+    "retrieval_source": "none",
+    "retrieval_triggered": false,
+    "retry_scheduled": false,
+    "safety_decision": "confirm_required",
+    "selected_goal": {
+     "affective_scores": {},
+     "attempts": 0,
+     "cache_hit": false,
+     "cache_source": "plan",
+     "confidence": 0.85,
+     "created_at": "<volatile:created_at>",
+     "depends_on": [],
+     "description": "Read the files and recent events that describe 'ship the stripe webhook fix' without changing anything.",
+     "evidence_event_ids": [],
+     "goal_kind": "normal",
+     "id": "<uuid>",
+     "mutating": false,
+     "parent_goal_id": "<uuid>",
+     "priority_score": 0.9,
+     "reasoning": "Ordered plan step derived from the user objective.",
+     "risk_tier": "medium",
+     "selection_score": 0.9,
+     "session_id": "p4-y1-session",
+     "source": "user_objective",
+     "status": "candidate",
+     "step_index": 1,
+     "title": "Read the current state",
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "workspace_id": "p4-y1-workspace"
+    },
+    "selected_goal_score_breakdown": {
+     "confidence": 0.85,
+     "priority_score": 0.9,
+     "selection_score": 0.9
+    },
+    "snapshot_age_hours": null,
+    "snapshot_rehydrated": false,
+    "state": {
+     "activated_at": "<volatile:activated_at>",
+     "activation_keywords": "hey igris take over,hey beru take over",
+     "active": true,
+     "active_goal_id": "<uuid>",
+     "autonomy_policy_profile": "human_consultative",
+     "autonomy_score": 0.6007,
+     "continuity_violation_count": 0,
+     "enforcement_mode": "strict_takeover",
+     "expires_at": "<volatile:expires_at>",
+     "goal_queue_size": 0,
+     "last_classification": "decisive",
+     "last_deliberation_at": "<volatile:last_deliberation_at>",
+     "last_discovery_at": "<volatile:last_discovery_at>",
+     "last_message_at": "<volatile:last_message_at>",
+     "last_safety_decision": "confirm_required",
+     "last_tick_at": "<volatile:last_tick_at>",
+     "mode": "takeover",
+     "objective_hash": "4f8e0384a77e9e026e48",
+     "pending_directive_count": 0,
+     "persona_mode": "shadow",
+     "recent_outcomes_json": [],
+     "retry_backlog_count": 0,
+     "session_id": "p4-y1-session",
+     "stop_keywords": "shadow stand down,beru stand down,igris stand down",
+     "takeover_context": {
+      "advisor_fail_streak": 0,
+      "last_fast_path_reason": null,
+      "last_retrieval_trigger_turn": 1,
+      "last_user_message": "ok continue",
+      "objective": "ship the stripe webhook fix",
+      "objective_contract": {
+       "completion_state": "in_progress",
+       "created_at": "<volatile:created_at>",
+       "definition_of_done": [
+        {
+         "id": "scope",
+         "label": "Scope accepted",
+         "status": "done"
+        },
+        {
+         "id": "implementation",
+         "label": "Implementation completed",
+         "status": "pending"
+        },
+        {
+         "id": "verification",
+         "label": "Build/test/lint verification passed",
+         "status": "pending"
+        },
+        {
+         "id": "docs",
+         "label": "Docs or handoff notes updated",
+         "status": "pending"
+        }
+       ],
+       "objective": "ship the stripe webhook fix",
+       "updated_at": "<volatile:updated_at>",
+       "verification": {
+        "failed_checks": [],
+        "last_run_at": "<volatile:last_run_at>",
+        "passed_checks": [],
+        "required": [
+         "build",
+         "test",
+         "lint"
+        ],
+        "status": "pending"
+       }
+      },
+      "pinned_user_objective": "ship the stripe webhook fix",
+      "pinned_user_objective_hash": "4f8e0384a77e9e026e48",
+      "pinned_user_objective_turn": 3,
+      "pinned_user_objective_until_turn": 203,
+      "project_binding": "unbound",
+      "quality_history": [
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": true,
+        "ts": "<ts>",
+        "turn": 1
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 2
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.6819,
+        "decision_confidence": 0.7255,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 3
+       }
+      ],
+      "quality_rollup": {
+       "avg_context_quality": 0.5388,
+       "avg_decision_confidence": 0.7038,
+       "needs_human_rate": 1.0,
+       "updated_at": "<volatile:updated_at>",
+       "window": 3
+      },
+      "selected_goal_title": "Read the current state",
+      "turn_count": 3
+     },
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "working_set_json": {
+      "activation_boost_applied": false,
+      "citation_snippets": [
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       },
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       }
+      ],
+      "citations": [
+       "<uuid>",
+       "<uuid>"
+      ],
+      "context_tier_used": "l2",
+      "do": [
+       "Capture TASK_DECISION and TASK_DONE events for faster personalization.",
+       "Use timeline search immediately while patterns are still warming up."
+      ],
+      "dont": [
+       "Do not treat low-evidence suggestions as hard constraints."
+      ],
+      "episode_boost_applied": false,
+      "evidence_count": 2,
+      "graph_entities": 0,
+      "planner_used": false,
+      "refreshed_at": "<volatile:refreshed_at>",
+      "subquery_count": 1,
+      "subquery_labels": [
+       "objective"
+      ],
+      "summary": "Cold start mode: limited historical signal; running timeline log/search behavior with cautious guidance.",
+      "summary_coverage": 0.0,
+      "top_patterns": []
+     },
+     "workspace_id": "p4-y1-workspace"
+    },
+    "subquery_count": 1,
+    "subquery_labels": [
+     "objective"
+    ],
+    "summary_coverage": 0.0,
+    "takeover_enforcement": {
+     "mode": "takeover",
+     "note": "weak evidence \u2014 enforced explore-and-implement directive",
+     "trigger": "weak_evidence_decisive"
+    },
+    "task_state": {
+     "contract_revision": 1,
+     "next_permitted_action": "execute_step",
+     "open_decision_count": 0,
+     "open_step_index": 1,
+     "plan_producer": "deterministic",
+     "plan_state": "approved",
+     "revision": 1,
+     "source_revision": "<volatile:source_revision>",
+     "status": "active",
+     "task_id": "p4-y1-session",
+     "unresolved_effect_count": 0
+    },
+    "task_state_revision": 1,
+    "unresolved_effects": []
+   },
+   "message": "ok continue",
+   "status_code": 200
+  },
+  {
+   "body": {
+    "action": "advisor_takeover",
+    "activation_boost_applied": false,
+    "auto_handoff": {},
+    "autonomy_notice": null,
+    "behavior_fidelity_gate": {
+     "enabled": false,
+     "passed": true,
+     "reason": "gate_disabled"
+    },
+    "capture_delivery_state": "unavailable",
+    "charter_active": false,
+    "charter_version": "",
+    "citations": [
+     "<uuid>",
+     "<uuid>",
+     "<uuid>"
+    ],
+    "classification": "decisive",
+    "clone_advice": {
+     "advisor_failure_reason": null,
+     "citations": [
+      "<uuid>",
+      "<uuid>",
+      "<uuid>"
+     ],
+     "clone_context": {
+      "current_task": "ship the stripe webhook fix",
+      "similar_observations": [],
+      "situation_type": "routine_task"
+     },
+     "confidence": 0.546,
+     "conflict_flags": [],
+     "do": [
+      "In coding, you commonly run interaction_takeover_step tasks via api-auto-capture.",
+      "Semantic memory: in coding/interaction_takeover_step, iterative evidence-backed execution is reliable."
+     ],
+     "dont": [
+      "Do not treat low-evidence suggestions as hard constraints."
+     ],
+     "evidence_observations": [],
+     "evidence_strength": "medium",
+     "fast_path_reason": null,
+     "guidance_summary": "Bundle generated at <ts> with 3 evidence events and 2 patterns.",
+     "interaction_id": "p4-y1-3",
+     "loop_guard": {
+      "max_turns": 100,
+      "turns_remaining": 99,
+      "turns_used": 1
+     },
+     "objective_contract": {
+      "completion_state": "in_progress",
+      "created_at": "<volatile:created_at>",
+      "definition_of_done": [
+       {
+        "id": "scope",
+        "label": "Scope accepted",
+        "status": "done"
+       },
+       {
+        "id": "implementation",
+        "label": "Implementation completed",
+        "status": "pending"
+       },
+       {
+        "id": "verification",
+        "label": "Build/test/lint verification passed",
+        "status": "pending"
+       },
+       {
+        "id": "docs",
+        "label": "Docs or handoff notes updated",
+        "status": "pending"
+       }
+      ],
+      "objective": "ship the stripe webhook fix",
+      "updated_at": "<volatile:updated_at>",
+      "verification": {
+       "failed_checks": [],
+       "last_run_at": "<volatile:last_run_at>",
+       "passed_checks": [],
+       "required": [
+        "build",
+        "test",
+        "lint"
+       ],
+       "status": "pending"
+      }
+     },
+     "policy": {
+      "blocked": 0,
+      "fallback_used": false,
+      "mode": "clone_advisor",
+      "observation_recall_count": 0,
+      "semantic_recall_used": false
+     },
+     "recommended_actions": [
+      "In coding, you commonly run interaction_takeover_step tasks via api-auto-capture.",
+      "Semantic memory: in coding/interaction_takeover_step, iterative evidence-backed execution is reliable."
+     ]
+    },
+    "constraints": [],
+    "context_quality_score": 0.7235,
+    "context_tier_used": "l2",
+    "continuity_ok": true,
+    "decision_confidence": 0.7255,
+    "decision_source": "safety_gate",
+    "directive_id": null,
+    "directive_state": null,
+    "enforced": false,
+    "enforcement_reason": null,
+    "enforcement_tier": null,
+    "episode_boost_applied": false,
+    "execution_permit_id": null,
+    "execution_permit_required": true,
+    "feedback_adjustment_applied": false,
+    "final_response": "Project binding is unbound (no repo/app_context identity); autonomous writes require a bound project. Provide app_context.project_root or repo remote.",
+    "goal_cache_hit": false,
+    "goal_cache_source": null,
+    "latency_breakdown_ms": "<volatile:latency_breakdown_ms>",
+    "needs_human": true,
+    "next_action": {
+     "kind": "confirm",
+     "rationale": "high-risk action detected; confirmation required",
+     "target": "ship the stripe webhook fix"
+    },
+    "note": null,
+    "open_decision_opportunity_id": "<uuid>",
+    "pending_execution": null,
+    "planner_used": false,
+    "planning_job_id": "<volatile:planning_job_id>",
+    "planning_pending": false,
+    "planning_pending_hint_ms": "<volatile:planning_pending_hint_ms>",
+    "project_binding": "unbound",
+    "query_expansion_terms": [],
+    "query_expansion_used": false,
+    "rerank_strategy": "none",
+    "retrieval_hit_count": 2,
+    "retrieval_latency_ms": "<volatile:retrieval_latency_ms>",
+    "retrieval_reason": null,
+    "retrieval_source": "none",
+    "retrieval_triggered": false,
+    "retry_scheduled": false,
+    "safety_decision": "confirm_required",
+    "selected_goal": {
+     "affective_scores": {},
+     "attempts": 0,
+     "cache_hit": false,
+     "cache_source": "plan",
+     "confidence": 0.85,
+     "created_at": "<volatile:created_at>",
+     "depends_on": [],
+     "description": "Read the files and recent events that describe 'ship the stripe webhook fix' without changing anything.",
+     "evidence_event_ids": [],
+     "goal_kind": "normal",
+     "id": "<uuid>",
+     "mutating": false,
+     "parent_goal_id": "<uuid>",
+     "priority_score": 0.9,
+     "reasoning": "Ordered plan step derived from the user objective.",
+     "risk_tier": "medium",
+     "selection_score": 0.9,
+     "session_id": "p4-y1-session",
+     "source": "user_objective",
+     "status": "candidate",
+     "step_index": 1,
+     "title": "Read the current state",
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "workspace_id": "p4-y1-workspace"
+    },
+    "selected_goal_score_breakdown": {
+     "confidence": 0.85,
+     "priority_score": 0.9,
+     "selection_score": 0.9
+    },
+    "snapshot_age_hours": null,
+    "snapshot_rehydrated": false,
+    "state": {
+     "activated_at": "<volatile:activated_at>",
+     "activation_keywords": "hey igris take over,hey beru take over",
+     "active": true,
+     "active_goal_id": "<uuid>",
+     "autonomy_policy_profile": "human_consultative",
+     "autonomy_score": 0.6257,
+     "continuity_violation_count": 0,
+     "enforcement_mode": "strict_takeover",
+     "expires_at": "<volatile:expires_at>",
+     "goal_queue_size": 0,
+     "last_classification": "decisive",
+     "last_deliberation_at": "<volatile:last_deliberation_at>",
+     "last_discovery_at": "<volatile:last_discovery_at>",
+     "last_message_at": "<volatile:last_message_at>",
+     "last_safety_decision": "confirm_required",
+     "last_tick_at": "<volatile:last_tick_at>",
+     "mode": "takeover",
+     "objective_hash": "4f8e0384a77e9e026e48",
+     "pending_directive_count": 0,
+     "persona_mode": "shadow",
+     "recent_outcomes_json": [],
+     "retry_backlog_count": 0,
+     "session_id": "p4-y1-session",
+     "stop_keywords": "shadow stand down,beru stand down,igris stand down",
+     "takeover_context": {
+      "advisor_fail_streak": 0,
+      "last_fast_path_reason": null,
+      "last_retrieval_trigger_turn": 1,
+      "last_user_message": "should i drop the payments table and rebuild it",
+      "objective": "ship the stripe webhook fix",
+      "objective_contract": {
+       "completion_state": "in_progress",
+       "created_at": "<volatile:created_at>",
+       "definition_of_done": [
+        {
+         "id": "scope",
+         "label": "Scope accepted",
+         "status": "done"
+        },
+        {
+         "id": "implementation",
+         "label": "Implementation completed",
+         "status": "pending"
+        },
+        {
+         "id": "verification",
+         "label": "Build/test/lint verification passed",
+         "status": "pending"
+        },
+        {
+         "id": "docs",
+         "label": "Docs or handoff notes updated",
+         "status": "pending"
+        }
+       ],
+       "objective": "ship the stripe webhook fix",
+       "updated_at": "<volatile:updated_at>",
+       "verification": {
+        "failed_checks": [],
+        "last_run_at": "<volatile:last_run_at>",
+        "passed_checks": [],
+        "required": [
+         "build",
+         "test",
+         "lint"
+        ],
+        "status": "pending"
+       }
+      },
+      "pending_safety": {
+       "opportunity_id": "<uuid>",
+       "pending_response": "Bundle generated at <ts> with 3 evidence events and 2 patterns.",
+       "reason": "irreversible_data_operation"
+      },
+      "pinned_user_objective": "ship the stripe webhook fix",
+      "pinned_user_objective_hash": "4f8e0384a77e9e026e48",
+      "pinned_user_objective_turn": 4,
+      "pinned_user_objective_until_turn": 204,
+      "project_binding": "unbound",
+      "quality_history": [
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": true,
+        "ts": "<ts>",
+        "turn": 1
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 2
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.6819,
+        "decision_confidence": 0.7255,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 3
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.7235,
+        "decision_confidence": 0.7255,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 4
+       }
+      ],
+      "quality_rollup": {
+       "avg_context_quality": 0.5849,
+       "avg_decision_confidence": 0.7092,
+       "needs_human_rate": 1.0,
+       "updated_at": "<volatile:updated_at>",
+       "window": 4
+      },
+      "selected_goal_title": "Read the current state",
+      "turn_count": 4
+     },
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "working_set_json": {
+      "activation_boost_applied": false,
+      "citation_snippets": [
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       },
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       },
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       }
+      ],
+      "citations": [
+       "<uuid>",
+       "<uuid>",
+       "<uuid>"
+      ],
+      "context_tier_used": "l2",
+      "do": [
+       "In coding, you commonly run interaction_takeover_step tasks via api-auto-capture.",
+       "Semantic memory: in coding/interaction_takeover_step, iterative evidence-backed execution is reliable."
+      ],
+      "dont": [
+       "Do not treat low-evidence suggestions as hard constraints."
+      ],
+      "episode_boost_applied": false,
+      "evidence_count": 3,
+      "graph_entities": 0,
+      "planner_used": false,
+      "refreshed_at": "<volatile:refreshed_at>",
+      "subquery_count": 1,
+      "subquery_labels": [
+       "objective"
+      ],
+      "summary": "Bundle generated at <ts> with 3 evidence events and 2 patterns.",
+      "summary_coverage": 0.0,
+      "top_patterns": []
+     },
+     "workspace_id": "p4-y1-workspace"
+    },
+    "subquery_count": 1,
+    "subquery_labels": [
+     "objective"
+    ],
+    "summary_coverage": 0.0,
+    "takeover_enforcement": {},
+    "task_state": {
+     "contract_revision": 1,
+     "next_permitted_action": "execute_step",
+     "open_decision_count": 0,
+     "open_step_index": 1,
+     "plan_producer": "deterministic",
+     "plan_state": "approved",
+     "revision": 1,
+     "source_revision": "<volatile:source_revision>",
+     "status": "active",
+     "task_id": "p4-y1-session",
+     "unresolved_effect_count": 0
+    },
+    "task_state_revision": 1,
+    "unresolved_effects": []
+   },
+   "message": "should i drop the payments table and rebuild it",
+   "status_code": 200
+  },
+  {
+   "body": {
+    "action": "stopped",
+    "activation_boost_applied": false,
+    "auto_handoff": {},
+    "autonomy_notice": null,
+    "behavior_fidelity_gate": {},
+    "capture_delivery_state": "unknown",
+    "charter_active": false,
+    "charter_version": "",
+    "citations": [],
+    "classification": "decisive",
+    "clone_advice": {},
+    "constraints": [],
+    "context_quality_score": 0.0,
+    "context_tier_used": "l2",
+    "continuity_ok": true,
+    "decision_confidence": 0.0,
+    "decision_source": "fast_path",
+    "directive_id": null,
+    "directive_state": null,
+    "enforced": false,
+    "enforcement_reason": null,
+    "enforcement_tier": null,
+    "episode_boost_applied": false,
+    "execution_permit_id": null,
+    "execution_permit_required": false,
+    "feedback_adjustment_applied": false,
+    "final_response": null,
+    "goal_cache_hit": false,
+    "goal_cache_source": null,
+    "latency_breakdown_ms": "<volatile:latency_breakdown_ms>",
+    "needs_human": false,
+    "next_action": {
+     "kind": "stop",
+     "rationale": "stand-down requested",
+     "target": ""
+    },
+    "note": "takeover stopped",
+    "open_decision_opportunity_id": null,
+    "pending_execution": null,
+    "planner_used": false,
+    "planning_job_id": "<volatile:planning_job_id>",
+    "planning_pending": false,
+    "planning_pending_hint_ms": "<volatile:planning_pending_hint_ms>",
+    "project_binding": "unbound",
+    "query_expansion_terms": [],
+    "query_expansion_used": false,
+    "rerank_strategy": "none",
+    "retrieval_hit_count": 0,
+    "retrieval_latency_ms": "<volatile:retrieval_latency_ms>",
+    "retrieval_reason": null,
+    "retrieval_source": "none",
+    "retrieval_triggered": false,
+    "retry_scheduled": false,
+    "safety_decision": "allow",
+    "selected_goal": null,
+    "selected_goal_score_breakdown": {},
+    "snapshot_age_hours": null,
+    "snapshot_rehydrated": false,
+    "state": {
+     "activated_at": "<volatile:activated_at>",
+     "activation_keywords": "hey igris take over,hey beru take over",
+     "active": false,
+     "active_goal_id": "<uuid>",
+     "autonomy_policy_profile": "human_consultative",
+     "autonomy_score": 0.6257,
+     "continuity_violation_count": 0,
+     "enforcement_mode": "strict_takeover",
+     "expires_at": "<volatile:expires_at>",
+     "goal_queue_size": 0,
+     "last_classification": "decisive",
+     "last_deliberation_at": "<volatile:last_deliberation_at>",
+     "last_discovery_at": "<volatile:last_discovery_at>",
+     "last_message_at": "<volatile:last_message_at>",
+     "last_safety_decision": "confirm_required",
+     "last_tick_at": "<volatile:last_tick_at>",
+     "mode": "takeover",
+     "objective_hash": "4f8e0384a77e9e026e48",
+     "pending_directive_count": 0,
+     "persona_mode": "shadow",
+     "recent_outcomes_json": [],
+     "retry_backlog_count": 0,
+     "session_id": "p4-y1-session",
+     "stop_keywords": "shadow stand down,beru stand down,igris stand down",
+     "takeover_context": {
+      "advisor_fail_streak": 0,
+      "last_fast_path_reason": null,
+      "last_retrieval_trigger_turn": 1,
+      "last_user_message": "should i drop the payments table and rebuild it",
+      "objective": "ship the stripe webhook fix",
+      "objective_contract": {
+       "completion_state": "in_progress",
+       "created_at": "<volatile:created_at>",
+       "definition_of_done": [
+        {
+         "id": "scope",
+         "label": "Scope accepted",
+         "status": "done"
+        },
+        {
+         "id": "implementation",
+         "label": "Implementation completed",
+         "status": "pending"
+        },
+        {
+         "id": "verification",
+         "label": "Build/test/lint verification passed",
+         "status": "pending"
+        },
+        {
+         "id": "docs",
+         "label": "Docs or handoff notes updated",
+         "status": "pending"
+        }
+       ],
+       "objective": "ship the stripe webhook fix",
+       "updated_at": "<volatile:updated_at>",
+       "verification": {
+        "failed_checks": [],
+        "last_run_at": "<volatile:last_run_at>",
+        "passed_checks": [],
+        "required": [
+         "build",
+         "test",
+         "lint"
+        ],
+        "status": "pending"
+       }
+      },
+      "pending_safety": {
+       "opportunity_id": "<uuid>",
+       "pending_response": "Bundle generated at <ts> with 3 evidence events and 2 patterns.",
+       "reason": "irreversible_data_operation"
+      },
+      "pinned_user_objective": "ship the stripe webhook fix",
+      "pinned_user_objective_hash": "4f8e0384a77e9e026e48",
+      "pinned_user_objective_turn": 4,
+      "pinned_user_objective_until_turn": 204,
+      "project_binding": "unbound",
+      "quality_history": [
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": true,
+        "ts": "<ts>",
+        "turn": 1
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.4672,
+        "decision_confidence": 0.693,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 2
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.6819,
+        "decision_confidence": 0.7255,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 3
+       },
+       {
+        "advisor_fail_streak": 0,
+        "advisor_last_error": null,
+        "advisor_required_in_takeover": true,
+        "advisor_unhealthy": false,
+        "context_quality_score": 0.7235,
+        "decision_confidence": 0.7255,
+        "decision_source": "safety_gate",
+        "needs_human": true,
+        "retrieval_triggered": false,
+        "ts": "<ts>",
+        "turn": 4
+       }
+      ],
+      "quality_rollup": {
+       "avg_context_quality": 0.5849,
+       "avg_decision_confidence": 0.7092,
+       "needs_human_rate": 1.0,
+       "updated_at": "<volatile:updated_at>",
+       "window": 4
+      },
+      "selected_goal_title": "Read the current state",
+      "turn_count": 4
+     },
+     "updated_at": "<volatile:updated_at>",
+     "user_id": "p4-y1-user",
+     "working_set_json": {
+      "activation_boost_applied": false,
+      "citation_snippets": [
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       },
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       },
+       {
+        "excerpt": "Interaction: takeover_step - ship the stripe webhook fix | ship the stripe webhook fix",
+        "id": "<uuid>"
+       }
+      ],
+      "citations": [
+       "<uuid>",
+       "<uuid>",
+       "<uuid>"
+      ],
+      "context_tier_used": "l2",
+      "do": [
+       "In coding, you commonly run interaction_takeover_step tasks via api-auto-capture.",
+       "Semantic memory: in coding/interaction_takeover_step, iterative evidence-backed execution is reliable."
+      ],
+      "dont": [
+       "Do not treat low-evidence suggestions as hard constraints."
+      ],
+      "episode_boost_applied": false,
+      "evidence_count": 3,
+      "graph_entities": 0,
+      "planner_used": false,
+      "refreshed_at": "<volatile:refreshed_at>",
+      "subquery_count": 1,
+      "subquery_labels": [
+       "objective"
+      ],
+      "summary": "Bundle generated at <ts> with 3 evidence events and 2 patterns.",
+      "summary_coverage": 0.0,
+      "top_patterns": []
+     },
+     "workspace_id": "p4-y1-workspace"
+    },
+    "subquery_count": 0,
+    "subquery_labels": [],
+    "summary_coverage": 0.0,
+    "takeover_enforcement": {},
+    "task_state": {
+     "contract_revision": 0,
+     "next_permitted_action": "await_owner_objective",
+     "open_decision_count": 0,
+     "open_step_index": null,
+     "plan_producer": null,
+     "plan_state": "absent",
+     "revision": 0,
+     "source_revision": "<volatile:source_revision>",
+     "status": "awaiting_objective",
+     "task_id": "",
+     "unresolved_effect_count": 0
+    },
+    "task_state_revision": 0,
+    "unresolved_effects": []
+   },
+   "message": "beru stand down",
+   "status_code": 200
+  }
+ ]
+}
