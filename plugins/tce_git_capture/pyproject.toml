@@ -12,5 +12,5 @@ dependencies = [
 tce-git-capture = "tce_git_capture.cli:app"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
